@@ -12,7 +12,9 @@
 EXTRA_INSTALL=contrib/pg_prewarm \
 	contrib/pg_stat_statements \
 	contrib/test_decoding \
-	src/test/modules/injection_points
+	src/test/modules/injection_points \
+	contrib/pageinspect \
+	contrib/postgres_fdw
 
 subdir = src/test/recovery
 top_builddir = ../../..
