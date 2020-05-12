@@ -24,6 +24,7 @@
 #include "access/twophase.h"
 #include "access/xlogprefetcher.h"
 #include "access/xlogrecovery.h"
+#include "access/global_csn_log.h"
 #include "commands/async.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -125,6 +126,7 @@ CalculateShmemSize(int *num_semaphores)
 	size = add_size(size, XLOGShmemSize());
 	size = add_size(size, XLogRecoveryShmemSize());
 	size = add_size(size, CLOGShmemSize());
+	size = add_size(size, GlobalCSNLogShmemSize());
 	size = add_size(size, CommitTsShmemSize());
 	size = add_size(size, SUBTRANSShmemSize());
 	size = add_size(size, TwoPhaseShmemSize());
@@ -302,6 +304,7 @@ CreateOrAttachShmemStructs(void)
 	XLogPrefetchShmemInit();
 	XLogRecoveryShmemInit();
 	CLOGShmemInit();
+	GlobalCSNLogShmemInit();
 	CommitTsShmemInit();
 	SUBTRANSShmemInit();
 	MultiXactShmemInit();

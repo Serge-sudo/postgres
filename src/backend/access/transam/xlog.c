@@ -48,6 +48,7 @@
 
 #include "access/clog.h"
 #include "access/commit_ts.h"
+#include "access/global_csn_log.h"
 #include "access/heaptoast.h"
 #include "access/multixact.h"
 #include "access/rewriteheap.h"
@@ -5155,6 +5156,7 @@ BootStrapXLOG(void)
 
 	/* Bootstrap the commit log, too */
 	BootStrapCLOG();
+	BootStrapGlobalCSNLog();
 	BootStrapCommitTs();
 	BootStrapSUBTRANS();
 	BootStrapMultiXact();
@@ -5778,6 +5780,7 @@ StartupXLOG(void)
 			 * have already been started up and other SLRUs are not maintained
 			 * during recovery and need not be started yet.
 			 */
+			StartupGlobalCSNLog(oldestActiveXID);
 			StartupSUBTRANS(oldestActiveXID);
 
 			/*
@@ -6087,7 +6090,10 @@ StartupXLOG(void)
 	 * timestamps are started below, if necessary.)
 	 */
 	if (standbyState == STANDBY_DISABLED)
+	{
+		StartupGlobalCSNLog(oldestActiveXID);
 		StartupSUBTRANS(oldestActiveXID);
+	}
 
 	/*
 	 * Perform end of recovery actions for any SLRUs that need it.
@@ -7338,7 +7344,10 @@ CreateCheckPoint(int flags)
 	 * StartupSUBTRANS hasn't been called yet.
 	 */
 	if (!RecoveryInProgress())
+	{
 		TruncateSUBTRANS(GetOldestTransactionIdConsideredRunning());
+		TruncateGlobalCSNLog(GetOldestTransactionIdConsideredRunning());
+	}
 
 	/* Real work is done; log and update stats. */
 	LogCheckpointEnd(false);
@@ -7509,6 +7518,7 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	TRACE_POSTGRESQL_BUFFER_CHECKPOINT_START(flags);
 	CheckpointStats.ckpt_write_t = GetCurrentTimestamp();
 	CheckPointCLOG();
+	CheckPointGlobalCSNLog();
 	CheckPointCommitTs();
 	CheckPointSUBTRANS();
 	CheckPointMultiXact();
@@ -7805,7 +7815,10 @@ CreateRestartPoint(int flags)
 	 * this because StartupSUBTRANS hasn't been called yet.
 	 */
 	if (EnableHotStandby)
+	{
 		TruncateSUBTRANS(GetOldestTransactionIdConsideredRunning());
+		TruncateGlobalCSNLog(GetOldestTransactionIdConsideredRunning());
+	}
 
 	/* Real work is done; log and update stats. */
 	LogCheckpointEnd(true);
