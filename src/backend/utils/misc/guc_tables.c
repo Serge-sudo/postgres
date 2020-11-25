@@ -412,6 +412,24 @@ static const struct config_enum_entry plan_cache_mode_options[] = {
 	{NULL, 0, false}
 };
 
+/*
+ * Although only "required" and "disabled" are documented, we accept all
+ * the likely variants of "on" and "off".
+ */
+static const struct config_enum_entry foreign_twophase_commit_options[] = {
+	{"required", FOREIGN_TWOPHASE_COMMIT_REQUIRED, false},
+	{"disabled", FOREIGN_TWOPHASE_COMMIT_DISABLED, false},
+	{"on", FOREIGN_TWOPHASE_COMMIT_REQUIRED, false},
+	{"off", FOREIGN_TWOPHASE_COMMIT_DISABLED, false},
+	{"true", FOREIGN_TWOPHASE_COMMIT_REQUIRED, true},
+	{"false", FOREIGN_TWOPHASE_COMMIT_DISABLED, true},
+	{"yes", FOREIGN_TWOPHASE_COMMIT_REQUIRED, true},
+	{"no", FOREIGN_TWOPHASE_COMMIT_DISABLED, true},
+	{"1", FOREIGN_TWOPHASE_COMMIT_REQUIRED, true},
+	{"0", FOREIGN_TWOPHASE_COMMIT_DISABLED, true},
+	{NULL, 0, false}
+};
+
 static const struct config_enum_entry password_encryption_options[] = {
 	{"md5", PASSWORD_TYPE_MD5, false},
 	{"scram-sha-256", PASSWORD_TYPE_SCRAM_SHA_256, false},
@@ -4954,7 +4972,15 @@ struct config_enum ConfigureNamesEnum[] =
 		SYNCHRONOUS_COMMIT_ON, synchronous_commit_options,
 		NULL, assign_synchronous_commit, NULL
 	},
-
+	{
+		{"foreign_twophase_commit", PGC_USERSET, FOREIGN_TRANSACTION,
+		 gettext_noop("Use of foreign twophase commit for the current transaction."),
+			NULL
+		},
+		&foreign_twophase_commit,
+		FOREIGN_TWOPHASE_COMMIT_DISABLED, foreign_twophase_commit_options,
+		NULL, NULL, NULL
+	},
 	{
 		{"archive_mode", PGC_POSTMASTER, WAL_ARCHIVING,
 			gettext_noop("Allows archiving of WAL files using \"archive_command\"."),
