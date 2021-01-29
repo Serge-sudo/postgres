@@ -222,13 +222,16 @@ CSNLogGetCSNByXid(TransactionId xid)
 	int entryno = TransactionIdToPgIndex(xid);
 	int slotno;
 	CSN csn;
+	LWLock	   *lock;
+
+	lock = SimpleLruGetBankLock(CsnlogCtl, pageno);
 
 	/* lock is acquired by SimpleLruReadPage_ReadOnly */
 	slotno = SimpleLruReadPage_ReadOnly(CsnlogCtl, pageno, xid);
 	csn = *(CSN *) (CsnlogCtl->shared->page_buffer[slotno] +
 														entryno * sizeof(CSN));
 
-	LWLockRelease(CSNLogControlLock);
+	LWLockRelease(lock);
 
 	return csn;
 }
@@ -239,7 +242,7 @@ CSNLogGetCSNByXid(TransactionId xid)
 static Size
 CSNLogShmemBuffers(void)
 {
-	return Min(32, Max(4, NBuffers / 512));
+	return Min(32, Max(16, NBuffers / 512));
 }
 
 /*
