@@ -6209,6 +6209,7 @@ StartupXLOG(void)
 	 */
 	if (promoted)
 		RequestCheckpoint(CHECKPOINT_FORCE);
+
 }
 
 /*
