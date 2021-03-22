@@ -24,6 +24,7 @@
 #include "access/xlog.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "access/csn_log.h"
 #include "portability/instr_time.h"
 #include "postmaster/bgwriter.h"
 #include "storage/fd.h"
@@ -114,6 +115,10 @@ static const SyncOps syncsw[] = {
 	/* pg_multixact/members */
 	[SYNC_HANDLER_MULTIXACT_MEMBER] = {
 		.sync_syncfiletag = multixactmemberssyncfiletag
+	},
+	/* CSN_Log */
+	[SYNC_HANDLER_CSN_LOG] = {
+		.sync_syncfiletag = csnlogsyncfiletag
 	}
 };
 

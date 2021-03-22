@@ -1057,6 +1057,24 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"enable_csn_snapshot", PGC_POSTMASTER, RESOURCES_MEM,
+			gettext_noop("Enable csn-base snapshot."),
+			gettext_noop("Used to achieve REPEATEBLE READ isolation level for postgres_fdw transactions.")
+		},
+		&enable_csn_snapshot,
+		false,
+		NULL, NULL, NULL
+	},
+	{
+		{"enable_csn_wal", PGC_POSTMASTER, RESOURCES_MEM,
+			gettext_noop("Enable csn-wal record."),
+			gettext_noop("Used to enable csn-wal record")
+		},
+		&enable_csn_wal,
+		true,
+		NULL, NULL, NULL
+	},
+	{
 		{"ssl", PGC_SIGHUP, CONN_AUTH_SSL,
 			gettext_noop("Enables SSL connections."),
 			NULL
