@@ -84,8 +84,10 @@ append_to_file($q2, q{
 });
 
 my $seconds = 5;
-my $pgb_handle1 = $node1->pgbench("-n -c 5 -T $seconds -f $q1", 0, [], [], 'concurrent INSERTs and CIC');
-my $pgb_handle2 = $node2->pgbench("-n -c 5 -T $seconds -f $q2", 0, [], [], 'concurrent INSERTs and CIC');
+my $pgb_handle1 = $node1->pgbench_async("-n -c 5 -T $seconds -f $q1", 0, [], [], 'concurrent INSERTs and CIC');
+my $pgb_handle2 = $node2->pgbench_async("-n -c 5 -T $seconds -f $q2", 0, [], [], 'concurrent INSERTs and CIC');
+$node1->pgbench_await($pgb_handle1);
+$node2->pgbench_await($pgb_handle2);
 
 $count1 = $node1->safe_psql('postgres', "SELECT SUM(value) FROM summary");
 $count2 = $node2->safe_psql('postgres', "SELECT SUM(value) FROM summary");
@@ -195,8 +197,10 @@ append_to_file($q2, q{
 	COMMIT;
 });
 $seconds = 3;
-$pgb_handle1 = $node1->pgbench("-n -c 1 -T $seconds -f $q1 'postgres'", 0, [], [], 'concurrent INSERTs and CIC');
-$pgb_handle2 = $node2->pgbench("-n -c 1 -T $seconds -f $q2 'postgres'", 0, [], [], 'concurrent INSERTs and CIC');
+$pgb_handle1 = $node1->pgbench_async("-n -c 1 -T $seconds -f $q1 'postgres'", 0, [], [], 'concurrent INSERTs and CIC');
+$pgb_handle2 = $node2->pgbench_async("-n -c 1 -T $seconds -f $q2 'postgres'", 0, [], [], 'concurrent INSERTs and CIC');
+$node1->pgbench_await($pgb_handle1);
+$node2->pgbench_await($pgb_handle2);
 
 $count1 = $node1->safe_psql('postgres', "SELECT SUM(value) FROM summary");
 $count2 = $node1->safe_psql('postgres', "SELECT SUM(ntrans) FROM summary");
