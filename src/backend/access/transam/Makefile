@@ -16,6 +16,7 @@ OBJS = \
 	clog.o \
 	commit_ts.o \
 	csn_log.o \
+	csn_snapshot.o \
 	generic_xlog.o \
 	multixact.o \
 	parallel.o \

@@ -29,6 +29,7 @@
 #include "access/commit_ts.h"
 #include "access/gin.h"
 #include "access/slru.h"
+#include "access/csn_snapshot.h"
 #include "access/toast_compression.h"
 #include "access/twophase.h"
 #include "access/xlog_internal.h"
@@ -3270,6 +3271,25 @@ struct config_int ConfigureNamesInt[] =
 		},
 		&max_identifier_length,
 		NAMEDATALEN - 1, NAMEDATALEN - 1, NAMEDATALEN - 1,
+		NULL, NULL, NULL
+	},
+	{
+		{"csn_snapshot_defer_time", PGC_POSTMASTER, PRESET_OPTIONS,
+			gettext_noop("Minimal age of records which allowed to be vacuumed, in seconds."),
+			NULL
+		},
+		&csn_snapshot_defer_time,
+		5, 0, INT_MAX,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"csn_time_shift", PGC_USERSET, RESOURCES_MEM,
+			gettext_noop("Do the time shift in the CSN generator."),
+			gettext_noop("Used for debug purposes.")
+		},
+		&csn_time_shift,
+		0, INT_MIN, INT_MAX,
 		NULL, NULL, NULL
 	},
 

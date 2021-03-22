@@ -48,6 +48,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "access/csn_log.h"
 #include "access/subtrans.h"
 #include "access/transam.h"
 #include "access/xact.h"
@@ -159,6 +160,7 @@ static Snapshot CopySnapshot(Snapshot snapshot);
 static void UnregisterSnapshotNoOwner(Snapshot snapshot);
 static void FreeSnapshot(Snapshot snapshot);
 static void SnapshotResetXmin(void);
+static bool XidInLocalMVCCSnapshot(TransactionId xid, Snapshot snapshot);
 
 /* ResourceOwner callbacks to track snapshot references */
 static void ResOwnerReleaseSnapshot(Datum res);
@@ -201,6 +203,8 @@ typedef struct SerializedSnapshotData
 	CommandId	curcid;
 	TimestampTz whenTaken;
 	XLogRecPtr	lsn;
+	CSN			csn;
+	bool		imported_csn;
 } SerializedSnapshotData;
 
 /*
@@ -257,6 +261,7 @@ GetTransactionSnapshot(void)
 				CurrentSnapshot = GetSerializableTransactionSnapshot(&CurrentSnapshotData);
 			else
 				CurrentSnapshot = GetSnapshotData(&CurrentSnapshotData);
+
 			/* Make a saved copy */
 			CurrentSnapshot = CopySnapshot(CurrentSnapshot);
 			FirstXactSnapshot = CurrentSnapshot;
@@ -1729,6 +1734,8 @@ SerializeSnapshot(Snapshot snapshot, char *start_address)
 	serialized_snapshot.curcid = snapshot->curcid;
 	serialized_snapshot.whenTaken = snapshot->whenTaken;
 	serialized_snapshot.lsn = snapshot->lsn;
+	serialized_snapshot.csn = snapshot->csn;
+	serialized_snapshot.imported_csn = snapshot->imported_csn;
 
 	/*
 	 * Ignore the SubXID array if it has overflowed, unless the snapshot was
@@ -1804,6 +1811,8 @@ RestoreSnapshot(char *start_address)
 	snapshot->whenTaken = serialized_snapshot.whenTaken;
 	snapshot->lsn = serialized_snapshot.lsn;
 	snapshot->snapXactCompletionCount = 0;
+	snapshot->csn = serialized_snapshot.csn;
+	snapshot->imported_csn = serialized_snapshot.imported_csn;
 
 	/* Copy XIDs, if present. */
 	if (serialized_snapshot.xcnt > 0)
@@ -1844,6 +1853,44 @@ RestoreTransactionSnapshot(Snapshot snapshot, void *source_pgproc)
 
 /*
  * XidInMVCCSnapshot
+ *
+ * Check whether this xid is in snapshot. When enable_csn_snapshot is
+ * switched off just call XidInLocalMVCCSnapshot().
+ */
+bool
+XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
+{
+	bool in_snapshot;
+
+	if (snapshot->imported_csn)
+	{
+		Assert(enable_csn_snapshot);
+		/* No point to using snapshot info except CSN */
+		return XidInvisibleInCSNSnapshot(xid, snapshot);
+	}
+
+	in_snapshot = XidInLocalMVCCSnapshot(xid, snapshot);
+
+	if (!get_csnlog_status())
+	{
+		Assert(CSNIsFrozen(snapshot->csn));
+		return in_snapshot;
+	}
+
+	if (in_snapshot)
+	{
+		/*
+		 * This xid may be already in unknown state and in that case
+		 * we must wait and recheck.
+		 */
+		return XidInvisibleInCSNSnapshot(xid, snapshot);
+	}
+	else
+		return false;
+}
+
+/*
+ * XidInLocalMVCCSnapshot
  *		Is the given XID still-in-progress according to the snapshot?
  *
  * Note: GetSnapshotData never stores either top xid or subxids of our own
@@ -1852,8 +1899,8 @@ RestoreTransactionSnapshot(Snapshot snapshot, void *source_pgproc)
  * TransactionIdIsCurrentTransactionId first, except when it's known the
  * XID could not be ours anyway.
  */
-bool
-XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
+static bool
+XidInLocalMVCCSnapshot(TransactionId xid, Snapshot snapshot)
 {
 	/*
 	 * Make a quick range check to eliminate most XIDs without looking at the
@@ -1955,4 +2002,99 @@ static void
 ResOwnerReleaseSnapshot(Datum res)
 {
 	UnregisterSnapshotNoOwner((Snapshot) DatumGetPointer(res));
+}
+
+/*
+ * ExportCSNSnapshot
+ *
+ * Export csn so that caller can expand this transaction to other
+ * nodes.
+ *
+ * TODO: it's better to do this through EXPORT/IMPORT SNAPSHOT syntax and
+ * add some additional checks that transaction did not yet acquired xid, but
+ * for current iteration of this patch I don't want to hack on parser.
+ */
+CSN
+ExportCSNSnapshot()
+{
+	if (!get_csnlog_status())
+		ereport(ERROR,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			 errmsg("could not export csn snapshot"),
+			 errhint("Make sure the configuration parameter \"%s\" is enabled.",
+					 "enable_csn_snapshot")));
+
+	return CurrentSnapshot->csn;
+}
+
+/* SQL accessor to ExportCSNSnapshot() */
+Datum
+pg_csn_snapshot_export(PG_FUNCTION_ARGS)
+{
+	CSN	export_csn = ExportCSNSnapshot();
+	PG_RETURN_UINT64(export_csn);
+}
+
+/*
+ * ImportCSNSnapshot
+ *
+ * Import csn and retract this backends xmin to the value that was
+ * actual when we had such csn.
+ *
+ * TODO: it's better to do this through EXPORT/IMPORT SNAPSHOT syntax and
+ * add some additional checks that transaction did not yet acquired xid, but
+ * for current iteration of this patch I don't want to hack on parser.
+ */
+void
+ImportCSNSnapshot(CSN csn)
+{
+	volatile TransactionId xmin;
+
+	if (!get_csnlog_status())
+		ereport(ERROR,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			 errmsg("could not import csn snapshot"),
+			 errhint("Make sure the configuration parameter \"%s\" is enabled.",
+					 "enable_csn_snapshot")));
+
+	if (csn_snapshot_defer_time <= 0)
+		ereport(ERROR,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			 errmsg("could not import csn snapshot"),
+			 errhint("Make sure the configuration parameter \"%s\" is positive.",
+					 "csn_snapshot_defer_time")));
+
+	/*
+	 * Call CSNSnapshotToXmin under ProcArrayLock to avoid situation that
+	 * resulting xmin will be evicted from map before we will set it into our
+	 * backend's xmin.
+	 */
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+	xmin = CSNSnapshotToXmin(csn);
+
+	if (!TransactionIdIsValid(xmin))
+	{
+		LWLockRelease(ProcArrayLock);
+		elog(ERROR, "CSNSnapshotToXmin: csn snapshot too old: %lu", csn);
+	}
+
+	MyProc->originalXmin = MyProc->xmin;
+	MyProc->xmin = TransactionXmin = xmin;
+	LWLockRelease(ProcArrayLock);
+
+	CurrentSnapshot->xmin = xmin; /* defuse SnapshotResetXmin() */
+	CurrentSnapshot->csn = csn;
+	CurrentSnapshot->imported_csn = true;
+
+	CSNSnapshotSync(csn);
+}
+
+/* SQL accessor to ImportCSNSnapshot() */
+Datum
+pg_csn_snapshot_import(PG_FUNCTION_ARGS)
+{
+	CSN	csn = PG_GETARG_UINT64(0);
+
+	ImportCSNSnapshot(csn);
+	PG_RETURN_VOID();
 }

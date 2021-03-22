@@ -217,7 +217,8 @@ typedef struct SnapshotData
 	 * CSN for snapshot isolation support.
 	 * Will be used only if enable_csn_snapshot is enabled.
 	 */
-	CSN	csn;
+	CSN			csn;
+	bool		imported_csn;
 
 	/*
 	 * The transaction completion count at the time GetSnapshotData() built

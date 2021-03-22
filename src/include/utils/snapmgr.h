@@ -90,6 +90,8 @@ extern void AtSubCommit_Snapshot(int level);
 extern void AtSubAbort_Snapshot(int level);
 extern void AtEOXact_Snapshot(bool isCommit, bool resetXmin);
 
+extern CSN ExportCSNSnapshot(void);
+extern void ImportCSNSnapshot(CSN csn);
 extern void ImportSnapshot(const char *idstr);
 extern bool XactHasExportedSnapshots(void);
 extern void DeleteAllExportedSnapshotFiles(void);
