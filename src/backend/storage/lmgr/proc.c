@@ -35,6 +35,7 @@
 
 #include "access/transam.h"
 #include "access/twophase.h"
+#include "access/csn_snapshot.h"
 #include "access/xlogutils.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -441,6 +442,9 @@ InitProcess(void)
 	MyProc->clogGroupMemberLsn = InvalidXLogRecPtr;
 	Assert(pg_atomic_read_u32(&MyProc->clogGroupNext) == INVALID_PROC_NUMBER);
 
+	MyProc->originalXmin = InvalidTransactionId;
+	pg_atomic_init_u64(&MyProc->assignedCSN, InProgressCSN);
+
 	/*
 	 * Acquire ownership of the PGPROC's latch, so that we can use WaitLatch
 	 * on it.  That allows us to repoint the process latch, which so far
@@ -597,6 +601,7 @@ InitAuxiliaryProcess(void)
 	MyProc->lwWaitMode = 0;
 	MyProc->waitLock = NULL;
 	MyProc->waitProcLock = NULL;
+	MyProc->originalXmin = InvalidTransactionId;
 	pg_atomic_write_u64(&MyProc->waitStart, 0);
 #ifdef USE_ASSERT_CHECKING
 	{

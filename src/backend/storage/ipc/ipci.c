@@ -22,6 +22,7 @@
 #include "access/syncscan.h"
 #include "access/transam.h"
 #include "access/csn_log.h"
+#include "access/csn_snapshot.h"
 #include "access/twophase.h"
 #include "access/xlogprefetcher.h"
 #include "access/xlogrecovery.h"
@@ -150,6 +151,7 @@ CalculateShmemSize(int *num_semaphores)
 	size = add_size(size, BTreeShmemSize());
 	size = add_size(size, SyncScanShmemSize());
 	size = add_size(size, AsyncShmemSize());
+	size = add_size(size, CSNSnapshotShmemSize());
 	size = add_size(size, StatsShmemSize());
 	size = add_size(size, WaitEventCustomShmemSize());
 	size = add_size(size, InjectionPointShmemSize());
@@ -357,6 +359,7 @@ CreateOrAttachShmemStructs(void)
 	BTreeShmemInit();
 	SyncScanShmemInit();
 	AsyncShmemInit();
+	CSNSnapshotShmemInit();
 	StatsShmemInit();
 	WaitEventCustomShmemInit();
 	InjectionPointShmemInit();

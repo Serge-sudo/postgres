@@ -680,20 +680,39 @@ get_xmin_for_csn(void)
 }
 
 void
-prepare_csn_env(bool enable)
+prepare_csn_env(bool enable, bool same, TransactionId *xmin_for_csn_in_control)
 {
 	if (enable)
 	{
-		TransactionId nextxid =
-						XidFromFullTransactionId(TransamVariables->nextXid);
-		/* 'xmin_for_csn' for when turn xid-snapshot to csn-snapshot */
-		csnShared->xmin_for_csn = nextxid;
-		/* produce the csnlog segment we want now and seek to current page */
-		ActivateCSNlog();
+		if (same)
+		{
+			/*
+			 * Database startup with no enable_csn_snapshot change and value is true,
+			 * it can just transmit xmin_for_csn from pg_control to csnState->xmin_for_csn.
+			 */
+			csnShared->xmin_for_csn = *xmin_for_csn_in_control;
+		}
+		else
+		{
+			TransactionId nextxid =
+ 						XidFromFullTransactionId(TransamVariables->nextXid);
+
+
+			/* 'xmin_for_csn' for when turn xid-snapshot to csn-snapshot */
+			csnShared->xmin_for_csn = nextxid;
+			*xmin_for_csn_in_control = nextxid;
+
+			/* produce the csnlog segment we want now and seek to current page */
+			ActivateCSNlog();
+		}
 	}
 	else
+	{
 		/* Try to drop all csnlog seg */
 		DeactivateCSNlog();
+		/* Clear xmin_for_csn in pg_control because we are xid-base snaposhot now. */
+		*xmin_for_csn_in_control = InvalidTransactionId;
+	}
 }
 
 /*
