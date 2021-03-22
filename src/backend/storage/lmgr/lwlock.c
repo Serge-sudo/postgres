@@ -133,6 +133,7 @@ static const char *const BuiltinTrancheNames[] = {
 	[LWTRANCHE_XACT_BUFFER] = "XactBuffer",
 	[LWTRANCHE_COMMITTS_BUFFER] = "CommitTsBuffer",
 	[LWTRANCHE_SUBTRANS_BUFFER] = "SubtransBuffer",
+	[LWTRANCHE_CSN_LOG_BUFFERS] = "CSNLogBuffer",
 	[LWTRANCHE_MULTIXACTOFFSET_BUFFER] = "MultiXactOffsetBuffer",
 	[LWTRANCHE_MULTIXACTMEMBER_BUFFER] = "MultiXactMemberBuffer",
 	[LWTRANCHE_NOTIFY_BUFFER] = "NotifyBuffer",
@@ -167,6 +168,7 @@ static const char *const BuiltinTrancheNames[] = {
 	[LWTRANCHE_NOTIFY_SLRU] = "NotifySLRU",
 	[LWTRANCHE_SERIAL_SLRU] = "SerialSLRU",
 	[LWTRANCHE_SUBTRANS_SLRU] = "SubtransSLRU",
+	[LWTRANCHE_CSN_LOG_SLRU] = "CSNLogSLRU",
 	[LWTRANCHE_XACT_SLRU] = "XactSLRU",
 	[LWTRANCHE_PARALLEL_VACUUM_DSA] = "ParallelVacuumDSA",
 };
