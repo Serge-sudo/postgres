@@ -67,6 +67,7 @@ typedef struct ConnCacheEntry
 	bool		keep_connections;	/* setting value of keep_connections
 									 * server option */
 	Oid			serverid;		/* foreign server OID used to get server name */
+	bool		modified;		/* true if data on the foreign server is modified */
 	uint32		server_hashvalue;	/* hash value of foreign server OID */
 	uint32		mapping_hashvalue;	/* hash value of user mapping OID */
 	PgFdwConnState state;		/* extra per-connection state */
@@ -369,6 +370,7 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 	entry->changing_xact_state = false;
 	entry->invalidated = false;
 	entry->serverid = server->serverid;
+	entry->modified = false;
 	entry->server_hashvalue =
 		GetSysCacheHashValue1(FOREIGNSERVEROID,
 							  ObjectIdGetDatum(server->serverid));
@@ -454,6 +456,21 @@ pgfdw_security_check(const char **keywords, const char **values, UserMapping *us
 			 errdetail("Non-superuser cannot connect if the server does not request a password or use GSSAPI with delegated credentials."),
 			 errhint("Target server's authentication method must be changed or password_required=false set in the user mapping attributes.")));
 }
+
+void
+MarkConnectionModified(UserMapping *user)
+{
+	ConnCacheEntry *entry;
+
+	entry = GetConnectionCacheEntry(user->umid);
+
+	if (entry && !entry->modified)
+	{
+		FdwXactRegisterEntry(user, true);
+		entry->modified = true;
+	}
+}
+
 
 /*
  * Connect to remote server using specified server and user mapping properties.
@@ -770,7 +787,7 @@ begin_remote_xact(ConnCacheEntry *entry, UserMapping *user)
 			 entry->conn);
 
 		/* Register the foreign server to the transaction */
-		FdwXactRegisterEntry(user);
+		FdwXactRegisterEntry(user, false);
 
 		if (IsolationIsSerializable())
 			sql = "START TRANSACTION ISOLATION LEVEL SERIALIZABLE";
@@ -779,6 +796,7 @@ begin_remote_xact(ConnCacheEntry *entry, UserMapping *user)
 		entry->changing_xact_state = true;
 		do_sql_command(entry->conn, sql);
 		entry->xact_depth = 1;
+		entry->modified = false;
 		entry->changing_xact_state = false;
 	}
 
