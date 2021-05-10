@@ -2253,7 +2253,7 @@ CommitTransaction(void)
 	}
 
 	/* Call foreign transaction callbacks at pre-commit phase, if any */
-	AtEOXact_FdwXact(true, is_parallel_worker);
+	PreCommit_FdwXact(is_parallel_worker);
 
 	/* Shut down the deferred-trigger manager */
 	AfterTriggerEndXact(true);
@@ -2424,6 +2424,7 @@ CommitTransaction(void)
 	AtEOXact_PgStat(true, is_parallel_worker);
 	AtEOXact_Snapshot(true, false);
 	AtEOXact_ApplyLauncher(true);
+	AtEOXact_FdwXact(true, is_parallel_worker);
 	AtEOXact_LogicalRepWorkers(true);
 	pgstat_report_xact_timestamp(0);
 
@@ -2704,6 +2705,7 @@ PrepareTransaction(void)
 	PostPrepare_Twophase();
 
 	/* PREPARE acts the same as COMMIT as far as GUC is concerned */
+	AtEOXact_FdwXact(true, false);
 	AtEOXact_GUC(true, 1);
 	AtEOXact_SPI(true);
 	AtEOXact_Enum();

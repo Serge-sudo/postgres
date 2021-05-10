@@ -541,6 +541,7 @@ CreateTableSpaceStmt
 CreateTransformStmt
 CreateTrigStmt
 CreateUserMappingStmt
+DropForeignServerStmt
 CreatedbStmt
 CredHandle
 CteItem

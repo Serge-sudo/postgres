@@ -29,6 +29,7 @@
 #include "access/commit_ts.h"
 #include "access/gin.h"
 #include "access/slru.h"
+#include "access/fdwxact.h"
 #include "access/toast_compression.h"
 #include "access/twophase.h"
 #include "access/xlog_internal.h"
@@ -718,6 +719,8 @@ const char *const config_group_names[] =
 	[PRESET_OPTIONS] = gettext_noop("Preset Options"),
 	[CUSTOM_OPTIONS] = gettext_noop("Customized Options"),
 	[DEVELOPER_OPTIONS] = gettext_noop("Developer Options"),
+	[FOREIGN_TRANSACTION] = gettext_noop("Foreign Transaction"),
+	[FOREIGN_TRANSACTION_RESOLVER] = gettext_noop("Foreign Transaction / Resolver"),
 };
 
 StaticAssertDecl(lengthof(config_group_names) == (DEVELOPER_OPTIONS + 1),
@@ -2572,6 +2575,48 @@ struct config_int ConfigureNamesInt[] =
 		},
 		&max_prepared_xacts,
 		0, 0, MAX_BACKENDS,
+		NULL, NULL, NULL
+	},
+	{
+		{"max_prepared_foreign_transactions", PGC_POSTMASTER, RESOURCES_MEM,
+			gettext_noop("Sets the maximum number of simultaneously prepared transactions on foreign servers."),
+			NULL
+		},
+		&max_prepared_foreign_xacts,
+		0, 0, INT_MAX,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"foreign_transaction_resolver_timeout", PGC_SIGHUP, FOREIGN_TRANSACTION_RESOLVER,
+			gettext_noop("Sets the maximum time to wait for foreign transaction resolution."),
+			NULL,
+			GUC_UNIT_MS
+		},
+		&foreign_xact_resolver_timeout,
+		60 * 1000, 0, INT_MAX,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"max_foreign_transaction_resolvers", PGC_POSTMASTER, RESOURCES_MEM,
+			gettext_noop("Maximum number of foreign transaction resolution processes."),
+			NULL
+		},
+		&max_foreign_xact_resolvers,
+		0, 0, INT_MAX,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"foreign_transaction_resolution_retry_interval", PGC_SIGHUP, FOREIGN_TRANSACTION_RESOLVER,
+		 gettext_noop("Sets the time to wait before retrying to resolve foreign transaction "
+					  "after a failed attempt."),
+		 NULL,
+		 GUC_UNIT_MS
+		},
+		&foreign_xact_resolution_retry_interval,
+		5000, 1, INT_MAX,
 		NULL, NULL, NULL
 	},
 

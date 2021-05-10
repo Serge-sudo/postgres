@@ -67,6 +67,7 @@
 
 #include <unistd.h>
 #include <signal.h>
+#include "access/fdwxact_launcher.h"
 #include <time.h>
 #include <sys/wait.h>
 #include <ctype.h>
@@ -834,10 +835,14 @@ PostmasterMain(int argc, char *argv[])
 	if (max_wal_senders > 0 && wal_level == WAL_LEVEL_MINIMAL)
 		ereport(ERROR,
 				(errmsg("WAL streaming (\"max_wal_senders\" > 0) requires \"wal_level\" to be \"replica\" or \"logical\"")));
+	if (max_prepared_foreign_xacts > 0 && max_foreign_xact_resolvers <= 0)
+		ereport(ERROR,
+				(errmsg("preparing foreign transactions (max_prepared_foreign_transactions > 0) requires max_foreign_transaction_resolvers > 0")));
 	if (summarize_wal && wal_level == WAL_LEVEL_MINIMAL)
 		ereport(ERROR,
 				(errmsg("WAL cannot be summarized when \"wal_level\" is \"minimal\"")));
 
+	
 	/*
 	 * Other one-time internal sanity checks can go here, if they are fast.
 	 * (Put any slow processing further down, after postmaster.pid creation.)
@@ -902,10 +907,11 @@ PostmasterMain(int argc, char *argv[])
 	LocalProcessControlFile(false);
 
 	/*
-	 * Register the apply launcher.  It's probably a good idea to call this
+	 * Register the apply launcher and foreign transaction launcher.  It's probably a good idea to call this
 	 * before any modules had a chance to take the background worker slots.
 	 */
 	ApplyLauncherRegister();
+	FdwXactLauncherRegister();
 
 	/*
 	 * process any libraries that should be preloaded at postmaster start

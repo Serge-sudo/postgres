@@ -36,6 +36,8 @@
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "commands/async.h"
+#include "access/fdwxact_launcher.h"
+#include "access/fdwxact_resolver.h"
 #include "commands/event_trigger.h"
 #include "commands/prepare.h"
 #include "common/pg_prng.h"
@@ -3302,6 +3304,20 @@ ProcessInterrupts(void)
 
 			/*
 			 * The logical replication launcher can be stopped at any time.
+			 * Use exit status 1 so the background worker is restarted.
+			 */
+			proc_exit(1);
+		}
+		else if (IsFdwXactResolver())
+			ereport(FATAL,
+					(errcode(ERRCODE_ADMIN_SHUTDOWN),
+					 errmsg("terminating foreign transaction resolver due to administrator command")));
+		else if (IsFdwXactLauncher())
+		{
+			ereport(DEBUG1,
+					(errmsg_internal("foreign transaction launcher shutting down")));
+			/*
+			 * The foreign transaction launcher can be stopped at any time.
 			 * Use exit status 1 so the background worker is restarted.
 			 */
 			proc_exit(1);

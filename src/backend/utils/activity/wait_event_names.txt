@@ -267,6 +267,11 @@ WAL_SUMMARY_WRITE	"Waiting for a write to a WAL summary file."
 WAL_SYNC	"Waiting for a WAL file to reach durable storage."
 WAL_SYNC_METHOD_ASSIGN	"Waiting for data to reach durable storage while assigning a new WAL sync method."
 WAL_WRITE	"Waiting for a write to a WAL file."
+FDWXACT_FILE_READ	"Waiting for a read from a foreign data wrapper transaction state file."
+FDWXACT_FILE_SYNC	"Waiting for a foreign data wrapper transaction state file to reach durable storage."
+FDWXACT_FILE_WRITE	"Waiting for a write to a foreign data wrapper transaction state file."
+FDWXACT_LAUNCHER_MAIN	"Waiting in main loop of foreign data wrapper transaction launcher process."
+FDWXACT_RESOLVER_MAIN	"Waiting in main loop of foreign data wrapper transaction resolver process."
 
 ABI_compatibility:
 
@@ -345,6 +350,8 @@ WALSummarizer	"Waiting to read or update WAL summarization state."
 DSMRegistry	"Waiting to read or update the dynamic shared memory registry."
 InjectionPoint	"Waiting to read or update information related to injection points."
 SerialControl	"Waiting to read or update shared <filename>pg_serial</filename> state."
+FdwXact	"Waiting to read or update foreign data wrapper transaction state."
+FdwXactResolver	"Waiting to read or update foreign data wrapper transaction state in the resolver process."
 
 #
 # END OF PREDEFINED LWLOCKS (DO NOT CHANGE THIS LINE)

@@ -1443,6 +1443,10 @@ doDeletion(const ObjectAddress *object, int flags)
 		case PublicationRelationId:
 			RemovePublicationById(object->objectId);
 			break;
+		
+		case UserMappingRelationId:
+			RemoveUserMappingById(object->objectId);
+			break;
 
 		case CastRelationId:
 		case CollationRelationId:
@@ -1459,7 +1463,6 @@ doDeletion(const ObjectAddress *object, int flags)
 		case TSTemplateRelationId:
 		case ForeignDataWrapperRelationId:
 		case ForeignServerRelationId:
-		case UserMappingRelationId:
 		case DefaultAclRelationId:
 		case EventTriggerRelationId:
 		case TransformRelationId:

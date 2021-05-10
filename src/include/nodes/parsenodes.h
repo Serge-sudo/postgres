@@ -2863,7 +2863,7 @@ typedef struct AlterFdwStmt
 } AlterFdwStmt;
 
 /* ----------------------
- *		Create/Alter FOREIGN SERVER Statements
+ *		Create/Alter/Drop FOREIGN SERVER Statements
  * ----------------------
  */
 
@@ -2886,6 +2886,14 @@ typedef struct AlterForeignServerStmt
 	List	   *options;		/* generic options to server */
 	bool		has_version;	/* version specified */
 } AlterForeignServerStmt;
+
+typedef struct DropForeignServerStmt
+{
+	NodeTag		type;
+	char	   *servername;		/* server name */
+	bool		missing_ok;		/* Skip error if missing? */
+	DropBehavior behavior;		/* RESTRICT or CASCADE behavior */
+} DropForeignServerStmt;
 
 /* ----------------------
  *		Create FOREIGN TABLE Statement

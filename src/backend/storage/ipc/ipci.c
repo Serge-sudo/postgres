@@ -23,6 +23,8 @@
 #include "access/transam.h"
 #include "access/twophase.h"
 #include "access/xlogprefetcher.h"
+#include "access/fdwxact.h"
+#include "access/fdwxact_launcher.h"
 #include "access/xlogrecovery.h"
 #include "commands/async.h"
 #include "miscadmin.h"
@@ -148,6 +150,8 @@ CalculateShmemSize(int *num_semaphores)
 	size = add_size(size, BTreeShmemSize());
 	size = add_size(size, SyncScanShmemSize());
 	size = add_size(size, AsyncShmemSize());
+	size = add_size(size, FdwXactShmemSize());
+	size = add_size(size, FdwXactLauncherShmemSize());
 	size = add_size(size, StatsShmemSize());
 	size = add_size(size, WaitEventCustomShmemSize());
 	size = add_size(size, InjectionPointShmemSize());
@@ -354,6 +358,8 @@ CreateOrAttachShmemStructs(void)
 	BTreeShmemInit();
 	SyncScanShmemInit();
 	AsyncShmemInit();
+	FdwXactShmemInit();
+	FdwXactLauncherShmemInit();
 	StatsShmemInit();
 	WaitEventCustomShmemInit();
 	InjectionPointShmemInit();
