@@ -1448,6 +1448,12 @@ RecordTransactionCommit(void)
 		TransactionTreeSetCommitTsData(xid, nchildren, children,
 									   replorigin_session_origin_timestamp,
 									   replorigin_session_origin);
+
+		/*
+		 * Mark our transaction as InDoubt in CsnLog and get ready for
+		 * commit.
+		 */
+		CSNSnapshotPrecommit(MyProc, xid, nchildren, children);
 	}
 
 	/*
@@ -1828,9 +1834,7 @@ RecordTransactionAbort(bool isSubXact)
 	 */
 	TransactionIdAbortTree(xid, nchildren, children);
 
-	/*
-	 * Mark our transaction as Aborted in CsnLog.
-	 */
+	/* Mark our transaction as Aborted in CSN Log. */
 	CSNSnapshotAbort(MyProc, xid, nchildren, children);
 
 	END_CRIT_SECTION();
@@ -2185,7 +2189,7 @@ StartTransaction(void)
 Datum
 pg_current_csn(PG_FUNCTION_ARGS)
 {
-	CSN	csn = GenerateCSN(InvalidCSN);
+	SnapshotCSN	csn = GenerateCSN(false, InvalidCSN);
 
 	PG_RETURN_INT64(csn);
 }

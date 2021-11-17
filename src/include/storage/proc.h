@@ -24,6 +24,7 @@
 #include "storage/pg_sema.h"
 #include "storage/proclist_types.h"
 #include "storage/procnumber.h"
+#include "utils/snapshot.h"
 
 /*
  * Each backend advertises up to PGPROC_MAX_CACHED_SUBXIDS TransactionIds
@@ -311,7 +312,7 @@ struct PGPROC
 
 	/*
 	 * assignedCSN holds CSN for this transaction.  It is generated
-	 * under a ProcArray lock and later is writter to a CSNLog.  This
+	 * under a ProcArray lock and later is written to a CSNLog.  This
 	 * variable defined as atomic only for case of group commit, in all other
 	 * scenarios only backend responsible for this proc entry is working with
 	 * this variable.

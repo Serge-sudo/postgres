@@ -10575,19 +10575,19 @@ dynamic_library_path = 'C:\tools\postgresql;H:\my_project\lib;$libdir'
 
      </variablelist>
 
-    <sect2 id="runtime-config-CSN-base-snapshot">
+    <sect2 id="runtime-config-CSN-based-snapshot">
      <title>CSN Based Snapshot</title>
-
       <para>
-       By default, The snapshots in <productname>PostgreSQL</productname> uses the
-       XID (TransactionID) to identify the status of the transaction, the in-progress
-       transactions, and the future transactions for all its visibility calculations.
+       By default, snapshots in <productname>PostgreSQL</productname> contains a
+       XID (TransactionID) that allows to identify the status of a transaction
+       and make arbitrary visibility calculations.
       </para>
 
       <para>
-       <productname>PostgreSQL</productname> also provides the CSN (commit-sequence-number)
-        based mechanism to identify the past-transactions and the ones that are yet to
-        be started/committed.
+       <productname>PostgreSQL</productname> also provides a CSN (Commit
+        Sequence Number) based machinery as an additional tool for visibility
+        calculations. It may be used within distributed transactions when a xid of
+        a local transaction can't correctly identify order of the distributed one.
       </para>
 
      <variablelist>
@@ -10600,13 +10600,13 @@ dynamic_library_path = 'C:\tools\postgresql;H:\my_project\lib;$libdir'
        <listitem>
 
         <para>
-        Enable/disable the CSN based transaction visibility tracking for the snapshot.
+         Enable/disable the CSN tracking for the snapshot.
         </para>
 
         <para>
-        <productname>PostgreSQL</productname> uses the clock timestamp as a CSN,
-        so enabling the CSN based snapshots can be useful for implementing the global
-        snapshots and global transaction visibility.
+        <productname>PostgreSQL</productname> uses a physical clock timestamp as
+        a CSN, so enabling the CSN based snapshots can be useful for implementing
+        cross-instance snapshots and visibility of distributed transaction.
         </para>
 
         <para>
@@ -10616,7 +10616,7 @@ dynamic_library_path = 'C:\tools\postgresql;H:\my_project\lib;$libdir'
         </para>
 
         <para>
-         The default value is off.
+         The default value is on.
         </para>
        </listitem>
       </varlistentry>

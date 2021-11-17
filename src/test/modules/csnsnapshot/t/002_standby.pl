@@ -3,13 +3,14 @@
 use strict;
 use warnings;
 
-
-use PostgreSQL::Test::Utils;
 use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
 use Test::More tests => 6;
 
-my $bkplabel = 'backup';
-my $master   = PostgreSQL::Test::Cluster->new('master');
+my ($master, $bkplabel, $standby, $guc_on_master, $guc_on_standby);
+
+$bkplabel = 'backup';
+$master = PostgreSQL::Test::Cluster->new('master');
 $master->init(allows_streaming => 1);
 
 $master->append_conf(
@@ -20,16 +21,16 @@ $master->append_conf(
 $master->start;
 $master->backup($bkplabel);
 
-my $standby = PostgreSQL::Test::Cluster->new('standby');
+$standby = PostgreSQL::Test::Cluster->new('standby');
 $standby->init_from_backup($master, $bkplabel, has_streaming => 1);
 $standby->start;
 
 $master->safe_psql('postgres', "create table t1(i int, j int)");
 
-my $guc_on_master = $master->safe_psql('postgres', 'show enable_csn_snapshot');
+$guc_on_master = $master->safe_psql('postgres', 'show enable_csn_snapshot');
 is($guc_on_master, 'on', "GUC on master");
 
-my $guc_on_standby = $standby->safe_psql('postgres', 'show enable_csn_snapshot');
+$guc_on_standby = $standby->safe_psql('postgres', 'show enable_csn_snapshot');
 is($guc_on_standby, 'on', "GUC on standby");
 
 $master->append_conf('postgresql.conf', 'enable_csn_snapshot = off');

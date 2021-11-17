@@ -1060,10 +1060,10 @@ struct config_bool ConfigureNamesBool[] =
 	{
 		{"enable_csn_snapshot", PGC_POSTMASTER, RESOURCES_MEM,
 			gettext_noop("Enable csn-base snapshot."),
-			gettext_noop("Used to achieve REPEATEBLE READ isolation level for postgres_fdw transactions.")
+			gettext_noop("Used to achieve REPEATABLE READ isolation level for postgres_fdw transactions.")
 		},
 		&enable_csn_snapshot,
-		false,
+		true,
 		NULL, NULL, NULL
 	},
 	{
@@ -3274,15 +3274,14 @@ struct config_int ConfigureNamesInt[] =
 		NULL, NULL, NULL
 	},
 	{
-		{"csn_snapshot_defer_time", PGC_POSTMASTER, PRESET_OPTIONS,
+		{"csn_snapshot_defer_time", PGC_POSTMASTER, REPLICATION_PRIMARY,
 			gettext_noop("Minimal age of records which allowed to be vacuumed, in seconds."),
 			NULL
 		},
 		&csn_snapshot_defer_time,
-		5, 0, INT_MAX,
+		0, 0, INT_MAX,
 		NULL, NULL, NULL
 	},
-
 	{
 		{"csn_time_shift", PGC_USERSET, RESOURCES_MEM,
 			gettext_noop("Do the time shift in the CSN generator."),
@@ -3292,7 +3291,6 @@ struct config_int ConfigureNamesInt[] =
 		0, INT_MIN, INT_MAX,
 		NULL, NULL, NULL
 	},
-
 	{
 		{"block_size", PGC_INTERNAL, PRESET_OPTIONS,
 			gettext_noop("Shows the size of a disk block."),

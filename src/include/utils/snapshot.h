@@ -123,9 +123,7 @@ typedef struct SnapshotData *Snapshot;
 #define InvalidSnapshot		((Snapshot) NULL)
 #define InvalidCSN			((CSN) 0)
 typedef uint64 CSN;
-
-extern bool enable_csn_snapshot;
-extern bool enable_csn_wal;
+typedef uint64 SnapshotCSN;
 
 /*
  * Struct representing all kind of possible snapshots.
@@ -214,18 +212,19 @@ typedef struct SnapshotData
 	XLogRecPtr	lsn;			/* position in the WAL stream when taken */
 
 	/*
-	 * CSN for snapshot isolation support.
-	 * Will be used only if enable_csn_snapshot is enabled.
-	 */
-	CSN			csn;
-	bool		imported_csn;
-
-	/*
 	 * The transaction completion count at the time GetSnapshotData() built
 	 * this snapshot. Allows to avoid re-computing static snapshots when no
 	 * transactions completed since the last GetSnapshotData().
 	 */
 	uint64		snapXactCompletionCount;
+
+	/*
+	 * SnapshotCSN for snapshot isolation support.
+	 * Will be used only if enable_csn_snapshot is enabled.
+	 */
+	SnapshotCSN	snapshot_csn;
+	/* Did we have our own snapshot_csn or imported one from different node */
+	bool		imported_csn;
 } SnapshotData;
 
 #endif							/* SNAPSHOT_H */

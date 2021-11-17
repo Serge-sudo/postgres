@@ -11,10 +11,10 @@
  *
  * If we switch database from CSN-base snapshot to xid-base snapshot then,
  * nothing wrong. But if we switch xid-base snapshot to CSN-base snapshot
- * it should decide a new xid whwich begin csn-base check. It can not be
+ * it should decide a new xid which begin csn-base check. It can not be
  * oldestActiveXID because of prepared transaction.
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/csn_log.c
@@ -25,43 +25,42 @@
 
 #include "access/csn_log.h"
 #include "access/slru.h"
-#include "access/xlogutils.h"
+#include "access/csn_snapshot.h"
 #include "access/subtrans.h"
 #include "access/xloginsert.h"
 #include "access/transam.h"
-#include "access/xlog_internal.h"
+#include "access/xlogutils.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
-#include "storage/spin.h"
+#include "portability/instr_time.h"
 #include "storage/shmem.h"
+#include "storage/spin.h"
 #include "utils/snapmgr.h"
-
+#include "access/xlog_internal.h"
 
 /*
- * We use csnActive to judge if csn snapshot enabled instead of by
+ * We use csnSnapshotActive to judge if csn snapshot enabled instead of by
  * enable_csn_snapshot, this design is similar to 'track_commit_timestamp'.
  *
- * Because in process of replication if master change 'enable_csn_snapshot'
+ * Because in process of replication if master changes 'enable_csn_snapshot'
  * in a database restart, standby should apply wal record for GUC changed,
  * then it's difficult to notice all backends about that. So they can get
- * the message by 'csnActive' which in share buffer. It will not
+ * the message by 'csnSnapshotActive' which in shared buffer. It will not
  * acquire a lock, so without performance issue.
- *
+ * last_max_csn - Record the max csn till now.
+ * last_csn_log_wal - for interval we log the assign csn to wal
+ * oldestXmin - first sensible Xmin on the first existed page in the CSN Log
  */
 typedef struct CSNShared
 {
-	bool				csnActive;
-	CSN					last_csn_log_wal; /* for interval we log the assign csn to wal */
-	CSN					last_max_csn; /* Record the max csn till now */
-	TransactionId		xmin_for_csn; /*'xmin_for_csn' for when turn xid-snapshot to csn-snapshot*/
+	bool				csnSnapshotActive;
+	pg_atomic_uint32	oldestXmin;
+	CSN					last_max_csn;
+	CSN					last_csn_log_wal;
 	volatile slock_t	lock;
 } CSNShared;
 
-
-static CSNShared *csnShared;
-
-bool enable_csn_snapshot;
-bool enable_csn_wal;
+CSNShared *csnShared;
 
 /*
  * Defines for CSNLog page sizes.  A page is the same BLCKSZ as is used
@@ -81,10 +80,11 @@ bool enable_csn_wal;
 #define TransactionIdToPage(xid)	((xid) / (TransactionId) CSN_LOG_XACTS_PER_PAGE)
 #define TransactionIdToPgIndex(xid) ((xid) % (TransactionId) CSN_LOG_XACTS_PER_PAGE)
 
-/* Link to shared-memory data structures for CLOG control */
+/*
+ * Link to shared-memory data structures for CLOG control
+ */
 static SlruCtlData CSNLogCtlData;
 #define CsnlogCtl (&CSNLogCtlData)
-
 
 static int	ZeroCSNLogPage(int64 pageno, bool write_xlog);
 static void ZeroTruncateCSNLogPage(int64 pageno, bool write_xlog);
@@ -98,9 +98,52 @@ static void WriteCSNXlogRec(TransactionId xid, int nsubxids,
 							TransactionId *subxids, CSN csn);
 static void WriteZeroCSNPageXlogRec(int64 pageno);
 static void WriteTruncateCSNXlogRec(int64 pageno);
-static void set_last_log_wal_csn(CSN csn);
-static CSN get_last_log_wal_csn(void);
+static void set_oldest_xmin(TransactionId xid);
 
+
+/*
+ * Number of shared CSNLog buffers.
+ */
+static Size
+CSNLogShmemBuffers(void)
+{
+	return (NBuffers / 512) > 16 ? 32 : 16;
+}
+
+/*
+ * Reserve shared memory for CsnlogCtl.
+ */
+Size
+CSNLogShmemSize(void)
+{
+	return SimpleLruShmemSize(CSNLogShmemBuffers(), 0);
+}
+
+/*
+ * Initialization of shared memory for CSNLog.
+ */
+void
+CSNLogShmemInit(void)
+{
+	bool		found;
+
+	CsnlogCtl->PagePrecedes = CSNLogPagePrecedes;
+	SimpleLruInit(CsnlogCtl, "CSNLog Ctl", CSNLogShmemBuffers(), 0,
+				  "pg_csn", LWTRANCHE_CSN_LOG_BUFFERS,
+				  LWTRANCHE_CSN_LOG_SLRU, SYNC_HANDLER_CSN, false);
+
+	csnShared = ShmemInitStruct("CSNlog shared",
+									 sizeof(CSNShared),
+									 &found);
+	if (!found)
+	{
+		csnShared->csnSnapshotActive = false;
+		pg_atomic_init_u32(&csnShared->oldestXmin, InvalidTransactionId);
+		csnShared->last_max_csn = InvalidCSN;
+		csnShared->last_csn_log_wal = InvalidCSN;
+		SpinLockInit(&csnShared->lock);
+	}
+}
 
 /*
  * CSNLogSetCSN
@@ -136,6 +179,7 @@ CSNLogSetCSN(TransactionId xid, int nsubxids, TransactionId *subxids, CSN csn,
 	{
 		int64 num_on_page = 0;
 
+		/* Form subtransactions bucket that can be written on the same page */
 		while (i < nsubxids && TransactionIdToPage(subxids[i]) == pageno)
 		{
 			num_on_page++;
@@ -156,20 +200,20 @@ CSNLogSetCSN(TransactionId xid, int nsubxids, TransactionId *subxids, CSN csn,
 
 /*
  * Record the final state of transaction entries in the csn log for
- * all entries on a single page. Atomic only on this page.
+ * all entries on a single page.  Atomic only on this page.
  *
  * Otherwise API is same as TransactionIdSetTreeStatus()
  */
 static void
-CSNLogSetPageStatus(TransactionId xid, int nsubxids,
-						   TransactionId *subxids,
-						   CSN csn, int64 pageno)
+CSNLogSetPageStatus(TransactionId xid, int nsubxids, TransactionId *subxids,
+					CSN csn, int64 pageno)
 {
 	int slotno;
 	int i;
 	LWLock	   *lock;
 
 	lock = SimpleLruGetBankLock(CsnlogCtl, pageno);
+
 	LWLockAcquire(lock, LW_EXCLUSIVE);
 
 	slotno = SimpleLruReadPage(CsnlogCtl, pageno, true, xid);
@@ -177,8 +221,7 @@ CSNLogSetPageStatus(TransactionId xid, int nsubxids,
 	/* Subtransactions first, if needed ... */
 	for (i = 0; i < nsubxids; i++)
 	{
-		Assert(CsnlogCtl->shared->page_number[slotno] ==
-											TransactionIdToPage(subxids[i]));
+		Assert(CsnlogCtl->shared->page_number[slotno] == TransactionIdToPage(subxids[i]));
 		CSNLogSetCSNInSlot(subxids[i], csn, slotno);
 	}
 
@@ -200,11 +243,10 @@ CSNLogSetCSNInSlot(TransactionId xid, CSN csn, int slotno)
 	int entryno = TransactionIdToPgIndex(xid);
 	CSN *ptr;
 
-	Assert(LWLockHeldByMe(CSNLogControlLock));
+	Assert(LWLockHeldByMe(CSNLogLock));
 
 	ptr = (CSN *) (CsnlogCtl->shared->page_buffer[slotno] +
 														entryno * sizeof(CSN));
-
 	*ptr = csn;
 }
 
@@ -230,54 +272,9 @@ CSNLogGetCSNByXid(TransactionId xid)
 	slotno = SimpleLruReadPage_ReadOnly(CsnlogCtl, pageno, xid);
 	csn = *(CSN *) (CsnlogCtl->shared->page_buffer[slotno] +
 														entryno * sizeof(CSN));
-
 	LWLockRelease(lock);
 
 	return csn;
-}
-
-/*
- * Number of shared CSNLog buffers.
- */
-static Size
-CSNLogShmemBuffers(void)
-{
-	return Min(32, Max(16, NBuffers / 512));
-}
-
-/*
- * Reserve shared memory for CsnlogCtl.
- */
-Size
-CSNLogShmemSize(void)
-{
-	return SimpleLruShmemSize(CSNLogShmemBuffers(), 0);
-}
-
-/*
- * Initialization of shared memory for CSNLog.
- */
-void
-CSNLogShmemInit(void)
-{
-	bool found;
-
-	CsnlogCtl->PagePrecedes = CSNLogPagePrecedes;
-	SimpleLruInit(CsnlogCtl, "CSNLog Ctl", CSNLogShmemBuffers(), 0,
-				  "pg_csn", LWTRANCHE_CSN_LOG_BUFFERS,
-				  LWTRANCHE_CSN_LOG_SLRU, SYNC_HANDLER_CSN_LOG, false);
-
-	csnShared = ShmemInitStruct("CSNlog shared",
-								sizeof(CSNShared),
-								&found);
-	if (!found)
-	{
-		set_last_max_csn(InvalidCSN, true);
-		csnShared->last_csn_log_wal = InvalidCSN;
-		csnShared->xmin_for_csn = InvalidTransactionId;
-		csnShared->csnActive = false;
-		SpinLockInit(&csnShared->lock);
-	}
 }
 
 /*
@@ -291,16 +288,10 @@ CSNLogShmemInit(void)
 static int
 ZeroCSNLogPage(int64 pageno, bool write_xlog)
 {
-	int slotno;
-
-	Assert(LWLockHeldByMe(CSNLogControlLock));
-
-	slotno = SimpleLruZeroPage(CsnlogCtl, pageno);
-
+	Assert(LWLockHeldByMe(CSNLogLock));
 	if(write_xlog)
 		WriteZeroCSNPageXlogRec(pageno);
-
-	return slotno;
+	return SimpleLruZeroPage(CsnlogCtl, pageno);
 }
 
 static void
@@ -308,62 +299,107 @@ ZeroTruncateCSNLogPage(int64 pageno, bool write_xlog)
 {
 	if(write_xlog)
 		WriteTruncateCSNXlogRec(pageno);
-
 	SimpleLruTruncate(CsnlogCtl, pageno);
 }
 
 void
 ActivateCSNlog(void)
 {
-	int				startPage;
+	int64				pageno;
 	TransactionId	nextXid = InvalidTransactionId;
+	TransactionId	oldest_xid = InvalidTransactionId;
 
-	LWLockAcquire(CSNLogControlLock, LW_EXCLUSIVE);
-	if (csnShared->csnActive)
+	LWLockAcquire(CSNLogLock, LW_EXCLUSIVE);
+	if (csnShared->csnSnapshotActive)
 	{
-		LWLockRelease(CSNLogControlLock);
+		LWLockRelease(CSNLogLock);
 		return;
 	}
-	LWLockRelease(CSNLogControlLock);
-	
+	LWLockRelease(CSNLogLock);
 
 	nextXid = XidFromFullTransactionId(TransamVariables->nextXid);
-	startPage = TransactionIdToPage(nextXid);
+	pageno = TransactionIdToPage(nextXid);
 
-	/* Create the current segment file, if necessary */
-	if (!SimpleLruDoesPhysicalPageExist(CsnlogCtl, startPage))
+	/*
+	 * Create the current segment file, if necessary.
+	 * This means that
+	 */
+	if (!SimpleLruDoesPhysicalPageExist(CsnlogCtl, pageno))
 	{
-		int			slotno;
-		LWLock	   *lock = SimpleLruGetBankLock(CsnlogCtl, startPage);
+		int slotno;
+		TransactionId curxid = nextXid;
+		LWLock	   *lock = SimpleLruGetBankLock(CsnlogCtl, pageno);
 		LWLockAcquire(lock, LW_EXCLUSIVE);
-		slotno = ZeroCSNLogPage(startPage, false);
+
+		slotno = ZeroCSNLogPage(pageno, false);
 		SimpleLruWritePage(CsnlogCtl, slotno);
 		LWLockRelease(lock);
+
+		elog(LOG, "Create SLRU page=%ld, slotno=%d for xid %u on a CSN log activation",
+			 pageno, slotno, nextXid);
+
+		/*
+		 * nextXid isn't first xid on the page. It is the first page in the CSN
+		 * log. Set UnclearCSN value into all previous slots on this page.
+		 * This xid value can be used as an oldest xid in the CSN log.
+		 */
+		if (TransactionIdToPgIndex(nextXid) > 0)
+		{
+			/* Cleaning procedure. Can be optimized. */
+			do
+			{
+				curxid--;
+				CSNLogSetCSNInSlot(curxid, UnclearCSN, slotno);
+			} while (TransactionIdToPgIndex(curxid) > 0);
+
+			elog(LOG,
+				 "Set UnclearCSN values for %d xids in the range [%u,%u]",
+				 nextXid - curxid, curxid, nextXid-1);
+
+			/* Oldest XID found on this page */
+			oldest_xid = nextXid;
+		}
 	}
 
-	LWLockAcquire(CSNLogControlLock, LW_EXCLUSIVE);
-	csnShared->csnActive = true;
-	LWLockRelease(CSNLogControlLock);
+	if (!TransactionIdIsValid(oldest_xid))
+	{
+		TransactionId curxid;
+
+		elog(LOG, "Search for the oldest xid across previous pages");
+
+		/* Need to scan previous pages for an oldest xid. */
+		while (pageno > 0 && SimpleLruDoesPhysicalPageExist(CsnlogCtl, pageno - 1))
+			pageno--;
+
+		/* look up for the first clear xid value. */
+		curxid = pageno * (TransactionId) CSN_LOG_XACTS_PER_PAGE;
+		while(CSNLogGetCSNByXid(curxid) == UnclearCSN)
+			curxid++;
+		oldest_xid = curxid;
+	}
+
+	set_oldest_xmin(oldest_xid);
+	LWLockAcquire(CSNLogLock, LW_EXCLUSIVE);
+	csnShared->csnSnapshotActive = true;
+	LWLockRelease(CSNLogLock);
+
 }
 
 bool
 get_csnlog_status(void)
 {
-	if(!csnShared)
-	{
-		/* Should not arrived */
-		elog(ERROR, "We do not have csnShared point");
-	}
-	return csnShared->csnActive;
+	return csnShared->csnSnapshotActive;
 }
 
 void
 DeactivateCSNlog(void)
 {
-	csnShared->csnActive = false;
-	LWLockAcquire(CSNLogControlLock, LW_EXCLUSIVE);
+	csnShared->csnSnapshotActive = false;
+	set_oldest_xmin(InvalidTransactionId);
+	LWLockAcquire(CSNLogLock, LW_EXCLUSIVE);
 	(void) SlruScanDirectory(CsnlogCtl, SlruScanDirCbDeleteAll, NULL);
-	LWLockRelease(CSNLogControlLock);
+	LWLockRelease(CSNLogLock);
+	elog(LOG, "CSN log has deactivated");
 }
 
 void
@@ -384,7 +420,7 @@ CompleteCSNInitialization(void)
 	 * control file contents at the beginning of recovery or when a
 	 * XLOG_PARAMETER_CHANGE is replayed.
 	 */
-	if (!get_csnlog_status())
+	if (!enable_csn_snapshot)
 		DeactivateCSNlog();
 	else
 		ActivateCSNlog();
@@ -395,10 +431,10 @@ CSNlogParameterChange(bool newvalue, bool oldvalue)
 {
 	if (newvalue)
 	{
-		if (!csnShared->csnActive)
+		if (!csnShared->csnSnapshotActive)
 			ActivateCSNlog();
 	}
-	else if (csnShared->csnActive)
+	else if (csnShared->csnSnapshotActive)
 		DeactivateCSNlog();
 }
 
@@ -449,7 +485,6 @@ ExtendCSNLog(TransactionId newestXact)
 		return;
 
 	pageno = TransactionIdToPage(newestXact);
-
 	lock = SimpleLruGetBankLock(CsnlogCtl, pageno);
 
 	LWLockAcquire(lock, LW_EXCLUSIVE);
@@ -470,9 +505,11 @@ ExtendCSNLog(TransactionId newestXact)
 void
 TruncateCSNLog(TransactionId oldestXact)
 {
-	int			cutoffPage;
+	int				cutoffPage;
+	TransactionId	oldestXmin;
 
-	if (!get_csnlog_status())
+	/* Can't do truncation because WAL messages isn't allowed during recovery */
+	if (RecoveryInProgress() || !get_csnlog_status())
 		return;
 
 	/*
@@ -485,6 +522,25 @@ TruncateCSNLog(TransactionId oldestXact)
 	 */
 	TransactionIdRetreat(oldestXact);
 	cutoffPage = TransactionIdToPage(oldestXact);
+
+	/* Detect, that we really need to cut CSN log. */
+	oldestXmin = pg_atomic_read_u32(&csnShared->oldestXmin);
+
+	if (TransactionIdToPage(oldestXmin) < cutoffPage)
+	{
+		/* OldestXact is located in the same page as oldestXmin. No actions needed. */
+		return;
+	}
+
+	/*
+	 * Shift oldestXmin to the start of new first page. Use first position
+	 * on the page because all transactions on this page is created with enabled
+	 * CSN snapshot machinery.
+	 */
+	pg_atomic_write_u32(&csnShared->oldestXmin,
+						oldestXact - TransactionIdToPgIndex(oldestXact));
+
+	SpinLockRelease(&csnShared->lock);
 	ZeroTruncateCSNLogPage(cutoffPage, true);
 }
 
@@ -515,20 +571,10 @@ CSNLogPagePrecedes(long page1, long page2)
 void
 WriteAssignCSNXlogRec(CSN csn)
 {
-	CSN log_csn = 0;
-
-	if (!enable_csn_wal || csn <= get_last_log_wal_csn())
-		return;
-
-	/*
-	 * We log the CSN 5s greater than generated, you can see comments on
-	 * CSN_ASSIGN_TIME_INTERVAL define.
-	 */
-	log_csn = CSNAddByNanosec(csn, CSN_ASSIGN_TIME_INTERVAL);
-	set_last_log_wal_csn(log_csn);
+	Assert(enable_csn_wal && csn <= csnShared->last_csn_log_wal);
 
 	XLogBeginInsert();
-	XLogRegisterData((char *) (&log_csn), sizeof(CSN));
+	XLogRegisterData((char *) (&csn), sizeof(CSN));
 	XLogInsert(RM_CSNLOG_ID, XLOG_CSN_ASSIGNMENT);
 }
 
@@ -538,7 +584,7 @@ WriteCSNXlogRec(TransactionId xid, int nsubxids,
 {
 	xl_csn_set xlrec;
 
-	if (!enable_csn_wal)
+	if(!enable_csn_wal)
 		return;
 
 	xlrec.xtop = xid;
@@ -548,7 +594,7 @@ WriteCSNXlogRec(TransactionId xid, int nsubxids,
 	XLogBeginInsert();
 	XLogRegisterData((char *) &xlrec, MinSizeOfCSNSet);
 	XLogRegisterData((char *) subxids, nsubxids * sizeof(TransactionId));
-	(void) XLogInsert(RM_CSNLOG_ID, XLOG_CSN_SETCSN);
+	XLogInsert(RM_CSNLOG_ID, XLOG_CSN_SETCSN);
 }
 
 /*
@@ -557,9 +603,10 @@ WriteCSNXlogRec(TransactionId xid, int nsubxids,
 static void
 WriteZeroCSNPageXlogRec(int64 pageno)
 {
-	if (!enable_csn_wal)
+	if(!enable_csn_wal)
+	{
 		return;
-
+	}
 	XLogBeginInsert();
 	XLogRegisterData((char *) (&pageno), sizeof(int64));
 	(void) XLogInsert(RM_CSNLOG_ID, XLOG_CSN_ZEROPAGE);
@@ -571,13 +618,15 @@ WriteZeroCSNPageXlogRec(int64 pageno)
 static void
 WriteTruncateCSNXlogRec(int64 pageno)
 {
-	if (!enable_csn_wal)
+	if(!enable_csn_wal)
+	{
 		return;
-
+	}
 	XLogBeginInsert();
 	XLogRegisterData((char *) (&pageno), sizeof(int64));
-	(void) XLogInsert(RM_CSNLOG_ID, XLOG_CSN_TRUNCATE);
+	XLogInsert(RM_CSNLOG_ID, XLOG_CSN_TRUNCATE);
 }
+
 
 void
 csnlog_redo(XLogReaderState *record)
@@ -592,7 +641,8 @@ csnlog_redo(XLogReaderState *record)
 		CSN csn;
 
 		memcpy(&csn, XLogRecGetData(record), sizeof(CSN));
-		set_last_max_csn(csn, true);
+		/* XXX: Do we really not needed to acquire the lock here? */
+		csnShared->last_max_csn = csn;
 	}
 	else if (info == XLOG_CSN_SETCSN)
 	{
@@ -620,48 +670,75 @@ csnlog_redo(XLogReaderState *record)
 
 		memcpy(&pageno, XLogRecGetData(record), sizeof(int64));
 		pg_atomic_write_u64(&CsnlogCtl->shared->latest_page_number,
-					pageno);
-
+			pageno);
 		ZeroTruncateCSNLogPage(pageno, false);
 	}
 	else
 		elog(PANIC, "csnlog_redo: unknown op code %u", info);
 }
 
-static void
-set_last_log_wal_csn(CSN csn)
+/*
+ * Entrypoint for sync.c to sync members files.
+ */
+int
+csnsyncfiletag(const FileTag *ftag, char *path)
 {
-	SpinLockAcquire(&csnShared->lock);
-	csnShared->last_csn_log_wal = csn;
-	SpinLockRelease(&csnShared->lock);
+	return SlruSyncFileTag(&CSNLogCtlData, ftag, path);
 }
 
-static CSN
-get_last_log_wal_csn(void)
-{
-	CSN csn;
-
-	SpinLockAcquire(&csnShared->lock);
-	csn = csnShared->last_csn_log_wal;
-	SpinLockRelease(&csnShared->lock);
-	return csn;
-}
-
+/*
+ * GenerateCSN
+ *
+ * Generate CSN which is actually a local time. Also we are forcing
+ * this time to be always increasing. Since now it is not uncommon to have
+ * millions of read transactions per second we are trying to use nanoseconds
+ * if such time resolution is available.
+ */
 CSN
-set_last_max_csn(CSN csn, bool force)
+GenerateCSN(bool locked, CSN assign)
 {
-	SpinLockAcquire(&csnShared->lock);
-	if (csn <= csnShared->last_max_csn && !force)
-		csn = csnShared->last_max_csn + 1;
+	instr_time	current_time;
+	CSN	csn;
+	CSN log_csn = InvalidCSN;
 
+	Assert(get_csnlog_status() || csn_snapshot_defer_time > 0);
+
+	/* TODO: create some macro that add small random shift to current time. */
+	INSTR_TIME_SET_CURRENT(current_time);
+	csn = (CSN) INSTR_TIME_GET_NANOSEC(current_time) + (int64) (csn_time_shift * 1E9);
+
+	if(assign != InvalidCSN && csn < assign)
+		csn = assign;
+
+	/* TODO: change to atomics? */
+	if (!locked)
+		SpinLockAcquire(&csnShared->lock);
+
+	if (csn <= csnShared->last_max_csn)
+		csn = csnShared->last_max_csn + 1;
 	csnShared->last_max_csn = csn;
 
-	SpinLockRelease(&csnShared->lock);
+	if (enable_csn_wal && csn > csnShared->last_csn_log_wal)
+	{
+		/*
+		 * We log the CSN 5s greater than generated, you can see comments on
+		 * the CSN_ASSIGN_TIME_INTERVAL.
+		 */
+		log_csn = CSNAddByNanosec(csn, CSN_ASSIGN_TIME_INTERVAL);
+		csnShared->last_csn_log_wal = log_csn;
+	}
+
+	if (!locked)
+		SpinLockRelease(&csnShared->lock);
+
+	if (log_csn != InvalidCSN)
+		WriteAssignCSNXlogRec(csn);
+
 	return csn;
 }
 
 CSN
-get_last_max_csn(void)
+GetLastGeneratedCSN(void)
 {
 	CSN csn;
 
@@ -671,58 +748,21 @@ get_last_max_csn(void)
 	return csn;
 }
 
-CSN
-get_xmin_for_csn(void)
-{
-	CSN csn;
-
-	SpinLockAcquire(&csnShared->lock);
-	csn = csnShared->xmin_for_csn;
-	SpinLockRelease(&csnShared->lock);
-	return csn;
-}
-
-void
-prepare_csn_env(bool enable, bool same, TransactionId *xmin_for_csn_in_control)
-{
-	if (enable)
-	{
-		if (same)
-		{
-			/*
-			 * Database startup with no enable_csn_snapshot change and value is true,
-			 * it can just transmit xmin_for_csn from pg_control to csnState->xmin_for_csn.
-			 */
-			csnShared->xmin_for_csn = *xmin_for_csn_in_control;
-		}
-		else
-		{
-			TransactionId nextxid =
- 						XidFromFullTransactionId(TransamVariables->nextXid);
-
-
-			/* 'xmin_for_csn' for when turn xid-snapshot to csn-snapshot */
-			csnShared->xmin_for_csn = nextxid;
-			*xmin_for_csn_in_control = nextxid;
-
-			/* produce the csnlog segment we want now and seek to current page */
-			ActivateCSNlog();
-		}
-	}
-	else
-	{
-		/* Try to drop all csnlog seg */
-		DeactivateCSNlog();
-		/* Clear xmin_for_csn in pg_control because we are xid-base snaposhot now. */
-		*xmin_for_csn_in_control = InvalidTransactionId;
-	}
-}
-
 /*
- * Entrypoint for sync.c to sync csnlog files.
+ * Mostly for debug purposes.
  */
-int
-csnlogsyncfiletag(const FileTag *ftag, char *path)
+static void
+set_oldest_xmin(TransactionId xid)
 {
-	return SlruSyncFileTag(CsnlogCtl, ftag, path);
+	elog(LOG, "Oldest Xmin for CSN will be changed from %u to %u",
+		 pg_atomic_read_u32(&csnShared->oldestXmin), xid);
+
+	pg_atomic_write_u32(&csnShared->oldestXmin, xid);
+}
+
+TransactionId
+GetOldestXmin(void)
+{
+	Assert(get_csnlog_status());
+	return pg_atomic_read_u32(&csnShared->oldestXmin);
 }

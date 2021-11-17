@@ -1159,7 +1159,7 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 					 * Read-only transactions haven't assigned xid csn. We only
 					 * increase the last csn value.
 					 */
-					GenerateCSN(max_csn);
+					GenerateCSN(false, max_csn);
 
 				sql = psprintf("SELECT pg_csn_snapshot_assign('%s',"UINT64_FORMAT")",
 								fdwTransState->gid, max_csn);
@@ -1239,7 +1239,7 @@ error:
 							sscanf(PQgetvalue(res, 0, 0), "%lu", &csn);
 
 							if (csn != InvalidCSN)
-								GenerateCSN(csn);
+								GenerateCSN(false, csn);
 						}
 					}
 					

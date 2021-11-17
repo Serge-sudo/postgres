@@ -84,8 +84,8 @@ append_to_file($q2, q{
 	\endif
 });
 my $transactions = 1000;
-my $pgb_handle1 = $node1->pgbench_async("-n -c 1 -t $transactions -f $q1, 'postgres'", 0, [], [], 'concurrent INSERTs and CIC');
-my $pgb_handle2 = $node2->pgbench_async("-n -c 20 -t $transactions -f $q2, 'postgres'", 0, [], [], 'concurrent INSERTs and CIC');
+my $pgb_handle1 = $node1->pgbench_async(-n, -c => 1, -t => $transactions, -f => $q1, 'postgres');
+my $pgb_handle2 = $node2->pgbench_async(-n, -c => 20, -t => $transactions, -f => $q2, 'postgres');
 $node1->pgbench_await($pgb_handle1);
 $node2->pgbench_await($pgb_handle2);
 

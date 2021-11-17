@@ -47,6 +47,8 @@
 
 #include <signal.h>
 
+#include "access/clog.h"
+#include "access/csn_snapshot.h"
 #include "access/subtrans.h"
 #include "access/transam.h"
 #include "access/twophase.h"
@@ -96,7 +98,6 @@ typedef struct ProcArrayStruct
 	TransactionId replication_slot_xmin;
 	/* oldest catalog xmin of any replication slot */
 	TransactionId replication_slot_catalog_xmin;
-
 	/* xmin of oldest active csn snapshot */
 	TransactionId csn_snapshot_xmin;
 
@@ -602,7 +603,7 @@ ProcArrayRemove(PGPROC *proc, TransactionId latestXid)
 		 * CSNSnapshotCommit() will write this value to CsnLog.
 		 */
 		if (CSNIsInDoubt(pg_atomic_read_u64(&proc->assignedCSN)))
-			pg_atomic_write_u64(&proc->assignedCSN, GenerateCSN(InvalidCSN));
+			pg_atomic_write_u64(&proc->assignedCSN, GenerateCSN(false, InvalidCSN));
 
 		/* Same with xactCompletionCount  */
 		TransamVariables->xactCompletionCount++;
@@ -722,6 +723,7 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
 		proc->delayChkptFlags = 0;
 
 		proc->recoveryConflictPending = false;
+		proc->originalXmin = InvalidTransactionId;
 
 		/* must be cleared with xid/xmin: */
 		/* avoid unnecessarily dirtying shared cachelines */
@@ -765,6 +767,7 @@ ProcArrayEndTransactionInternal(PGPROC *proc, TransactionId latestXid)
 	proc->delayChkptFlags = 0;
 
 	proc->recoveryConflictPending = false;
+	proc->originalXmin = InvalidTransactionId;
 
 	/* must be cleared with xid/xmin: */
 	/* avoid unnecessarily dirtying shared cachelines */
@@ -796,7 +799,7 @@ ProcArrayEndTransactionInternal(PGPROC *proc, TransactionId latestXid)
 	 * whole group to save time on timestamp aquisition.
 	 */
 	if (CSNIsInDoubt(pg_atomic_read_u64(&proc->assignedCSN)))
-		pg_atomic_write_u64(&proc->assignedCSN, GenerateCSN(InvalidCSN));
+		pg_atomic_write_u64(&proc->assignedCSN, GenerateCSN(false, InvalidCSN));
 
 	/* Same with xactCompletionCount  */
 	TransamVariables->xactCompletionCount++;
@@ -959,6 +962,7 @@ ProcArrayClearTransaction(PGPROC *proc)
 	proc->xmin = InvalidTransactionId;
 	proc->originalXmin = InvalidTransactionId;
 	proc->recoveryConflictPending = false;
+	proc->originalXmin = InvalidTransactionId;
 
 	Assert(!(proc->statusFlags & PROC_VACUUM_STATE_MASK));
 	Assert(!proc->delayChkptFlags);
@@ -1905,6 +1909,10 @@ ComputeXidHorizons(ComputeXidHorizonsResult *h)
 	if (in_recovery)
 		kaxmin = KnownAssignedXidsGetOldestXmin();
 
+	/* Get value of xmin, delayed by a CSN snapshot settings. */
+	if (get_csnlog_status() && csn_snapshot_defer_time > 0 && IsUnderPostmaster)
+		csn_snapshot_xmin = ProcArrayGetCSNSnapshotXmin();
+
 	/*
 	 * No other information from shared state is needed, release the lock
 	 * immediately. The rest of the computations can be done without a lock.
@@ -1938,6 +1946,15 @@ ComputeXidHorizons(ComputeXidHorizonsResult *h)
 		TransactionIdOlder(h->shared_oldest_nonremovable, h->slot_xmin);
 	h->data_oldest_nonremovable =
 		TransactionIdOlder(h->data_oldest_nonremovable, h->slot_xmin);
+
+	/*
+	 * Hold non-removable border because distributed transactions
+	 * can wish to see old data.
+	 */
+	h->shared_oldest_nonremovable =
+		TransactionIdOlder(h->shared_oldest_nonremovable, csn_snapshot_xmin);
+	h->data_oldest_nonremovable =
+		TransactionIdOlder(h->data_oldest_nonremovable, csn_snapshot_xmin);
 
 	/*
 	 * The only difference between catalog / data horizons is that the slot's
@@ -2223,8 +2240,9 @@ GetSnapshotData(Snapshot snapshot)
 	int			count = 0;
 	int			subcount = 0;
 	bool		suboverflowed = false;
+	CSN			csn = FrozenCSN;
+	TransactionId csn_snapshot_xmin = InvalidTransactionId;
 	FullTransactionId latest_completed;
-	CSN	csn = FrozenCSN;
 	TransactionId oldestxid;
 	int			mypgxactoff;
 	TransactionId myxid;
@@ -2232,7 +2250,6 @@ GetSnapshotData(Snapshot snapshot)
 
 	TransactionId replication_slot_xmin = InvalidTransactionId;
 	TransactionId replication_slot_catalog_xmin = InvalidTransactionId;
-	TransactionId csn_snapshot_xmin = InvalidTransactionId;
 
 	Assert(snapshot != NULL);
 
@@ -2458,12 +2475,19 @@ GetSnapshotData(Snapshot snapshot)
 	if (!TransactionIdIsValid(MyProc->xmin))
 		MyProc->xmin = TransactionXmin = xmin;
 
-	/*
-	 * Take CSN under ProcArrayLock so the snapshot stays
-	 * synchronized.
-	 */
+	/* Take CSN under ProcArrayLock so the snapshot stays synchronized. */
 	if (!snapshot->takenDuringRecovery && get_csnlog_status())
-		csn = GenerateCSN(InvalidCSN);
+		csn = GenerateCSN(false, InvalidCSN);
+
+	if (get_csnlog_status() && csn_snapshot_defer_time > 0 && IsUnderPostmaster)
+	{
+		CSNSnapshotMapXmin(snapshot->snapshot_csn);
+
+		/* Get value of xmin, delayed by a CSN snapshot settings. */
+		csn_snapshot_xmin = ProcArrayGetCSNSnapshotXmin();
+		/* Adjust an oldest xid value with a xmin, delayed by CSN options. */
+		oldestxid = TransactionIdOlder(oldestxid, csn_snapshot_xmin);
+	}
 
 	LWLockRelease(ProcArrayLock);
 
@@ -2488,6 +2512,10 @@ GetSnapshotData(Snapshot snapshot)
 		/* Check whether there's a replication slot requiring an older xmin. */
 		def_vis_xid_data =
 			TransactionIdOlder(xmin, replication_slot_xmin);
+
+		/* The csn-related settings can require an older xmin. */
+		def_vis_xid_data =
+			TransactionIdOlder(def_vis_xid_data, csn_snapshot_xmin);
 
 		/*
 		 * Rows in non-shared, non-catalog tables possibly could be vacuumed
@@ -2572,10 +2600,7 @@ GetSnapshotData(Snapshot snapshot)
 	snapshot->lsn = InvalidXLogRecPtr;
 	snapshot->whenTaken = 0;
 	snapshot->imported_csn = false;
-	snapshot->csn = csn;
-
-	if (csn_snapshot_defer_time > 0 && IsUnderPostmaster)
-		CSNSnapshotMapXmin(snapshot->csn);
+	snapshot->snapshot_csn = csn;
  
 	return snapshot;
 }
