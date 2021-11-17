@@ -402,5 +402,6 @@ extern PGDLLIMPORT bool ArchiveRecoveryRequested;
 extern PGDLLIMPORT bool InArchiveRecovery;
 extern PGDLLIMPORT bool StandbyMode;
 extern PGDLLIMPORT char *recoveryRestoreCommand;
+extern PGDLLIMPORT bool enable_csn_wal;
 
 #endif							/* XLOG_INTERNAL_H */

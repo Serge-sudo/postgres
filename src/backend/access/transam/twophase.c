@@ -77,7 +77,6 @@
 #include <unistd.h>
 
 #include "access/commit_ts.h"
-#include "access/csn_log.h"
 #include "access/csn_snapshot.h"
 #include "access/htup_details.h"
 #include "access/subtrans.h"
@@ -2700,20 +2699,19 @@ LookupGXact(const char *gid, XLogRecPtr prepare_end_lsn,
 	return found;
 }
 
-
 /*
  * CSNSnapshotPrepareTwophase
  *
  * Set InDoubt state for currently active transaction and return commit's
  * global snapshot.
  */
-static CSN
+static SnapshotCSN
 CSNSnapshotPrepareTwophase(const char *gid)
 {
-	GlobalTransaction gxact;
-	PGPROC	   *proc;
-	char	   *buf;
-	TransactionId xid;
+	GlobalTransaction	gxact;
+	PGPROC				*proc;
+	char				*buf;
+	TransactionId		xid;
 	xl_xact_parsed_prepare parsed;
 
 	if (!enable_csn_snapshot)
@@ -2747,14 +2745,13 @@ CSNSnapshotPrepareTwophase(const char *gid)
 	LWLockRelease(TwoPhaseStateLock);
 
 	pfree(buf);
-
-	return GenerateCSN(InvalidCSN);
+	return GenerateCSN(false, InvalidCSN);
 }
 
 /*
  * CSNSnapshotAssignTwoPhase
  *
- * Asign CSN for currently active transaction. CSN is supposedly
+ * Asign SnapshotCSN for currently active transaction. SnapshotCSN is supposedly
  * maximal among of values returned by CSNSnapshotPrepareCurrent and
  * pg_csn_snapshot_prepare.
  *
@@ -2762,10 +2759,10 @@ CSNSnapshotPrepareTwophase(const char *gid)
  * twophase transactions.
  */
 static void
-CSNSnapshotAssignTwoPhase(const char *gid, CSN csn)
+CSNSnapshotAssignTwoPhase(const char *gid, SnapshotCSN csn)
 {
-	GlobalTransaction	gxact;
-	PGPROC				*proc;
+	GlobalTransaction gxact;
+	PGPROC	   *proc;
 
 	if (!enable_csn_snapshot)
 		ereport(ERROR,
@@ -2777,7 +2774,7 @@ CSNSnapshotAssignTwoPhase(const char *gid, CSN csn)
 	if (!CSNIsNormal(csn))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("pg_csn_snapshot_assign expects normal csn")));
+				 errmsg("pg_csn_snapshot_assign expects normal snapshot_csn")));
 
 	/*
 	 * Validate the GID, and lock the GXACT to ensure that two backends do not
@@ -2788,10 +2785,10 @@ CSNSnapshotAssignTwoPhase(const char *gid, CSN csn)
 
 	Assert(csn != InvalidCSN);
 	/* We do not care the Generate result, we just want to make sure max
-	 * csnState->last_max_csn value.
+	 * csnShared->last_max_csn value.
 	 */
-	GenerateCSN(csn);
-	/* Set csn and defuse ProcArrayRemove from assigning one. */
+	GenerateCSN(false, csn);
+	/* Set snapshot_csn and defuse ProcArrayRemove from assigning one. */
 	pg_atomic_write_u64(&proc->assignedCSN, csn);
 
 	/* Unlock our GXACT */
@@ -2809,9 +2806,7 @@ Datum
 pg_csn_snapshot_prepare(PG_FUNCTION_ARGS)
 {
 	const char 	*gid = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	CSN	csn;
-
-	csn = CSNSnapshotPrepareTwophase(gid);
+	SnapshotCSN	csn = CSNSnapshotPrepareTwophase(gid);
 
 	PG_RETURN_INT64(csn);
 }
@@ -2825,7 +2820,7 @@ Datum
 pg_csn_snapshot_assign(PG_FUNCTION_ARGS)
 {
 	const char *gid = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	CSN	csn = PG_GETARG_INT64(1);
+	SnapshotCSN	csn = PG_GETARG_INT64(1);
 
 	CSNSnapshotAssignTwoPhase(gid, csn);
 	PG_RETURN_VOID();

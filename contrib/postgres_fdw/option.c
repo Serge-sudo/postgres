@@ -586,10 +586,9 @@ _PG_init(void)
 							   NULL,
 							   NULL);
 
-	MarkGUCPrefixReserved("postgres_fdw");
-
 	DefineCustomBoolVariable("postgres_fdw.use_csn_snapshots",
-							"Use global snapshots for FDW transactions", NULL,
-							&UseCSNSnapshots, false, PGC_USERSET, 0, NULL,
-							NULL, NULL);
+		"Use global snapshots for FDW transactions", NULL,
+		&UseCSNSnapshots, false, PGC_USERSET, 0, NULL,
+		NULL, NULL);
+	MarkGUCPrefixReserved("postgres_fdw");
 }

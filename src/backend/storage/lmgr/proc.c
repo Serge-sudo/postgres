@@ -33,10 +33,12 @@
 #include <unistd.h>
 #include <sys/time.h>
 
+#include "access/csn_snapshot.h"
 #include "access/transam.h"
 #include "access/twophase.h"
 #include "access/csn_snapshot.h"
 #include "access/xlogutils.h"
+#include "access/xact.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
