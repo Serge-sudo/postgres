@@ -3081,6 +3081,8 @@ WALAvailability
 WALInsertLock
 WALInsertLockPadded
 WALOpenSegment
+WALPrevPosLink
+WALPrevPosLinkVal
 WALReadError
 WALSegmentCloseCB
 WALSegmentContext

@@ -531,7 +531,9 @@ int			log_temp_files = -1;
 double		log_statement_sample_rate = 1.0;
 double		log_xact_sample_rate = 0;
 char	   *backtrace_functions;
+
 int			log2_num_xlog_insert_locks;
+bool 		wal_reserve_lock_free;
 
 int			temp_file_limit = -1;
 
@@ -1022,6 +1024,21 @@ struct config_bool ConfigureNamesBool[] =
 		&current_role_is_superuser,
 		false,
 		NULL, NULL, NULL
+	},
+	{
+		{
+			"wal_reserve_lock_free",
+			PGC_POSTMASTER,
+			UNGROUPED,
+			gettext_noop("Enables the use of a lock-free algorithm for reserving WAL space."),
+			NULL,
+			0
+		},
+		&wal_reserve_lock_free,
+		false,
+		NULL,
+		NULL,
+		NULL
 	},
 	{
 		/*
