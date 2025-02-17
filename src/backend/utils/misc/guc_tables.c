@@ -534,6 +534,7 @@ char	   *backtrace_functions;
 
 int			log2_num_xlog_insert_locks;
 bool 		wal_reserve_lock_free;
+bool 		enable_wal_locking_reduction;
 
 int			temp_file_limit = -1;
 
@@ -1035,6 +1036,21 @@ struct config_bool ConfigureNamesBool[] =
 			0
 		},
 		&wal_reserve_lock_free,
+		false,
+		NULL,
+		NULL,
+		NULL
+	},
+	{
+		{
+			"enable_wal_locking_reduction",
+			PGC_POSTMASTER,
+			UNGROUPED,
+			gettext_noop("Enables reduced locking in WAL during new buffer allocation."),
+			NULL,
+			0
+		},
+		&enable_wal_locking_reduction,
 		false,
 		NULL,
 		NULL,

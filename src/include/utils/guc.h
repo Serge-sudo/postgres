@@ -271,6 +271,7 @@ extern PGDLLIMPORT char *backtrace_functions;
 
 extern PGDLLIMPORT int log2_num_xlog_insert_locks;
 extern PGDLLIMPORT bool wal_reserve_lock_free;
+extern PGDLLIMPORT bool enable_wal_locking_reduction;
 
 extern PGDLLIMPORT int temp_file_limit;
 

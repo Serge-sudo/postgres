@@ -304,11 +304,12 @@ static bool doPageWrites;
  * info_lck is only held long enough to read/update the protected variables,
  * so it's a plain spinlock.  The other locks are held longer (potentially
  * over I/O operations), so we use LWLocks for them.  These locks are:
- *
+ * 
  * WALBufMappingLock: must be held to replace a page in the WAL buffer cache.
  * It is only held while initializing and changing the mapping.  If the
  * contents of the buffer being replaced haven't been written yet, the mapping
  * lock is released while the write is done, and reacquired afterwards.
+ * This is only relevant if enable_wal_locking_reduction is off.
  *
  * WALWriteLock: must be held to write WAL buffers to disk (XLogWrite or
  * XLogFlush).
@@ -602,6 +603,36 @@ typedef struct XLogCtlData
 	pg_atomic_uint64 logWriteResult;	/* last byte + 1 written out */
 	pg_atomic_uint64 logFlushResult;	/* last byte + 1 flushed */
 
+	/* Used only if enable_wal_locking_reduction is on */
+	/*
+	 * First initialized page in the cache (first byte position).
+	 */
+	XLogRecPtr	InitializedFrom;
+
+	/*
+	 * Latest reserved for inititalization page in the cache (last byte
+	 * position + 1).
+	 *
+	 * To change the identity of a buffer, you need to advance
+	 * InitializeReserved first.  To change the identity of a buffer that's
+	 * still dirty, the old page needs to be written out first, and for that
+	 * you need WALWriteLock, and you need to ensure that there are no
+	 * in-progress insertions to the page by calling
+	 * WaitXLogInsertionsToFinish().
+	 */
+	pg_atomic_uint64 InitializeReserved;
+
+	/*
+	 * Latest initialized page in the cache (last byte position + 1).
+	 *
+	 * InitializedUpToAtomic is updated after the buffer initialization. After
+	 * update, waiters got notification using InitializedUpToCondVar.
+	 */
+	pg_atomic_uint64 InitializedUpToAtomic;
+	ConditionVariable InitializedUpToCondVar;
+	
+	/* Used only if enable_wal_locking_reduction is off */
+
 	/*
 	 * Latest initialized page in the cache (last byte position + 1).
 	 *
@@ -616,8 +647,12 @@ typedef struct XLogCtlData
 
 	/*
 	 * These values do not change after startup, although the pointed-to pages
-	 * and xlblocks values certainly do.  xlblocks values are protected by
-	 * WALBufMappingLock.
+	 * and xlblocks values certainly do. xlblocks values are protected by
+	 * WALBufMappingLock in case enable_wal_locking_reduction is off.
+	 * And xlblocks values are changed lock-free according to the 
+	 * check for the xlog write position and are accompanied by changes 
+	 * of InitializeReserved and InitializedUpToAtomic in case 
+	 * enable_wal_locking_reduction is on.
 	 */
 	char	   *pages;			/* buffers for unwritten XLOG pages */
 	pg_atomic_uint64 *xlblocks; /* 1st byte ptr-s + XLOG_BLCKSZ */
@@ -804,6 +839,8 @@ static XLogRecPtr XLogGetReplicationSlotMinimumLSN(void);
 
 static void AdvanceXLInsertBuffer(XLogRecPtr upto, TimeLineID tli,
 								  bool opportunistic);
+static void AdvanceXLInsertBufferLockFree(XLogRecPtr upto, TimeLineID tli,
+								  		  bool opportunistic);
 static void XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible);
 static bool InstallXLogFileSegment(XLogSegNo *segno, char *tmppath,
 								   bool find_free, XLogSegNo max_segno,
@@ -956,9 +993,9 @@ XLogInsertRecord(XLogRecData *rdata,
 	 * fullPageWrites from changing until the insertion is finished.
 	 *
 	 * Step 2 can usually be done completely in parallel. If the required WAL
-	 * page is not initialized yet, you have to grab WALBufMappingLock to
-	 * initialize it, but the WAL writer tries to do that ahead of insertions
-	 * to avoid that from happening in the critical path.
+	 * page is not initialized yet, you have to go through AdvanceXLInsertBuffer,
+	 * which will ensure it is initialized. But the WAL writer tries to do that
+	 * ahead of insertions to avoid that from happening in the critical path.
 	 *
 	 *----------
 	 */
@@ -2231,7 +2268,10 @@ GetXLogBuffer(XLogRecPtr ptr, TimeLineID tli)
 
 		WALInsertLockUpdateInsertingAt(initializedUpto);
 
-		AdvanceXLInsertBuffer(ptr, tli, false);
+		if (enable_wal_locking_reduction)
+			AdvanceXLInsertBufferLockFree(ptr, tli, false);
+		else
+			AdvanceXLInsertBuffer(ptr, tli, false);
 		endptr = pg_atomic_read_u64(&XLogCtl->xlblocks[idx]);
 
 		if (expectedEndPtr != endptr)
@@ -2510,6 +2550,8 @@ XLogRecPtrToBytePos(XLogRecPtr ptr)
  * true, initialize as many pages as we can without having to write out
  * unwritten data. Any new pages are initialized to zeros, with pages headers
  * initialized properly.
+ * 
+ * Used only if enable_wal_locking_reduction is off.
  */
 static void
 AdvanceXLInsertBuffer(XLogRecPtr upto, TimeLineID tli, bool opportunistic)
@@ -2674,6 +2716,309 @@ AdvanceXLInsertBuffer(XLogRecPtr upto, TimeLineID tli, bool opportunistic)
 		npages++;
 	}
 	LWLockRelease(WALBufMappingLock);
+
+#ifdef WAL_DEBUG
+	if (XLOG_DEBUG && npages > 0)
+	{
+		elog(DEBUG1, "initialized %d pages, up to %X/%X",
+			 npages, LSN_FORMAT_ARGS(NewPageEndPtr));
+	}
+#endif
+}
+
+/* 
+ * Same as AdvanceXLInsertBuffer, but lock-free version.
+ * This function uses atomic operations and condition variables to
+ * coordinate multiple processes initializing different pages in parallel.
+ * Used only when enable_wal_locking_reduction is enabled.
+ */
+static void
+AdvanceXLInsertBufferLockFree(XLogRecPtr upto, TimeLineID tli, bool opportunistic)
+{
+	XLogCtlInsert *Insert = &XLogCtl->Insert;
+	int			nextidx;
+	XLogRecPtr	OldPageRqstPtr;
+	XLogwrtRqst WriteRqst;
+	XLogRecPtr	NewPageEndPtr = InvalidXLogRecPtr;
+	XLogRecPtr	NewPageBeginPtr;
+	XLogPageHeader NewPage;
+	XLogRecPtr	ReservedPtr;
+	int			npages pg_attribute_unused() = 0;
+
+	Assert(enable_wal_locking_reduction);
+
+	/*
+	 * We must run the loop below inside the critical section as we expect
+	 * XLogCtl->InitializedUpToAtomic to eventually keep up.  The most of callers
+	 * already run inside the critical section. Except for WAL writer, which
+	 * passed 'opportunistic == true', and therefore we don't perform
+	 * operations that could error out.
+	 *
+	 * Start an explicit critical section anyway though.
+	 */
+	Assert(CritSectionCount > 0 || opportunistic);
+	START_CRIT_SECTION();
+
+	/*--
+	 * Loop till we get all the pages in WAL buffer before 'upto' reserved for
+	 * initialization.  Multiple process can initialize different buffers with
+	 * this loop in parallel as following.
+	 *
+	 * 1. Reserve page for initialization using XLogCtl->InitializeReserved.
+	 * 2. Initialize the reserved page.
+	 * 3. Attempt to advance XLogCtl->InitializedUpToAtomic,
+	 */
+	ReservedPtr = pg_atomic_read_u64(&XLogCtl->InitializeReserved);
+	while (upto >= ReservedPtr || opportunistic)
+	{
+		Assert(ReservedPtr % XLOG_BLCKSZ == 0);
+
+		/*
+		 * Get ending-offset of the buffer page we need to replace.
+		 *
+		 * We don't lookup into xlblocks, but rather calculate position we
+		 * must wait to be written. If it was written, xlblocks will have this
+		 * position (or uninitialized)
+		 */
+		if (ReservedPtr + XLOG_BLCKSZ > XLogCtl->InitializedFrom + XLOG_BLCKSZ * XLOGbuffers)
+			OldPageRqstPtr = ReservedPtr + XLOG_BLCKSZ - (XLogRecPtr) XLOG_BLCKSZ * XLOGbuffers;
+		else
+			OldPageRqstPtr = InvalidXLogRecPtr;
+
+		if (LogwrtResult.Write < OldPageRqstPtr && opportunistic)
+		{
+			/*
+			 * If we just want to pre-initialize as much as we can without
+			 * flushing, give up now.
+			 */
+			upto = ReservedPtr - 1;
+			break;
+		}
+
+		/*
+		 * Attempt to reserve the page for initialization.  Failure means that
+		 * this page got reserved by another process.
+		 */
+		if (!pg_atomic_compare_exchange_u64(&XLogCtl->InitializeReserved,
+											&ReservedPtr,
+											ReservedPtr + XLOG_BLCKSZ))
+			continue;
+
+		/*
+		 * Wait till page gets correctly initialized up to OldPageRqstPtr.
+		 */
+		nextidx = XLogRecPtrToBufIdx(ReservedPtr);
+		while (pg_atomic_read_u64(&XLogCtl->InitializedUpToAtomic) < OldPageRqstPtr)
+			ConditionVariableSleep(&XLogCtl->InitializedUpToCondVar, WAIT_EVENT_WAL_BUFFER_INIT);
+		ConditionVariableCancelSleep();
+		Assert(pg_atomic_read_u64(&XLogCtl->xlblocks[nextidx]) == OldPageRqstPtr);
+
+		/* Fall through if it's already written out. */
+		if (LogwrtResult.Write < OldPageRqstPtr)
+		{
+			/* Nope, got work to do. */
+
+			/* Advance shared memory write request position */
+			SpinLockAcquire(&XLogCtl->info_lck);
+			if (XLogCtl->LogwrtRqst.Write < OldPageRqstPtr)
+				XLogCtl->LogwrtRqst.Write = OldPageRqstPtr;
+			SpinLockRelease(&XLogCtl->info_lck);
+
+			/*
+			 * Acquire an up-to-date LogwrtResult value and see if we still
+			 * need to write it or if someone else already did.
+			 */
+			RefreshXLogWriteResult(LogwrtResult);
+			if (LogwrtResult.Write < OldPageRqstPtr)
+			{
+				WaitXLogInsertionsToFinish(OldPageRqstPtr);
+
+				LWLockAcquire(WALWriteLock, LW_EXCLUSIVE);
+
+				RefreshXLogWriteResult(LogwrtResult);
+				if (LogwrtResult.Write >= OldPageRqstPtr)
+				{
+					/* OK, someone wrote it already */
+					LWLockRelease(WALWriteLock);
+				}
+				else
+				{
+					/* Have to write it ourselves */
+					TRACE_POSTGRESQL_WAL_BUFFER_WRITE_DIRTY_START();
+					WriteRqst.Write = OldPageRqstPtr;
+					WriteRqst.Flush = 0;
+					XLogWrite(WriteRqst, tli, false);
+					LWLockRelease(WALWriteLock);
+					PendingWalStats.wal_buffers_full++;
+					TRACE_POSTGRESQL_WAL_BUFFER_WRITE_DIRTY_DONE();
+				}
+			}
+		}
+
+		/*
+		 * Now the next buffer slot is free and we can set it up to be the
+		 * next output page.
+		 */
+		NewPageBeginPtr = ReservedPtr;
+		NewPageEndPtr = NewPageBeginPtr + XLOG_BLCKSZ;
+
+		NewPage = (XLogPageHeader) (XLogCtl->pages + nextidx * (Size) XLOG_BLCKSZ);
+
+		/*
+		 * Mark the xlblock with InvalidXLogRecPtr and issue a write barrier
+		 * before initializing. Otherwise, the old page may be partially
+		 * zeroed but look valid.
+		 */
+		pg_atomic_write_u64(&XLogCtl->xlblocks[nextidx], InvalidXLogRecPtr);
+		pg_write_barrier();
+
+		/*
+		 * Be sure to re-zero the buffer so that bytes beyond what we've
+		 * written will look like zeroes and not valid XLOG records...
+		 */
+		MemSet((char *) NewPage, 0, XLOG_BLCKSZ);
+
+		/*
+		 * Fill the new page's header
+		 */
+		NewPage->xlp_magic = XLOG_PAGE_MAGIC;
+
+		/* NewPage->xlp_info = 0; */	/* done by memset */
+		NewPage->xlp_tli = tli;
+		NewPage->xlp_pageaddr = NewPageBeginPtr;
+
+		/* NewPage->xlp_rem_len = 0; */	/* done by memset */
+
+		/*
+		 * If online backup is not in progress, mark the header to indicate
+		 * that WAL records beginning in this page have removable backup
+		 * blocks.  This allows the WAL archiver to know whether it is safe to
+		 * compress archived WAL data by transforming full-block records into
+		 * the non-full-block format.  It is sufficient to record this at the
+		 * page level because we force a page switch (in fact a segment
+		 * switch) when starting a backup, so the flag will be off before any
+		 * records can be written during the backup.  At the end of a backup,
+		 * the last page will be marked as all unsafe when perhaps only part
+		 * is unsafe, but at worst the archiver would miss the opportunity to
+		 * compress a few records.
+		 */
+		if (Insert->runningBackups == 0)
+			NewPage->xlp_info |= XLP_BKP_REMOVABLE;
+
+		/*
+		 * If first page of an XLOG segment file, make it a long header.
+		 */
+		if ((XLogSegmentOffset(NewPage->xlp_pageaddr, wal_segment_size)) == 0)
+		{
+			XLogLongPageHeader NewLongPage = (XLogLongPageHeader) NewPage;
+
+			NewLongPage->xlp_sysid = ControlFile->system_identifier;
+			NewLongPage->xlp_seg_size = wal_segment_size;
+			NewLongPage->xlp_xlog_blcksz = XLOG_BLCKSZ;
+			NewPage->xlp_info |= XLP_LONG_HEADER;
+		}
+
+		/*
+		 * Make sure the initialization of the page becomes visible to others
+		 * before the xlblocks update. GetXLogBuffer() reads xlblocks without
+		 * holding a lock.
+		 */
+		pg_write_barrier();
+
+		/*-----
+		 * Update the value of XLogCtl->xlblocks[nextidx] and try to advance
+		 * XLogCtl->InitializedUpToAtomic in a lock-less manner.
+		 *
+		 * First, let's provide a formal proof of the algorithm.  Let it be 'n'
+		 * process with the following variables in shared memory:
+		 *	f - an array of 'n' boolean flags,
+		 *	v - atomic integer variable.
+		 *
+		 * Also, let
+		 *	i - a number of a process,
+		 *	j - local integer variable,
+		 * CAS(var, oldval, newval) - compare-and-swap atomic operation
+		 *							  returning true on success,
+		 * write_barrier()/read_barrier() - memory barriers.
+		 *
+		 * The pseudocode for each process is the following.
+		 *
+		 *	j := i
+		 *	f[i] := true
+		 *	write_barrier()
+		 *	while CAS(v, j, j + 1):
+		 *		j := j + 1
+		 *		read_barrier()
+		 *		if not f[j]:
+		 *			break
+		 *
+		 * Let's prove that v eventually reaches the value of n.
+		 * 1. Prove by contradiction.  Assume v doesn't reach n and stucks
+		 *	  on k, where k < n.
+		 * 2. Process k attempts CAS(v, k, k + 1).  1). If, as we assumed, v
+		 *	  gets stuck at k, then this CAS operation must fail.  Therefore,
+		 *    v < k when process k attempts CAS(v, k, k + 1).
+		 * 3. If, as we assumed, v gets stuck at k, then the value k of v
+		 *	  must be achieved by some process m, where m < k.  The process
+		 *	  m must observe f[k] == false.  Otherwise, it will later attempt
+		 *	  CAS(v, k, k + 1) with success.
+		 * 4. Therefore, corresponding read_barrier() (while j == k) on
+		 *	  process m happend before write_barrier() of process k.  But then
+		 *	  process k attempts CAS(v, k, k + 1) after process m successfully
+		 *	  incremented v to k, and that CAS operation must succeed.
+		 *	  That leads to a contradiction.  So, there is no such k (k < n)
+		 *    where v gets stuck.  Q.E.D.
+		 *
+		 * To apply this proof to the code below, we assume
+		 * XLogCtl->InitializedUpToAtomic will play the role of v with XLOG_BLCKSZ
+		 * granularity.  We also assume setting XLogCtl->xlblocks[nextidx] to
+		 * NewPageEndPtr to play the role of setting f[i] to true.  Also, note
+		 * that processes can't concurrently map different xlog locations to
+		 * the same nextidx because we previously requested that
+		 * XLogCtl->InitializedUpToAtomic >= OldPageRqstPtr.  So, a xlog buffer can
+		 * be taken for initialization only once the previous initialization
+		 * takes effect on XLogCtl->InitializedUpToAtomic.
+		 */
+
+		pg_atomic_write_u64(&XLogCtl->xlblocks[nextidx], NewPageEndPtr);
+
+		pg_write_barrier();
+
+		while (pg_atomic_compare_exchange_u64(&XLogCtl->InitializedUpToAtomic, &NewPageBeginPtr, NewPageEndPtr))
+		{
+			NewPageBeginPtr = NewPageEndPtr;
+			NewPageEndPtr = NewPageBeginPtr + XLOG_BLCKSZ;
+			nextidx = XLogRecPtrToBufIdx(NewPageBeginPtr);
+
+			pg_read_barrier();
+
+			if (pg_atomic_read_u64(&XLogCtl->xlblocks[nextidx]) != NewPageEndPtr)
+			{
+				/*
+				 * Page at nextidx wasn't initialized yet, so we cann't move
+				 * InitializedUpto further. It will be moved by backend which
+				 * will initialize nextidx.
+				 */
+				ConditionVariableBroadcast(&XLogCtl->InitializedUpToCondVar);
+				break;
+			}
+		}
+
+		npages++;
+	}
+
+	END_CRIT_SECTION();
+
+	/*
+	 * All the pages in WAL buffer before 'upto' were reserved for
+	 * initialization.  However, some pages might be reserved by concurrent
+	 * processes.  Wait till they finish initialization.
+	 */
+	while (upto >= pg_atomic_read_u64(&XLogCtl->InitializedUpToAtomic))
+		ConditionVariableSleep(&XLogCtl->InitializedUpToCondVar, WAIT_EVENT_WAL_BUFFER_INIT);
+	ConditionVariableCancelSleep();
+
+	pg_read_barrier();
 
 #ifdef WAL_DEBUG
 	if (XLOG_DEBUG && npages > 0)
@@ -3637,7 +3982,10 @@ XLogBackgroundFlush(void)
 	 * Great, done. To take some work off the critical path, try to initialize
 	 * as many of the no-longer-needed WAL buffers for future use as we can.
 	 */
-	AdvanceXLInsertBuffer(InvalidXLogRecPtr, insertTLI, true);
+	if (enable_wal_locking_reduction)
+		AdvanceXLInsertBufferLockFree(InvalidXLogRecPtr, insertTLI, true);
+	else
+		AdvanceXLInsertBuffer(InvalidXLogRecPtr, insertTLI, true);
 
 	/*
 	 * If we determined that we need to write data, but somebody else
@@ -5540,6 +5888,13 @@ XLOGShmemInit(void)
 	pg_atomic_init_u64(&XLogCtl->logFlushResult, InvalidXLogRecPtr);
 	pg_atomic_init_u64(&XLogCtl->unloggedLSN, InvalidXLogRecPtr);
 	
+	if (enable_wal_locking_reduction)
+	{
+		pg_atomic_init_u64(&XLogCtl->InitializeReserved, InvalidXLogRecPtr);
+		pg_atomic_init_u64(&XLogCtl->InitializedUpToAtomic, InvalidXLogRecPtr);
+		ConditionVariableInit(&XLogCtl->InitializedUpToCondVar);
+	}
+
 	if (wal_reserve_lock_free)
 	{
 		pg_atomic_init_u64(&XLogCtl->Insert.CurrBytePosAtomic, 0);
@@ -6585,7 +6940,16 @@ StartupXLOG(void)
 		memset(page + len, 0, XLOG_BLCKSZ - len);
 
 		pg_atomic_write_u64(&XLogCtl->xlblocks[firstIdx], endOfRecoveryInfo->lastPageBeginPtr + XLOG_BLCKSZ);
-		XLogCtl->InitializedUpTo = endOfRecoveryInfo->lastPageBeginPtr + XLOG_BLCKSZ;
+		
+		if (enable_wal_locking_reduction)
+		{
+			pg_atomic_write_u64(&XLogCtl->InitializedUpToAtomic, endOfRecoveryInfo->lastPageBeginPtr + XLOG_BLCKSZ);
+			XLogCtl->InitializedFrom = endOfRecoveryInfo->lastPageBeginPtr;
+		}
+		else
+		{
+			XLogCtl->InitializedUpTo = endOfRecoveryInfo->lastPageBeginPtr + XLOG_BLCKSZ;
+		}
 	}
 	else
 	{
@@ -6594,7 +6958,20 @@ StartupXLOG(void)
 		 * let the first attempt to insert a log record to initialize the next
 		 * buffer.
 		 */
-		XLogCtl->InitializedUpTo = EndOfLog;
+		if (enable_wal_locking_reduction)
+		{
+			pg_atomic_write_u64(&XLogCtl->InitializedUpToAtomic, EndOfLog);
+			XLogCtl->InitializedFrom = EndOfLog;
+		}
+		else
+		{
+			XLogCtl->InitializedUpTo = EndOfLog;
+		}
+	}
+	
+	if (enable_wal_locking_reduction)
+	{
+		pg_atomic_write_u64(&XLogCtl->InitializeReserved, pg_atomic_read_u64(&XLogCtl->InitializedUpToAtomic));
 	}
 
 	/*
