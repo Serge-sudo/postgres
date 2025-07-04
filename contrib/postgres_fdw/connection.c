@@ -169,7 +169,8 @@ static void pgfdw_security_check(const char **keywords, const char **values,
 								 UserMapping *user, PGconn *conn);
 static bool UserMappingPasswordRequired(UserMapping *user);
 static ConnCacheEntry *GetConnectionCacheEntry(Oid umid);
-static void pgfdw_cleanup_after_transaction(ConnCacheEntry *entry);
+static void pgfdw_cleanup_after_transaction(ConnCacheEntry *entry, List*pending_entries,
+								List *cancel_requested, bool iscommit);
 static void pgfdw_end_prepared_xact(ConnCacheEntry *entry, UserMapping *usermapping,
 									char *fdwxact_id, bool is_commit);
 static bool disconnect_cached_connections(Oid serverid);
@@ -315,6 +316,10 @@ GetConnectionCacheEntry(Oid umid)
 	if (ConnectionHash == NULL)
 	{
 		HASHCTL		ctl;
+
+		if (pgfdw_we_get_result == 0)
+			pgfdw_we_get_result =
+				WaitEventExtensionNew("PostgresFdwGetResult");
 
 		ctl.keysize = sizeof(ConnCacheKey);
 		ctl.entrysize = sizeof(ConnCacheEntry);
@@ -2131,6 +2136,7 @@ postgresCommitForeignTransaction(FdwXactInfo *finfo)
 	ConnCacheEntry *entry;
 	bool		is_onephase = (finfo->flags & FDWXACT_FLAG_ONEPHASE) != 0;
 	PGresult   *res;
+	List	   *pending_entries = NIL;
 
 	entry = GetConnectionCacheEntry(finfo->usermapping->umid);
 
@@ -2151,7 +2157,11 @@ postgresCommitForeignTransaction(FdwXactInfo *finfo)
 	pgfdw_reject_incomplete_xact_state_change(entry);
 
 	entry->changing_xact_state = true;
-	do_sql_command(entry->conn, "COMMIT TRANSACTION");
+	if (entry->parallel_commit)
+	{
+		do_sql_command_begin(entry->conn, "COMMIT TRANSACTION");
+		pending_entries = lappend(pending_entries, entry);
+	}
 	entry->changing_xact_state = false;
 
 	/*
@@ -2176,7 +2186,7 @@ postgresCommitForeignTransaction(FdwXactInfo *finfo)
 	}
 
 	/* Cleanup transaction status */
-	pgfdw_cleanup_after_transaction(entry);
+	pgfdw_cleanup_after_transaction(entry, pending_entries, NIL, true);
 }
 
 void
@@ -2184,7 +2194,8 @@ postgresRollbackForeignTransaction(FdwXactInfo *finfo)
 {
 	ConnCacheEntry *entry = NULL;
 	bool is_onephase = (finfo->flags & FDWXACT_FLAG_ONEPHASE) != 0;
-	bool abort_cleanup_failure = false;
+	List	   *pending_entries = NIL;
+	List	   *cancel_requested = NIL;
 
 	entry = GetConnectionCacheEntry(finfo->usermapping->umid);
 
@@ -2205,64 +2216,20 @@ postgresRollbackForeignTransaction(FdwXactInfo *finfo)
 	if (!entry->conn)
 		goto cleanup;
 
-	/*
-	 * Don't try to clean up the connection if we're already
-	 * in error recursion trouble.
-	 */
-	if (in_error_recursion_trouble())
-		entry->changing_xact_state = true;
 
-	/*
-	 * If connection is before starting transaction or is already unsalvageable,
-	 * do only the cleanup and don't touch it further.
-	 */
-	if (entry->changing_xact_state)
-		goto cleanup;
-
-	/*
-	 * Mark this connection as in the process of changing
-	 * transaction state.
-	 */
-	entry->changing_xact_state = true;
-
-	/* Assume we might have lost track of prepared statements */
-	entry->have_error = true;
-
-	/*
-	 * If a command has been submitted to the remote server by
-	 * using an asynchronous execution function, the command
-	 * might not have yet completed.  Check to see if a
-	 * command is still being processed by the remote server,
-	 * and if so, request cancellation of the command.
-	 */
-	if (PQtransactionStatus(entry->conn) == PQTRANS_ACTIVE &&
-		!pgfdw_cancel_query(entry->conn))
+	if (entry->parallel_abort)
 	{
-		/* Unable to cancel running query. */
-		abort_cleanup_failure = true;
+		if (pgfdw_abort_cleanup_begin(entry, true,
+										&pending_entries,
+										&cancel_requested))
+			goto cleanup;
 	}
-	else if (!pgfdw_exec_cleanup_query(entry->conn,
-									   "ABORT TRANSACTION",
-									   false))
-	{
-		/* Unable to abort remote transaction. */
-		abort_cleanup_failure = true;
-	}
-	else if (entry->have_prep_stmt && entry->have_error &&
-			 !pgfdw_exec_cleanup_query(entry->conn,
-									   "DEALLOCATE ALL",
-									   true))
-	{
-		/* Trouble clearing prepared statements. */
-		abort_cleanup_failure = true;
-	}
-
-	/* Disarm changing_xact_state if it all worked. */
-	entry->changing_xact_state = abort_cleanup_failure;
+	else
+		pgfdw_abort_cleanup(entry, true);
 
 cleanup:
 	/* Cleanup transaction status */
-	pgfdw_cleanup_after_transaction(entry);
+	pgfdw_cleanup_after_transaction(entry, pending_entries, cancel_requested, false);
 }
 
 /*
@@ -2302,37 +2269,41 @@ postgresPrepareForeignTransaction(FdwXactInfo *finfo)
 		PQclear(res);
 	}
 
-	pgfdw_cleanup_after_transaction(entry);
+	pgfdw_cleanup_after_transaction(entry, NIL, NIL, false);
 }
 
 /* Cleanup at main-transaction end */
 static void
-pgfdw_cleanup_after_transaction(ConnCacheEntry *entry)
+pgfdw_cleanup_after_transaction(ConnCacheEntry *entry, List*pending_entries,
+								List *cancel_requested, bool commit)
 {
 	/* Reset state to show we're out of a transaction */
-	entry->xact_depth = 0;
 	entry->have_prep_stmt = false;
 	entry->have_error = false;
 
-	/*
-	 * If the connection isn't in a good idle state, discard it to
-	 * recover. Next GetConnection will open a new connection.
-	 */
-	if (PQstatus(entry->conn) != CONNECTION_OK ||
-		PQtransactionStatus(entry->conn) != PQTRANS_IDLE ||
-		entry->changing_xact_state ||
-		entry->invalidated ||
-		!entry->keep_connections)
+	/* Reset state to show we're out of a transaction */
+	pgfdw_reset_xact_state(entry, true);
+
+	/* If there are any pending connections, finish cleaning them up */
+	if (pending_entries || cancel_requested)
 	{
-		elog(DEBUG3, "discarding connection %p", entry->conn);
-		disconnect_pg_server(entry);
+		if (commit)
+		{
+			Assert(cancel_requested == NIL);
+			pgfdw_finish_pre_commit_cleanup(pending_entries);
+		}
+		else
+		{
+			pgfdw_finish_abort_cleanup(pending_entries, cancel_requested,
+									   true);
+		}
 	}
 
 	/*
 	 * Regardless of the event type, we can now mark ourselves as out of the
 	 * transaction.
 	 */
-   xact_got_connection = false;
+   	xact_got_connection = false;
 
 	/* Also reset cursor numbering for next transaction */
 	cursor_number = 0;
@@ -2406,5 +2377,5 @@ pgfdw_end_prepared_xact(ConnCacheEntry *entry, UserMapping *usermapping,
 		 is_commit ? "commit" : "rollback", fdwxact_id);
 
 	/* Cleanup transaction status */
-	pgfdw_cleanup_after_transaction(entry);
+	pgfdw_cleanup_after_transaction(entry, NIL, NIL, is_commit);
 }
