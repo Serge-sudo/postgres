@@ -644,6 +644,13 @@ disconnect_pg_server(ConnCacheEntry *entry)
 	{
 		libpqsrv_disconnect(entry->conn);
 		entry->conn = NULL;
+		
+		/* Reset connection state flags when disconnecting */
+		entry->changing_xact_state = false;
+		entry->xact_depth = 0;
+		entry->have_prep_stmt = false;
+		entry->have_error = false;
+		memset(&entry->state, 0, sizeof(entry->state));
 	}
 }
 
