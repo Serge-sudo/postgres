@@ -267,12 +267,11 @@ GetLocalVictimBuffer(void)
 		if (delayed_temp_table_placement && SmgrIsTemp(oreln))
 		{
 			ForkNumber	forknum = BufTagGetForkNum(&bufHdr->tag);
+			BlockNumber blocknum = bufHdr->tag.blockNum;
+			BlockNumber current_blocks;
 			
 			if (!smgrexists(oreln, forknum))
 			{
-				BlockNumber blocknum = bufHdr->tag.blockNum;
-				BlockNumber current_blocks;
-				
 				/* Create the disk file now that we need it */
 				smgrcreate(oreln, forknum, false);
 				
@@ -291,6 +290,25 @@ GetLocalVictimBuffer(void)
 						pfree(zero_page);
 					}
 					SetDelayedTempTableNBlocks(oreln, forknum, blocknum + 1);
+				}
+			}
+			else
+			{
+				/*
+				 * Fork exists but we need to ensure the specific block exists.
+				 * smgrwrite() can only write to existing blocks, so we must
+				 * extend the file if the target block doesn't exist yet.
+				 */
+				current_blocks = smgrnblocks(oreln, forknum);
+				if (blocknum >= current_blocks)
+				{
+					/* Extend the file to include all blocks up to blocknum */
+					for (BlockNumber i = current_blocks; i <= blocknum; i++)
+					{
+						Page zero_page = palloc0(BLCKSZ);
+						smgrextend(oreln, forknum, i, zero_page, false);
+						pfree(zero_page);
+					}
 				}
 			}
 		}
