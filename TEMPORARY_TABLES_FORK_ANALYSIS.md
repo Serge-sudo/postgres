@@ -95,16 +95,13 @@ if (!smgrexists(RelationGetSmgr(rel), FSM_FORKNUM))
 
 ### 5. VM (Visibility Map) Fork Creation
 
-**Key Finding**: VM forks are **NOT created for temporary tables** because they don't need MVCC visibility tracking.
+**CORRECTED Analysis**: VM forks **CAN be created for temporary tables** during manual VACUUM operations.
 
-**Rationale**:
-- VM forks optimize visibility checks across multiple backends/sessions
-- Temporary tables are session-local (single backend access only)
-- No concurrency control needed since only one backend can access the data
-- Autovacuum explicitly skips temporary tables (`src/backend/postmaster/autovacuum.c:2086`)
-- VM forks are primarily created and maintained by VACUUM operations
+**Key Findings**:
 
-**Evidence from autovacuum.c**:
+1. **Autovacuum behavior**: Autovacuum explicitly skips temporary tables, so VM forks are NOT created by autovacuum.
+
+**Evidence from autovacuum.c:2086**:
 ```c
 /*
  * We cannot safely process other backends' temp tables, so skip 'em.
@@ -113,6 +110,43 @@ if (classForm->relpersistence == RELPERSISTENCE_TEMP)
     continue;
 ```
 
+2. **Manual VACUUM behavior**: Manual VACUUM commands CAN run on temporary tables from the same backend and WILL create VM forks.
+
+**Evidence from vacuum.c:2095-2100**:
+```c
+/*
+ * Silently ignore tables that are temp tables of other backends ---
+ * trying to vacuum these will lead to great unhappiness, since their
+ * contents are probably not up-to-date on disk.
+ */
+if (RELATION_IS_OTHER_TEMP(rel))  // Only skips OTHER backends' temp tables
+{
+    relation_close(rel, lmode);
+    PopActiveSnapshot();
+    CommitTransactionCommand();
+    return false;
+}
+```
+
+**VM Fork Creation Code Path for Manual VACUUM**:
+
+1. `vacuum.c:vacuum_rel()` → `table_relation_vacuum()` 
+2. `vacuumlazy.c:heap_vacuum_rel()` → `lazy_scan_heap()`
+3. `vacuumlazy.c:913: visibilitymap_pin(vacrel->rel, blkno, &vmbuffer)`
+4. `visibilitymap.c:203: *vmbuf = vm_readbuf(rel, mapBlock, true)` ← `extend=true`
+5. `visibilitymap.c:574: buf = vm_extend(rel, blkno + 1)` (if beyond current size)
+6. `bufmgr.c:617: ExtendBufferedRelTo(..., EB_CREATE_FORK_IF_NEEDED, ...)`
+7. `bufmgr.c:945: smgrcreate(bmr.smgr, fork, flags & EB_PERFORMING_RECOVERY)` ← **VM fork created**
+
+**Practical Impact**:
+- Temporary tables from the current backend can be manually vacuumed
+- Manual VACUUM will create VM forks for temporary tables if they don't exist
+- VM fork creation logic does NOT check relation persistence type
+- This behavior is technically possible but rarely occurs in practice since:
+  - Temporary tables are typically short-lived
+  - Users rarely run manual VACUUM on temporary tables
+  - The visibility benefits are minimal for single-backend access
+
 ## Code Locations Summary
 
 | Fork Type | Creation Pattern | Key Files | Temporary Table Behavior |
@@ -120,7 +154,7 @@ if (classForm->relpersistence == RELPERSISTENCE_TEMP)
 | **MAIN** | At table creation | `src/backend/catalog/storage.c:150` | ✅ Created |
 | **INIT** | Only for unlogged | `src/backend/access/heap/heapam_handler.c:331-338` | ❌ Not created |
 | **FSM** | Lazy/on-demand | `src/backend/storage/freespace/freespace.c` | ✅ Created when needed |
-| **VM** | Lazy/on-demand for permanent/unlogged only | `src/backend/access/heap/visibilitymap.c` | ❌ Not created - no MVCC needed |
+| **VM** | Lazy/on-demand during VACUUM | `src/backend/access/heap/visibilitymap.c` | ⚠️ Can be created during manual VACUUM |
 
 ## Key Data Structures
 
@@ -176,20 +210,23 @@ This macro returns `false` for temporary tables since they are not permanent.
 
 2. **FSM Forks**: Temporary tables DO create FSM forks when needed for space management within the single backend session.
 
-3. **VM Forks**: Temporary tables do NOT create VM (visibility map) forks because they don't need MVCC visibility tracking. VM forks are only useful for multi-session access patterns, but temporary tables are session-local.
+3. **VM Forks**: **CORRECTED**: Temporary tables CAN create VM forks during manual VACUUM operations, although this is rare in practice. Autovacuum skips temporary tables, but manual VACUUM can run on temporary tables from the same backend and will create VM forks if needed.
 
 4. **WAL Logging**: Temporary tables never write to WAL (`needs_wal = false`), which is consistent with their session-local, non-persistent nature.
 
-5. **Storage Management**: Temporary tables use a special proc number and are tracked differently for cleanup purposes, but follow similar storage patterns for data management forks (main and FSM only).
+5. **Storage Management**: Temporary tables use a special proc number and are tracked differently for cleanup purposes, but follow similar storage patterns for data management forks (main, FSM, and potentially VM during manual vacuum only).
 
-6. **Autovacuum Behavior**: Autovacuum explicitly skips temporary tables since they don't benefit from cross-session optimization strategies.
+6. **Autovacuum Behavior**: Autovacuum explicitly skips temporary tables since cross-session optimization strategies are not applicable to session-local data.
 
 ## Recommendations
 
-1. The current implementation is correct and efficient - temporary tables don't need init forks or VM forks.
+1. The current implementation is correct and efficient - temporary tables don't need init forks.
 2. The lazy creation of FSM forks for temporary tables is appropriate since space management is still beneficial within a single backend session.
 3. The WAL exemption for temporary tables is a significant performance benefit for temporary data operations.
-4. VM forks are correctly omitted for temporary tables since MVCC visibility optimizations are not needed for session-local data.
+4. **CORRECTED**: VM forks can be created for temporary tables during manual VACUUM, but this behavior is technically correct since the VM creation logic doesn't (and shouldn't need to) check persistence type. The practical impact is minimal since:
+   - Temporary tables are rarely manually vacuumed
+   - VM benefits are minimal for single-backend access
+   - Autovacuum correctly skips temporary tables
 
 ## Test Cases Needed
 
