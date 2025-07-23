@@ -36,6 +36,19 @@ typedef struct
 	int			id;				/* Associated local buffer's index */
 } LocalBufferLookupEnt;
 
+/* entry for tracking logical block counts of delayed temp tables */
+typedef struct
+{
+	RelFileLocator rlocator;	/* Relation file locator */
+	ForkNumber	forkNum;		/* Fork number */
+} DelayedTempTableKey;
+
+typedef struct
+{
+	DelayedTempTableKey key;	/* Hash key */
+	BlockNumber	nblocks;		/* Current logical block count */
+} DelayedTempTableEnt;
+
 /* Note: this macro only works on local buffers, not shared ones! */
 #define LocalBufHdrGetBlock(bufHdr) \
 	LocalBufferBlockPointers[-((bufHdr)->buf_id + 2)]
@@ -49,6 +62,7 @@ int32	   *LocalRefCount = NULL;
 static int	nextFreeLocalBufId = 0;
 
 static HTAB *LocalBufHash = NULL;
+static HTAB *DelayedTempTableHash = NULL;
 
 /* number of local buffers pinned at least once */
 static int	NLocalPinnedBuffers = 0;
@@ -57,6 +71,8 @@ static int	NLocalPinnedBuffers = 0;
 static void InitLocalBuffers(void);
 static Block GetLocalBufferStorage(void);
 static Buffer GetLocalVictimBuffer(void);
+static BlockNumber GetDelayedTempTableNBlocks(SMgrRelation smgr, ForkNumber forkNum);
+static void SetDelayedTempTableNBlocks(SMgrRelation smgr, ForkNumber forkNum, BlockNumber nblocks);
 
 
 /*
@@ -254,8 +270,28 @@ GetLocalVictimBuffer(void)
 			
 			if (!smgrexists(oreln, forknum))
 			{
+				BlockNumber blocknum = bufHdr->tag.blockNum;
+				BlockNumber current_blocks;
+				
 				/* Create the disk file now that we need it */
 				smgrcreate(oreln, forknum, false);
+				
+				/*
+				 * We need to ensure all blocks from 0 to blocknum exist.
+				 * Get the current logical block count and extend if needed.
+				 */
+				current_blocks = GetDelayedTempTableNBlocks(oreln, forknum);
+				if (blocknum >= current_blocks)
+				{
+					/* Extend the file to include all blocks up to blocknum */
+					for (BlockNumber i = current_blocks; i <= blocknum; i++)
+					{
+						Page zero_page = palloc0(BLCKSZ);
+						smgrextend(oreln, forknum, i, zero_page, false);
+						pfree(zero_page);
+					}
+					SetDelayedTempTableNBlocks(oreln, forknum, blocknum + 1);
+				}
 			}
 		}
 
@@ -360,12 +396,12 @@ ExtendBufferedRelLocal(BufferManagerRelation bmr,
 
 	/*
 	 * For delayed temp table placement, the file might not exist yet.
-	 * In that case, we start from block 0.
+	 * Use our tracking hash table to get the current logical block count.
 	 */
 	if (delayed_temp_table_placement && SmgrIsTemp(bmr.smgr) && 
 		!smgrexists(bmr.smgr, fork))
 	{
-		first_block = 0;
+		first_block = GetDelayedTempTableNBlocks(bmr.smgr, fork);
 	}
 	else
 	{
@@ -480,6 +516,14 @@ ExtendBufferedRelLocal(BufferManagerRelation bmr,
 	*extended_by = extend_by;
 
 	pgBufferUsage.local_blks_written += extend_by;
+
+	/*
+	 * Update our tracking hash table for delayed temp tables
+	 */
+	if (delayed_temp_table_placement && SmgrIsTemp(bmr.smgr))
+	{
+		SetDelayedTempTableNBlocks(bmr.smgr, fork, first_block + extend_by);
+	}
 
 	return first_block;
 }
@@ -683,6 +727,18 @@ InitLocalBuffers(void)
 	if (!LocalBufHash)
 		elog(ERROR, "could not initialize local buffer hash table");
 
+	/* Create the delayed temp table tracking hash table */
+	info.keysize = sizeof(DelayedTempTableKey);
+	info.entrysize = sizeof(DelayedTempTableEnt);
+
+	DelayedTempTableHash = hash_create("Delayed Temp Table Tracking",
+									   64, /* initial size */
+									   &info,
+									   HASH_ELEM | HASH_BLOBS);
+
+	if (!DelayedTempTableHash)
+		elog(ERROR, "could not initialize delayed temp table hash table");
+
 	/* Initialization done, mark buffers allocated */
 	NLocBuffer = nbufs;
 }
@@ -738,6 +794,49 @@ UnpinLocalBufferNoOwner(Buffer buffer)
 
 	if (--LocalRefCount[buffid] == 0)
 		NLocalPinnedBuffers--;
+}
+
+/*
+ * Get the current logical block count for a delayed temp table.
+ * Returns 0 if the table is not in the tracking hash.
+ */
+static BlockNumber
+GetDelayedTempTableNBlocks(SMgrRelation smgr, ForkNumber forkNum)
+{
+	DelayedTempTableKey key;
+	DelayedTempTableEnt *entry;
+
+	if (DelayedTempTableHash == NULL)
+		return 0;
+
+	key.rlocator = smgr->smgr_rlocator.locator;
+	key.forkNum = forkNum;
+
+	entry = (DelayedTempTableEnt *) hash_search(DelayedTempTableHash, &key, HASH_FIND, NULL);
+	if (entry == NULL)
+		return 0;
+
+	return entry->nblocks;
+}
+
+/*
+ * Set the current logical block count for a delayed temp table.
+ */
+static void
+SetDelayedTempTableNBlocks(SMgrRelation smgr, ForkNumber forkNum, BlockNumber nblocks)
+{
+	DelayedTempTableKey key;
+	DelayedTempTableEnt *entry;
+	bool found;
+
+	if (DelayedTempTableHash == NULL)
+		InitLocalBuffers();
+
+	key.rlocator = smgr->smgr_rlocator.locator;
+	key.forkNum = forkNum;
+
+	entry = (DelayedTempTableEnt *) hash_search(DelayedTempTableHash, &key, HASH_ENTER, &found);
+	entry->nblocks = nblocks;
 }
 
 /*
