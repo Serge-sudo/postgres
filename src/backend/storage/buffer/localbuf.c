@@ -500,23 +500,25 @@ ExtendBufferedRelLocal(BufferManagerRelation bmr,
 	io_start = pgstat_prepare_io_time(track_io_timing);
 
 	/*
-	 * If delayed_temp_table_placement is enabled, we may need to create
-	 * the disk file on-demand when extending temporary relations.
+	 * For delayed temp table placement, don't create disk files yet.
+	 * Only extend to disk for non-delayed tables or when files already exist.
 	 */
-	if (delayed_temp_table_placement && SmgrIsTemp(bmr.smgr))
+	if (delayed_temp_table_placement && SmgrIsTemp(bmr.smgr) && 
+		!smgrexists(bmr.smgr, fork))
 	{
-		if (!smgrexists(bmr.smgr, fork))
-		{
-			/* Create the disk file now that we need it */
-			smgrcreate(bmr.smgr, fork, false);
-		}
+		/*
+		 * For delayed temp tables without disk files, skip disk extension.
+		 * The file will be created later when dirty pages need to be written.
+		 */
 	}
+	else
+	{
+		/* actually extend relation */
+		smgrzeroextend(bmr.smgr, fork, first_block, extend_by, false);
 
-	/* actually extend relation */
-	smgrzeroextend(bmr.smgr, fork, first_block, extend_by, false);
-
-	pgstat_count_io_op_time(IOOBJECT_TEMP_RELATION, IOCONTEXT_NORMAL, IOOP_EXTEND,
-							io_start, 1, extend_by * BLCKSZ);
+		pgstat_count_io_op_time(IOOBJECT_TEMP_RELATION, IOCONTEXT_NORMAL, IOOP_EXTEND,
+								io_start, 1, extend_by * BLCKSZ);
+	}
 
 	for (uint32 i = 0; i < extend_by; i++)
 	{
@@ -533,7 +535,14 @@ ExtendBufferedRelLocal(BufferManagerRelation bmr,
 
 	*extended_by = extend_by;
 
-	pgBufferUsage.local_blks_written += extend_by;
+	/*
+	 * Only count blocks as written if we actually wrote to disk
+	 */
+	if (!(delayed_temp_table_placement && SmgrIsTemp(bmr.smgr) && 
+		  !smgrexists(bmr.smgr, fork)))
+	{
+		pgBufferUsage.local_blks_written += extend_by;
+	}
 
 	/*
 	 * Update our tracking hash table for delayed temp tables
