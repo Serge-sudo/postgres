@@ -358,7 +358,19 @@ ExtendBufferedRelLocal(BufferManagerRelation bmr,
 		MemSet(buf_block, 0, BLCKSZ);
 	}
 
-	first_block = smgrnblocks(bmr.smgr, fork);
+	/*
+	 * For delayed temp table placement, the file might not exist yet.
+	 * In that case, we start from block 0.
+	 */
+	if (delayed_temp_table_placement && SmgrIsTemp(bmr.smgr) && 
+		!smgrexists(bmr.smgr, fork))
+	{
+		first_block = 0;
+	}
+	else
+	{
+		first_block = smgrnblocks(bmr.smgr, fork);
+	}
 
 	if (extend_upto != InvalidBlockNumber)
 	{
