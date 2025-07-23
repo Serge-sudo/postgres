@@ -240,6 +240,7 @@ bool		log_hostname;		/* for ps display and logging */
 
 bool		enable_bonjour = false;
 char	   *bonjour_name;
+bool		enable_example_feature = false;
 bool		restart_after_crash = true;
 bool		remove_temp_files_after_crash = true;
 
@@ -2331,6 +2332,11 @@ process_pm_child_exit(void)
 			/* at this point we are really open for business */
 			ereport(LOG,
 					(errmsg("database system is ready to accept connections")));
+
+			/* Log if example feature is enabled */
+			if (enable_example_feature)
+				ereport(LOG,
+						(errmsg("example feature is enabled")));
 
 			/* Report status */
 			AddToDataDirLockFile(LOCK_FILE_LINE_PM_STATUS, PM_STATUS_READY);

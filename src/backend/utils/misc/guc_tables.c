@@ -1080,6 +1080,15 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"enable_example_feature", PGC_POSTMASTER, DEVELOPER_OPTIONS,
+			gettext_noop("Enables example feature for demonstration."),
+			gettext_noop("This parameter can only be set at server start.")
+		},
+		&enable_example_feature,
+		false,
+		NULL, NULL, NULL
+	},
+	{
 		{"ssl", PGC_SIGHUP, CONN_AUTH_SSL,
 			gettext_noop("Enables SSL connections."),
 			NULL

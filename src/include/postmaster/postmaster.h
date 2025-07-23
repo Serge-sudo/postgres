@@ -66,6 +66,7 @@ extern PGDLLIMPORT int AuthenticationTimeout;
 extern PGDLLIMPORT bool log_hostname;
 extern PGDLLIMPORT bool enable_bonjour;
 extern PGDLLIMPORT char *bonjour_name;
+extern PGDLLIMPORT bool enable_example_feature;
 extern PGDLLIMPORT bool restart_after_crash;
 extern PGDLLIMPORT bool remove_temp_files_after_crash;
 extern PGDLLIMPORT bool send_abort_for_crash;
