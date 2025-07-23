@@ -21,6 +21,7 @@
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
 #include "storage/fd.h"
+#include "utils/guc.h"
 #include "utils/guc_hooks.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
@@ -242,6 +243,22 @@ GetLocalVictimBuffer(void)
 		/* Find smgr relation for buffer */
 		oreln = smgropen(BufTagGetRelFileLocator(&bufHdr->tag), MyProcNumber);
 
+		/*
+		 * If delayed_temp_table_placement is enabled, we may need to create
+		 * the disk file on-demand when buffers overflow. This reduces I/O
+		 * for small temporary tables that fit entirely in temp_buffers.
+		 */
+		if (delayed_temp_table_placement && SmgrIsTemp(oreln))
+		{
+			ForkNumber	forknum = BufTagGetForkNum(&bufHdr->tag);
+			
+			if (!smgrexists(oreln, forknum))
+			{
+				/* Create the disk file now that we need it */
+				smgrcreate(oreln, forknum, false);
+			}
+		}
+
 		PageSetChecksumInplace(localpage, bufHdr->tag.blockNum);
 
 		io_start = pgstat_prepare_io_time(track_io_timing);
@@ -415,6 +432,19 @@ ExtendBufferedRelLocal(BufferManagerRelation bmr,
 	}
 
 	io_start = pgstat_prepare_io_time(track_io_timing);
+
+	/*
+	 * If delayed_temp_table_placement is enabled, we may need to create
+	 * the disk file on-demand when extending temporary relations.
+	 */
+	if (delayed_temp_table_placement && SmgrIsTemp(bmr.smgr))
+	{
+		if (!smgrexists(bmr.smgr, fork))
+		{
+			/* Create the disk file now that we need it */
+			smgrcreate(bmr.smgr, fork, false);
+		}
+	}
 
 	/* actually extend relation */
 	smgrzeroextend(bmr.smgr, fork, first_block, extend_by, false);

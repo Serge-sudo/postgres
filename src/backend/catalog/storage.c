@@ -34,6 +34,7 @@
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/guc.h"
 
 /* GUC variables */
 int			wal_skip_threshold = 2048;	/* in kilobytes */
@@ -147,7 +148,19 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 	}
 
 	srel = smgropen(rlocator, procNumber);
-	smgrcreate(srel, MAIN_FORKNUM, false);
+	
+	/*
+	 * For temporary tables, optionally delay disk allocation until buffers overflow.
+	 * This reduces disk I/O for small temporary tables that fit entirely in temp_buffers.
+	 */
+	if (relpersistence == RELPERSISTENCE_TEMP && delayed_temp_table_placement)
+	{
+		/* Skip actual disk file creation - it will be created on-demand when buffers overflow */
+	}
+	else
+	{
+		smgrcreate(srel, MAIN_FORKNUM, false);
+	}
 
 	if (needs_wal)
 		log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
