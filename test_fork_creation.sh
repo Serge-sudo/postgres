@@ -4,9 +4,11 @@
 # 
 # This script demonstrates that:
 # 1. Temporary tables do NOT create init forks
-# 2. Unlogged tables DO create init forks  
-# 3. All table types create main forks
-# 4. FSM/VM forks are created on-demand
+# 2. Temporary tables do NOT create VM forks (no MVCC needed for single backend)
+# 3. Unlogged tables DO create init forks  
+# 4. All table types create main forks
+# 5. FSM forks are created on-demand for space management
+# 6. VM forks are created only for permanent and unlogged tables (multi-session MVCC)
 
 set -e
 
@@ -51,20 +53,20 @@ echo
 echo "Temporary Table (temp_test):"
 echo "  ✓ t<pid>_<relfilenode>        (main fork)"
 echo "  ✗ t<pid>_<relfilenode>_init   (NO init fork)"
-echo "  ? t<pid>_<relfilenode>_fsm    (created on demand)"
-echo "  ? t<pid>_<relfilenode>_vm     (created on demand)"
+echo "  ? t<pid>_<relfilenode>_fsm    (created on demand for space management)"
+echo "  ✗ t<pid>_<relfilenode>_vm     (NO VM fork - no MVCC needed)"
 echo
 echo "Unlogged Table (unlogged_test):"
 echo "  ✓ <relfilenode>               (main fork)"
 echo "  ✓ <relfilenode>_init          (init fork - for crash recovery)"
-echo "  ? <relfilenode>_fsm           (created on demand)"
-echo "  ? <relfilenode>_vm            (created on demand)"
+echo "  ? <relfilenode>_fsm           (created on demand for space management)"
+echo "  ? <relfilenode>_vm            (created on demand for MVCC optimization)"
 echo
 echo "Permanent Table (permanent_test):"
 echo "  ✓ <relfilenode>               (main fork)"
 echo "  ✗ <relfilenode>_init          (NO init fork)"
-echo "  ? <relfilenode>_fsm           (created on demand)"
-echo "  ? <relfilenode>_vm            (created on demand)"
+echo "  ? <relfilenode>_fsm           (created on demand for space management)"
+echo "  ? <relfilenode>_vm            (created on demand for MVCC optimization)"
 echo
 
 echo "Key Code Locations:"
@@ -81,6 +83,7 @@ To run this test:
 2. Run the SQL commands above
 3. Check the data directory for fork files
 4. Verify init forks only exist for unlogged tables
+5. Verify VM forks are NOT created for temporary tables
 
 Example verification commands:
 # Find PostgreSQL data directory
@@ -88,4 +91,9 @@ SHOW data_directory;
 
 # List fork files (from shell)
 ls -la $PGDATA/base/[your_db_oid]/ | grep -E "(temp_test|unlogged_test|permanent_test)"
+
+# Look specifically for the different fork types:
+# _init files should only exist for unlogged tables
+# _vm files should NOT exist for temporary tables
+# _fsm files may exist for any table type when space management is needed
 EOF

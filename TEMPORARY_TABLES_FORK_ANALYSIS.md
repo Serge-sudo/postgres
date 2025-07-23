@@ -76,13 +76,12 @@ switch (relpersistence)
 }
 ```
 
-### 4. FSM and VM Fork Creation
+### 4. FSM Fork Creation
 
-**Pattern**: These forks are created **lazily** (on-demand) for all relation types, including temporary tables.
+**Pattern**: FSM (Free Space Map) forks are created **lazily** (on-demand) for all relation types to track available space within pages.
 
 **Evidence**:
 - `src/backend/storage/freespace/freespace.c`: Uses `smgrexists()` checks before operations
-- `src/backend/access/heap/visibilitymap.c`: Similar lazy creation pattern
 
 Example from FSM code:
 ```c
@@ -94,6 +93,26 @@ if (!smgrexists(RelationGetSmgr(rel), FSM_FORKNUM))
     return InvalidBlockNumber;
 ```
 
+### 5. VM (Visibility Map) Fork Creation
+
+**Key Finding**: VM forks are **NOT created for temporary tables** because they don't need MVCC visibility tracking.
+
+**Rationale**:
+- VM forks optimize visibility checks across multiple backends/sessions
+- Temporary tables are session-local (single backend access only)
+- No concurrency control needed since only one backend can access the data
+- Autovacuum explicitly skips temporary tables (`src/backend/postmaster/autovacuum.c:2086`)
+- VM forks are primarily created and maintained by VACUUM operations
+
+**Evidence from autovacuum.c**:
+```c
+/*
+ * We cannot safely process other backends' temp tables, so skip 'em.
+ */
+if (classForm->relpersistence == RELPERSISTENCE_TEMP)
+    continue;
+```
+
 ## Code Locations Summary
 
 | Fork Type | Creation Pattern | Key Files | Temporary Table Behavior |
@@ -101,7 +120,7 @@ if (!smgrexists(RelationGetSmgr(rel), FSM_FORKNUM))
 | **MAIN** | At table creation | `src/backend/catalog/storage.c:150` | ✅ Created |
 | **INIT** | Only for unlogged | `src/backend/access/heap/heapam_handler.c:331-338` | ❌ Not created |
 | **FSM** | Lazy/on-demand | `src/backend/storage/freespace/freespace.c` | ✅ Created when needed |
-| **VM** | Lazy/on-demand | `src/backend/access/heap/visibilitymap.c` | ✅ Created when needed |
+| **VM** | Lazy/on-demand for permanent/unlogged only | `src/backend/access/heap/visibilitymap.c` | ❌ Not created - no MVCC needed |
 
 ## Key Data Structures
 
@@ -155,17 +174,22 @@ This macro returns `false` for temporary tables since they are not permanent.
 
 1. **Init Fork**: Temporary tables do NOT create init forks, confirming the hypothesis. Only unlogged relations create init forks for crash recovery purposes.
 
-2. **FSM/VM Forks**: Temporary tables DO create FSM and VM forks when needed, using the same lazy creation pattern as other relation types.
+2. **FSM Forks**: Temporary tables DO create FSM forks when needed for space management within the single backend session.
 
-3. **WAL Logging**: Temporary tables never write to WAL (`needs_wal = false`), which is consistent with their session-local, non-persistent nature.
+3. **VM Forks**: Temporary tables do NOT create VM (visibility map) forks because they don't need MVCC visibility tracking. VM forks are only useful for multi-session access patterns, but temporary tables are session-local.
 
-4. **Storage Management**: Temporary tables use a special proc number and are tracked differently for cleanup purposes, but follow similar storage patterns for data management forks.
+4. **WAL Logging**: Temporary tables never write to WAL (`needs_wal = false`), which is consistent with their session-local, non-persistent nature.
+
+5. **Storage Management**: Temporary tables use a special proc number and are tracked differently for cleanup purposes, but follow similar storage patterns for data management forks (main and FSM only).
+
+6. **Autovacuum Behavior**: Autovacuum explicitly skips temporary tables since they don't benefit from cross-session optimization strategies.
 
 ## Recommendations
 
-1. The current implementation is correct and efficient - temporary tables don't need init forks.
-2. The lazy creation of FSM/VM forks for temporary tables is appropriate since these improve performance even for session-local data.
+1. The current implementation is correct and efficient - temporary tables don't need init forks or VM forks.
+2. The lazy creation of FSM forks for temporary tables is appropriate since space management is still beneficial within a single backend session.
 3. The WAL exemption for temporary tables is a significant performance benefit for temporary data operations.
+4. VM forks are correctly omitted for temporary tables since MVCC visibility optimizations are not needed for session-local data.
 
 ## Test Cases Needed
 
@@ -173,4 +197,5 @@ To verify this analysis, test cases should be created that:
 1. Create temporary, unlogged, and permanent tables
 2. Check filesystem for existence of different fork files
 3. Verify that only unlogged tables have init forks
-4. Confirm FSM/VM forks are created on-demand for all types
+4. Confirm FSM forks are created on-demand for all types when space management is needed
+5. Verify that VM forks are NOT created for temporary tables, only for permanent and unlogged tables

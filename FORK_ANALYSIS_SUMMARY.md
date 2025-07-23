@@ -2,7 +2,8 @@
 
 ### Quick Answer
 **Do temporary tables create init forks?** ❌ **NO**  
-**Do temporary tables create VSM forks?** ✅ **YES** (on-demand)
+**Do temporary tables create VM forks?** ❌ **NO** (no MVCC needed for single backend)
+**Do temporary tables create FSM forks?** ✅ **YES** (on-demand for space management)
 
 ### The Investigation
 
@@ -12,7 +13,7 @@ This analysis examined PostgreSQL's source code to understand fork creation patt
 
 | Table Type | Main Fork | Init Fork | FSM Fork | VM Fork | WAL Logged |
 |------------|-----------|-----------|----------|---------|------------|
-| **Temporary** | ✅ Always | ❌ Never | ✅ On-demand | ✅ On-demand | ❌ No |
+| **Temporary** | ✅ Always | ❌ Never | ✅ On-demand | ❌ Never | ❌ No |
 | **Unlogged** | ✅ Always | ✅ Always | ✅ On-demand | ✅ On-demand | ❌ No |
 | **Permanent** | ✅ Always | ❌ Never | ✅ On-demand | ✅ On-demand | ✅ Yes |
 
@@ -26,16 +27,16 @@ This analysis examined PostgreSQL's source code to understand fork creation patt
    - Init fork creation is conditional: `if (persistence == RELPERSISTENCE_UNLOGGED)`
    - Comment explicitly states purpose: "reinitialized on restart"
 
-3. **Lazy Fork Creation** pattern in FSM/VM modules
-   - Uses `smgrexists()` checks before operations
-   - Created when needed regardless of table type
+3. **Lazy Fork Creation** pattern for FSM and VM modules
+   - FSM: Uses `smgrexists()` checks before operations, created when needed for all table types
+   - VM: Created only for permanent and unlogged tables, not for temporary tables
 
 ### Why This Design Makes Sense
 
-- **Temporary tables**: Session-local, don't survive crashes → no init fork needed
-- **Unlogged tables**: Persist across sessions but reset on crash → init fork for recovery
-- **Permanent tables**: Full crash recovery via WAL → no init fork needed
-- **FSM/VM forks**: Performance optimization useful for all table types
+- **Temporary tables**: Session-local, don't survive crashes → no init fork needed, no VM fork needed (no MVCC)
+- **Unlogged tables**: Persist across sessions but reset on crash → init fork for recovery, VM fork for multi-session visibility
+- **Permanent tables**: Full crash recovery via WAL → no init fork needed, VM fork for multi-session visibility
+- **FSM forks**: Space management optimization useful for all table types within their respective scopes
 
 ### Files Created in This Analysis
 
@@ -49,6 +50,7 @@ The analysis can be verified by:
 1. Creating tables of different persistence types
 2. Examining the data directory for fork files
 3. Confirming only unlogged tables have `_init` files
-4. Observing FSM/VM files appear on-demand
+4. Observing FSM files appear on-demand for space management
+5. Verifying that VM files are NOT created for temporary tables
 
-This investigation confirms that PostgreSQL's fork creation strategy is efficient and appropriate for each table type's persistence requirements.
+This investigation confirms that PostgreSQL's fork creation strategy is efficient and appropriate for each table type's persistence and concurrency requirements.
