@@ -301,6 +301,8 @@ extern Size BufferManagerShmemSize(void);
 
 /* in localbuf.c */
 extern void AtProcExit_LocalBuffers(void);
+extern BlockNumber GetDelayedTempTableNBlocks(struct SMgrRelationData *smgr, ForkNumber forkNum);
+extern void SetDelayedTempTableNBlocks(struct SMgrRelationData *smgr, ForkNumber forkNum, BlockNumber nblocks);
 
 /* in freelist.c */
 

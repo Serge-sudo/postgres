@@ -72,8 +72,8 @@ static int	NLocalPinnedBuffers = 0;
 static void InitLocalBuffers(void);
 static Block GetLocalBufferStorage(void);
 static Buffer GetLocalVictimBuffer(void);
-static BlockNumber GetDelayedTempTableNBlocks(SMgrRelation smgr, ForkNumber forkNum);
-static void SetDelayedTempTableNBlocks(SMgrRelation smgr, ForkNumber forkNum, BlockNumber nblocks);
+BlockNumber GetDelayedTempTableNBlocks(SMgrRelation smgr, ForkNumber forkNum);
+void SetDelayedTempTableNBlocks(SMgrRelation smgr, ForkNumber forkNum, BlockNumber nblocks);
 
 
 /*
@@ -963,7 +963,7 @@ UnpinLocalBufferNoOwner(Buffer buffer)
  * Get the current logical block count for a delayed temp table.
  * Returns 0 if the table is not in the tracking hash.
  */
-static BlockNumber
+BlockNumber
 GetDelayedTempTableNBlocks(SMgrRelation smgr, ForkNumber forkNum)
 {
 	DelayedTempTableKey key;
@@ -985,7 +985,7 @@ GetDelayedTempTableNBlocks(SMgrRelation smgr, ForkNumber forkNum)
 /*
  * Set the current logical block count for a delayed temp table.
  */
-static void
+void
 SetDelayedTempTableNBlocks(SMgrRelation smgr, ForkNumber forkNum, BlockNumber nblocks)
 {
 	DelayedTempTableKey key;

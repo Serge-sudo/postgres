@@ -57,6 +57,7 @@
 #include "storage/read_stream.h"
 #include "storage/smgr.h"
 #include "storage/standby.h"
+#include "utils/guc.h"
 #include "utils/memdebug.h"
 #include "utils/ps_status.h"
 #include "utils/rel.h"
@@ -4458,6 +4459,59 @@ FlushRelationBuffers(Relation rel)
 				error_context_stack = &errcallback;
 
 				PageSetChecksumInplace(localpage, bufHdr->tag.blockNum);
+
+				/*
+				 * If delayed_temp_table_placement is enabled, we may need to create
+				 * the disk file and extend blocks before writing.
+				 */
+				if (delayed_temp_table_placement && SmgrIsTemp(srel))
+				{
+					ForkNumber	forknum = BufTagGetForkNum(&bufHdr->tag);
+					BlockNumber blocknum = bufHdr->tag.blockNum;
+					BlockNumber current_blocks;
+					
+					if (!smgrexists(srel, forknum))
+					{
+						/* Create the disk file now that we need it */
+						smgrcreate(srel, forknum, false);
+						
+						/*
+						 * We need to ensure all blocks from 0 to blocknum exist.
+						 * Get the current logical block count and extend if needed.
+						 */
+						current_blocks = GetDelayedTempTableNBlocks(srel, forknum);
+						if (blocknum >= current_blocks)
+						{
+							/* Extend the file to include all blocks up to blocknum */
+							for (BlockNumber i = current_blocks; i <= blocknum; i++)
+							{
+								Page zero_page = palloc0(BLCKSZ);
+								smgrextend(srel, forknum, i, zero_page, false);
+								pfree(zero_page);
+							}
+							SetDelayedTempTableNBlocks(srel, forknum, blocknum + 1);
+						}
+					}
+					else
+					{
+						/*
+						 * Fork exists but we need to ensure the specific block exists.
+						 * smgrwrite() can only write to existing blocks, so we must
+						 * extend the file if the target block doesn't exist yet.
+						 */
+						current_blocks = smgrnblocks(srel, forknum);
+						if (blocknum >= current_blocks)
+						{
+							/* Extend the file to include all blocks up to blocknum */
+							for (BlockNumber i = current_blocks; i <= blocknum; i++)
+							{
+								Page zero_page = palloc0(BLCKSZ);
+								smgrextend(srel, forknum, i, zero_page, false);
+								pfree(zero_page);
+							}
+						}
+					}
+				}
 
 				io_start = pgstat_prepare_io_time(track_io_timing);
 
