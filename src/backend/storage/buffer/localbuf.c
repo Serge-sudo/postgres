@@ -638,6 +638,35 @@ DropRelationLocalBuffers(RelFileLocator rlocator, ForkNumber forkNum,
 			pg_atomic_unlocked_write_u32(&bufHdr->state, buf_state);
 		}
 	}
+
+	/*
+	 * Clean up delayed temp table tracking hash table entries.
+	 * If we're dropping from block 0, remove the entire entry.
+	 * If dropping from a higher block, update the logical block count.
+	 */
+	if (DelayedTempTableHash != NULL)
+	{
+		DelayedTempTableKey key;
+		DelayedTempTableEnt *entry;
+
+		key.rlocator = rlocator;
+		key.forkNum = forkNum;
+
+		entry = (DelayedTempTableEnt *) hash_search(DelayedTempTableHash, &key, HASH_FIND, NULL);
+		if (entry != NULL)
+		{
+			if (firstDelBlock == 0)
+			{
+				/* Remove the entire entry */
+				hash_search(DelayedTempTableHash, &key, HASH_REMOVE, NULL);
+			}
+			else if (entry->nblocks > firstDelBlock)
+			{
+				/* Update the logical block count */
+				entry->nblocks = firstDelBlock;
+			}
+		}
+	}
 }
 
 /*
@@ -680,6 +709,27 @@ DropRelationAllLocalBuffers(RelFileLocator rlocator)
 			buf_state &= ~BUF_FLAG_MASK;
 			buf_state &= ~BUF_USAGECOUNT_MASK;
 			pg_atomic_unlocked_write_u32(&bufHdr->state, buf_state);
+		}
+	}
+
+	/*
+	 * Clean up delayed temp table tracking hash table entries.
+	 * Remove all entries matching the given rlocator across all forks.
+	 */
+	if (DelayedTempTableHash != NULL)
+	{
+		HASH_SEQ_STATUS seq;
+		DelayedTempTableEnt *entry;
+
+		hash_seq_init(&seq, DelayedTempTableHash);
+		while ((entry = (DelayedTempTableEnt *) hash_seq_search(&seq)) != NULL)
+		{
+			if (RelFileLocatorEquals(entry->key.rlocator, rlocator))
+			{
+				/* Remove this entry */
+				if (hash_search(DelayedTempTableHash, &entry->key, HASH_REMOVE, NULL) == NULL)
+					elog(ERROR, "delayed temp table hash table corrupted");
+			}
 		}
 	}
 }
