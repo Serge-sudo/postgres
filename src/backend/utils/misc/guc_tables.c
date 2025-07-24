@@ -535,7 +535,7 @@ char	   *backtrace_functions;
 int			temp_file_limit = -1;
 
 int			num_temp_buffers = 1024;
-bool		delayed_temp_table_placement = false;
+bool		deferred_temp_table_placement = false;
 
 char	   *cluster_name = "";
 char	   *ConfigFileName;
@@ -2111,12 +2111,12 @@ struct config_bool ConfigureNamesBool[] =
 	},
 
 	{
-		{"delayed_temp_table_placement", PGC_POSTMASTER, RESOURCES_DISK,
+		{"deferred_temp_table_placement", PGC_POSTMASTER, RESOURCES_DISK,
 			gettext_noop("Delays disk allocation for temporary tables until local buffers overflow."),
 			gettext_noop("When enabled, temporary tables are kept entirely in memory "
 						"until temp_buffers are exhausted, reducing disk I/O for small temp tables.")
 		},
-		&delayed_temp_table_placement,
+		&deferred_temp_table_placement,
 		false,
 		NULL, NULL, NULL
 	},

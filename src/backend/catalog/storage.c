@@ -153,7 +153,7 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 	 * For temporary tables, optionally delay disk allocation until buffers overflow.
 	 * This reduces disk I/O for small temporary tables that fit entirely in temp_buffers.
 	 */
-	if (relpersistence == RELPERSISTENCE_TEMP && delayed_temp_table_placement)
+	if (relpersistence == RELPERSISTENCE_TEMP && deferred_temp_table_placement)
 	{
 		/* Skip actual disk file creation - it will be created on-demand when buffers overflow */
 	}

@@ -261,11 +261,11 @@ GetLocalVictimBuffer(void)
 		oreln = smgropen(BufTagGetRelFileLocator(&bufHdr->tag), MyProcNumber);
 
 		/*
-		 * If delayed_temp_table_placement is enabled, we may need to create
+		 * If deferred_temp_table_placement is enabled, we may need to create
 		 * the disk file on-demand when buffers overflow. This reduces I/O
 		 * for small temporary tables that fit entirely in temp_buffers.
 		 */
-		if (delayed_temp_table_placement && SmgrIsTemp(oreln))
+		if (deferred_temp_table_placement && SmgrIsTemp(oreln))
 		{
 			ForkNumber	forknum = BufTagGetForkNum(&bufHdr->tag);
 			BlockNumber blocknum = bufHdr->tag.blockNum;
@@ -417,7 +417,7 @@ ExtendBufferedRelLocal(BufferManagerRelation bmr,
 	 * For delayed temp table placement, the file might not exist yet.
 	 * Use our tracking hash table to get the current logical block count.
 	 */
-	if (delayed_temp_table_placement && SmgrIsTemp(bmr.smgr) && 
+	if (deferred_temp_table_placement && SmgrIsTemp(bmr.smgr) && 
 		!smgrexists(bmr.smgr, fork))
 	{
 		first_block = GetDelayedTempTableNBlocks(bmr.smgr, fork);
@@ -504,7 +504,7 @@ ExtendBufferedRelLocal(BufferManagerRelation bmr,
 	 * For delayed temp table placement, don't create disk files yet.
 	 * Only extend to disk for non-delayed tables or when files already exist.
 	 */
-	if (delayed_temp_table_placement && SmgrIsTemp(bmr.smgr) && 
+	if (deferred_temp_table_placement && SmgrIsTemp(bmr.smgr) && 
 		!smgrexists(bmr.smgr, fork))
 	{
 		/*
@@ -539,7 +539,7 @@ ExtendBufferedRelLocal(BufferManagerRelation bmr,
 	/*
 	 * Only count blocks as written if we actually wrote to disk
 	 */
-	if (!(delayed_temp_table_placement && SmgrIsTemp(bmr.smgr) && 
+	if (!(deferred_temp_table_placement && SmgrIsTemp(bmr.smgr) && 
 		  !smgrexists(bmr.smgr, fork)))
 	{
 		pgBufferUsage.local_blks_written += extend_by;
@@ -548,7 +548,7 @@ ExtendBufferedRelLocal(BufferManagerRelation bmr,
 	/*
 	 * Update our tracking hash table for delayed temp tables
 	 */
-	if (delayed_temp_table_placement && SmgrIsTemp(bmr.smgr))
+	if (deferred_temp_table_placement && SmgrIsTemp(bmr.smgr))
 	{
 		SetDelayedTempTableNBlocks(bmr.smgr, fork, first_block + extend_by);
 	}

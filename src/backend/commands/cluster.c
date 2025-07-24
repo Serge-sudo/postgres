@@ -1116,7 +1116,7 @@ swap_relation_files(Oid r1, Oid r2, bool target_is_pg_class,
 		 * hash table entries for the two relations since their RelFileLocators
 		 * are now swapped.
 		 */
-		if (delayed_temp_table_placement && 
+		if (deferred_temp_table_placement && 
 			(relform1->relpersistence == RELPERSISTENCE_TEMP ||
 			 relform2->relpersistence == RELPERSISTENCE_TEMP))
 		{

@@ -4461,10 +4461,10 @@ FlushRelationBuffers(Relation rel)
 				PageSetChecksumInplace(localpage, bufHdr->tag.blockNum);
 
 				/*
-				 * If delayed_temp_table_placement is enabled, we may need to create
+				 * If deferred_temp_table_placement is enabled, we may need to create
 				 * the disk file and extend blocks before writing.
 				 */
-				if (delayed_temp_table_placement && SmgrIsTemp(srel))
+				if (deferred_temp_table_placement && SmgrIsTemp(srel))
 				{
 					ForkNumber	forknum = BufTagGetForkNum(&bufHdr->tag);
 					BlockNumber blocknum = bufHdr->tag.blockNum;

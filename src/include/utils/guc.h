@@ -283,7 +283,7 @@ extern PGDLLIMPORT char *backtrace_functions;
 extern PGDLLIMPORT int temp_file_limit;
 
 extern PGDLLIMPORT int num_temp_buffers;
-extern PGDLLIMPORT bool delayed_temp_table_placement;
+extern PGDLLIMPORT bool deferred_temp_table_placement;
 
 extern PGDLLIMPORT char *cluster_name;
 extern PGDLLIMPORT char *ConfigFileName;

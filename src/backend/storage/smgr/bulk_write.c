@@ -115,7 +115,7 @@ smgr_bulk_start_smgr(SMgrRelation smgr, ForkNumber forknum, bool use_wal)
 	 * For delayed temp tables without disk files, start with relsize = 0.
 	 * For other relations, get the current size from disk.
 	 */
-	if (delayed_temp_table_placement && SmgrIsTemp(smgr) && !smgrexists(smgr, forknum))
+	if (deferred_temp_table_placement && SmgrIsTemp(smgr) && !smgrexists(smgr, forknum))
 	{
 		state->relsize = 0;
 	}
@@ -293,7 +293,7 @@ smgr_bulk_flush(BulkWriteState *bulkstate)
 	 * For temporary relations with delayed placement enabled, use local buffers
 	 * instead of direct smgr calls to preserve the delayed disk allocation behavior.
 	 */
-	if (SmgrIsTemp(bulkstate->smgr) && delayed_temp_table_placement)
+	if (SmgrIsTemp(bulkstate->smgr) && deferred_temp_table_placement)
 	{
 		for (int i = 0; i < npending; i++)
 		{

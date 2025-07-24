@@ -408,10 +408,10 @@ calculate_relation_size(RelFileLocator *rfn, ProcNumber backend, ForkNumber fork
 
 	/*
 	 * For delayed temp table placement, if this is a temporary relation and
-	 * delayed_temp_table_placement is enabled, also add the size of data
+	 * deferred_temp_table_placement is enabled, also add the size of data
 	 * in local buffers that hasn't been written to disk yet.
 	 */
-	if (delayed_temp_table_placement && backend != INVALID_PROC_NUMBER)
+	if (deferred_temp_table_placement && backend != INVALID_PROC_NUMBER)
 	{
 		/* Add size of blocks in local buffers for this temp relation */
 		totalsize += calculate_local_buffer_size(rfn, backend, forknum);
