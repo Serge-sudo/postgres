@@ -23,8 +23,10 @@
 #include "commands/tablespace.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
+#include "storage/buf_internals.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/numeric.h"
 #include "utils/rel.h"
 #include "utils/relfilenumbermap.h"
@@ -315,6 +317,53 @@ pg_tablespace_size_name(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(size);
 }
 
+/*
+ * calculate size of (one fork of) a delayed temp relation in local buffers
+ *
+ * For delayed temp tables that don't have disk files yet, this function
+ * counts the size of valid blocks in local buffers that belong to the relation.
+ */
+static int64
+calculate_local_buffer_size(RelFileLocator *rfn, ProcNumber backend, ForkNumber forknum)
+{
+	int64		totalsize = 0;
+	int			i;
+	
+	/* Declare external variables from localbuf.c */
+	extern BufferDesc *LocalBufferDescriptors;
+	extern int NLocBuffer;
+	
+	/* If local buffers are not initialized, return 0 */
+	if (LocalBufferDescriptors == NULL || NLocBuffer == 0)
+		return 0;
+		
+	/* Iterate through all local buffers */
+	for (i = 0; i < NLocBuffer; i++)
+	{
+		BufferDesc *bufHdr = &LocalBufferDescriptors[i];
+		BufferTag  *tag = &bufHdr->tag;
+		uint32		buf_state;
+		
+		/* Skip buffers that don't have a valid tag */
+		buf_state = pg_atomic_read_u32(&bufHdr->state);
+		if (!(buf_state & BM_TAG_VALID))
+			continue;
+			
+		/* Check if this buffer belongs to our relation and fork */
+		if (tag->spcOid == rfn->spcOid &&
+			tag->dbOid == rfn->dbOid &&
+			tag->relNumber == rfn->relNumber &&
+			tag->forkNum == forknum)
+		{
+			/* Only count valid blocks */
+			if (buf_state & BM_VALID)
+				totalsize += BLCKSZ;
+		}
+	}
+	
+	return totalsize;
+}
+
 
 /*
  * calculate size of (one fork of) a relation
@@ -355,6 +404,17 @@ calculate_relation_size(RelFileLocator *rfn, ProcNumber backend, ForkNumber fork
 						 errmsg("could not stat file \"%s\": %m", pathname)));
 		}
 		totalsize += fst.st_size;
+	}
+
+	/*
+	 * For delayed temp table placement, if this is a temporary relation and
+	 * delayed_temp_table_placement is enabled, also add the size of data
+	 * in local buffers that hasn't been written to disk yet.
+	 */
+	if (delayed_temp_table_placement && backend != INVALID_PROC_NUMBER)
+	{
+		/* Add size of blocks in local buffers for this temp relation */
+		totalsize += calculate_local_buffer_size(rfn, backend, forknum);
 	}
 
 	return totalsize;
