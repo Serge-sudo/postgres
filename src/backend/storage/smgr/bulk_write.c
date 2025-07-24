@@ -40,8 +40,11 @@
 #include "access/xlogrecord.h"
 #include "storage/bufpage.h"
 #include "storage/bulk_write.h"
+#include "storage/buf_internals.h"
+#include "storage/bufmgr.h"
 #include "storage/proc.h"
 #include "storage/smgr.h"
+#include "utils/guc.h"
 #include "utils/rel.h"
 
 #define MAX_PENDING_WRITES XLR_MAX_BLOCK_ID
@@ -274,38 +277,76 @@ smgr_bulk_flush(BulkWriteState *bulkstate)
 					 npending, blknos, pages, page_std);
 	}
 
-	for (int i = 0; i < npending; i++)
+	/*
+	 * For temporary relations with delayed placement enabled, use local buffers
+	 * instead of direct smgr calls to preserve the delayed disk allocation behavior.
+	 */
+	if (SmgrIsTemp(bulkstate->smgr) && delayed_temp_table_placement)
 	{
-		BlockNumber blkno = pending_writes[i].blkno;
-		Page		page = pending_writes[i].buf->data;
-
-		PageSetChecksumInplace(page, blkno);
-
-		if (blkno >= bulkstate->relsize)
+		for (int i = 0; i < npending; i++)
 		{
-			/*
-			 * If we have to write pages nonsequentially, fill in the space
-			 * with zeroes until we come back and overwrite.  This is not
-			 * logically necessary on standard Unix filesystems (unwritten
-			 * space will read as zeroes anyway), but it should help to avoid
-			 * fragmentation.  The dummy pages aren't WAL-logged though.
-			 */
-			while (blkno > bulkstate->relsize)
+			BlockNumber blkno = pending_writes[i].blkno;
+			Page		page = pending_writes[i].buf->data;
+			BufferDesc *bufHdr;
+			bool		found;
+			Buffer		buffer;
+			Block		bufBlock;
+
+			PageSetChecksumInplace(page, blkno);
+
+			/* Get a local buffer for this page */
+			bufHdr = LocalBufferAlloc(bulkstate->smgr, bulkstate->forknum, blkno, &found);
+			buffer = BufferDescriptorGetBuffer(bufHdr);
+			bufBlock = BufferGetBlock(buffer);
+
+			/* Copy the page data to the buffer */
+			memcpy(bufBlock, page, BLCKSZ);
+
+			/* Mark the buffer as dirty so it will be written when local buffers overflow */
+			MarkLocalBufferDirty(buffer);
+
+			/* Unpin the buffer */
+			UnpinLocalBuffer(buffer);
+
+			pfree(page);
+		}
+	}
+	else
+	{
+		/* Regular bulk write path for non-temp relations or when delayed placement is disabled */
+		for (int i = 0; i < npending; i++)
+		{
+			BlockNumber blkno = pending_writes[i].blkno;
+			Page		page = pending_writes[i].buf->data;
+
+			PageSetChecksumInplace(page, blkno);
+
+			if (blkno >= bulkstate->relsize)
 			{
-				/* don't set checksum for all-zero page */
-				smgrextend(bulkstate->smgr, bulkstate->forknum,
-						   bulkstate->relsize,
-						   &zero_buffer,
-						   true);
+				/*
+				 * If we have to write pages nonsequentially, fill in the space
+				 * with zeroes until we come back and overwrite.  This is not
+				 * logically necessary on standard Unix filesystems (unwritten
+				 * space will read as zeroes anyway), but it should help to avoid
+				 * fragmentation.  The dummy pages aren't WAL-logged though.
+				 */
+				while (blkno > bulkstate->relsize)
+				{
+					/* don't set checksum for all-zero page */
+					smgrextend(bulkstate->smgr, bulkstate->forknum,
+							   bulkstate->relsize,
+							   &zero_buffer,
+							   true);
+					bulkstate->relsize++;
+				}
+
+				smgrextend(bulkstate->smgr, bulkstate->forknum, blkno, page, true);
 				bulkstate->relsize++;
 			}
-
-			smgrextend(bulkstate->smgr, bulkstate->forknum, blkno, page, true);
-			bulkstate->relsize++;
+			else
+				smgrwrite(bulkstate->smgr, bulkstate->forknum, blkno, page, true);
+			pfree(page);
 		}
-		else
-			smgrwrite(bulkstate->smgr, bulkstate->forknum, blkno, page, true);
-		pfree(page);
 	}
 
 	bulkstate->npending = 0;
