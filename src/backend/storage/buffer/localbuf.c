@@ -510,6 +510,7 @@ ExtendBufferedRelLocal(BufferManagerRelation bmr,
 		/*
 		 * For delayed temp tables without disk files, skip disk extension.
 		 * The file will be created later when dirty pages need to be written.
+		 * Also skip I/O statistics since no actual I/O occurred.
 		 */
 	}
 	else
