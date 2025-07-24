@@ -475,6 +475,7 @@ extern void DropRelationLocalBuffers(RelFileLocator rlocator,
 									 ForkNumber forkNum,
 									 BlockNumber firstDelBlock);
 extern void DropRelationAllLocalBuffers(RelFileLocator rlocator);
+extern void SwapDelayedTempTableHash(RelFileLocator rlocator1, RelFileLocator rlocator2);
 extern void AtEOXact_LocalBuffers(bool isCommit);
 
 #endif							/* BUFMGR_INTERNALS_H */

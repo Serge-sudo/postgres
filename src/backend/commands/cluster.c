@@ -42,6 +42,7 @@
 #include "miscadmin.h"
 #include "optimizer/optimizer.h"
 #include "pgstat.h"
+#include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
@@ -1109,6 +1110,29 @@ swap_relation_files(Oid r1, Oid r2, bool target_is_pg_class,
 		swaptemp = relform1->relfilenode;
 		relform1->relfilenode = relform2->relfilenode;
 		relform2->relfilenode = swaptemp;
+
+		/*
+		 * If delayed temp table placement is enabled, we need to swap the
+		 * hash table entries for the two relations since their RelFileLocators
+		 * are now swapped.
+		 */
+		if (delayed_temp_table_placement && 
+			(relform1->relpersistence == RELPERSISTENCE_TEMP ||
+			 relform2->relpersistence == RELPERSISTENCE_TEMP))
+		{
+			RelFileLocator rlocator1, rlocator2;
+
+			/* Construct RelFileLocators before the swap */
+			rlocator1.spcOid = relform1->reltablespace ? relform1->reltablespace : MyDatabaseTableSpace;
+			rlocator1.dbOid = (relform1->relpersistence == RELPERSISTENCE_TEMP) ? MyDatabaseId : InvalidOid;
+			rlocator1.relNumber = swaptemp; /* Original relform1->relfilenode before swap */
+
+			rlocator2.spcOid = relform2->reltablespace ? relform2->reltablespace : MyDatabaseTableSpace;
+			rlocator2.dbOid = (relform2->relpersistence == RELPERSISTENCE_TEMP) ? MyDatabaseId : InvalidOid;
+			rlocator2.relNumber = relform1->relfilenode; /* Original relform2->relfilenode before swap */
+
+			SwapDelayedTempTableHash(rlocator1, rlocator2);
+		}
 
 		swaptemp = relform1->reltablespace;
 		relform1->reltablespace = relform2->reltablespace;

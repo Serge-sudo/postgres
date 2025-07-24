@@ -17,6 +17,7 @@
 
 #include "access/parallel.h"
 #include "executor/instrument.h"
+#include "nodes/pg_list.h"
 #include "pgstat.h"
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
@@ -732,6 +733,91 @@ DropRelationAllLocalBuffers(RelFileLocator rlocator)
 			}
 		}
 	}
+}
+
+/*
+ * SwapDelayedTempTableHash -
+ *	  swap delayed temp table hash entries between two relations.
+ *	  This is needed during VACUUM FULL when relation file locators are swapped.
+ */
+void
+SwapDelayedTempTableHash(RelFileLocator rlocator1, RelFileLocator rlocator2)
+{
+	if (DelayedTempTableHash == NULL)
+		return;
+	
+	/* Collect all entries for both relations */
+	HASH_SEQ_STATUS seq;
+	DelayedTempTableEnt *entry;
+	List *entries1 = NIL;
+	List *entries2 = NIL;
+	
+	hash_seq_init(&seq, DelayedTempTableHash);
+	while ((entry = (DelayedTempTableEnt *) hash_seq_search(&seq)) != NULL)
+	{
+		if (RelFileLocatorEquals(entry->key.rlocator, rlocator1))
+		{
+			/* Store entry data for rlocator1 */
+			DelayedTempTableEnt *copy = palloc(sizeof(DelayedTempTableEnt));
+			*copy = *entry;
+			entries1 = lappend(entries1, copy);
+		}
+		else if (RelFileLocatorEquals(entry->key.rlocator, rlocator2))
+		{
+			/* Store entry data for rlocator2 */
+			DelayedTempTableEnt *copy = palloc(sizeof(DelayedTempTableEnt));
+			*copy = *entry;
+			entries2 = lappend(entries2, copy);
+		}
+	}
+	
+	/* Remove all entries for both relations */
+	hash_seq_init(&seq, DelayedTempTableHash);
+	while ((entry = (DelayedTempTableEnt *) hash_seq_search(&seq)) != NULL)
+	{
+		if (RelFileLocatorEquals(entry->key.rlocator, rlocator1) ||
+			RelFileLocatorEquals(entry->key.rlocator, rlocator2))
+		{
+			if (hash_search(DelayedTempTableHash, &entry->key, HASH_REMOVE, NULL) == NULL)
+				elog(ERROR, "delayed temp table hash table corrupted during swap");
+		}
+	}
+	
+	/* Re-insert entries with swapped rlocators */
+	ListCell *lc;
+	foreach(lc, entries1)
+	{
+		DelayedTempTableEnt *old_entry = (DelayedTempTableEnt *) lfirst(lc);
+		DelayedTempTableEnt *new_entry;
+		bool found;
+		
+		/* Create new entry with rlocator2 */
+		DelayedTempTableKey new_key;
+		new_key.rlocator = rlocator2;
+		new_key.forkNum = old_entry->key.forkNum;
+		
+		new_entry = (DelayedTempTableEnt *) hash_search(DelayedTempTableHash, &new_key, HASH_ENTER, &found);
+		new_entry->nblocks = old_entry->nblocks;
+	}
+	
+	foreach(lc, entries2)
+	{
+		DelayedTempTableEnt *old_entry = (DelayedTempTableEnt *) lfirst(lc);
+		DelayedTempTableEnt *new_entry;
+		bool found;
+		
+		/* Create new entry with rlocator1 */
+		DelayedTempTableKey new_key;
+		new_key.rlocator = rlocator1;
+		new_key.forkNum = old_entry->key.forkNum;
+		
+		new_entry = (DelayedTempTableEnt *) hash_search(DelayedTempTableHash, &new_key, HASH_ENTER, &found);
+		new_entry->nblocks = old_entry->nblocks;
+	}
+	
+	/* Clean up temporary lists */
+	list_free_deep(entries1);
+	list_free_deep(entries2);
 }
 
 /*
