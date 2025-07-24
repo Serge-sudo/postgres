@@ -110,7 +110,19 @@ smgr_bulk_start_smgr(SMgrRelation smgr, ForkNumber forknum, bool use_wal)
 	state->use_wal = use_wal;
 
 	state->npending = 0;
-	state->relsize = smgrnblocks(smgr, forknum);
+	
+	/*
+	 * For delayed temp tables without disk files, start with relsize = 0.
+	 * For other relations, get the current size from disk.
+	 */
+	if (delayed_temp_table_placement && SmgrIsTemp(smgr) && !smgrexists(smgr, forknum))
+	{
+		state->relsize = 0;
+	}
+	else
+	{
+		state->relsize = smgrnblocks(smgr, forknum);
+	}
 
 	state->start_RedoRecPtr = GetRedoRecPtr();
 
@@ -294,10 +306,43 @@ smgr_bulk_flush(BulkWriteState *bulkstate)
 
 			PageSetChecksumInplace(page, blkno);
 
-			/* Get a local buffer for this page */
+			/*
+			 * Handle relation extension for delayed temp tables.
+			 * If we're writing beyond the current size, we need to extend first.
+			 */
+			if (blkno >= bulkstate->relsize)
+			{
+				/*
+				 * For delayed temp tables, use ExtendBufferedRel to handle extension
+				 * through the local buffer manager instead of direct smgr calls.
+				 */
+				BufferManagerRelation bmr = BMR_SMGR(bulkstate->smgr, RELPERSISTENCE_TEMP);
+				
+				/* Extend to include all blocks up to and including blkno */
+				while (bulkstate->relsize <= blkno)
+				{
+					Buffer extend_buffer = ExtendBufferedRel(bmr, bulkstate->forknum, NULL, 0);
+					/* The buffer is pinned, so unpin it */
+					UnpinLocalBuffer(extend_buffer);
+					bulkstate->relsize++;
+				}
+			}
+
+			/* Now get a local buffer for this page - the relation should be extended */
 			bufHdr = LocalBufferAlloc(bulkstate->smgr, bulkstate->forknum, blkno, &found);
+			if (bufHdr == NULL)
+			{
+				elog(ERROR, "failed to allocate local buffer for block %u", blkno);
+			}
+			
 			buffer = BufferDescriptorGetBuffer(bufHdr);
 			bufBlock = BufferGetBlock(buffer);
+
+			/* Ensure the buffer is valid and accessible */
+			if (bufBlock == NULL)
+			{
+				elog(ERROR, "failed to get block for local buffer %d", buffer);
+			}
 
 			/* Copy the page data to the buffer */
 			memcpy(bufBlock, page, BLCKSZ);
