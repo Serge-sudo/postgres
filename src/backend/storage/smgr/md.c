@@ -37,6 +37,7 @@
 #include "storage/relfilelocator.h"
 #include "storage/smgr.h"
 #include "storage/sync.h"
+#include "utils/guc.h"
 #include "utils/memutils.h"
 
 /*
@@ -1114,6 +1115,17 @@ mdnblocks(SMgrRelation reln, ForkNumber forknum)
 	MdfdVec    *v;
 	BlockNumber nblocks;
 	BlockNumber segno;
+
+	/*
+	 * For temp relations with deferred_temp_table_placement enabled,
+	 * check if the disk file exists before attempting to open.
+	 * If it doesn't exist, return the logical block count from our hash table.
+	 */
+	if (deferred_temp_table_placement && SmgrIsTemp(reln) && 
+		!mdexists(reln, forknum))
+	{
+		return GetDelayedTempTableNBlocks(reln, forknum);
+	}
 
 	mdopenfork(reln, forknum, EXTENSION_FAIL);
 

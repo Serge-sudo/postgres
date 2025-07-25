@@ -1511,7 +1511,28 @@ WaitReadBuffers(ReadBuffersOperation *operation)
 		}
 
 		io_start = pgstat_prepare_io_time(track_io_timing);
-		smgrreadv(operation->smgr, forknum, io_first_block, io_pages, io_buffers_len);
+		
+		/*
+		 * For temp relations with deferred_temp_table_placement enabled,
+		 * check if the disk file exists before attempting to read.
+		 * If it doesn't exist, the data is only in local buffers and
+		 * we should treat this as reading uninitialized (zero) pages.
+		 */
+		if (persistence == RELPERSISTENCE_TEMP && 
+			deferred_temp_table_placement && 
+			!smgrexists(operation->smgr, forknum))
+		{
+			/* File doesn't exist yet - zero out the pages as if reading from uninitialized disk */
+			for (int j = 0; j < io_buffers_len; ++j)
+			{
+				memset(io_pages[j], 0, BLCKSZ);
+			}
+		}
+		else
+		{
+			smgrreadv(operation->smgr, forknum, io_first_block, io_pages, io_buffers_len);
+		}
+		
 		pgstat_count_io_op_time(io_object, io_context, IOOP_READ, io_start,
 								1, io_buffers_len * BLCKSZ);
 
@@ -3935,6 +3956,18 @@ RelationGetNumberOfBlocksInFork(Relation relation, ForkNumber forkNum)
 	}
 	else if (RELKIND_HAS_STORAGE(relation->rd_rel->relkind))
 	{
+		/*
+		 * For temp relations with deferred_temp_table_placement enabled,
+		 * check if the disk file exists before calling smgrnblocks.
+		 * If it doesn't exist, the relation size is tracked in our hash table.
+		 */
+		if (deferred_temp_table_placement && 
+			RelationUsesLocalBuffers(relation) &&
+			!smgrexists(RelationGetSmgr(relation), forkNum))
+		{
+			return GetDelayedTempTableNBlocks(RelationGetSmgr(relation), forkNum);
+		}
+		
 		return smgrnblocks(RelationGetSmgr(relation), forkNum);
 	}
 	else

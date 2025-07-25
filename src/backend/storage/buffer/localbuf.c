@@ -414,8 +414,8 @@ ExtendBufferedRelLocal(BufferManagerRelation bmr,
 	}
 
 	/*
-	 * For delayed temp table placement, the file might not exist yet.
-	 * Use our tracking hash table to get the current logical block count.
+	 * For delayed temp table placement, use our tracking hash table to get
+	 * the current logical block count instead of disk file size.
 	 */
 	if (deferred_temp_table_placement && SmgrIsTemp(bmr.smgr) && 
 		!smgrexists(bmr.smgr, fork))
@@ -424,6 +424,10 @@ ExtendBufferedRelLocal(BufferManagerRelation bmr,
 	}
 	else
 	{
+		/*
+		 * For temp relations, get current relation size before extending.
+		 * The mdnblocks() function now handles deferred temp table placement.
+		 */
 		first_block = smgrnblocks(bmr.smgr, fork);
 	}
 
@@ -504,13 +508,16 @@ ExtendBufferedRelLocal(BufferManagerRelation bmr,
 	 * For delayed temp table placement, don't create disk files yet.
 	 * Only extend to disk for non-delayed tables or when files already exist.
 	 */
+	/*
+	 * For delayed temp table placement, check if we should defer disk operations.
+	 * For deferred temp tables without disk files, avoid creating files during extend.
+	 */
 	if (deferred_temp_table_placement && SmgrIsTemp(bmr.smgr) && 
 		!smgrexists(bmr.smgr, fork))
 	{
 		/*
-		 * For delayed temp tables without disk files, skip disk extension.
+		 * Skip disk extension for deferred temp tables without disk files.
 		 * The file will be created later when dirty pages need to be written.
-		 * Also skip I/O statistics since no actual I/O occurred.
 		 */
 	}
 	else
@@ -538,7 +545,8 @@ ExtendBufferedRelLocal(BufferManagerRelation bmr,
 	*extended_by = extend_by;
 
 	/*
-	 * Only count blocks as written if we actually wrote to disk
+	 * Only count blocks as written if we actually wrote to disk.
+	 * For deferred temp tables without disk files, we don't write to disk yet.
 	 */
 	if (!(deferred_temp_table_placement && SmgrIsTemp(bmr.smgr) && 
 		  !smgrexists(bmr.smgr, fork)))
@@ -549,7 +557,8 @@ ExtendBufferedRelLocal(BufferManagerRelation bmr,
 	/*
 	 * Update our tracking hash table for delayed temp tables
 	 */
-	if (deferred_temp_table_placement && SmgrIsTemp(bmr.smgr))
+	if (deferred_temp_table_placement && SmgrIsTemp(bmr.smgr) && 
+		!smgrexists(bmr.smgr, fork))
 	{
 		SetDelayedTempTableNBlocks(bmr.smgr, fork, first_block + extend_by);
 	}
