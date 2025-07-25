@@ -753,15 +753,16 @@ DropRelationAllLocalBuffers(RelFileLocator rlocator)
 void
 SwapDelayedTempTableHash(RelFileLocator rlocator1, RelFileLocator rlocator2)
 {
-	if (DelayedTempTableHash == NULL)
-		return;
-	
-	/* Collect all entries for both relations */
 	HASH_SEQ_STATUS seq;
 	DelayedTempTableEnt *entry;
 	List *entries1 = NIL;
 	List *entries2 = NIL;
+	ListCell *lc;
 	
+	if (DelayedTempTableHash == NULL)
+		return;
+	
+	/* Collect all entries for both relations */
 	hash_seq_init(&seq, DelayedTempTableHash);
 	while ((entry = (DelayedTempTableEnt *) hash_seq_search(&seq)) != NULL)
 	{
@@ -794,7 +795,6 @@ SwapDelayedTempTableHash(RelFileLocator rlocator1, RelFileLocator rlocator2)
 	}
 	
 	/* Re-insert entries with swapped rlocators */
-	ListCell *lc;
 	foreach(lc, entries1)
 	{
 		DelayedTempTableEnt *old_entry = (DelayedTempTableEnt *) lfirst(lc);
