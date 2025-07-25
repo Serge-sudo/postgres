@@ -1514,18 +1514,55 @@ WaitReadBuffers(ReadBuffersOperation *operation)
 		
 		/*
 		 * For temp relations with deferred_temp_table_placement enabled,
-		 * check if the disk file exists before attempting to read.
-		 * If it doesn't exist, the data is only in local buffers and
-		 * we should treat this as reading uninitialized (zero) pages.
+		 * handle partial reads when some blocks exist on disk but others don't.
 		 */
 		if (persistence == RELPERSISTENCE_TEMP && 
-			deferred_temp_table_placement && 
-			!smgrexists(operation->smgr, forknum))
+			deferred_temp_table_placement)
 		{
-			/* File doesn't exist yet - zero out the pages as if reading from uninitialized disk */
-			for (int j = 0; j < io_buffers_len; ++j)
+			if (!smgrexists(operation->smgr, forknum))
 			{
-				memset(io_pages[j], 0, BLCKSZ);
+				/* File doesn't exist yet - zero out all pages */
+				for (int j = 0; j < io_buffers_len; ++j)
+				{
+					memset(io_pages[j], 0, BLCKSZ);
+				}
+			}
+			else
+			{
+				/* File exists, but some blocks might not exist yet */
+				BlockNumber actual_nblocks = smgrnblocks(operation->smgr, forknum);
+				BlockNumber read_end_block = io_first_block + io_buffers_len;
+				
+				if (io_first_block >= actual_nblocks)
+				{
+					/* All requested blocks are beyond the actual file size - zero fill all */
+					for (int j = 0; j < io_buffers_len; ++j)
+					{
+						memset(io_pages[j], 0, BLCKSZ);
+					}
+				}
+				else if (read_end_block <= actual_nblocks)
+				{
+					/* All requested blocks exist on disk - normal read */
+					smgrreadv(operation->smgr, forknum, io_first_block, io_pages, io_buffers_len);
+				}
+				else
+				{
+					/* Partial read: some blocks exist, some don't */
+					int blocks_to_read = actual_nblocks - io_first_block;
+					
+					/* Read the existing blocks */
+					if (blocks_to_read > 0)
+					{
+						smgrreadv(operation->smgr, forknum, io_first_block, io_pages, blocks_to_read);
+					}
+					
+					/* Zero-fill the non-existent blocks */
+					for (int j = blocks_to_read; j < io_buffers_len; ++j)
+					{
+						memset(io_pages[j], 0, BLCKSZ);
+					}
+				}
 			}
 		}
 		else
