@@ -39,6 +39,7 @@
 #include "catalog/pg_subscription.h"
 #include "catalog/pg_transform.h"
 #include "catalog/pg_type.h"
+#include "catalog/virtual_catalog.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "utils/array.h"
@@ -840,6 +841,21 @@ char *
 get_attname(Oid relid, AttrNumber attnum, bool missing_ok)
 {
 	HeapTuple	tp;
+
+	/* Check virtual catalog first for temporary relations */
+	if (IsTemporaryRelation(relid))
+	{
+		tp = VirtualCatalogSearchAttribute(relid, attnum);
+		if (HeapTupleIsValid(tp))
+		{
+			Form_pg_attribute att_tup = (Form_pg_attribute) GETSTRUCT(tp);
+			char	   *result;
+
+			result = pstrdup(NameStr(att_tup->attname));
+			heap_freetuple(tp);
+			return result;
+		}
+	}
 
 	tp = SearchSysCache2(ATTNUM,
 						 ObjectIdGetDatum(relid), Int16GetDatum(attnum));
@@ -1968,6 +1984,21 @@ get_rel_name(Oid relid)
 {
 	HeapTuple	tp;
 
+	/* Check virtual catalog first for temporary relations */
+	if (IsTemporaryRelation(relid))
+	{
+		tp = VirtualCatalogSearchClass(relid);
+		if (HeapTupleIsValid(tp))
+		{
+			Form_pg_class reltup = (Form_pg_class) GETSTRUCT(tp);
+			char	   *result;
+
+			result = pstrdup(NameStr(reltup->relname));
+			heap_freetuple(tp);
+			return result;
+		}
+	}
+
 	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
 	if (HeapTupleIsValid(tp))
 	{
@@ -1991,6 +2022,21 @@ Oid
 get_rel_namespace(Oid relid)
 {
 	HeapTuple	tp;
+
+	/* Check virtual catalog first for temporary relations */
+	if (IsTemporaryRelation(relid))
+	{
+		tp = VirtualCatalogSearchClass(relid);
+		if (HeapTupleIsValid(tp))
+		{
+			Form_pg_class reltup = (Form_pg_class) GETSTRUCT(tp);
+			Oid			result;
+
+			result = reltup->relnamespace;
+			heap_freetuple(tp);
+			return result;
+		}
+	}
 
 	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
 	if (HeapTupleIsValid(tp))
@@ -2018,6 +2064,21 @@ Oid
 get_rel_type_id(Oid relid)
 {
 	HeapTuple	tp;
+
+	/* Check virtual catalog first for temporary relations */
+	if (IsTemporaryRelation(relid))
+	{
+		tp = VirtualCatalogSearchClass(relid);
+		if (HeapTupleIsValid(tp))
+		{
+			Form_pg_class reltup = (Form_pg_class) GETSTRUCT(tp);
+			Oid			result;
+
+			result = reltup->reltype;
+			heap_freetuple(tp);
+			return result;
+		}
+	}
 
 	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
 	if (HeapTupleIsValid(tp))

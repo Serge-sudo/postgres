@@ -26,6 +26,7 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#include "catalog/virtual_catalog.h"
 #include "commands/defrem.h"
 #include "commands/typecmds.h"
 #include "mb/pg_wchar.h"
@@ -487,7 +488,17 @@ TypeCreate(Oid newTypeOid,
 		tup = heap_form_tuple(RelationGetDescr(pg_type_desc),
 							  values, nulls);
 
-		CatalogTupleInsert(pg_type_desc, tup);
+		if (OidIsValid(relationOid) && IsTemporaryRelation(relationOid))
+		{
+			/* Store in virtual catalog for types associated with temporary relations */
+			VirtualCatalogInsertType(tup, typeObjectId);
+			/* Also store in disk catalog for now to maintain compatibility */
+			CatalogTupleInsert(pg_type_desc, tup);
+		}
+		else
+		{
+			CatalogTupleInsert(pg_type_desc, tup);
+		}
 	}
 
 	/*

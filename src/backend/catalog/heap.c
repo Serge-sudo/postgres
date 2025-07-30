@@ -718,6 +718,7 @@ InsertPgAttributeTuples(Relation pg_attribute_rel,
 	int			natts = 0;
 	int			slotCount = 0;
 	bool		close_index = false;
+	Oid			relid;
 
 	td = RelationGetDescr(pg_attribute_rel);
 
@@ -799,9 +800,29 @@ InsertPgAttributeTuples(Relation pg_attribute_rel,
 				close_index = true;
 			}
 
-			/* insert the new tuples and update the indexes */
-			CatalogTuplesMultiInsertWithInfo(pg_attribute_rel, slot, slotCount,
-											 indstate);
+			/* Check if this is for a temporary relation */
+			relid = new_rel_oid != InvalidOid ? new_rel_oid : 
+					DatumGetObjectId(slot[0]->tts_values[Anum_pg_attribute_attrelid - 1]);
+			
+			if (IsTemporaryRelation(relid))
+			{
+				/* Store each attribute tuple in virtual catalog for temporary tables */
+				for (int i = 0; i < slotCount; i++)
+				{
+					HeapTuple tuple = ExecFetchSlotHeapTuple(slot[i], false, NULL);
+					Form_pg_attribute attr = (Form_pg_attribute) GETSTRUCT(tuple);
+					VirtualCatalogInsertAttribute(tuple, relid, attr->attnum);
+				}
+				/* Also store in disk catalog for now to maintain compatibility */
+				CatalogTuplesMultiInsertWithInfo(pg_attribute_rel, slot, slotCount,
+												 indstate);
+			}
+			else
+			{
+				/* insert the new tuples and update the indexes */
+				CatalogTuplesMultiInsertWithInfo(pg_attribute_rel, slot, slotCount,
+												 indstate);
+			}
 			slotCount = 0;
 		}
 

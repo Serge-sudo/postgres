@@ -93,8 +93,13 @@ extern void VirtualCatalogInsertAttribute(HeapTuple tuple, Oid relid, int attnum
 extern HeapTuple VirtualCatalogSearchAttribute(Oid relid, int attnum);
 extern void VirtualCatalogDeleteAttribute(Oid relid, int attnum);
 
+extern void VirtualCatalogInsertType(HeapTuple tuple, Oid typid);
+extern HeapTuple VirtualCatalogSearchType(Oid typid);
+extern void VirtualCatalogDeleteType(Oid typid);
+
 /* Utility functions */
 extern bool IsTemporaryRelation(Oid relid);
+extern bool IsTemporaryType(Oid typid);
 extern bool ShouldUseVirtualCatalog(Oid relid);
 
 /* Debug and inspection functions */

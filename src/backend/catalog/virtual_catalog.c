@@ -19,6 +19,7 @@
 
 #include "catalog/virtual_catalog.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_type.h"
 #include "catalog/namespace.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
@@ -337,6 +338,70 @@ void
 VirtualCatalogDeleteAttribute(Oid relid, int attnum)
 {
 	VirtualCatalogDeleteTuple(VIRTUAL_CATALOG_ATTRIBUTE, relid, attnum);
+}
+
+/*
+ * VirtualCatalogInsertType
+ *		Insert a pg_type tuple into virtual catalog
+ */
+void
+VirtualCatalogInsertType(HeapTuple tuple, Oid typid)
+{
+	VirtualCatalogInsertTuple(VIRTUAL_CATALOG_TYPE, tuple, typid, 0);
+}
+
+/*
+ * VirtualCatalogSearchType
+ *		Search for a pg_type tuple in virtual catalog
+ */
+HeapTuple
+VirtualCatalogSearchType(Oid typid)
+{
+	return VirtualCatalogSearchTuple(VIRTUAL_CATALOG_TYPE, typid, 0);
+}
+
+/*
+ * VirtualCatalogDeleteType
+ *		Delete a pg_type tuple from virtual catalog
+ */
+void
+VirtualCatalogDeleteType(Oid typid)
+{
+	VirtualCatalogDeleteTuple(VIRTUAL_CATALOG_TYPE, typid, 0);
+}
+
+/*
+ * IsTemporaryType
+ *		Check if a type OID corresponds to a type associated with a temporary relation
+ */
+bool
+IsTemporaryType(Oid typid)
+{
+	HeapTuple	tuple;
+	Form_pg_type typetup;
+	bool		is_temp = false;
+	
+	/* First check virtual catalog */
+	tuple = VirtualCatalogSearchType(typid);
+	if (HeapTupleIsValid(tuple))
+	{
+		heap_freetuple(tuple);
+		return true;  /* If it's in virtual catalog, it's temp */
+	}
+	
+	/* Fall back to regular syscache lookup and check if associated relation is temp */
+	tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
+	if (HeapTupleIsValid(tuple))
+	{
+		typetup = (Form_pg_type) GETSTRUCT(tuple);
+		if (OidIsValid(typetup->typrelid))
+		{
+			is_temp = IsTemporaryRelation(typetup->typrelid);
+		}
+		ReleaseSysCache(tuple);
+	}
+	
+	return is_temp;
 }
 
 /*
