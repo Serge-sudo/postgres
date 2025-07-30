@@ -35,6 +35,7 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_enum.h"
 #include "catalog/storage.h"
+#include "catalog/virtual_catalog.h"
 #include "commands/async.h"
 #include "commands/tablecmds.h"
 #include "commands/trigger.h"
@@ -2417,6 +2418,9 @@ CommitTransaction(void)
 	/* Clean up the relation cache */
 	AtEOXact_RelationCache(true);
 
+	/* Clean up the virtual catalog */
+	ResetVirtualCatalog();
+
 	/* Clean up the type cache */
 	AtEOXact_TypeCache();
 
@@ -2962,6 +2966,7 @@ AbortTransaction(void)
 							 false, true);
 		AtEOXact_Buffers(false);
 		AtEOXact_RelationCache(false);
+		ResetVirtualCatalog();
 		AtEOXact_TypeCache();
 		AtEOXact_Inval(false);
 		AtEOXact_MultiXact();

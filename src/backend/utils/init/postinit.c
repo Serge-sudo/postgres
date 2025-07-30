@@ -33,6 +33,7 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_db_role_setting.h"
 #include "catalog/pg_tablespace.h"
+#include "catalog/virtual_catalog.h"
 #include "libpq/auth.h"
 #include "libpq/libpq-be.h"
 #include "mb/pg_wchar.h"
@@ -803,6 +804,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	 */
 	RelationCacheInitialize();
 	InitCatalogCache();
+	InitVirtualCatalog();
 	InitPlanCache();
 
 	/* Initialize portal manager */

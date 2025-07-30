@@ -54,6 +54,7 @@
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
 #include "catalog/storage.h"
+#include "catalog/virtual_catalog.h"
 #include "commands/tablecmds.h"
 #include "commands/typecmds.h"
 #include "common/int.h"
@@ -958,8 +959,17 @@ InsertPgClassTuple(Relation pg_class_desc,
 
 	tup = heap_form_tuple(RelationGetDescr(pg_class_desc), values, nulls);
 
-	/* finally insert the new tuple, update the indexes, and clean up */
-	CatalogTupleInsert(pg_class_desc, tup);
+	/* Check if this is a temporary relation */
+	if (rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+	{
+		/* Store in virtual catalog for temporary tables */
+		VirtualCatalogInsertClass(tup, new_rel_oid);
+	}
+	else
+	{
+		/* Use traditional disk-based catalog for permanent/unlogged tables */
+		CatalogTupleInsert(pg_class_desc, tup);
+	}
 
 	heap_freetuple(tup);
 }

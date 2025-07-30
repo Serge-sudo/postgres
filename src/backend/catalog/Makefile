@@ -46,7 +46,8 @@ OBJS = \
 	pg_subscription.o \
 	pg_type.o \
 	storage.o \
-	toasting.o
+	toasting.o \
+	virtual_catalog.o
 
 include $(top_srcdir)/src/backend/common.mk
 

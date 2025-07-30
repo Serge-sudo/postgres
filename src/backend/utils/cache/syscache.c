@@ -28,6 +28,7 @@
 #include "catalog/pg_shdepend_d.h"
 #include "catalog/pg_shdescription_d.h"
 #include "catalog/pg_shseclabel_d.h"
+#include "catalog/virtual_catalog.h"
 #include "common/int.h"
 #include "lib/qunique.h"
 #include "miscadmin.h"
