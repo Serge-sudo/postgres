@@ -21,6 +21,7 @@
 #include "catalog/pg_attribute.h"
 #include "utils/hsearch.h"
 #include "access/htup.h"
+#include "fmgr.h"
 
 /*
  * Virtual catalog entry types
@@ -95,5 +96,12 @@ extern void VirtualCatalogDeleteAttribute(Oid relid, int attnum);
 /* Utility functions */
 extern bool IsTemporaryRelation(Oid relid);
 extern bool ShouldUseVirtualCatalog(Oid relid);
+
+/* Debug and inspection functions */
+extern int VirtualCatalogGetEntryCount(void);
+extern void VirtualCatalogDebugPrint(void);
+
+/* SQL interface functions */
+extern Datum pg_virtual_catalog_entry_count(PG_FUNCTION_ARGS);
 
 #endif							/* VIRTUAL_CATALOG_H */

@@ -28,6 +28,7 @@
 #include "access/htup_details.h"
 #include "storage/lmgr.h"
 #include "miscadmin.h"
+#include "fmgr.h"
 
 /* Global state */
 VirtualCatalogState *virtual_catalog_state = NULL;
@@ -379,4 +380,59 @@ bool
 ShouldUseVirtualCatalog(Oid relid)
 {
 	return IsTemporaryRelation(relid);
+}
+
+/*
+ * VirtualCatalogGetEntryCount
+ *		Get the number of entries in the virtual catalog (for debugging)
+ */
+int
+VirtualCatalogGetEntryCount(void)
+{
+	if (!IsVirtualCatalogEnabled())
+		return 0;
+		
+	return hash_get_num_entries(virtual_catalog_state->hash_table);
+}
+
+/*
+ * VirtualCatalogDebugPrint
+ *		Print virtual catalog entries for debugging
+ */
+void
+VirtualCatalogDebugPrint(void)
+{
+	HASH_SEQ_STATUS hash_seq;
+	VirtualCatalogEntry *entry;
+	int count = 0;
+	
+	if (!IsVirtualCatalogEnabled())
+	{
+		elog(LOG, "Virtual catalog is not enabled");
+		return;
+	}
+	
+	elog(LOG, "Virtual catalog contents:");
+	
+	hash_seq_init(&hash_seq, virtual_catalog_state->hash_table);
+	while ((entry = (VirtualCatalogEntry *) hash_seq_search(&hash_seq)) != NULL)
+	{
+		if (!entry->deleted && entry->tuple)
+		{
+			elog(LOG, "Entry %d: OID=%u, Type=%d, SecKey=%d", 
+				 ++count, entry->key.oid, entry->key.catalog_type, entry->key.secondary_key);
+		}
+	}
+	
+	elog(LOG, "Total virtual catalog entries: %d", count);
+}
+
+/*
+ * pg_virtual_catalog_entry_count
+ *		SQL function to get virtual catalog entry count
+ */
+Datum
+pg_virtual_catalog_entry_count(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT32(VirtualCatalogGetEntryCount());
 }

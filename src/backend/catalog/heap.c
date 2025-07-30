@@ -964,6 +964,8 @@ InsertPgClassTuple(Relation pg_class_desc,
 	{
 		/* Store in virtual catalog for temporary tables */
 		VirtualCatalogInsertClass(tup, new_rel_oid);
+		/* Also store in disk catalog for now to avoid issues */
+		CatalogTupleInsert(pg_class_desc, tup);
 	}
 	else
 	{
