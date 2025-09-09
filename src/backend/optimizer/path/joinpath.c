@@ -289,6 +289,8 @@ add_paths_to_joinrel(PlannerInfo *root,
 	if ((jointype == JOIN_LEFT || jointype == JOIN_RIGHT) &&
 		root->limit_tuples > 0 && root->sort_pathkeys != NIL)
 	{
+		elog(DEBUG1, "Considering outer join LIMIT pushdown for jointype %d, limit_tuples %g", 
+			 jointype, root->limit_tuples);
 		consider_outer_join_limit_pushdown(root, joinrel, outerrel, innerrel,
 										   jointype, &extra);
 	}
@@ -2482,6 +2484,8 @@ consider_outer_join_limit_pushdown(PlannerInfo *root,
 	Path	   *best_inner_path;
 	Path	   *join_path;
 
+	elog(DEBUG1, "Consider outer join limit pushdown called for jointype %d", jointype);
+
 	/* Determine which relation is preserved in this outer join */
 	if (jointype == JOIN_LEFT)
 	{
@@ -2503,53 +2507,59 @@ consider_outer_join_limit_pushdown(PlannerInfo *root,
 
 	/*
 	 * Check if all ORDER BY expressions reference only the preserved relation.
-	 * We need to extract the expressions from the pathkeys.
+	 * We'll do this by checking the actual sort clause expressions.
 	 */
-	pathkey_exprs = NIL;
-	foreach(lc, root->sort_pathkeys)
+	Query	   *parse = root->parse;
+	ListCell   *sc;
+	
+	foreach(sc, parse->sortClause)
 	{
-		PathKey    *pathkey = (PathKey *) lfirst(lc);
-		EquivalenceClass *eclass = pathkey->pk_eclass;
-		Expr	   *expr;
+		SortGroupClause *sortcl = (SortGroupClause *) lfirst(sc);
+		TargetEntry *tle;
 		Bitmapset  *expr_relids;
 
-		/* 
-		 * Get a representative expression from the equivalence class.
-		 * We need an expression that can be computed from the preserved relation.
-		 */
-		EquivalenceMember *em = find_computable_ec_member(root, eclass, NIL,
-														  preserved_relids, false);
-		if (!em)
+		elog(DEBUG1, "Checking sort clause for pushdown eligibility");
+
+		/* Get the target entry for this sort group reference */
+		tle = get_sortgroupref_tle(sortcl->tleSortGroupRef, parse->targetList);
+		if (!tle)
 		{
-			/* Can't find computable expression for this pathkey in preserved rel */
+			elog(DEBUG1, "Cannot find target entry for sort group reference");
 			can_pushdown = false;
 			break;
 		}
 
-		expr = em->em_expr;
-
-		/* Check if this expression references only the preserved relation */
-		expr_relids = pull_varnos(root, (Node *) expr);
+		/* Check which relations this expression references */
+		expr_relids = pull_varnos(root, (Node *) tle->expr);
 		if (!bms_is_subset(expr_relids, preserved_relids))
 		{
+			elog(DEBUG1, "Sort expression references non-preserved relations");
 			can_pushdown = false;
 			bms_free(expr_relids);
 			break;
 		}
 		bms_free(expr_relids);
-
-		pathkey_exprs = lappend(pathkey_exprs, expr);
+		
+		elog(DEBUG1, "Sort expression is suitable for pushdown");
 	}
 
 	if (!can_pushdown)
+	{
+		elog(DEBUG1, "Cannot pushdown: ORDER BY expressions not suitable");
 		return;
+	}
 
 	/*
 	 * Create a path for the preserved relation that includes the LIMIT.
 	 * We'll use the cheapest total path as a base and add a Limit node.
 	 */
 	if (preserved_rel->cheapest_total_path == NULL)
+	{
+		elog(DEBUG1, "No cheapest total path for preserved relation");
 		return;
+	}
+
+	elog(DEBUG1, "Creating limited path for preserved relation");
 
 	/*
 	 * Create a limited path by adding a limit to the preserved relation.
@@ -2560,13 +2570,15 @@ consider_outer_join_limit_pushdown(PlannerInfo *root,
 							  preserved_rel->cheapest_total_path->pathkeys))
 	{
 		/* Already sorted correctly, just add limit */
+		Node	   *limitCount = (Node *) makeConst(INT8OID, -1, InvalidOid,
+														sizeof(int64),
+														Int64GetDatum(root->limit_tuples),
+														false, FLOAT8PASSBYVAL);
+		
 		limited_path = (Path *) create_limit_path(root, preserved_rel,
 												  preserved_rel->cheapest_total_path,
 												  NULL, /* offset */
-												  (Node *) makeConst(INT8OID, -1, InvalidOid,
-																	 sizeof(int64),
-																	 Int64GetDatum(root->limit_tuples),
-																	 false, FLOAT8PASSBYVAL),
+												  limitCount,
 												  LIMIT_OPTION_COUNT,
 												  0, root->limit_tuples);
 	}
@@ -2574,21 +2586,36 @@ consider_outer_join_limit_pushdown(PlannerInfo *root,
 	{
 		/* Need to sort first, then limit */
 		Path	   *sorted_path;
+		Node	   *limitCount;
 		
 		sorted_path = (Path *) create_sort_path(root, preserved_rel,
 												preserved_rel->cheapest_total_path,
 												root->sort_pathkeys,
 												root->limit_tuples);
 		
+		if (!sorted_path)
+		{
+			elog(DEBUG1, "Failed to create sorted path");
+			return;
+		}
+		
+		limitCount = (Node *) makeConst(INT8OID, -1, InvalidOid,
+										sizeof(int64),
+										Int64GetDatum(root->limit_tuples),
+										false, FLOAT8PASSBYVAL);
+		
 		limited_path = (Path *) create_limit_path(root, preserved_rel,
 												  sorted_path,
 												  NULL, /* offset */
-												  (Node *) makeConst(INT8OID, -1, InvalidOid,
-																	 sizeof(int64),
-																	 Int64GetDatum(root->limit_tuples),
-																	 false, FLOAT8PASSBYVAL),
+												  limitCount,
 												  LIMIT_OPTION_COUNT,
 												  0, root->limit_tuples);
+	}
+
+	if (!limited_path)
+	{
+		elog(DEBUG1, "Failed to create limited path");
+		return;
 	}
 
 	/*
@@ -2597,12 +2624,17 @@ consider_outer_join_limit_pushdown(PlannerInfo *root,
 	 */
 	best_inner_path = other_rel->cheapest_total_path;
 	if (best_inner_path == NULL)
+	{
+		elog(DEBUG1, "No cheapest total path for other relation");
 		return;
+	}
 
 	/*
 	 * Create different types of join paths (nested loop, hash, merge)
 	 * using our limited preserved relation.
 	 */
+	
+	elog(DEBUG1, "Creating join path with limited preserved relation");
 	
 	/* Try nested loop join */
 	if (jointype == JOIN_LEFT)
@@ -2657,6 +2689,16 @@ consider_outer_join_limit_pushdown(PlannerInfo *root,
 		add_path(joinrel, join_path);
 		elog(DEBUG1, "Added outer join path with ORDER BY LIMIT pushdown");
 	}
+	else
+	{
+		elog(DEBUG1, "Failed to create optimized join path");
+	}
 
 	/* TODO: Consider hash join and merge join paths as well */
+	
+	/*
+	 * For now, just log that we would have created an optimized path
+	 * instead of actually creating it to avoid crashes during development
+	 */
+	elog(DEBUG1, "ORDER BY LIMIT pushdown optimization would be beneficial here");
 }

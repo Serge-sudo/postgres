@@ -8167,13 +8167,21 @@ can_pushdown_outer_join_limit(PlannerInfo *root)
 	Query	   *parse = root->parse;
 	ListCell   *lc;
 
+	elog(DEBUG1, "Checking if can pushdown outer join limit");
+
 	/* Must have both ORDER BY and LIMIT */
 	if (!parse->sortClause || (!parse->limitCount && !parse->limitOffset))
+	{
+		elog(DEBUG1, "No ORDER BY or LIMIT clause found");
 		return false;
+	}
 
 	/* Must have more than one relation in FROM clause for joins */
 	if (list_length(parse->rtable) < 2)
+	{
+		elog(DEBUG1, "Less than 2 relations in FROM clause");
 		return false;
+	}
 
 	/* Look for outer joins in the join info list */
 	foreach(lc, root->join_info_list)
@@ -8188,10 +8196,12 @@ can_pushdown_outer_join_limit(PlannerInfo *root)
 			 * More sophisticated analysis of ORDER BY columns vs.
 			 * preserved side will be done in setup function.
 			 */
+			elog(DEBUG1, "Found outer join, can attempt pushdown optimization");
 			return true;
 		}
 	}
 
+	elog(DEBUG1, "No outer joins found");
 	return false;
 }
 
