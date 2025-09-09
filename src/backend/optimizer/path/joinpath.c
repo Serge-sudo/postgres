@@ -127,7 +127,8 @@ static Path *create_optimized_mergejoin_path(PlannerInfo *root,
 											 Path *other_path,
 											 RelOptInfo *preserved_rel,
 											 RelOptInfo *other_rel,
-											 JoinPathExtraData *extra);
+											 JoinPathExtraData *extra,
+											 MergePath *original_path);
 static Path *create_optimized_hashjoin_path(PlannerInfo *root,
 											RelOptInfo *joinrel,
 											JoinType jointype,
@@ -135,7 +136,8 @@ static Path *create_optimized_hashjoin_path(PlannerInfo *root,
 											Path *other_path,
 											RelOptInfo *preserved_rel,
 											RelOptInfo *other_rel,
-											JoinPathExtraData *extra);
+											JoinPathExtraData *extra,
+											HashPath *original_path);
 
 
 /*
@@ -2666,13 +2668,15 @@ create_optimized_outer_join_path(PlannerInfo *root,
 	{
 		optimized_join_path = create_optimized_mergejoin_path(root, joinrel, jointype,
 															  limited_path, other_path,
-															  preserved_rel, other_rel, extra);
+															  preserved_rel, other_rel, extra,
+															  (MergePath *) original_path);
 	}
 	else if (IsA(original_path, HashPath))
 	{
 		optimized_join_path = create_optimized_hashjoin_path(root, joinrel, jointype,
 															 limited_path, other_path,
-															 preserved_rel, other_rel, extra);
+															 preserved_rel, other_rel, extra,
+															 (HashPath *) original_path);
 	}
 
 	if (optimized_join_path)
@@ -2787,7 +2791,8 @@ create_optimized_nestloop_path(PlannerInfo *root,
 /*
  * create_optimized_mergejoin_path
  *		Create a merge join path using the limited preserved relation.
- *		This is more complex as we need to handle merge clauses and sort keys.
+ *		This function extracts merge clauses from the original path and 
+ *		creates a new merge join with the limited preserved relation.
  */
 static Path *
 create_optimized_mergejoin_path(PlannerInfo *root,
@@ -2797,18 +2802,77 @@ create_optimized_mergejoin_path(PlannerInfo *root,
 							   Path *other_path,
 							   RelOptInfo *preserved_rel,
 							   RelOptInfo *other_rel,
-							   JoinPathExtraData *extra)
+							   JoinPathExtraData *extra,
+							   MergePath *original_path)
 {
-	/* For now, fall back to nested loop for merge joins */
-	elog(DEBUG1, "Merge join optimization not yet implemented, falling back to nested loop");
-	return create_optimized_nestloop_path(root, joinrel, jointype,
-										  limited_path, other_path,
-										  preserved_rel, other_rel, extra);
+	JoinCostWorkspace workspace;
+	Relids		required_outer;
+	Path	   *outer_path, *inner_path;
+	List	   *mergeclauses;
+	List	   *outersortkeys = NIL;
+	List	   *innersortkeys = NIL;
+	List	   *pathkeys;
+
+	elog(DEBUG1, "Creating optimized merge join path");
+
+	/* Extract merge clauses from the original path */
+	mergeclauses = original_path->path_mergeclauses;
+
+	/* Determine which path is outer and which is inner */
+	if (jointype == JOIN_LEFT)
+	{
+		outer_path = limited_path;
+		inner_path = other_path;
+		/* Use original sort keys, but adjust for the limited path */
+		outersortkeys = original_path->outersortkeys;
+		innersortkeys = original_path->innersortkeys;
+		pathkeys = limited_path->pathkeys; /* Limited path should have ORDER BY pathkeys */
+	}
+	else /* JOIN_RIGHT */
+	{
+		outer_path = other_path;
+		inner_path = limited_path;
+		/* Use original sort keys, but adjust for the limited path */
+		outersortkeys = original_path->outersortkeys;
+		innersortkeys = original_path->innersortkeys;
+		pathkeys = limited_path->pathkeys; /* Limited path should have ORDER BY pathkeys */
+	}
+
+	/* Calculate the required outer relations */
+	required_outer = bms_union(PATH_REQ_OUTER(outer_path),
+							   PATH_REQ_OUTER(inner_path));
+
+	/* Check if we need to avoid duplicate sort keys that are already satisfied */
+	if (outersortkeys &&
+		pathkeys_contained_in(outersortkeys, outer_path->pathkeys))
+		outersortkeys = NIL;
+	if (innersortkeys &&
+		pathkeys_contained_in(innersortkeys, inner_path->pathkeys))
+		innersortkeys = NIL;
+
+	/* Calculate join costs */
+	initial_cost_mergejoin(root, &workspace, jointype, mergeclauses,
+						   outer_path, inner_path,
+						   outersortkeys, innersortkeys,
+						   extra);
+
+	/* Create the merge join path */
+	return (Path *) create_mergejoin_path(root, joinrel, jointype,
+										  &workspace, extra,
+										  outer_path, inner_path,
+										  extra->restrictlist,
+										  pathkeys,
+										  required_outer,
+										  mergeclauses,
+										  outersortkeys,
+										  innersortkeys);
 }
 
 /*
  * create_optimized_hashjoin_path
  *		Create a hash join path using the limited preserved relation.
+ *		This function extracts hash clauses from the original path and
+ *		creates a new hash join with the limited preserved relation.
  */
 static Path *
 create_optimized_hashjoin_path(PlannerInfo *root,
@@ -2818,11 +2882,45 @@ create_optimized_hashjoin_path(PlannerInfo *root,
 							  Path *other_path,
 							  RelOptInfo *preserved_rel,
 							  RelOptInfo *other_rel,
-							  JoinPathExtraData *extra)
+							  JoinPathExtraData *extra,
+							  HashPath *original_path)
 {
-	/* For now, fall back to nested loop for hash joins */
-	elog(DEBUG1, "Hash join optimization not yet implemented, falling back to nested loop");
-	return create_optimized_nestloop_path(root, joinrel, jointype,
-										  limited_path, other_path,
-										  preserved_rel, other_rel, extra);
+	JoinCostWorkspace workspace;
+	Relids		required_outer;
+	Path	   *outer_path, *inner_path;
+	List	   *hashclauses;
+
+	elog(DEBUG1, "Creating optimized hash join path");
+
+	/* Extract hash clauses from the original path */
+	hashclauses = original_path->path_hashclauses;
+
+	/* Determine which path is outer and which is inner */
+	if (jointype == JOIN_LEFT)
+	{
+		outer_path = limited_path;
+		inner_path = other_path;
+	}
+	else /* JOIN_RIGHT */
+	{
+		outer_path = other_path;
+		inner_path = limited_path;
+	}
+
+	/* Calculate the required outer relations */
+	required_outer = bms_union(PATH_REQ_OUTER(outer_path),
+							   PATH_REQ_OUTER(inner_path));
+
+	/* Calculate join costs */
+	initial_cost_hashjoin(root, &workspace, jointype, hashclauses,
+						  outer_path, inner_path, extra, false);
+
+	/* Create the hash join path */
+	return (Path *) create_hashjoin_path(root, joinrel, jointype,
+										 &workspace, extra,
+										 outer_path, inner_path,
+										 false, /* parallel_hash */
+										 extra->restrictlist,
+										 required_outer,
+										 hashclauses);
 }
