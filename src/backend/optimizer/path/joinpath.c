@@ -95,6 +95,12 @@ static void generate_mergejoin_paths(PlannerInfo *root,
 									 Path *inner_cheapest_total,
 									 List *merge_pathkeys,
 									 bool is_partial);
+static void consider_outer_join_limit_pushdown(PlannerInfo *root,
+											   RelOptInfo *joinrel,
+											   RelOptInfo *outerrel,
+											   RelOptInfo *innerrel,
+											   JoinType jointype,
+											   JoinPathExtraData *extra);
 
 
 /*
@@ -274,6 +280,18 @@ add_paths_to_joinrel(PlannerInfo *root,
 	 */
 	extra.param_source_rels = bms_add_members(extra.param_source_rels,
 											  joinrel->lateral_relids);
+
+	/*
+	 * Consider optimization for ORDER BY ... LIMIT pushdown in outer joins.
+	 * This can significantly reduce the amount of data processed in the join
+	 * by applying the limit to the preserved side before joining.
+	 */
+	if ((jointype == JOIN_LEFT || jointype == JOIN_RIGHT) &&
+		root->limit_tuples > 0 && root->sort_pathkeys != NIL)
+	{
+		consider_outer_join_limit_pushdown(root, joinrel, outerrel, innerrel,
+										   jointype, &extra);
+	}
 
 	/*
 	 * 1. Consider mergejoin paths where both relations must be explicitly
@@ -2430,4 +2448,215 @@ select_mergejoin_clauses(PlannerInfo *root,
 	}
 
 	return result_list;
+}
+
+/*
+ * consider_outer_join_limit_pushdown
+ *		Create paths that push ORDER BY ... LIMIT down to the preserved side
+ *		of an outer join for optimization.
+ *
+ * For LEFT OUTER JOIN: preserved side is outerrel (left)
+ * For RIGHT OUTER JOIN: preserved side is innerrel (right) 
+ *
+ * The optimization works by:
+ * 1. Checking if ORDER BY references only columns from the preserved side
+ * 2. Creating a limited path for the preserved side
+ * 3. Joining this limited path with the other side
+ * 4. This reduces the number of tuples processed in the join
+ */
+static void
+consider_outer_join_limit_pushdown(PlannerInfo *root,
+								   RelOptInfo *joinrel,
+								   RelOptInfo *outerrel,
+								   RelOptInfo *innerrel,
+								   JoinType jointype,
+								   JoinPathExtraData *extra)
+{
+	RelOptInfo *preserved_rel;
+	RelOptInfo *other_rel;
+	Bitmapset  *preserved_relids;
+	List	   *pathkey_exprs;
+	ListCell   *lc;
+	bool		can_pushdown = true;
+	Path	   *limited_path;
+	Path	   *best_inner_path;
+	Path	   *join_path;
+
+	/* Determine which relation is preserved in this outer join */
+	if (jointype == JOIN_LEFT)
+	{
+		preserved_rel = outerrel;
+		other_rel = innerrel;
+		preserved_relids = outerrel->relids;
+	}
+	else if (jointype == JOIN_RIGHT)
+	{
+		preserved_rel = innerrel;
+		other_rel = outerrel;
+		preserved_relids = innerrel->relids;
+	}
+	else
+	{
+		/* Should not happen given our caller's check */
+		return;
+	}
+
+	/*
+	 * Check if all ORDER BY expressions reference only the preserved relation.
+	 * We need to extract the expressions from the pathkeys.
+	 */
+	pathkey_exprs = NIL;
+	foreach(lc, root->sort_pathkeys)
+	{
+		PathKey    *pathkey = (PathKey *) lfirst(lc);
+		EquivalenceClass *eclass = pathkey->pk_eclass;
+		Expr	   *expr;
+		Bitmapset  *expr_relids;
+
+		/* 
+		 * Get a representative expression from the equivalence class.
+		 * We need an expression that can be computed from the preserved relation.
+		 */
+		EquivalenceMember *em = find_computable_ec_member(root, eclass, NIL,
+														  preserved_relids, false);
+		if (!em)
+		{
+			/* Can't find computable expression for this pathkey in preserved rel */
+			can_pushdown = false;
+			break;
+		}
+
+		expr = em->em_expr;
+
+		/* Check if this expression references only the preserved relation */
+		expr_relids = pull_varnos(root, (Node *) expr);
+		if (!bms_is_subset(expr_relids, preserved_relids))
+		{
+			can_pushdown = false;
+			bms_free(expr_relids);
+			break;
+		}
+		bms_free(expr_relids);
+
+		pathkey_exprs = lappend(pathkey_exprs, expr);
+	}
+
+	if (!can_pushdown)
+		return;
+
+	/*
+	 * Create a path for the preserved relation that includes the LIMIT.
+	 * We'll use the cheapest total path as a base and add a Limit node.
+	 */
+	if (preserved_rel->cheapest_total_path == NULL)
+		return;
+
+	/*
+	 * Create a limited path by adding a limit to the preserved relation.
+	 * First, we may need to add a sort if the relation isn't already
+	 * sorted by our pathkeys.
+	 */
+	if (pathkeys_contained_in(root->sort_pathkeys,
+							  preserved_rel->cheapest_total_path->pathkeys))
+	{
+		/* Already sorted correctly, just add limit */
+		limited_path = (Path *) create_limit_path(root, preserved_rel,
+												  preserved_rel->cheapest_total_path,
+												  NULL, /* offset */
+												  (Node *) makeConst(INT8OID, -1, InvalidOid,
+																	 sizeof(int64),
+																	 Int64GetDatum(root->limit_tuples),
+																	 false, FLOAT8PASSBYVAL),
+												  LIMIT_OPTION_COUNT,
+												  0, root->limit_tuples);
+	}
+	else
+	{
+		/* Need to sort first, then limit */
+		Path	   *sorted_path;
+		
+		sorted_path = (Path *) create_sort_path(root, preserved_rel,
+												preserved_rel->cheapest_total_path,
+												root->sort_pathkeys,
+												root->limit_tuples);
+		
+		limited_path = (Path *) create_limit_path(root, preserved_rel,
+												  sorted_path,
+												  NULL, /* offset */
+												  (Node *) makeConst(INT8OID, -1, InvalidOid,
+																	 sizeof(int64),
+																	 Int64GetDatum(root->limit_tuples),
+																	 false, FLOAT8PASSBYVAL),
+												  LIMIT_OPTION_COUNT,
+												  0, root->limit_tuples);
+	}
+
+	/*
+	 * Now create the join path using the limited preserved relation.
+	 * Use the cheapest path from the other relation.
+	 */
+	best_inner_path = other_rel->cheapest_total_path;
+	if (best_inner_path == NULL)
+		return;
+
+	/*
+	 * Create different types of join paths (nested loop, hash, merge)
+	 * using our limited preserved relation.
+	 */
+	
+	/* Try nested loop join */
+	if (jointype == JOIN_LEFT)
+	{
+		/* Limited outer (left) relation with inner (right) relation */
+		JoinCostWorkspace workspace;
+		Relids		required_outer;
+		
+		/* Calculate the required outer relations */
+		required_outer = bms_union(PATH_REQ_OUTER(limited_path),
+								   PATH_REQ_OUTER(best_inner_path));
+		
+		/* Calculate join costs */
+		initial_cost_nestloop(root, &workspace, jointype, limited_path, best_inner_path, extra);
+		
+		join_path = (Path *) create_nestloop_path(root, joinrel,
+												  jointype,
+												  &workspace,
+												  extra,
+												  limited_path,
+												  best_inner_path,
+												  extra->restrictlist,
+												  limited_path->pathkeys,
+												  required_outer);
+	}
+	else /* JOIN_RIGHT */
+	{
+		/* Outer (left) relation with limited inner (right) relation */
+		JoinCostWorkspace workspace;
+		Relids		required_outer;
+		
+		/* Calculate the required outer relations */
+		required_outer = bms_union(PATH_REQ_OUTER(outerrel->cheapest_total_path),
+								   PATH_REQ_OUTER(limited_path));
+		
+		/* Calculate join costs */
+		initial_cost_nestloop(root, &workspace, jointype, outerrel->cheapest_total_path, limited_path, extra);
+		
+		join_path = (Path *) create_nestloop_path(root, joinrel,
+												  jointype,
+												  &workspace,
+												  extra,
+												  outerrel->cheapest_total_path,
+												  limited_path,
+												  extra->restrictlist,
+												  outerrel->cheapest_total_path->pathkeys,
+												  required_outer);
+	}
+
+	if (join_path)
+	{
+		add_path(joinrel, join_path);
+		elog(DEBUG1, "Added outer join path with ORDER BY LIMIT pushdown");
+	}
+
+	/* TODO: Consider hash join and merge join paths as well */
 }
