@@ -96,12 +96,9 @@ static void generate_mergejoin_paths(PlannerInfo *root,
 									 Path *inner_cheapest_total,
 									 List *merge_pathkeys,
 									 bool is_partial);
-static void consider_outer_join_limit_pushdown(PlannerInfo *root,
-											   RelOptInfo *joinrel,
-											   RelOptInfo *outerrel,
-											   RelOptInfo *innerrel,
-											   JoinType jointype,
-											   JoinPathExtraData *extra);
+static bool should_apply_limit_pushdown_optimization(PlannerInfo *root,
+													 RelOptInfo *joinrel,
+													 JoinType jointype);
 static void create_optimized_outer_join_path(PlannerInfo *root,
 											 RelOptInfo *joinrel,
 											 JoinPath *original_path,
@@ -109,6 +106,12 @@ static void create_optimized_outer_join_path(PlannerInfo *root,
 											 RelOptInfo *other_rel,
 											 JoinType jointype,
 											 JoinPathExtraData *extra);
+static void try_optimized_join_path(PlannerInfo *root,
+									RelOptInfo *joinrel,
+									RelOptInfo *outerrel,
+									RelOptInfo *innerrel,
+									JoinType jointype,
+									JoinPathExtraData *extra);
 static Path *create_limited_path_for_relation(PlannerInfo *root,
 											  RelOptInfo *rel,
 											  Path *base_path);
@@ -381,28 +384,7 @@ add_paths_to_joinrel(PlannerInfo *root,
 												 outerrel, innerrel,
 												 jointype, &extra);
 
-	/*
-	 * 5a. Consider optimization for ORDER BY ... LIMIT pushdown in outer joins.
-	 * This can significantly reduce the amount of data processed in the join
-	 * by applying the limit to the preserved side before joining.
-	 * We do this after creating the standard paths so we can modify them.
-	 * 
-	 * Check if this join covers all base relations by subtracting outer join
-	 * relation IDs from the joinrel's relids and comparing with all_baserels.
-	 */
-	if ((jointype == JOIN_LEFT || jointype == JOIN_RIGHT) &&
-		root->limit_tuples > 0 && root->sort_pathkeys != NIL)
-	{
-		Relids base_relids = bms_difference(joinrel->relids, root->outer_join_rels);
-		if (bms_equal(base_relids, root->all_baserels))
-		{
-			elog(DEBUG1, "Considering outer join LIMIT pushdown for jointype %d, limit_tuples %g", 
-				 jointype, root->limit_tuples);
-			consider_outer_join_limit_pushdown(root, joinrel, outerrel, innerrel,
-											   jointype, &extra);
-		}
-		bms_free(base_relids);
-	}
+
 
 	/*
 	 * 6. Finally, give extensions a chance to manipulate the path list.  They
@@ -1505,6 +1487,15 @@ sort_inner_and_outer(PlannerInfo *root,
 						   false);
 
 		/*
+		 * Try creating an optimized version with ORDER BY LIMIT pushdown
+		 * if applicable for outer joins
+		 */
+		if (should_apply_limit_pushdown_optimization(root, joinrel, jointype))
+		{
+			try_optimized_join_path(root, joinrel, outerrel, innerrel, jointype, extra);
+		}
+
+		/*
 		 * If we have partial outer and parallel safe inner path then try
 		 * partial mergejoin path.
 		 */
@@ -2022,6 +2013,15 @@ match_unsorted_outer(PlannerInfo *root,
 										save_jointype, extra,
 										inner_cheapest_total);
 	}
+
+	/*
+	 * Try creating optimized versions with ORDER BY LIMIT pushdown
+	 * if applicable for outer joins
+	 */
+	if (should_apply_limit_pushdown_optimization(root, joinrel, save_jointype))
+	{
+		try_optimized_join_path(root, joinrel, outerrel, innerrel, save_jointype, extra);
+	}
 }
 
 /*
@@ -2390,6 +2390,15 @@ hash_inner_and_outer(PlannerInfo *root,
 										  false /* parallel_hash */ );
 		}
 	}
+
+	/*
+	 * Try creating optimized versions with ORDER BY LIMIT pushdown
+	 * if applicable for outer joins
+	 */
+	if (should_apply_limit_pushdown_optimization(root, joinrel, save_jointype))
+	{
+		try_optimized_join_path(root, joinrel, outerrel, innerrel, save_jointype, extra);
+	}
 }
 
 /*
@@ -2501,6 +2510,143 @@ select_mergejoin_clauses(PlannerInfo *root,
 	}
 
 	return result_list;
+}
+
+/*
+ * should_apply_limit_pushdown_optimization
+ *		Check if ORDER BY LIMIT pushdown optimization should be applied 
+ *		for this join.
+ */
+static bool
+should_apply_limit_pushdown_optimization(PlannerInfo *root,
+										 RelOptInfo *joinrel,
+										 JoinType jointype)
+{
+	Relids base_relids;
+	bool result;
+	
+	/* Must be an outer join with LIMIT and ORDER BY */
+	if ((jointype != JOIN_LEFT && jointype != JOIN_RIGHT) ||
+		root->limit_tuples <= 0 || root->sort_pathkeys == NIL)
+		return false;
+	
+	/* Must be the final join covering all base relations */
+	base_relids = bms_difference(joinrel->relids, root->outer_join_rels);
+	result = bms_equal(base_relids, root->all_baserels);
+	bms_free(base_relids);
+	
+	return result;
+}
+
+/*
+ * can_pushdown_order_by_expressions
+ *		Check if all ORDER BY expressions reference only the preserved relation.
+ */
+static bool
+can_pushdown_order_by_expressions(PlannerInfo *root, Bitmapset *preserved_relids)
+{
+	Query	   *parse = root->parse;
+	ListCell   *sc;
+	
+	foreach(sc, parse->sortClause)
+	{
+		SortGroupClause *sortcl = (SortGroupClause *) lfirst(sc);
+		TargetEntry *tle;
+		Bitmapset  *expr_relids;
+
+		/* Get the target entry for this sort group reference */
+		tle = get_sortgroupref_tle(sortcl->tleSortGroupRef, parse->targetList);
+		if (!tle)
+			return false;
+
+		/* Check which relations this expression references */
+		expr_relids = pull_varnos(root, (Node *) tle->expr);
+		if (!bms_is_subset(expr_relids, preserved_relids))
+		{
+			bms_free(expr_relids);
+			return false;
+		}
+		bms_free(expr_relids);
+	}
+	
+	return true;
+}
+
+/*
+ * try_optimized_join_path
+ *		Create optimized versions of outer join paths with ORDER BY LIMIT pushdown.
+ *
+ * This function examines the paths that have been added to joinrel->pathlist
+ * and creates optimized versions that push ORDER BY ... LIMIT down to the
+ * preserved side of outer joins.
+ */
+static void
+try_optimized_join_path(PlannerInfo *root,
+					   RelOptInfo *joinrel,
+					   RelOptInfo *outerrel,
+					   RelOptInfo *innerrel,
+					   JoinType jointype,
+					   JoinPathExtraData *extra)
+{
+	RelOptInfo *preserved_rel;
+	RelOptInfo *other_rel;
+	Bitmapset  *preserved_relids;
+	ListCell   *lc;
+
+	elog(DEBUG1, "try_optimized_join_path called for jointype %d", jointype);
+
+	/* Determine which relation is preserved in this outer join */
+	if (jointype == JOIN_LEFT)
+	{
+		preserved_rel = outerrel;
+		other_rel = innerrel;
+		preserved_relids = outerrel->relids;
+	}
+	else if (jointype == JOIN_RIGHT)
+	{
+		preserved_rel = innerrel;
+		other_rel = outerrel;
+		preserved_relids = innerrel->relids;
+	}
+	else
+	{
+		/* Should not happen given our caller's check */
+		return;
+	}
+
+	/* Check if all ORDER BY expressions reference only the preserved relation */
+	if (!can_pushdown_order_by_expressions(root, preserved_relids))
+	{
+		elog(DEBUG1, "Cannot pushdown: ORDER BY expressions reference non-preserved relations");
+		return;
+	}
+
+	/*
+	 * Examine recently added paths in joinrel->pathlist and create optimized versions.
+	 * We look for join paths of the right type that were just added.
+	 */
+	foreach(lc, joinrel->pathlist)
+	{
+		Path *path = (Path *) lfirst(lc);
+		JoinPath *jpath;
+		
+		/* Only consider join paths (not scan paths) */
+		if (!IsA(path, NestPath) && !IsA(path, MergePath) && !IsA(path, HashPath))
+			continue;
+			
+		/* Only consider outer join paths of the right type */
+		jpath = (JoinPath *) path;
+		if (jpath->jointype != jointype)
+			continue;
+			
+		elog(DEBUG1, "Creating optimized version of %s join path", 
+			 IsA(path, NestPath) ? "nested loop" : 
+			 IsA(path, MergePath) ? "merge" : "hash");
+		
+		/* Create an optimized version of this path with limit pushdown */
+		create_optimized_outer_join_path(root, joinrel, jpath, preserved_rel, 
+										 other_rel, jointype, extra);
+	}
 }
 
 /*
