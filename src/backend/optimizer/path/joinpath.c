@@ -383,9 +383,15 @@ add_paths_to_joinrel(PlannerInfo *root,
 	 * This can significantly reduce the amount of data processed in the join
 	 * by applying the limit to the preserved side before joining.
 	 * We do this after creating the standard paths so we can modify them.
+	 * 
+	 * IMPORTANT: Only apply this optimization if this joinrel covers all base
+	 * relations in the query. If there are more joins to come after this one,
+	 * pushing the limit down would be incorrect because subsequent joins could
+	 * change which rows are in the final result.
 	 */
 	if ((jointype == JOIN_LEFT || jointype == JOIN_RIGHT) &&
-		root->limit_tuples > 0 && root->sort_pathkeys != NIL)
+		root->limit_tuples > 0 && root->sort_pathkeys != NIL &&
+		bms_equal(joinrel->relids, root->all_baserels))
 	{
 		elog(DEBUG1, "Considering outer join LIMIT pushdown for jointype %d, limit_tuples %g", 
 			 jointype, root->limit_tuples);
