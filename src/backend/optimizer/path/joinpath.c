@@ -3058,10 +3058,104 @@ try_recursive_limit_pushdown(PlannerInfo *root,
 	}
 
 	/* Create a new optimized join path */
-	/* Initialize extra data (simplified version) */
+	/* Initialize extra data (complete version as in add_paths_to_joinrel) */
 	extra.restrictlist = jpath->joinrestrictinfo;
 	extra.mergeclause_list = NIL;
-	extra.inner_unique = false;
+	extra.sjinfo = NULL;
+	extra.param_source_rels = NULL;
+
+	/* Find the SpecialJoinInfo for this join */
+	ListCell   *lc;
+	Relids		joinrelids = rel->relids;
+	
+	foreach(lc, root->join_info_list)
+	{
+		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
+		
+		/* Check if this sjinfo matches our join */
+		if (bms_equal(sjinfo->syn_righthand, other_rel->relids) &&
+			sjinfo->jointype == jointype)
+		{
+			extra.sjinfo = sjinfo;
+			break;
+		}
+	}
+
+	/* Calculate inner_unique properly */
+	switch (jointype)
+	{
+		case JOIN_SEMI:
+		case JOIN_ANTI:
+			extra.inner_unique = false; /* well, unproven */
+			break;
+		default:
+			/* For LEFT JOIN: outer=preserved, inner=other
+			 * For RIGHT JOIN: outer=other, inner=preserved */
+			if (jointype == JOIN_LEFT)
+			{
+				extra.inner_unique = innerrel_is_unique(root,
+														rel->relids,
+														preserved_rel->relids,
+														other_rel,
+														jointype,
+														extra.restrictlist,
+														false);
+			}
+			else /* JOIN_RIGHT */
+			{
+				extra.inner_unique = innerrel_is_unique(root,
+														rel->relids,
+														other_rel->relids,
+														preserved_rel,
+														jointype,
+														extra.restrictlist,
+														false);
+			}
+			break;
+	}
+
+	/* Calculate param_source_rels as done in add_paths_to_joinrel */
+	foreach(lc, root->join_info_list)
+	{
+		SpecialJoinInfo *sjinfo2 = (SpecialJoinInfo *) lfirst(lc);
+
+		if (bms_overlap(joinrelids, sjinfo2->min_righthand) &&
+			!bms_overlap(joinrelids, sjinfo2->min_lefthand))
+			extra.param_source_rels = bms_join(extra.param_source_rels,
+											   bms_difference(root->all_baserels,
+															  sjinfo2->min_righthand));
+
+		/* full joins constrain both sides symmetrically */
+		if (sjinfo2->jointype == JOIN_FULL &&
+			bms_overlap(joinrelids, sjinfo2->min_lefthand) &&
+			!bms_overlap(joinrelids, sjinfo2->min_righthand))
+			extra.param_source_rels = bms_join(extra.param_source_rels,
+											   bms_difference(root->all_baserels,
+															  sjinfo2->min_lefthand));
+	}
+
+	/* Add lateral dependencies */
+	extra.param_source_rels = bms_add_members(extra.param_source_rels,
+											  rel->lateral_relids);
+
+	/* Calculate semifactors if needed */
+	if (jointype == JOIN_SEMI || jointype == JOIN_ANTI || extra.inner_unique)
+		compute_semi_anti_join_factors(root, rel, preserved_rel, other_rel,
+									   jointype, extra.sjinfo, extra.restrictlist,
+									   &extra.semifactors);
+
+	/* Get proper mergeclause_list for merge joins */
+	if (IsA(base_path, MergePath))
+	{
+		bool		mergejoin_allowed = true;
+		extra.mergeclause_list = select_mergejoin_clauses(root,
+														  rel,
+														  preserved_rel,
+														  other_rel,
+														  extra.restrictlist,
+														  jointype,
+														  &mergejoin_allowed);
+	}
 
 	if (IsA(base_path, NestPath))
 	{
