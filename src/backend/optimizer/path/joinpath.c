@@ -115,6 +115,15 @@ static Path *create_limited_path_for_relation(PlannerInfo *root,
 static Path *try_recursive_limit_pushdown(PlannerInfo *root,
 										  RelOptInfo *rel,
 										  Path *base_path);
+static void populate_joinpath_extra_data(PlannerInfo *root,
+										  RelOptInfo *joinrel,
+										  RelOptInfo *outerrel,
+										  RelOptInfo *innerrel,
+										  SpecialJoinInfo *sjinfo,
+										  JoinType jointype,
+										  List *restrictlist,
+										  JoinPathExtraData *extra,
+										  bool *mergejoin_allowed);
 static Path *create_optimized_nestloop_path(PlannerInfo *root,
 											RelOptInfo *joinrel,
 											JoinType jointype,
@@ -177,149 +186,11 @@ add_paths_to_joinrel(PlannerInfo *root,
 {
 	JoinPathExtraData extra;
 	bool		mergejoin_allowed = true;
-	ListCell   *lc;
-	Relids		joinrelids;
 
-	/*
-	 * PlannerInfo doesn't contain the SpecialJoinInfos created for joins
-	 * between child relations, even if there is a SpecialJoinInfo node for
-	 * the join between the topmost parents. So, while calculating Relids set
-	 * representing the restriction, consider relids of topmost parent of
-	 * partitions.
-	 */
-	if (joinrel->reloptkind == RELOPT_OTHER_JOINREL)
-		joinrelids = joinrel->top_parent_relids;
-	else
-		joinrelids = joinrel->relids;
-
-	extra.restrictlist = restrictlist;
-	extra.mergeclause_list = NIL;
-	extra.sjinfo = sjinfo;
-	extra.param_source_rels = NULL;
-
-	/*
-	 * See if the inner relation is provably unique for this outer rel.
-	 *
-	 * We have some special cases: for JOIN_SEMI and JOIN_ANTI, it doesn't
-	 * matter since the executor can make the equivalent optimization anyway;
-	 * we need not expend planner cycles on proofs.  For JOIN_UNIQUE_INNER, we
-	 * must be considering a semijoin whose inner side is not provably unique
-	 * (else reduce_unique_semijoins would've simplified it), so there's no
-	 * point in calling innerrel_is_unique.  However, if the LHS covers all of
-	 * the semijoin's min_lefthand, then it's appropriate to set inner_unique
-	 * because the path produced by create_unique_path will be unique relative
-	 * to the LHS.  (If we have an LHS that's only part of the min_lefthand,
-	 * that is *not* true.)  For JOIN_UNIQUE_OUTER, pass JOIN_INNER to avoid
-	 * letting that value escape this module.
-	 */
-	switch (jointype)
-	{
-		case JOIN_SEMI:
-		case JOIN_ANTI:
-
-			/*
-			 * XXX it may be worth proving this to allow a Memoize to be
-			 * considered for Nested Loop Semi/Anti Joins.
-			 */
-			extra.inner_unique = false; /* well, unproven */
-			break;
-		case JOIN_UNIQUE_INNER:
-			extra.inner_unique = bms_is_subset(sjinfo->min_lefthand,
-											   outerrel->relids);
-			break;
-		case JOIN_UNIQUE_OUTER:
-			extra.inner_unique = innerrel_is_unique(root,
-													joinrel->relids,
-													outerrel->relids,
-													innerrel,
-													JOIN_INNER,
-													restrictlist,
-													false);
-			break;
-		default:
-			extra.inner_unique = innerrel_is_unique(root,
-													joinrel->relids,
-													outerrel->relids,
-													innerrel,
-													jointype,
-													restrictlist,
-													false);
-			break;
-	}
-
-	/*
-	 * Find potential mergejoin clauses.  We can skip this if we are not
-	 * interested in doing a mergejoin.  However, mergejoin may be our only
-	 * way of implementing a full outer join, so override enable_mergejoin if
-	 * it's a full join.
-	 */
-	if (enable_mergejoin || jointype == JOIN_FULL)
-		extra.mergeclause_list = select_mergejoin_clauses(root,
-														  joinrel,
-														  outerrel,
-														  innerrel,
-														  restrictlist,
-														  jointype,
-														  &mergejoin_allowed);
-
-	/*
-	 * If it's SEMI, ANTI, or inner_unique join, compute correction factors
-	 * for cost estimation.  These will be the same for all paths.
-	 */
-	if (jointype == JOIN_SEMI || jointype == JOIN_ANTI || extra.inner_unique)
-		compute_semi_anti_join_factors(root, joinrel, outerrel, innerrel,
-									   jointype, sjinfo, restrictlist,
-									   &extra.semifactors);
-
-	/*
-	 * Decide whether it's sensible to generate parameterized paths for this
-	 * joinrel, and if so, which relations such paths should require.  There
-	 * is usually no need to create a parameterized result path unless there
-	 * is a join order restriction that prevents joining one of our input rels
-	 * directly to the parameter source rel instead of joining to the other
-	 * input rel.  (But see allow_star_schema_join().)	This restriction
-	 * reduces the number of parameterized paths we have to deal with at
-	 * higher join levels, without compromising the quality of the resulting
-	 * plan.  We express the restriction as a Relids set that must overlap the
-	 * parameterization of any proposed join path.  Note: param_source_rels
-	 * should contain only baserels, not OJ relids, so starting from
-	 * all_baserels not all_query_rels is correct.
-	 */
-	foreach(lc, root->join_info_list)
-	{
-		SpecialJoinInfo *sjinfo2 = (SpecialJoinInfo *) lfirst(lc);
-
-		/*
-		 * SJ is relevant to this join if we have some part of its RHS
-		 * (possibly not all of it), and haven't yet joined to its LHS.  (This
-		 * test is pretty simplistic, but should be sufficient considering the
-		 * join has already been proven legal.)  If the SJ is relevant, it
-		 * presents constraints for joining to anything not in its RHS.
-		 */
-		if (bms_overlap(joinrelids, sjinfo2->min_righthand) &&
-			!bms_overlap(joinrelids, sjinfo2->min_lefthand))
-			extra.param_source_rels = bms_join(extra.param_source_rels,
-											   bms_difference(root->all_baserels,
-															  sjinfo2->min_righthand));
-
-		/* full joins constrain both sides symmetrically */
-		if (sjinfo2->jointype == JOIN_FULL &&
-			bms_overlap(joinrelids, sjinfo2->min_lefthand) &&
-			!bms_overlap(joinrelids, sjinfo2->min_righthand))
-			extra.param_source_rels = bms_join(extra.param_source_rels,
-											   bms_difference(root->all_baserels,
-															  sjinfo2->min_lefthand));
-	}
-
-	/*
-	 * However, when a LATERAL subquery is involved, there will simply not be
-	 * any paths for the joinrel that aren't parameterized by whatever the
-	 * subquery is parameterized by, unless its parameterization is resolved
-	 * within the joinrel.  So we might as well allow additional dependencies
-	 * on whatever residual lateral dependencies the joinrel will have.
-	 */
-	extra.param_source_rels = bms_add_members(extra.param_source_rels,
-											  joinrel->lateral_relids);
+	/* Populate the JoinPathExtraData structure */
+	populate_joinpath_extra_data(root, joinrel, outerrel, innerrel,
+								 sjinfo, jointype, restrictlist, &extra,
+								 &mergejoin_allowed);
 
 
 
@@ -405,16 +276,6 @@ add_paths_to_joinrel(PlannerInfo *root,
 	}
 
 	/*
-	 * Save JoinPathExtraData in the joinrel for reuse in optimizations.
-	 * We need to make a copy since the local 'extra' variable will go out of scope.
-	 */
-	if (joinrel->reloptkind == RELOPT_JOINREL)
-	{
-		joinrel->join_extra = (JoinPathExtraData *) palloc(sizeof(JoinPathExtraData));
-		memcpy(joinrel->join_extra, &extra, sizeof(JoinPathExtraData));
-	}
-
-	/*
 	 * 6. Finally, give extensions a chance to manipulate the path list.  They
 	 * could add new paths (such as CustomPaths) by calling add_path(), or
 	 * add_partial_path() if parallel aware.  They could also delete or modify
@@ -451,6 +312,173 @@ allow_star_schema_join(PlannerInfo *root,
 	 */
 	return (bms_overlap(inner_paramrels, outerrelids) &&
 			bms_nonempty_difference(inner_paramrels, outerrelids));
+}
+
+/*
+ * populate_joinpath_extra_data
+ *		Fill in JoinPathExtraData structure with all necessary information
+ *		for creating join paths.
+ *
+ * This function encapsulates the common logic for initializing JoinPathExtraData
+ * that is used in both add_paths_to_joinrel and try_recursive_limit_pushdown
+ * to avoid code duplication.
+ */
+static void
+populate_joinpath_extra_data(PlannerInfo *root,
+							  RelOptInfo *joinrel,
+							  RelOptInfo *outerrel,
+							  RelOptInfo *innerrel,
+							  SpecialJoinInfo *sjinfo,
+							  JoinType jointype,
+							  List *restrictlist,
+							  JoinPathExtraData *extra,
+							  bool *mergejoin_allowed)
+{
+	ListCell   *lc;
+	Relids		joinrelids;
+
+	/*
+	 * PlannerInfo doesn't contain the SpecialJoinInfos created for joins
+	 * between child relations, even if there is a SpecialJoinInfo node for
+	 * the join between the topmost parents. So, while calculating Relids set
+	 * representing the restriction, consider relids of topmost parent of
+	 * partitions.
+	 */
+	if (joinrel->reloptkind == RELOPT_OTHER_JOINREL)
+		joinrelids = joinrel->top_parent_relids;
+	else
+		joinrelids = joinrel->relids;
+
+	extra->restrictlist = restrictlist;
+	extra->mergeclause_list = NIL;
+	extra->sjinfo = sjinfo;
+	extra->param_source_rels = NULL;
+
+	/*
+	 * See if the inner relation is provably unique for this outer rel.
+	 *
+	 * We have some special cases: for JOIN_SEMI and JOIN_ANTI, it doesn't
+	 * matter since the executor can make the equivalent optimization anyway;
+	 * we need not expend planner cycles on proofs.  For JOIN_UNIQUE_INNER, we
+	 * must be considering a semijoin whose inner side is not provably unique
+	 * (else reduce_unique_semijoins would've simplified it), so there's no
+	 * point in calling innerrel_is_unique.  However, if the LHS covers all of
+	 * the semijoin's min_lefthand, then it's appropriate to set inner_unique
+	 * because the path produced by create_unique_path will be unique relative
+	 * to the LHS.  (If we have an LHS that's only part of the min_lefthand,
+	 * that is *not* true.)  For JOIN_UNIQUE_OUTER, pass JOIN_INNER to avoid
+	 * letting that value escape this module.
+	 */
+	switch (jointype)
+	{
+		case JOIN_SEMI:
+		case JOIN_ANTI:
+
+			/*
+			 * XXX it may be worth proving this to allow a Memoize to be
+			 * considered for Nested Loop Semi/Anti Joins.
+			 */
+			extra->inner_unique = false; /* well, unproven */
+			break;
+		case JOIN_UNIQUE_INNER:
+			extra->inner_unique = bms_is_subset(sjinfo->min_lefthand,
+											   outerrel->relids);
+			break;
+		case JOIN_UNIQUE_OUTER:
+			extra->inner_unique = innerrel_is_unique(root,
+													joinrel->relids,
+													outerrel->relids,
+													innerrel,
+													JOIN_INNER,
+													restrictlist,
+													false);
+			break;
+		default:
+			extra->inner_unique = innerrel_is_unique(root,
+													joinrel->relids,
+													outerrel->relids,
+													innerrel,
+													jointype,
+													restrictlist,
+													false);
+			break;
+	}
+
+	/*
+	 * Find potential mergejoin clauses.  We can skip this if we are not
+	 * interested in doing a mergejoin.  However, mergejoin may be our only
+	 * way of implementing a full outer join, so override enable_mergejoin if
+	 * it's a full join.
+	 */
+	if (mergejoin_allowed && (enable_mergejoin || jointype == JOIN_FULL))
+	{
+		extra->mergeclause_list = select_mergejoin_clauses(root,
+														  joinrel,
+														  outerrel,
+														  innerrel,
+														  restrictlist,
+														  jointype,
+														  mergejoin_allowed);
+	}
+
+	/*
+	 * If it's SEMI, ANTI, or inner_unique join, compute correction factors
+	 * for cost estimation.  These will be the same for all paths.
+	 */
+	if (jointype == JOIN_SEMI || jointype == JOIN_ANTI || extra->inner_unique)
+		compute_semi_anti_join_factors(root, joinrel, outerrel, innerrel,
+									   jointype, sjinfo, restrictlist,
+									   &extra->semifactors);
+
+	/*
+	 * Decide whether it's sensible to generate parameterized paths for this
+	 * joinrel, and if so, which relations such paths should require.  There
+	 * is usually no need to create a parameterized result path unless there
+	 * is a join order restriction that prevents joining one of our input rels
+	 * directly to the parameter source rel instead of joining to the other
+	 * input rel.  (But see allow_star_schema_join().)	This restriction
+	 * reduces the number of parameterized paths we have to deal with at
+	 * higher join levels, without compromising the quality of the resulting
+	 * plan.  We express the restriction as a Relids set that must overlap the
+	 * parameterization of any proposed join path.  Note: param_source_rels
+	 * should contain only baserels, not OJ relids, so starting from
+	 * all_baserels not all_query_rels is correct.
+	 */
+	foreach(lc, root->join_info_list)
+	{
+		SpecialJoinInfo *sjinfo2 = (SpecialJoinInfo *) lfirst(lc);
+
+		/*
+		 * SJ is relevant to this join if we have some part of its RHS
+		 * (possibly not all of it), and haven't yet joined to its LHS.  (This
+		 * test is pretty simplistic, but should be sufficient considering the
+		 * join has already been proven legal.)  If the SJ is relevant, it
+		 * presents constraints for joining to anything not in its RHS.
+		 */
+		if (bms_overlap(joinrelids, sjinfo2->min_righthand) &&
+			!bms_overlap(joinrelids, sjinfo2->min_lefthand))
+			extra->param_source_rels = bms_join(extra->param_source_rels,
+											   bms_difference(root->all_baserels,
+															  sjinfo2->min_righthand));
+
+		/* full joins constrain both sides symmetrically */
+		if (sjinfo2->jointype == JOIN_FULL &&
+			bms_overlap(joinrelids, sjinfo2->min_lefthand) &&
+			!bms_overlap(joinrelids, sjinfo2->min_righthand))
+			extra->param_source_rels = bms_join(extra->param_source_rels,
+											   bms_difference(root->all_baserels,
+															  sjinfo2->min_lefthand));
+	}
+
+	/*
+	 * However, when a LATERAL subquery is involved, there will simply not be
+	 * any paths for the joinrel that aren't parameterized by whatever the
+	 * subquery is parameterized by, unless its parameterization is resolved
+	 * within the joinrel.  So we might as well allow additional dependencies
+	 * on whatever residual lateral dependencies the joinrel will have.
+	 */
+	extra->param_source_rels = bms_add_members(extra->param_source_rels,
+											  joinrel->lateral_relids);
 }
 
 /*
@@ -2980,11 +3008,14 @@ try_recursive_limit_pushdown(PlannerInfo *root,
 	JoinType	jointype;
 	Query	   *parse = root->parse;
 	ListCell   *sc;
+	ListCell   *lc;
 	bool		can_pushdown = true;
+	bool		mergejoin_allowed = true;
 	Bitmapset  *preserved_relids;
 	Path	   *recursive_preserved_path;
 	Path	   *limited_preserved_path;
 	Path	   *optimized_path = NULL;
+	SpecialJoinInfo *found_sjinfo = NULL;
 	JoinPathExtraData extra;
 
 	/* Only consider join paths for recursive optimization */
@@ -3068,27 +3099,37 @@ try_recursive_limit_pushdown(PlannerInfo *root,
 	}
 
 	/* Create a new optimized join path */
-	/* Use saved JoinPathExtraData from the RelOptInfo */
-	if (!rel->join_extra)
-	{
-		elog(DEBUG1, "No saved join_extra data found for recursive optimization");
-		return NULL;
-	}
+	/* First, find the SpecialJoinInfo for this join */
 	
-	/* Copy the saved extra data (in case we need to modify it) */
-	memcpy(&extra, rel->join_extra, sizeof(JoinPathExtraData));
-
-	/* Update mergeclause_list for merge joins if needed */
-	if (IsA(base_path, MergePath))
+	foreach(lc, root->join_info_list)
 	{
-		bool		mergejoin_allowed = true;
-		extra.mergeclause_list = select_mergejoin_clauses(root,
-														  rel,
-														  preserved_rel,
-														  other_rel,
-														  extra.restrictlist,
-														  jointype,
-														  &mergejoin_allowed);
+		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
+		
+		/* Check if this sjinfo matches our join */
+		if (bms_equal(sjinfo->syn_righthand, other_rel->relids) &&
+			sjinfo->jointype == jointype)
+		{
+			found_sjinfo = sjinfo;
+			break;
+		}
+	}
+
+	/* Populate JoinPathExtraData using the shared function */
+	if (jointype == JOIN_LEFT)
+	{
+		/* LEFT JOIN: preserved=outer, other=inner */
+		populate_joinpath_extra_data(root, rel, preserved_rel, other_rel,
+									 found_sjinfo, jointype, 
+									 jpath->joinrestrictinfo, &extra,
+									 &mergejoin_allowed);
+	}
+	else /* JOIN_RIGHT */
+	{
+		/* RIGHT JOIN: other=outer, preserved=inner */
+		populate_joinpath_extra_data(root, rel, other_rel, preserved_rel,
+									 found_sjinfo, jointype,
+									 jpath->joinrestrictinfo, &extra,
+									 &mergejoin_allowed);
 	}
 
 	if (IsA(base_path, NestPath))
