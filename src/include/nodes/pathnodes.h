@@ -30,6 +30,11 @@
 typedef Bitmapset *Relids;
 
 /*
+ * Forward declarations for structures used in RelOptInfo
+ */
+typedef struct JoinPathExtraData JoinPathExtraData;
+
+/*
  * When looking for a "cheapest path", this enum specifies whether we want
  * cheapest startup cost or cheapest total cost.
  */
@@ -985,6 +990,12 @@ typedef struct RelOptInfo
 	List	   *joininfo;
 	/* T means joininfo is incomplete */
 	bool		has_eclass_joins;
+
+	/*
+	 * join path extra data (for join rels only):
+	 */
+	/* saved JoinPathExtraData for reuse in optimizations */
+	JoinPathExtraData *join_extra pg_node_attr(read_write_ignore);
 
 	/*
 	 * used by partitionwise joins:

@@ -405,6 +405,16 @@ add_paths_to_joinrel(PlannerInfo *root,
 	}
 
 	/*
+	 * Save JoinPathExtraData in the joinrel for reuse in optimizations.
+	 * We need to make a copy since the local 'extra' variable will go out of scope.
+	 */
+	if (joinrel->reloptkind == RELOPT_JOINREL)
+	{
+		joinrel->join_extra = (JoinPathExtraData *) palloc(sizeof(JoinPathExtraData));
+		memcpy(joinrel->join_extra, &extra, sizeof(JoinPathExtraData));
+	}
+
+	/*
 	 * 6. Finally, give extensions a chance to manipulate the path list.  They
 	 * could add new paths (such as CustomPaths) by calling add_path(), or
 	 * add_partial_path() if parallel aware.  They could also delete or modify
@@ -3058,93 +3068,17 @@ try_recursive_limit_pushdown(PlannerInfo *root,
 	}
 
 	/* Create a new optimized join path */
-	/* Initialize extra data (complete version as in add_paths_to_joinrel) */
-	extra.restrictlist = jpath->joinrestrictinfo;
-	extra.mergeclause_list = NIL;
-	extra.sjinfo = NULL;
-	extra.param_source_rels = NULL;
-
-	/* Find the SpecialJoinInfo for this join */
-	ListCell   *lc;
-	Relids		joinrelids = rel->relids;
+	/* Use saved JoinPathExtraData from the RelOptInfo */
+	if (!rel->join_extra)
+	{
+		elog(DEBUG1, "No saved join_extra data found for recursive optimization");
+		return NULL;
+	}
 	
-	foreach(lc, root->join_info_list)
-	{
-		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
-		
-		/* Check if this sjinfo matches our join */
-		if (bms_equal(sjinfo->syn_righthand, other_rel->relids) &&
-			sjinfo->jointype == jointype)
-		{
-			extra.sjinfo = sjinfo;
-			break;
-		}
-	}
+	/* Copy the saved extra data (in case we need to modify it) */
+	memcpy(&extra, rel->join_extra, sizeof(JoinPathExtraData));
 
-	/* Calculate inner_unique properly */
-	switch (jointype)
-	{
-		case JOIN_SEMI:
-		case JOIN_ANTI:
-			extra.inner_unique = false; /* well, unproven */
-			break;
-		default:
-			/* For LEFT JOIN: outer=preserved, inner=other
-			 * For RIGHT JOIN: outer=other, inner=preserved */
-			if (jointype == JOIN_LEFT)
-			{
-				extra.inner_unique = innerrel_is_unique(root,
-														rel->relids,
-														preserved_rel->relids,
-														other_rel,
-														jointype,
-														extra.restrictlist,
-														false);
-			}
-			else /* JOIN_RIGHT */
-			{
-				extra.inner_unique = innerrel_is_unique(root,
-														rel->relids,
-														other_rel->relids,
-														preserved_rel,
-														jointype,
-														extra.restrictlist,
-														false);
-			}
-			break;
-	}
-
-	/* Calculate param_source_rels as done in add_paths_to_joinrel */
-	foreach(lc, root->join_info_list)
-	{
-		SpecialJoinInfo *sjinfo2 = (SpecialJoinInfo *) lfirst(lc);
-
-		if (bms_overlap(joinrelids, sjinfo2->min_righthand) &&
-			!bms_overlap(joinrelids, sjinfo2->min_lefthand))
-			extra.param_source_rels = bms_join(extra.param_source_rels,
-											   bms_difference(root->all_baserels,
-															  sjinfo2->min_righthand));
-
-		/* full joins constrain both sides symmetrically */
-		if (sjinfo2->jointype == JOIN_FULL &&
-			bms_overlap(joinrelids, sjinfo2->min_lefthand) &&
-			!bms_overlap(joinrelids, sjinfo2->min_righthand))
-			extra.param_source_rels = bms_join(extra.param_source_rels,
-											   bms_difference(root->all_baserels,
-															  sjinfo2->min_lefthand));
-	}
-
-	/* Add lateral dependencies */
-	extra.param_source_rels = bms_add_members(extra.param_source_rels,
-											  rel->lateral_relids);
-
-	/* Calculate semifactors if needed */
-	if (jointype == JOIN_SEMI || jointype == JOIN_ANTI || extra.inner_unique)
-		compute_semi_anti_join_factors(root, rel, preserved_rel, other_rel,
-									   jointype, extra.sjinfo, extra.restrictlist,
-									   &extra.semifactors);
-
-	/* Get proper mergeclause_list for merge joins */
+	/* Update mergeclause_list for merge joins if needed */
 	if (IsA(base_path, MergePath))
 	{
 		bool		mergejoin_allowed = true;
