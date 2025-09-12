@@ -2708,13 +2708,16 @@ create_optimized_outer_join_path(PlannerInfo *root,
 	/* 
 	 * Recursively apply LIMIT pushdown if the preserved relation is also 
 	 * an outer join that can benefit from the optimization 
+	 * 
+	 * Temporarily disabled due to "variable not found in subplan target lists" errors
+	 * in complex nested outer joins. This optimization needs further investigation.
 	 */
-	recursive_path = try_recursive_limit_pushdown(root, preserved_rel, preserved_path);
+	/* recursive_path = try_recursive_limit_pushdown(root, preserved_rel, preserved_path);
 	if (recursive_path)
 	{
 		elog(DEBUG1, "Applied recursive LIMIT pushdown to preserved relation");
 		preserved_path = recursive_path;
-	}
+	} */
 
 	/* Create a limited version of the preserved relation path */
 	limited_path = create_limited_path_for_relation(root, preserved_rel, preserved_path);
