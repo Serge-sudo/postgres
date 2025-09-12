@@ -931,6 +931,16 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"enable_outer_join_limit_pushdown", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enables the planner's use of ORDER BY LIMIT pushdown for outer joins."),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&enable_outer_join_limit_pushdown,
+		true,
+		NULL, NULL, NULL
+	},
+	{
 		{"enable_parallel_append", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables the planner's use of parallel append plans."),
 			NULL,

@@ -261,7 +261,8 @@ add_paths_to_joinrel(PlannerInfo *root,
 	 * Check if this join covers all base relations by subtracting outer join
 	 * relation IDs from the joinrel's relids and comparing with all_baserels.
 	 */
-	if ((jointype == JOIN_LEFT || jointype == JOIN_RIGHT) &&
+	if (enable_outer_join_limit_pushdown &&
+		(jointype == JOIN_LEFT || jointype == JOIN_RIGHT) &&
 		root->limit_tuples > 0 && root->sort_pathkeys != NIL)
 	{
 		Relids base_relids = bms_difference(joinrel->relids, root->outer_join_rels);

@@ -1,0 +1,3005 @@
+diff -U3 /home/runner/work/postgres/postgres/src/test/regress/expected/sysviews.out /home/runner/work/postgres/postgres/src/test/regress/results/sysviews.out
+--- /home/runner/work/postgres/postgres/src/test/regress/expected/sysviews.out	2025-09-12 09:02:26.802193905 +0000
++++ /home/runner/work/postgres/postgres/src/test/regress/results/sysviews.out	2025-09-12 09:15:05.107005804 +0000
+@@ -132,31 +132,32 @@
+ -- This is to record the prevailing planner enable_foo settings during
+ -- a regression test run.
+ select name, setting from pg_settings where name like 'enable%';
+-              name              | setting 
+---------------------------------+---------
+- enable_async_append            | on
+- enable_bitmapscan              | on
+- enable_gathermerge             | on
+- enable_group_by_reordering     | on
+- enable_hashagg                 | on
+- enable_hashjoin                | on
+- enable_incremental_sort        | on
+- enable_indexonlyscan           | on
+- enable_indexscan               | on
+- enable_material                | on
+- enable_memoize                 | on
+- enable_mergejoin               | on
+- enable_nestloop                | on
+- enable_parallel_append         | on
+- enable_parallel_hash           | on
+- enable_partition_pruning       | on
+- enable_partitionwise_aggregate | off
+- enable_partitionwise_join      | off
+- enable_presorted_aggregate     | on
+- enable_seqscan                 | on
+- enable_sort                    | on
+- enable_tidscan                 | on
+-(22 rows)
++               name               | setting 
++----------------------------------+---------
++ enable_async_append              | on
++ enable_bitmapscan                | on
++ enable_gathermerge               | on
++ enable_group_by_reordering       | on
++ enable_hashagg                   | on
++ enable_hashjoin                  | on
++ enable_incremental_sort          | on
++ enable_indexonlyscan             | on
++ enable_indexscan                 | on
++ enable_material                  | on
++ enable_memoize                   | on
++ enable_mergejoin                 | on
++ enable_nestloop                  | on
++ enable_outer_join_limit_pushdown | on
++ enable_parallel_append           | on
++ enable_parallel_hash             | on
++ enable_partition_pruning         | on
++ enable_partitionwise_aggregate   | off
++ enable_partitionwise_join        | off
++ enable_presorted_aggregate       | on
++ enable_seqscan                   | on
++ enable_sort                      | on
++ enable_tidscan                   | on
++(23 rows)
+ 
+ -- There are always wait event descriptions for various types.  InjectionPoint
+ -- may be present or absent, depending on history since last postmaster start.
+diff -U3 /home/runner/work/postgres/postgres/src/test/regress/expected/plpgsql.out /home/runner/work/postgres/postgres/src/test/regress/results/plpgsql.out
+--- /home/runner/work/postgres/postgres/src/test/regress/expected/plpgsql.out	2025-09-12 09:02:26.794193791 +0000
++++ /home/runner/work/postgres/postgres/src/test/regress/results/plpgsql.out	2025-09-12 09:15:12.436109833 +0000
+@@ -5201,654 +5201,10 @@
+   raise notice 'a = %', a;
+ end$$;
+ NOTICE:  a = {1,2,3}
+---
+--- Test access to call stack
+---
+-create function inner_func(int)
+-returns int as $$
+-declare _context text;
+-begin
+-  get diagnostics _context = pg_context;
+-  raise notice '***%***', _context;
+-  -- lets do it again, just for fun..
+-  get diagnostics _context = pg_context;
+-  raise notice '***%***', _context;
+-  raise notice 'lets make sure we didnt break anything';
+-  return 2 * $1;
+-end;
+-$$ language plpgsql;
+-create or replace function outer_func(int)
+-returns int as $$
+-declare
+-  myresult int;
+-begin
+-  raise notice 'calling down into inner_func()';
+-  myresult := inner_func($1);
+-  raise notice 'inner_func() done';
+-  return myresult;
+-end;
+-$$ language plpgsql;
+-create or replace function outer_outer_func(int)
+-returns int as $$
+-declare
+-  myresult int;
+-begin
+-  raise notice 'calling down into outer_func()';
+-  myresult := outer_func($1);
+-  raise notice 'outer_func() done';
+-  return myresult;
+-end;
+-$$ language plpgsql;
+-select outer_outer_func(10);
+-NOTICE:  calling down into outer_func()
+-NOTICE:  calling down into inner_func()
+-NOTICE:  ***PL/pgSQL function inner_func(integer) line 4 at GET DIAGNOSTICS
+-PL/pgSQL function outer_func(integer) line 6 at assignment
+-PL/pgSQL function outer_outer_func(integer) line 6 at assignment***
+-NOTICE:  ***PL/pgSQL function inner_func(integer) line 7 at GET DIAGNOSTICS
+-PL/pgSQL function outer_func(integer) line 6 at assignment
+-PL/pgSQL function outer_outer_func(integer) line 6 at assignment***
+-NOTICE:  lets make sure we didnt break anything
+-NOTICE:  inner_func() done
+-NOTICE:  outer_func() done
+- outer_outer_func 
+-------------------
+-               20
+-(1 row)
+-
+--- repeated call should work
+-select outer_outer_func(20);
+-NOTICE:  calling down into outer_func()
+-NOTICE:  calling down into inner_func()
+-NOTICE:  ***PL/pgSQL function inner_func(integer) line 4 at GET DIAGNOSTICS
+-PL/pgSQL function outer_func(integer) line 6 at assignment
+-PL/pgSQL function outer_outer_func(integer) line 6 at assignment***
+-NOTICE:  ***PL/pgSQL function inner_func(integer) line 7 at GET DIAGNOSTICS
+-PL/pgSQL function outer_func(integer) line 6 at assignment
+-PL/pgSQL function outer_outer_func(integer) line 6 at assignment***
+-NOTICE:  lets make sure we didnt break anything
+-NOTICE:  inner_func() done
+-NOTICE:  outer_func() done
+- outer_outer_func 
+-------------------
+-               40
+-(1 row)
+-
+-drop function outer_outer_func(int);
+-drop function outer_func(int);
+-drop function inner_func(int);
+--- access to call stack from exception
+-create function inner_func(int)
+-returns int as $$
+-declare
+-  _context text;
+-  sx int := 5;
+-begin
+-  begin
+-    perform sx / 0;
+-  exception
+-    when division_by_zero then
+-      get diagnostics _context = pg_context;
+-      raise notice '***%***', _context;
+-  end;
+-
+-  -- lets do it again, just for fun..
+-  get diagnostics _context = pg_context;
+-  raise notice '***%***', _context;
+-  raise notice 'lets make sure we didnt break anything';
+-  return 2 * $1;
+-end;
+-$$ language plpgsql;
+-create or replace function outer_func(int)
+-returns int as $$
+-declare
+-  myresult int;
+-begin
+-  raise notice 'calling down into inner_func()';
+-  myresult := inner_func($1);
+-  raise notice 'inner_func() done';
+-  return myresult;
+-end;
+-$$ language plpgsql;
+-create or replace function outer_outer_func(int)
+-returns int as $$
+-declare
+-  myresult int;
+-begin
+-  raise notice 'calling down into outer_func()';
+-  myresult := outer_func($1);
+-  raise notice 'outer_func() done';
+-  return myresult;
+-end;
+-$$ language plpgsql;
+-select outer_outer_func(10);
+-NOTICE:  calling down into outer_func()
+-NOTICE:  calling down into inner_func()
+-NOTICE:  ***PL/pgSQL function inner_func(integer) line 10 at GET DIAGNOSTICS
+-PL/pgSQL function outer_func(integer) line 6 at assignment
+-PL/pgSQL function outer_outer_func(integer) line 6 at assignment***
+-NOTICE:  ***PL/pgSQL function inner_func(integer) line 15 at GET DIAGNOSTICS
+-PL/pgSQL function outer_func(integer) line 6 at assignment
+-PL/pgSQL function outer_outer_func(integer) line 6 at assignment***
+-NOTICE:  lets make sure we didnt break anything
+-NOTICE:  inner_func() done
+-NOTICE:  outer_func() done
+- outer_outer_func 
+-------------------
+-               20
+-(1 row)
+-
+--- repeated call should work
+-select outer_outer_func(20);
+-NOTICE:  calling down into outer_func()
+-NOTICE:  calling down into inner_func()
+-NOTICE:  ***PL/pgSQL function inner_func(integer) line 10 at GET DIAGNOSTICS
+-PL/pgSQL function outer_func(integer) line 6 at assignment
+-PL/pgSQL function outer_outer_func(integer) line 6 at assignment***
+-NOTICE:  ***PL/pgSQL function inner_func(integer) line 15 at GET DIAGNOSTICS
+-PL/pgSQL function outer_func(integer) line 6 at assignment
+-PL/pgSQL function outer_outer_func(integer) line 6 at assignment***
+-NOTICE:  lets make sure we didnt break anything
+-NOTICE:  inner_func() done
+-NOTICE:  outer_func() done
+- outer_outer_func 
+-------------------
+-               40
+-(1 row)
+-
+-drop function outer_outer_func(int);
+-drop function outer_func(int);
+-drop function inner_func(int);
+--- Test pg_routine_oid
+-create function current_function(text)
+-returns regprocedure as $$
+-declare
+-  fn_oid regprocedure;
+-begin
+-  get diagnostics fn_oid = pg_routine_oid;
+-  return fn_oid;
+-end;
+-$$ language plpgsql;
+-select current_function('foo');
+-    current_function    
+-------------------------
+- current_function(text)
+-(1 row)
+-
+-drop function current_function(text);
+--- shouldn't fail in DO, even though there's no useful data
+-do $$
+-declare
+-  fn_oid oid;
+-begin
+-  get diagnostics fn_oid = pg_routine_oid;
+-  raise notice 'pg_routine_oid = %', fn_oid;
+-end;
+-$$;
+-NOTICE:  pg_routine_oid = 0
+---
+--- Test ASSERT
+---
+-do $$
+-begin
+-  assert 1=1;  -- should succeed
+-end;
+-$$;
+-do $$
+-begin
+-  assert 1=0;  -- should fail
+-end;
+-$$;
+-ERROR:  assertion failed
+-CONTEXT:  PL/pgSQL function inline_code_block line 3 at ASSERT
+-do $$
+-begin
+-  assert NULL;  -- should fail
+-end;
+-$$;
+-ERROR:  assertion failed
+-CONTEXT:  PL/pgSQL function inline_code_block line 3 at ASSERT
+--- check controlling GUC
+-set plpgsql.check_asserts = off;
+-do $$
+-begin
+-  assert 1=0;  -- won't be tested
+-end;
+-$$;
+-reset plpgsql.check_asserts;
+--- test custom message
+-do $$
+-declare var text := 'some value';
+-begin
+-  assert 1=0, format('assertion failed, var = "%s"', var);
+-end;
+-$$;
+-ERROR:  assertion failed, var = "some value"
+-CONTEXT:  PL/pgSQL function inline_code_block line 4 at ASSERT
+--- ensure assertions are not trapped by 'others'
+-do $$
+-begin
+-  assert 1=0, 'unhandled assertion';
+-exception when others then
+-  null; -- do nothing
+-end;
+-$$;
+-ERROR:  unhandled assertion
+-CONTEXT:  PL/pgSQL function inline_code_block line 3 at ASSERT
+--- Test use of plpgsql in a domain check constraint (cf. bug #14414)
+-create function plpgsql_domain_check(val int) returns boolean as $$
+-begin return val > 0; end
+-$$ language plpgsql immutable;
+-create domain plpgsql_domain as integer check(plpgsql_domain_check(value));
+-do $$
+-declare v_test plpgsql_domain;
+-begin
+-  v_test := 1;
+-end;
+-$$;
+-do $$
+-declare v_test plpgsql_domain := 1;
+-begin
+-  v_test := 0;  -- fail
+-end;
+-$$;
+-ERROR:  value for domain plpgsql_domain violates check constraint "plpgsql_domain_check"
+-CONTEXT:  PL/pgSQL function inline_code_block line 4 at assignment
+--- Test handling of expanded array passed to a domain constraint (bug #14472)
+-create function plpgsql_arr_domain_check(val int[]) returns boolean as $$
+-begin return val[1] > 0; end
+-$$ language plpgsql immutable;
+-create domain plpgsql_arr_domain as int[] check(plpgsql_arr_domain_check(value));
+-do $$
+-declare v_test plpgsql_arr_domain;
+-begin
+-  v_test := array[1];
+-  v_test := v_test || 2;
+-end;
+-$$;
+-do $$
+-declare v_test plpgsql_arr_domain := array[1];
+-begin
+-  v_test := 0 || v_test;  -- fail
+-end;
+-$$;
+-ERROR:  value for domain plpgsql_arr_domain violates check constraint "plpgsql_arr_domain_check"
+-CONTEXT:  PL/pgSQL function inline_code_block line 4 at assignment
+---
+--- test usage of transition tables in AFTER triggers
+---
+-CREATE TABLE transition_table_base (id int PRIMARY KEY, val text);
+-CREATE FUNCTION transition_table_base_ins_func()
+-  RETURNS trigger
+-  LANGUAGE plpgsql
+-AS $$
+-DECLARE
+-  t text;
+-  l text;
+-BEGIN
+-  t = '';
+-  FOR l IN EXECUTE
+-           $q$
+-             EXPLAIN (TIMING off, COSTS off, VERBOSE on)
+-             SELECT * FROM newtable
+-           $q$ LOOP
+-    t = t || l || E'\n';
+-  END LOOP;
+-
+-  RAISE INFO '%', t;
+-  RETURN new;
+-END;
+-$$;
+-CREATE TRIGGER transition_table_base_ins_trig
+-  AFTER INSERT ON transition_table_base
+-  REFERENCING OLD TABLE AS oldtable NEW TABLE AS newtable
+-  FOR EACH STATEMENT
+-  EXECUTE PROCEDURE transition_table_base_ins_func();
+-ERROR:  OLD TABLE can only be specified for a DELETE or UPDATE trigger
+-CREATE TRIGGER transition_table_base_ins_trig
+-  AFTER INSERT ON transition_table_base
+-  REFERENCING NEW TABLE AS newtable
+-  FOR EACH STATEMENT
+-  EXECUTE PROCEDURE transition_table_base_ins_func();
+-INSERT INTO transition_table_base VALUES (1, 'One'), (2, 'Two');
+-INFO:  Named Tuplestore Scan
+-  Output: id, val
+-
+-INSERT INTO transition_table_base VALUES (3, 'Three'), (4, 'Four');
+-INFO:  Named Tuplestore Scan
+-  Output: id, val
+-
+-CREATE OR REPLACE FUNCTION transition_table_base_upd_func()
+-  RETURNS trigger
+-  LANGUAGE plpgsql
+-AS $$
+-DECLARE
+-  t text;
+-  l text;
+-BEGIN
+-  t = '';
+-  FOR l IN EXECUTE
+-           $q$
+-             EXPLAIN (TIMING off, COSTS off, VERBOSE on)
+-             SELECT * FROM oldtable ot FULL JOIN newtable nt USING (id)
+-           $q$ LOOP
+-    t = t || l || E'\n';
+-  END LOOP;
+-
+-  RAISE INFO '%', t;
+-  RETURN new;
+-END;
+-$$;
+-CREATE TRIGGER transition_table_base_upd_trig
+-  AFTER UPDATE ON transition_table_base
+-  REFERENCING OLD TABLE AS oldtable NEW TABLE AS newtable
+-  FOR EACH STATEMENT
+-  EXECUTE PROCEDURE transition_table_base_upd_func();
+-UPDATE transition_table_base
+-  SET val = '*' || val || '*'
+-  WHERE id BETWEEN 2 AND 3;
+-INFO:  Hash Full Join
+-  Output: COALESCE(ot.id, nt.id), ot.val, nt.val
+-  Hash Cond: (ot.id = nt.id)
+-  ->  Named Tuplestore Scan
+-        Output: ot.id, ot.val
+-  ->  Hash
+-        Output: nt.id, nt.val
+-        ->  Named Tuplestore Scan
+-              Output: nt.id, nt.val
+-
+-CREATE TABLE transition_table_level1
+-(
+-      level1_no serial NOT NULL ,
+-      level1_node_name varchar(255),
+-       PRIMARY KEY (level1_no)
+-) WITHOUT OIDS;
+-CREATE TABLE transition_table_level2
+-(
+-      level2_no serial NOT NULL ,
+-      parent_no int NOT NULL,
+-      level1_node_name varchar(255),
+-       PRIMARY KEY (level2_no)
+-) WITHOUT OIDS;
+-CREATE TABLE transition_table_status
+-(
+-      level int NOT NULL,
+-      node_no int NOT NULL,
+-      status int,
+-       PRIMARY KEY (level, node_no)
+-) WITHOUT OIDS;
+-CREATE FUNCTION transition_table_level1_ri_parent_del_func()
+-  RETURNS TRIGGER
+-  LANGUAGE plpgsql
+-AS $$
+-  DECLARE n bigint;
+-  BEGIN
+-    PERFORM FROM p JOIN transition_table_level2 c ON c.parent_no = p.level1_no;
+-    IF FOUND THEN
+-      RAISE EXCEPTION 'RI error';
+-    END IF;
+-    RETURN NULL;
+-  END;
+-$$;
+-CREATE TRIGGER transition_table_level1_ri_parent_del_trigger
+-  AFTER DELETE ON transition_table_level1
+-  REFERENCING OLD TABLE AS p
+-  FOR EACH STATEMENT EXECUTE PROCEDURE
+-    transition_table_level1_ri_parent_del_func();
+-CREATE FUNCTION transition_table_level1_ri_parent_upd_func()
+-  RETURNS TRIGGER
+-  LANGUAGE plpgsql
+-AS $$
+-  DECLARE
+-    x int;
+-  BEGIN
+-    WITH p AS (SELECT level1_no, sum(delta) cnt
+-                 FROM (SELECT level1_no, 1 AS delta FROM i
+-                       UNION ALL
+-                       SELECT level1_no, -1 AS delta FROM d) w
+-                 GROUP BY level1_no
+-                 HAVING sum(delta) < 0)
+-    SELECT level1_no
+-      FROM p JOIN transition_table_level2 c ON c.parent_no = p.level1_no
+-      INTO x;
+-    IF FOUND THEN
+-      RAISE EXCEPTION 'RI error';
+-    END IF;
+-    RETURN NULL;
+-  END;
+-$$;
+-CREATE TRIGGER transition_table_level1_ri_parent_upd_trigger
+-  AFTER UPDATE ON transition_table_level1
+-  REFERENCING OLD TABLE AS d NEW TABLE AS i
+-  FOR EACH STATEMENT EXECUTE PROCEDURE
+-    transition_table_level1_ri_parent_upd_func();
+-CREATE FUNCTION transition_table_level2_ri_child_insupd_func()
+-  RETURNS TRIGGER
+-  LANGUAGE plpgsql
+-AS $$
+-  BEGIN
+-    PERFORM FROM i
+-      LEFT JOIN transition_table_level1 p
+-        ON p.level1_no IS NOT NULL AND p.level1_no = i.parent_no
+-      WHERE p.level1_no IS NULL;
+-    IF FOUND THEN
+-      RAISE EXCEPTION 'RI error';
+-    END IF;
+-    RETURN NULL;
+-  END;
+-$$;
+-CREATE TRIGGER transition_table_level2_ri_child_ins_trigger
+-  AFTER INSERT ON transition_table_level2
+-  REFERENCING NEW TABLE AS i
+-  FOR EACH STATEMENT EXECUTE PROCEDURE
+-    transition_table_level2_ri_child_insupd_func();
+-CREATE TRIGGER transition_table_level2_ri_child_upd_trigger
+-  AFTER UPDATE ON transition_table_level2
+-  REFERENCING NEW TABLE AS i
+-  FOR EACH STATEMENT EXECUTE PROCEDURE
+-    transition_table_level2_ri_child_insupd_func();
+--- create initial test data
+-INSERT INTO transition_table_level1 (level1_no)
+-  SELECT generate_series(1,200);
+-ANALYZE transition_table_level1;
+-INSERT INTO transition_table_level2 (level2_no, parent_no)
+-  SELECT level2_no, level2_no / 50 + 1 AS parent_no
+-    FROM generate_series(1,9999) level2_no;
+-ANALYZE transition_table_level2;
+-INSERT INTO transition_table_status (level, node_no, status)
+-  SELECT 1, level1_no, 0 FROM transition_table_level1;
+-INSERT INTO transition_table_status (level, node_no, status)
+-  SELECT 2, level2_no, 0 FROM transition_table_level2;
+-ANALYZE transition_table_status;
+-INSERT INTO transition_table_level1(level1_no)
+-  SELECT generate_series(201,1000);
+-ANALYZE transition_table_level1;
+--- behave reasonably if someone tries to modify a transition table
+-CREATE FUNCTION transition_table_level2_bad_usage_func()
+-  RETURNS TRIGGER
+-  LANGUAGE plpgsql
+-AS $$
+-  BEGIN
+-    INSERT INTO dx VALUES (1000000, 1000000, 'x');
+-    RETURN NULL;
+-  END;
+-$$;
+-CREATE TRIGGER transition_table_level2_bad_usage_trigger
+-  AFTER DELETE ON transition_table_level2
+-  REFERENCING OLD TABLE AS dx
+-  FOR EACH STATEMENT EXECUTE PROCEDURE
+-    transition_table_level2_bad_usage_func();
+-DELETE FROM transition_table_level2
+-  WHERE level2_no BETWEEN 301 AND 305;
+-ERROR:  relation "dx" cannot be the target of a modifying statement
+-CONTEXT:  SQL statement "INSERT INTO dx VALUES (1000000, 1000000, 'x')"
+-PL/pgSQL function transition_table_level2_bad_usage_func() line 3 at SQL statement
+-DROP TRIGGER transition_table_level2_bad_usage_trigger
+-  ON transition_table_level2;
+--- attempt modifications which would break RI (should all fail)
+-DELETE FROM transition_table_level1
+-  WHERE level1_no = 25;
+-ERROR:  RI error
+-CONTEXT:  PL/pgSQL function transition_table_level1_ri_parent_del_func() line 6 at RAISE
+-UPDATE transition_table_level1 SET level1_no = -1
+-  WHERE level1_no = 30;
+-ERROR:  RI error
+-CONTEXT:  PL/pgSQL function transition_table_level1_ri_parent_upd_func() line 15 at RAISE
+-INSERT INTO transition_table_level2 (level2_no, parent_no)
+-  VALUES (10000, 10000);
+-ERROR:  RI error
+-CONTEXT:  PL/pgSQL function transition_table_level2_ri_child_insupd_func() line 8 at RAISE
+-UPDATE transition_table_level2 SET parent_no = 2000
+-  WHERE level2_no = 40;
+-ERROR:  RI error
+-CONTEXT:  PL/pgSQL function transition_table_level2_ri_child_insupd_func() line 8 at RAISE
+--- attempt modifications which would not break RI (should all succeed)
+-DELETE FROM transition_table_level1
+-  WHERE level1_no BETWEEN 201 AND 1000;
+-DELETE FROM transition_table_level1
+-  WHERE level1_no BETWEEN 100000000 AND 100000010;
+-SELECT count(*) FROM transition_table_level1;
+- count 
+--------
+-   200
+-(1 row)
+-
+-DELETE FROM transition_table_level2
+-  WHERE level2_no BETWEEN 211 AND 220;
+-SELECT count(*) FROM transition_table_level2;
+- count 
+--------
+-  9989
+-(1 row)
+-
+-CREATE TABLE alter_table_under_transition_tables
+-(
+-  id int PRIMARY KEY,
+-  name text
+-);
+-CREATE FUNCTION alter_table_under_transition_tables_upd_func()
+-  RETURNS TRIGGER
+-  LANGUAGE plpgsql
+-AS $$
+-BEGIN
+-  RAISE WARNING 'old table = %, new table = %',
+-                  (SELECT string_agg(id || '=' || name, ',') FROM d),
+-                  (SELECT string_agg(id || '=' || name, ',') FROM i);
+-  RAISE NOTICE 'one = %', (SELECT 1 FROM alter_table_under_transition_tables LIMIT 1);
+-  RETURN NULL;
+-END;
+-$$;
+--- should fail, TRUNCATE is not compatible with transition tables
+-CREATE TRIGGER alter_table_under_transition_tables_upd_trigger
+-  AFTER TRUNCATE OR UPDATE ON alter_table_under_transition_tables
+-  REFERENCING OLD TABLE AS d NEW TABLE AS i
+-  FOR EACH STATEMENT EXECUTE PROCEDURE
+-    alter_table_under_transition_tables_upd_func();
+-ERROR:  TRUNCATE triggers with transition tables are not supported
+--- should work
+-CREATE TRIGGER alter_table_under_transition_tables_upd_trigger
+-  AFTER UPDATE ON alter_table_under_transition_tables
+-  REFERENCING OLD TABLE AS d NEW TABLE AS i
+-  FOR EACH STATEMENT EXECUTE PROCEDURE
+-    alter_table_under_transition_tables_upd_func();
+-INSERT INTO alter_table_under_transition_tables
+-  VALUES (1, '1'), (2, '2'), (3, '3');
+-UPDATE alter_table_under_transition_tables
+-  SET name = name || name;
+-WARNING:  old table = 1=1,2=2,3=3, new table = 1=11,2=22,3=33
+-NOTICE:  one = 1
+--- now change 'name' to an integer to see what happens...
+-ALTER TABLE alter_table_under_transition_tables
+-  ALTER COLUMN name TYPE int USING name::integer;
+-UPDATE alter_table_under_transition_tables
+-  SET name = (name::text || name::text)::integer;
+-WARNING:  old table = 1=11,2=22,3=33, new table = 1=1111,2=2222,3=3333
+-NOTICE:  one = 1
+--- now drop column 'name'
+-ALTER TABLE alter_table_under_transition_tables
+-  DROP column name;
+-UPDATE alter_table_under_transition_tables
+-  SET id = id;
+-ERROR:  column "name" does not exist
+-LINE 1: (SELECT string_agg(id || '=' || name, ',') FROM d)
+-                                        ^
+-QUERY:  (SELECT string_agg(id || '=' || name, ',') FROM d)
+-CONTEXT:  PL/pgSQL function alter_table_under_transition_tables_upd_func() line 3 at RAISE
+---
+--- Test multiple reference to a transition table
+---
+-CREATE TABLE multi_test (i int);
+-INSERT INTO multi_test VALUES (1);
+-CREATE OR REPLACE FUNCTION multi_test_trig() RETURNS trigger
+-LANGUAGE plpgsql AS $$
+-BEGIN
+-    RAISE NOTICE 'count = %', (SELECT COUNT(*) FROM new_test);
+-    RAISE NOTICE 'count union = %',
+-      (SELECT COUNT(*)
+-       FROM (SELECT * FROM new_test UNION ALL SELECT * FROM new_test) ss);
+-    RETURN NULL;
+-END$$;
+-CREATE TRIGGER my_trigger AFTER UPDATE ON multi_test
+-  REFERENCING NEW TABLE AS new_test OLD TABLE as old_test
+-  FOR EACH STATEMENT EXECUTE PROCEDURE multi_test_trig();
+-UPDATE multi_test SET i = i;
+-NOTICE:  count = 1
+-NOTICE:  count union = 2
+-DROP TABLE multi_test;
+-DROP FUNCTION multi_test_trig();
+---
+--- Check type parsing and record fetching from partitioned tables
+---
+-CREATE TABLE partitioned_table (a int, b text) PARTITION BY LIST (a);
+-CREATE TABLE pt_part1 PARTITION OF partitioned_table FOR VALUES IN (1);
+-CREATE TABLE pt_part2 PARTITION OF partitioned_table FOR VALUES IN (2);
+-INSERT INTO partitioned_table VALUES (1, 'Row 1');
+-INSERT INTO partitioned_table VALUES (2, 'Row 2');
+-CREATE OR REPLACE FUNCTION get_from_partitioned_table(partitioned_table.a%type)
+-RETURNS partitioned_table AS $$
+-DECLARE
+-    a_val partitioned_table.a%TYPE;
+-    result partitioned_table%ROWTYPE;
+-BEGIN
+-    a_val := $1;
+-    SELECT * INTO result FROM partitioned_table WHERE a = a_val;
+-    RETURN result;
+-END; $$ LANGUAGE plpgsql;
+-NOTICE:  type reference partitioned_table.a%TYPE converted to integer
+-SELECT * FROM get_from_partitioned_table(1) AS t;
+- a |   b   
+----+-------
+- 1 | Row 1
+-(1 row)
+-
+-CREATE OR REPLACE FUNCTION list_partitioned_table()
+-RETURNS SETOF public.partitioned_table.a%TYPE AS $$
+-DECLARE
+-    row public.partitioned_table%ROWTYPE;
+-    a_val public.partitioned_table.a%TYPE;
+-BEGIN
+-    FOR row IN SELECT * FROM public.partitioned_table ORDER BY a LOOP
+-        a_val := row.a;
+-        RETURN NEXT a_val;
+-    END LOOP;
+-    RETURN;
+-END; $$ LANGUAGE plpgsql;
+-NOTICE:  type reference public.partitioned_table.a%TYPE converted to integer
+-SELECT * FROM list_partitioned_table() AS t;
+- t 
+----
+- 1
+- 2
+-(2 rows)
+-
+---
+--- Check argument name is used instead of $n in error message
+---
+-CREATE FUNCTION fx(x WSlot) RETURNS void AS $$
+-BEGIN
+-  GET DIAGNOSTICS x = ROW_COUNT;
+-  RETURN;
+-END; $$ LANGUAGE plpgsql;
+-ERROR:  "x" is not a scalar variable
+-LINE 3:   GET DIAGNOSTICS x = ROW_COUNT;
+-                          ^
++WARNING:  terminating connection because of crash of another server process
++DETAIL:  The postmaster has commanded this server process to roll back the current transaction and exit, because another server process exited abnormally and possibly corrupted shared memory.
++HINT:  In a moment you should be able to reconnect to the database and repeat your command.
++server closed the connection unexpectedly
++	This probably means the server terminated abnormally
++	before or while processing the request.
++connection to server was lost
+diff -U3 /home/runner/work/postgres/postgres/src/test/regress/expected/alter_table.out /home/runner/work/postgres/postgres/src/test/regress/results/alter_table.out
+--- /home/runner/work/postgres/postgres/src/test/regress/expected/alter_table.out	2025-09-12 09:02:26.772193476 +0000
++++ /home/runner/work/postgres/postgres/src/test/regress/results/alter_table.out	2025-09-12 09:15:12.433109790 +0000
+@@ -2438,2268 +2438,10 @@
+ Number of child tables: 1 (Use \d+ to list them.)
+ 
+ \d test_inh_check_child
+-        Table "public.test_inh_check_child"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- a      | numeric |           |          | 
+- b      | numeric |           |          | 
+-Check constraints:
+-    "blocal" CHECK (b::double precision < 1000::double precision)
+-    "bmerged" CHECK (b::double precision > 1::double precision)
+-    "test_inh_check_a_check" CHECK (a::double precision > 10.2::double precision)
+-Inherits: test_inh_check
+-
+-select relname, conname, coninhcount, conislocal, connoinherit
+-  from pg_constraint c, pg_class r
+-  where relname like 'test_inh_check%' and c.conrelid = r.oid
+-  order by 1, 2;
+-       relname        |        conname         | coninhcount | conislocal | connoinherit 
+-----------------------+------------------------+-------------+------------+--------------
+- test_inh_check       | bmerged                |           0 | t          | f
+- test_inh_check       | bnoinherit             |           0 | t          | t
+- test_inh_check       | test_inh_check_a_check |           0 | t          | f
+- test_inh_check_child | blocal                 |           0 | t          | f
+- test_inh_check_child | bmerged                |           1 | t          | f
+- test_inh_check_child | test_inh_check_a_check |           1 | f          | f
+-(6 rows)
+-
+--- ALTER COLUMN TYPE with different schema in children
+--- Bug at https://postgr.es/m/20170102225618.GA10071@telsasoft.com
+-CREATE TABLE test_type_diff (f1 int);
+-CREATE TABLE test_type_diff_c (extra smallint) INHERITS (test_type_diff);
+-ALTER TABLE test_type_diff ADD COLUMN f2 int;
+-INSERT INTO test_type_diff_c VALUES (1, 2, 3);
+-ALTER TABLE test_type_diff ALTER COLUMN f2 TYPE bigint USING f2::bigint;
+-CREATE TABLE test_type_diff2 (int_two int2, int_four int4, int_eight int8);
+-CREATE TABLE test_type_diff2_c1 (int_four int4, int_eight int8, int_two int2);
+-CREATE TABLE test_type_diff2_c2 (int_eight int8, int_two int2, int_four int4);
+-CREATE TABLE test_type_diff2_c3 (int_two int2, int_four int4, int_eight int8);
+-ALTER TABLE test_type_diff2_c1 INHERIT test_type_diff2;
+-ALTER TABLE test_type_diff2_c2 INHERIT test_type_diff2;
+-ALTER TABLE test_type_diff2_c3 INHERIT test_type_diff2;
+-INSERT INTO test_type_diff2_c1 VALUES (1, 2, 3);
+-INSERT INTO test_type_diff2_c2 VALUES (4, 5, 6);
+-INSERT INTO test_type_diff2_c3 VALUES (7, 8, 9);
+-ALTER TABLE test_type_diff2 ALTER COLUMN int_four TYPE int8 USING int_four::int8;
+--- whole-row references are disallowed
+-ALTER TABLE test_type_diff2 ALTER COLUMN int_four TYPE int4 USING (pg_column_size(test_type_diff2));
+-ERROR:  cannot convert whole-row table reference
+-DETAIL:  USING expression contains a whole-row table reference.
+--- check for rollback of ANALYZE corrupting table property flags (bug #11638)
+-CREATE TABLE check_fk_presence_1 (id int PRIMARY KEY, t text);
+-CREATE TABLE check_fk_presence_2 (id int REFERENCES check_fk_presence_1, t text);
+-BEGIN;
+-ALTER TABLE check_fk_presence_2 DROP CONSTRAINT check_fk_presence_2_id_fkey;
+-ANALYZE check_fk_presence_2;
+-ROLLBACK;
+-\d check_fk_presence_2
+-        Table "public.check_fk_presence_2"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- id     | integer |           |          | 
+- t      | text    |           |          | 
+-Foreign-key constraints:
+-    "check_fk_presence_2_id_fkey" FOREIGN KEY (id) REFERENCES check_fk_presence_1(id)
+-
+-DROP TABLE check_fk_presence_1, check_fk_presence_2;
+--- check column addition within a view (bug #14876)
+-create table at_base_table(id int, stuff text);
+-insert into at_base_table values (23, 'skidoo');
+-create view at_view_1 as select * from at_base_table bt;
+-create view at_view_2 as select *, to_json(v1) as j from at_view_1 v1;
+-\d+ at_view_1
+-                          View "public.at_view_1"
+- Column |  Type   | Collation | Nullable | Default | Storage  | Description 
+---------+---------+-----------+----------+---------+----------+-------------
+- id     | integer |           |          |         | plain    | 
+- stuff  | text    |           |          |         | extended | 
+-View definition:
+- SELECT id,
+-    stuff
+-   FROM at_base_table bt;
+-
+-\d+ at_view_2
+-                          View "public.at_view_2"
+- Column |  Type   | Collation | Nullable | Default | Storage  | Description 
+---------+---------+-----------+----------+---------+----------+-------------
+- id     | integer |           |          |         | plain    | 
+- stuff  | text    |           |          |         | extended | 
+- j      | json    |           |          |         | extended | 
+-View definition:
+- SELECT id,
+-    stuff,
+-    to_json(v1.*) AS j
+-   FROM at_view_1 v1;
+-
+-explain (verbose, costs off) select * from at_view_2;
+-                        QUERY PLAN                        
+-----------------------------------------------------------
+- Seq Scan on public.at_base_table bt
+-   Output: bt.id, bt.stuff, to_json(ROW(bt.id, bt.stuff))
+-(2 rows)
+-
+-select * from at_view_2;
+- id | stuff  |             j              
+-----+--------+----------------------------
+- 23 | skidoo | {"id":23,"stuff":"skidoo"}
+-(1 row)
+-
+-create or replace view at_view_1 as select *, 2+2 as more from at_base_table bt;
+-\d+ at_view_1
+-                          View "public.at_view_1"
+- Column |  Type   | Collation | Nullable | Default | Storage  | Description 
+---------+---------+-----------+----------+---------+----------+-------------
+- id     | integer |           |          |         | plain    | 
+- stuff  | text    |           |          |         | extended | 
+- more   | integer |           |          |         | plain    | 
+-View definition:
+- SELECT id,
+-    stuff,
+-    2 + 2 AS more
+-   FROM at_base_table bt;
+-
+-\d+ at_view_2
+-                          View "public.at_view_2"
+- Column |  Type   | Collation | Nullable | Default | Storage  | Description 
+---------+---------+-----------+----------+---------+----------+-------------
+- id     | integer |           |          |         | plain    | 
+- stuff  | text    |           |          |         | extended | 
+- j      | json    |           |          |         | extended | 
+-View definition:
+- SELECT id,
+-    stuff,
+-    to_json(v1.*) AS j
+-   FROM at_view_1 v1;
+-
+-explain (verbose, costs off) select * from at_view_2;
+-                         QUERY PLAN                          
+--------------------------------------------------------------
+- Seq Scan on public.at_base_table bt
+-   Output: bt.id, bt.stuff, to_json(ROW(bt.id, bt.stuff, 4))
+-(2 rows)
+-
+-select * from at_view_2;
+- id | stuff  |                  j                  
+-----+--------+-------------------------------------
+- 23 | skidoo | {"id":23,"stuff":"skidoo","more":4}
+-(1 row)
+-
+-drop view at_view_2;
+-drop view at_view_1;
+-drop table at_base_table;
+--- related case (bug #17811)
+-begin;
+-create temp table t1 as select * from int8_tbl;
+-create temp view v1 as select 1::int8 as q1;
+-create temp view v2 as select * from v1;
+-create or replace temp view v1 with (security_barrier = true)
+-  as select * from t1;
+-create temp table log (q1 int8, q2 int8);
+-create rule v1_upd_rule as on update to v1
+-  do also insert into log values (new.*);
+-update v2 set q1 = q1 + 1 where q1 = 123;
+-select * from t1;
+-        q1        |        q2         
+-------------------+-------------------
+- 4567890123456789 |               123
+- 4567890123456789 |  4567890123456789
+- 4567890123456789 | -4567890123456789
+-              124 |               456
+-              124 |  4567890123456789
+-(5 rows)
+-
+-select * from log;
+- q1  |        q2        
+------+------------------
+- 124 |              456
+- 124 | 4567890123456789
+-(2 rows)
+-
+-rollback;
+--- check adding a column not itself requiring a rewrite, together with
+--- a column requiring a default (bug #16038)
+--- ensure that rewrites aren't silently optimized away, removing the
+--- value of the test
+-CREATE FUNCTION check_ddl_rewrite(p_tablename regclass, p_ddl text)
+-RETURNS boolean
+-LANGUAGE plpgsql AS $$
+-DECLARE
+-    v_relfilenode oid;
+-BEGIN
+-    v_relfilenode := relfilenode FROM pg_class WHERE oid = p_tablename;
+-
+-    EXECUTE p_ddl;
+-
+-    RETURN v_relfilenode <> (SELECT relfilenode FROM pg_class WHERE oid = p_tablename);
+-END;
+-$$;
+-CREATE TABLE rewrite_test(col text);
+-INSERT INTO rewrite_test VALUES ('something');
+-INSERT INTO rewrite_test VALUES (NULL);
+--- empty[12] don't need rewrite, but notempty[12]_rewrite will force one
+-SELECT check_ddl_rewrite('rewrite_test', $$
+-  ALTER TABLE rewrite_test
+-      ADD COLUMN empty1 text,
+-      ADD COLUMN notempty1_rewrite serial;
+-$$);
+- check_ddl_rewrite 
+--------------------
+- t
+-(1 row)
+-
+-SELECT check_ddl_rewrite('rewrite_test', $$
+-    ALTER TABLE rewrite_test
+-        ADD COLUMN notempty2_rewrite serial,
+-        ADD COLUMN empty2 text;
+-$$);
+- check_ddl_rewrite 
+--------------------
+- t
+-(1 row)
+-
+--- also check that fast defaults cause no problem, first without rewrite
+-SELECT check_ddl_rewrite('rewrite_test', $$
+-    ALTER TABLE rewrite_test
+-        ADD COLUMN empty3 text,
+-        ADD COLUMN notempty3_norewrite int default 42;
+-$$);
+- check_ddl_rewrite 
+--------------------
+- f
+-(1 row)
+-
+-SELECT check_ddl_rewrite('rewrite_test', $$
+-    ALTER TABLE rewrite_test
+-        ADD COLUMN notempty4_norewrite int default 42,
+-        ADD COLUMN empty4 text;
+-$$);
+- check_ddl_rewrite 
+--------------------
+- f
+-(1 row)
+-
+--- then with rewrite
+-SELECT check_ddl_rewrite('rewrite_test', $$
+-    ALTER TABLE rewrite_test
+-        ADD COLUMN empty5 text,
+-        ADD COLUMN notempty5_norewrite int default 42,
+-        ADD COLUMN notempty5_rewrite serial;
+-$$);
+- check_ddl_rewrite 
+--------------------
+- t
+-(1 row)
+-
+-SELECT check_ddl_rewrite('rewrite_test', $$
+-    ALTER TABLE rewrite_test
+-        ADD COLUMN notempty6_rewrite serial,
+-        ADD COLUMN empty6 text,
+-        ADD COLUMN notempty6_norewrite int default 42;
+-$$);
+- check_ddl_rewrite 
+--------------------
+- t
+-(1 row)
+-
+--- cleanup
+-DROP FUNCTION check_ddl_rewrite(regclass, text);
+-DROP TABLE rewrite_test;
+---
+--- lock levels
+---
+-drop type lockmodes;
+-ERROR:  type "lockmodes" does not exist
+-create type lockmodes as enum (
+- 'SIReadLock'
+-,'AccessShareLock'
+-,'RowShareLock'
+-,'RowExclusiveLock'
+-,'ShareUpdateExclusiveLock'
+-,'ShareLock'
+-,'ShareRowExclusiveLock'
+-,'ExclusiveLock'
+-,'AccessExclusiveLock'
+-);
+-drop view my_locks;
+-ERROR:  view "my_locks" does not exist
+-create or replace view my_locks as
+-select case when c.relname like 'pg_toast%' then 'pg_toast' else c.relname end, max(mode::lockmodes) as max_lockmode
+-from pg_locks l join pg_class c on l.relation = c.oid
+-where virtualtransaction = (
+-        select virtualtransaction
+-        from pg_locks
+-        where transactionid = pg_current_xact_id()::xid)
+-and locktype = 'relation'
+-and relnamespace != (select oid from pg_namespace where nspname = 'pg_catalog')
+-and c.relname != 'my_locks'
+-group by c.relname;
+-create table alterlock (f1 int primary key, f2 text);
+-insert into alterlock values (1, 'foo');
+-create table alterlock2 (f3 int primary key, f1 int);
+-insert into alterlock2 values (1, 1);
+-begin; alter table alterlock alter column f2 set statistics 150;
+-select * from my_locks order by 1;
+-  relname  |       max_lockmode       
+------------+--------------------------
+- alterlock | ShareUpdateExclusiveLock
+-(1 row)
+-
+-rollback;
+-begin; alter table alterlock cluster on alterlock_pkey;
+-select * from my_locks order by 1;
+-    relname     |       max_lockmode       
+-----------------+--------------------------
+- alterlock      | ShareUpdateExclusiveLock
+- alterlock_pkey | ShareUpdateExclusiveLock
+-(2 rows)
+-
+-commit;
+-begin; alter table alterlock set without cluster;
+-select * from my_locks order by 1;
+-  relname  |       max_lockmode       
+------------+--------------------------
+- alterlock | ShareUpdateExclusiveLock
+-(1 row)
+-
+-commit;
+-begin; alter table alterlock set (fillfactor = 100);
+-select * from my_locks order by 1;
+-  relname  |       max_lockmode       
+------------+--------------------------
+- alterlock | ShareUpdateExclusiveLock
+- pg_toast  | ShareUpdateExclusiveLock
+-(2 rows)
+-
+-commit;
+-begin; alter table alterlock reset (fillfactor);
+-select * from my_locks order by 1;
+-  relname  |       max_lockmode       
+------------+--------------------------
+- alterlock | ShareUpdateExclusiveLock
+- pg_toast  | ShareUpdateExclusiveLock
+-(2 rows)
+-
+-commit;
+-begin; alter table alterlock set (toast.autovacuum_enabled = off);
+-select * from my_locks order by 1;
+-  relname  |       max_lockmode       
+------------+--------------------------
+- alterlock | ShareUpdateExclusiveLock
+- pg_toast  | ShareUpdateExclusiveLock
+-(2 rows)
+-
+-commit;
+-begin; alter table alterlock set (autovacuum_enabled = off);
+-select * from my_locks order by 1;
+-  relname  |       max_lockmode       
+------------+--------------------------
+- alterlock | ShareUpdateExclusiveLock
+- pg_toast  | ShareUpdateExclusiveLock
+-(2 rows)
+-
+-commit;
+-begin; alter table alterlock alter column f2 set (n_distinct = 1);
+-select * from my_locks order by 1;
+-  relname  |       max_lockmode       
+------------+--------------------------
+- alterlock | ShareUpdateExclusiveLock
+-(1 row)
+-
+-rollback;
+--- test that mixing options with different lock levels works as expected
+-begin; alter table alterlock set (autovacuum_enabled = off, fillfactor = 80);
+-select * from my_locks order by 1;
+-  relname  |       max_lockmode       
+------------+--------------------------
+- alterlock | ShareUpdateExclusiveLock
+- pg_toast  | ShareUpdateExclusiveLock
+-(2 rows)
+-
+-commit;
+-begin; alter table alterlock alter column f2 set storage extended;
+-select * from my_locks order by 1;
+-  relname  |    max_lockmode     
+------------+---------------------
+- alterlock | AccessExclusiveLock
+-(1 row)
+-
+-rollback;
+-begin; alter table alterlock alter column f2 set default 'x';
+-select * from my_locks order by 1;
+-  relname  |    max_lockmode     
+------------+---------------------
+- alterlock | AccessExclusiveLock
+-(1 row)
+-
+-rollback;
+-begin;
+-create trigger ttdummy
+-	before delete or update on alterlock
+-	for each row
+-	execute procedure
+-	ttdummy (1, 1);
+-select * from my_locks order by 1;
+-  relname  |     max_lockmode      
+------------+-----------------------
+- alterlock | ShareRowExclusiveLock
+-(1 row)
+-
+-rollback;
+-begin;
+-select * from my_locks order by 1;
+- relname | max_lockmode 
+----------+--------------
+-(0 rows)
+-
+-alter table alterlock2 add foreign key (f1) references alterlock (f1);
+-select * from my_locks order by 1;
+-     relname     |     max_lockmode      
+------------------+-----------------------
+- alterlock       | ShareRowExclusiveLock
+- alterlock2      | ShareRowExclusiveLock
+- alterlock2_pkey | AccessShareLock
+- alterlock_pkey  | AccessShareLock
+-(4 rows)
+-
+-rollback;
+-begin;
+-alter table alterlock2
+-add constraint alterlock2nv foreign key (f1) references alterlock (f1) NOT VALID;
+-select * from my_locks order by 1;
+-  relname   |     max_lockmode      
+-------------+-----------------------
+- alterlock  | ShareRowExclusiveLock
+- alterlock2 | ShareRowExclusiveLock
+-(2 rows)
+-
+-commit;
+-begin;
+-alter table alterlock2 validate constraint alterlock2nv;
+-select * from my_locks order by 1;
+-     relname     |       max_lockmode       
+------------------+--------------------------
+- alterlock       | RowShareLock
+- alterlock2      | ShareUpdateExclusiveLock
+- alterlock2_pkey | AccessShareLock
+- alterlock_pkey  | AccessShareLock
+-(4 rows)
+-
+-rollback;
+-create or replace view my_locks as
+-select case when c.relname like 'pg_toast%' then 'pg_toast' else c.relname end, max(mode::lockmodes) as max_lockmode
+-from pg_locks l join pg_class c on l.relation = c.oid
+-where virtualtransaction = (
+-        select virtualtransaction
+-        from pg_locks
+-        where transactionid = pg_current_xact_id()::xid)
+-and locktype = 'relation'
+-and relnamespace != (select oid from pg_namespace where nspname = 'pg_catalog')
+-and c.relname = 'my_locks'
+-group by c.relname;
+--- raise exception
+-alter table my_locks set (autovacuum_enabled = false);
+-ERROR:  unrecognized parameter "autovacuum_enabled"
+-alter view my_locks set (autovacuum_enabled = false);
+-ERROR:  unrecognized parameter "autovacuum_enabled"
+-alter table my_locks reset (autovacuum_enabled);
+-alter view my_locks reset (autovacuum_enabled);
+-begin;
+-alter view my_locks set (security_barrier=off);
+-select * from my_locks order by 1;
+- relname  |    max_lockmode     
+-----------+---------------------
+- my_locks | AccessExclusiveLock
+-(1 row)
+-
+-alter view my_locks reset (security_barrier);
+-rollback;
+--- this test intentionally applies the ALTER TABLE command against a view, but
+--- uses a view option so we expect this to succeed. This form of SQL is
+--- accepted for historical reasons, as shown in the docs for ALTER VIEW
+-begin;
+-alter table my_locks set (security_barrier=off);
+-select * from my_locks order by 1;
+- relname  |    max_lockmode     
+-----------+---------------------
+- my_locks | AccessExclusiveLock
+-(1 row)
+-
+-alter table my_locks reset (security_barrier);
+-rollback;
+--- cleanup
+-drop table alterlock2;
+-drop table alterlock;
+-drop view my_locks;
+-drop type lockmodes;
+---
+--- alter function
+---
+-create function test_strict(text) returns text as
+-    'select coalesce($1, ''got passed a null'');'
+-    language sql returns null on null input;
+-select test_strict(NULL);
+- test_strict 
+--------------
+- 
+-(1 row)
+-
+-alter function test_strict(text) called on null input;
+-select test_strict(NULL);
+-    test_strict    
+--------------------
+- got passed a null
+-(1 row)
+-
+-create function non_strict(text) returns text as
+-    'select coalesce($1, ''got passed a null'');'
+-    language sql called on null input;
+-select non_strict(NULL);
+-    non_strict     
+--------------------
+- got passed a null
+-(1 row)
+-
+-alter function non_strict(text) returns null on null input;
+-select non_strict(NULL);
+- non_strict 
+-------------
+- 
+-(1 row)
+-
+---
+--- alter object set schema
+---
+-create schema alter1;
+-create schema alter2;
+-create table alter1.t1(f1 serial primary key, f2 int check (f2 > 0));
+-create view alter1.v1 as select * from alter1.t1;
+-create function alter1.plus1(int) returns int as 'select $1+1' language sql;
+-create domain alter1.posint integer check (value > 0);
+-create type alter1.ctype as (f1 int, f2 text);
+-create function alter1.same(alter1.ctype, alter1.ctype) returns boolean language sql
+-as 'select $1.f1 is not distinct from $2.f1 and $1.f2 is not distinct from $2.f2';
+-create operator alter1.=(procedure = alter1.same, leftarg  = alter1.ctype, rightarg = alter1.ctype);
+-create operator class alter1.ctype_hash_ops default for type alter1.ctype using hash as
+-  operator 1 alter1.=(alter1.ctype, alter1.ctype);
+-create conversion alter1.latin1_to_utf8 for 'latin1' to 'utf8' from iso8859_1_to_utf8;
+-create text search parser alter1.prs(start = prsd_start, gettoken = prsd_nexttoken, end = prsd_end, lextypes = prsd_lextype);
+-create text search configuration alter1.cfg(parser = alter1.prs);
+-create text search template alter1.tmpl(init = dsimple_init, lexize = dsimple_lexize);
+-create text search dictionary alter1.dict(template = alter1.tmpl);
+-insert into alter1.t1(f2) values(11);
+-insert into alter1.t1(f2) values(12);
+-alter table alter1.t1 set schema alter1; -- no-op, same schema
+-alter table alter1.t1 set schema alter2;
+-alter table alter1.v1 set schema alter2;
+-alter function alter1.plus1(int) set schema alter2;
+-alter domain alter1.posint set schema alter2;
+-alter operator class alter1.ctype_hash_ops using hash set schema alter2;
+-alter operator family alter1.ctype_hash_ops using hash set schema alter2;
+-alter operator alter1.=(alter1.ctype, alter1.ctype) set schema alter2;
+-alter function alter1.same(alter1.ctype, alter1.ctype) set schema alter2;
+-alter type alter1.ctype set schema alter1; -- no-op, same schema
+-alter type alter1.ctype set schema alter2;
+-alter conversion alter1.latin1_to_utf8 set schema alter2;
+-alter text search parser alter1.prs set schema alter2;
+-alter text search configuration alter1.cfg set schema alter2;
+-alter text search template alter1.tmpl set schema alter2;
+-alter text search dictionary alter1.dict set schema alter2;
+--- this should succeed because nothing is left in alter1
+-drop schema alter1;
+-insert into alter2.t1(f2) values(13);
+-insert into alter2.t1(f2) values(14);
+-select * from alter2.t1;
+- f1 | f2 
+-----+----
+-  1 | 11
+-  2 | 12
+-  3 | 13
+-  4 | 14
+-(4 rows)
+-
+-select * from alter2.v1;
+- f1 | f2 
+-----+----
+-  1 | 11
+-  2 | 12
+-  3 | 13
+-  4 | 14
+-(4 rows)
+-
+-select alter2.plus1(41);
+- plus1 
+--------
+-    42
+-(1 row)
+-
+--- clean up
+-drop schema alter2 cascade;
+-NOTICE:  drop cascades to 13 other objects
+-DETAIL:  drop cascades to table alter2.t1
+-drop cascades to view alter2.v1
+-drop cascades to function alter2.plus1(integer)
+-drop cascades to type alter2.posint
+-drop cascades to type alter2.ctype
+-drop cascades to function alter2.same(alter2.ctype,alter2.ctype)
+-drop cascades to operator alter2.=(alter2.ctype,alter2.ctype)
+-drop cascades to operator family alter2.ctype_hash_ops for access method hash
+-drop cascades to conversion alter2.latin1_to_utf8
+-drop cascades to text search parser alter2.prs
+-drop cascades to text search configuration alter2.cfg
+-drop cascades to text search template alter2.tmpl
+-drop cascades to text search dictionary alter2.dict
+---
+--- composite types
+---
+-CREATE TYPE test_type AS (a int);
+-\d test_type
+-         Composite type "public.test_type"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- a      | integer |           |          | 
+-
+-ALTER TYPE nosuchtype ADD ATTRIBUTE b text; -- fails
+-ERROR:  relation "nosuchtype" does not exist
+-ALTER TYPE test_type ADD ATTRIBUTE b text;
+-\d test_type
+-         Composite type "public.test_type"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- a      | integer |           |          | 
+- b      | text    |           |          | 
+-
+-ALTER TYPE test_type ADD ATTRIBUTE b text; -- fails
+-ERROR:  column "b" of relation "test_type" already exists
+-ALTER TYPE test_type ALTER ATTRIBUTE b SET DATA TYPE varchar;
+-\d test_type
+-              Composite type "public.test_type"
+- Column |       Type        | Collation | Nullable | Default 
+---------+-------------------+-----------+----------+---------
+- a      | integer           |           |          | 
+- b      | character varying |           |          | 
+-
+-ALTER TYPE test_type ALTER ATTRIBUTE b SET DATA TYPE integer;
+-\d test_type
+-         Composite type "public.test_type"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- a      | integer |           |          | 
+- b      | integer |           |          | 
+-
+-ALTER TYPE test_type DROP ATTRIBUTE b;
+-\d test_type
+-         Composite type "public.test_type"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- a      | integer |           |          | 
+-
+-ALTER TYPE test_type DROP ATTRIBUTE c; -- fails
+-ERROR:  column "c" of relation "test_type" does not exist
+-ALTER TYPE test_type DROP ATTRIBUTE IF EXISTS c;
+-NOTICE:  column "c" of relation "test_type" does not exist, skipping
+-ALTER TYPE test_type DROP ATTRIBUTE a, ADD ATTRIBUTE d boolean;
+-\d test_type
+-         Composite type "public.test_type"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- d      | boolean |           |          | 
+-
+-ALTER TYPE test_type RENAME ATTRIBUTE a TO aa;
+-ERROR:  column "a" does not exist
+-ALTER TYPE test_type RENAME ATTRIBUTE d TO dd;
+-\d test_type
+-         Composite type "public.test_type"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- dd     | boolean |           |          | 
+-
+-DROP TYPE test_type;
+-CREATE TYPE test_type1 AS (a int, b text);
+-CREATE TABLE test_tbl1 (x int, y test_type1);
+-ALTER TYPE test_type1 ALTER ATTRIBUTE b TYPE varchar; -- fails
+-ERROR:  cannot alter type "test_type1" because column "test_tbl1.y" uses it
+-DROP TABLE test_tbl1;
+-CREATE TABLE test_tbl1 (x int, y text);
+-CREATE INDEX test_tbl1_idx ON test_tbl1((row(x,y)::test_type1));
+-ALTER TYPE test_type1 ALTER ATTRIBUTE b TYPE varchar; -- fails
+-ERROR:  cannot alter type "test_type1" because column "test_tbl1_idx.row" uses it
+-DROP TABLE test_tbl1;
+-DROP TYPE test_type1;
+-CREATE TYPE test_type2 AS (a int, b text);
+-CREATE TABLE test_tbl2 OF test_type2;
+-CREATE TABLE test_tbl2_subclass () INHERITS (test_tbl2);
+-\d test_type2
+-        Composite type "public.test_type2"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- a      | integer |           |          | 
+- b      | text    |           |          | 
+-
+-\d test_tbl2
+-             Table "public.test_tbl2"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- a      | integer |           |          | 
+- b      | text    |           |          | 
+-Number of child tables: 1 (Use \d+ to list them.)
+-Typed table of type: test_type2
+-
+-ALTER TYPE test_type2 ADD ATTRIBUTE c text; -- fails
+-ERROR:  cannot alter type "test_type2" because it is the type of a typed table
+-HINT:  Use ALTER ... CASCADE to alter the typed tables too.
+-ALTER TYPE test_type2 ADD ATTRIBUTE c text CASCADE;
+-\d test_type2
+-        Composite type "public.test_type2"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- a      | integer |           |          | 
+- b      | text    |           |          | 
+- c      | text    |           |          | 
+-
+-\d test_tbl2
+-             Table "public.test_tbl2"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- a      | integer |           |          | 
+- b      | text    |           |          | 
+- c      | text    |           |          | 
+-Number of child tables: 1 (Use \d+ to list them.)
+-Typed table of type: test_type2
+-
+-ALTER TYPE test_type2 ALTER ATTRIBUTE b TYPE varchar; -- fails
+-ERROR:  cannot alter type "test_type2" because it is the type of a typed table
+-HINT:  Use ALTER ... CASCADE to alter the typed tables too.
+-ALTER TYPE test_type2 ALTER ATTRIBUTE b TYPE varchar CASCADE;
+-\d test_type2
+-             Composite type "public.test_type2"
+- Column |       Type        | Collation | Nullable | Default 
+---------+-------------------+-----------+----------+---------
+- a      | integer           |           |          | 
+- b      | character varying |           |          | 
+- c      | text              |           |          | 
+-
+-\d test_tbl2
+-                  Table "public.test_tbl2"
+- Column |       Type        | Collation | Nullable | Default 
+---------+-------------------+-----------+----------+---------
+- a      | integer           |           |          | 
+- b      | character varying |           |          | 
+- c      | text              |           |          | 
+-Number of child tables: 1 (Use \d+ to list them.)
+-Typed table of type: test_type2
+-
+-ALTER TYPE test_type2 DROP ATTRIBUTE b; -- fails
+-ERROR:  cannot alter type "test_type2" because it is the type of a typed table
+-HINT:  Use ALTER ... CASCADE to alter the typed tables too.
+-ALTER TYPE test_type2 DROP ATTRIBUTE b CASCADE;
+-\d test_type2
+-        Composite type "public.test_type2"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- a      | integer |           |          | 
+- c      | text    |           |          | 
+-
+-\d test_tbl2
+-             Table "public.test_tbl2"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- a      | integer |           |          | 
+- c      | text    |           |          | 
+-Number of child tables: 1 (Use \d+ to list them.)
+-Typed table of type: test_type2
+-
+-ALTER TYPE test_type2 RENAME ATTRIBUTE a TO aa; -- fails
+-ERROR:  cannot alter type "test_type2" because it is the type of a typed table
+-HINT:  Use ALTER ... CASCADE to alter the typed tables too.
+-ALTER TYPE test_type2 RENAME ATTRIBUTE a TO aa CASCADE;
+-\d test_type2
+-        Composite type "public.test_type2"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- aa     | integer |           |          | 
+- c      | text    |           |          | 
+-
+-\d test_tbl2
+-             Table "public.test_tbl2"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- aa     | integer |           |          | 
+- c      | text    |           |          | 
+-Number of child tables: 1 (Use \d+ to list them.)
+-Typed table of type: test_type2
+-
+-\d test_tbl2_subclass
+-         Table "public.test_tbl2_subclass"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- aa     | integer |           |          | 
+- c      | text    |           |          | 
+-Inherits: test_tbl2
+-
+-DROP TABLE test_tbl2_subclass, test_tbl2;
+-DROP TYPE test_type2;
+-CREATE TYPE test_typex AS (a int, b text);
+-CREATE TABLE test_tblx (x int, y test_typex check ((y).a > 0));
+-ALTER TYPE test_typex DROP ATTRIBUTE a; -- fails
+-ERROR:  cannot drop column a of composite type test_typex because other objects depend on it
+-DETAIL:  constraint test_tblx_y_check on table test_tblx depends on column a of composite type test_typex
+-HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+-ALTER TYPE test_typex DROP ATTRIBUTE a CASCADE;
+-NOTICE:  drop cascades to constraint test_tblx_y_check on table test_tblx
+-\d test_tblx
+-               Table "public.test_tblx"
+- Column |    Type    | Collation | Nullable | Default 
+---------+------------+-----------+----------+---------
+- x      | integer    |           |          | 
+- y      | test_typex |           |          | 
+-
+-DROP TABLE test_tblx;
+-DROP TYPE test_typex;
+--- This test isn't that interesting on its own, but the purpose is to leave
+--- behind a table to test pg_upgrade with. The table has a composite type
+--- column in it, and the composite type has a dropped attribute.
+-CREATE TYPE test_type3 AS (a int);
+-CREATE TABLE test_tbl3 (c) AS SELECT '(1)'::test_type3;
+-ALTER TYPE test_type3 DROP ATTRIBUTE a, ADD ATTRIBUTE b int;
+-CREATE TYPE test_type_empty AS ();
+-DROP TYPE test_type_empty;
+---
+--- typed tables: OF / NOT OF
+---
+-CREATE TYPE tt_t0 AS (z inet, x int, y numeric(8,2));
+-ALTER TYPE tt_t0 DROP ATTRIBUTE z;
+-CREATE TABLE tt0 (x int NOT NULL, y numeric(8,2));	-- OK
+-CREATE TABLE tt1 (x int, y bigint);					-- wrong base type
+-CREATE TABLE tt2 (x int, y numeric(9,2));			-- wrong typmod
+-CREATE TABLE tt3 (y numeric(8,2), x int);			-- wrong column order
+-CREATE TABLE tt4 (x int);							-- too few columns
+-CREATE TABLE tt5 (x int, y numeric(8,2), z int);	-- too few columns
+-CREATE TABLE tt6 () INHERITS (tt0);					-- can't have a parent
+-CREATE TABLE tt7 (x int, q text, y numeric(8,2));
+-ALTER TABLE tt7 DROP q;								-- OK
+-ALTER TABLE tt0 OF tt_t0;
+-ALTER TABLE tt1 OF tt_t0;
+-ERROR:  table "tt1" has different type for column "y"
+-ALTER TABLE tt2 OF tt_t0;
+-ERROR:  table "tt2" has different type for column "y"
+-ALTER TABLE tt3 OF tt_t0;
+-ERROR:  table has column "y" where type requires "x"
+-ALTER TABLE tt4 OF tt_t0;
+-ERROR:  table is missing column "y"
+-ALTER TABLE tt5 OF tt_t0;
+-ERROR:  table has extra column "z"
+-ALTER TABLE tt6 OF tt_t0;
+-ERROR:  typed tables cannot inherit
+-ALTER TABLE tt7 OF tt_t0;
+-CREATE TYPE tt_t1 AS (x int, y numeric(8,2));
+-ALTER TABLE tt7 OF tt_t1;			-- reassign an already-typed table
+-ALTER TABLE tt7 NOT OF;
+-\d tt7
+-                   Table "public.tt7"
+- Column |     Type     | Collation | Nullable | Default 
+---------+--------------+-----------+----------+---------
+- x      | integer      |           |          | 
+- y      | numeric(8,2) |           |          | 
+-
+--- make sure we can drop a constraint on the parent but it remains on the child
+-CREATE TABLE test_drop_constr_parent (c text CHECK (c IS NOT NULL));
+-CREATE TABLE test_drop_constr_child () INHERITS (test_drop_constr_parent);
+-ALTER TABLE ONLY test_drop_constr_parent DROP CONSTRAINT "test_drop_constr_parent_c_check";
+--- should fail
+-INSERT INTO test_drop_constr_child (c) VALUES (NULL);
+-ERROR:  new row for relation "test_drop_constr_child" violates check constraint "test_drop_constr_parent_c_check"
+-DETAIL:  Failing row contains (null).
+-DROP TABLE test_drop_constr_parent CASCADE;
+-NOTICE:  drop cascades to table test_drop_constr_child
+---
+--- IF EXISTS test
+---
+-ALTER TABLE IF EXISTS tt8 ADD COLUMN f int;
+-NOTICE:  relation "tt8" does not exist, skipping
+-ALTER TABLE IF EXISTS tt8 ADD CONSTRAINT xxx PRIMARY KEY(f);
+-NOTICE:  relation "tt8" does not exist, skipping
+-ALTER TABLE IF EXISTS tt8 ADD CHECK (f BETWEEN 0 AND 10);
+-NOTICE:  relation "tt8" does not exist, skipping
+-ALTER TABLE IF EXISTS tt8 ALTER COLUMN f SET DEFAULT 0;
+-NOTICE:  relation "tt8" does not exist, skipping
+-ALTER TABLE IF EXISTS tt8 RENAME COLUMN f TO f1;
+-NOTICE:  relation "tt8" does not exist, skipping
+-ALTER TABLE IF EXISTS tt8 SET SCHEMA alter2;
+-NOTICE:  relation "tt8" does not exist, skipping
+-CREATE TABLE tt8(a int);
+-CREATE SCHEMA alter2;
+-ALTER TABLE IF EXISTS tt8 ADD COLUMN f int;
+-ALTER TABLE IF EXISTS tt8 ADD CONSTRAINT xxx PRIMARY KEY(f);
+-ALTER TABLE IF EXISTS tt8 ADD CHECK (f BETWEEN 0 AND 10);
+-ALTER TABLE IF EXISTS tt8 ALTER COLUMN f SET DEFAULT 0;
+-ALTER TABLE IF EXISTS tt8 RENAME COLUMN f TO f1;
+-ALTER TABLE IF EXISTS tt8 SET SCHEMA alter2;
+-\d alter2.tt8
+-                Table "alter2.tt8"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- a      | integer |           |          | 
+- f1     | integer |           | not null | 0
+-Indexes:
+-    "xxx" PRIMARY KEY, btree (f1)
+-Check constraints:
+-    "tt8_f_check" CHECK (f1 >= 0 AND f1 <= 10)
+-
+-DROP TABLE alter2.tt8;
+-DROP SCHEMA alter2;
+---
+--- Check conflicts between index and CHECK constraint names
+---
+-CREATE TABLE tt9(c integer);
+-ALTER TABLE tt9 ADD CHECK(c > 1);
+-ALTER TABLE tt9 ADD CHECK(c > 2);  -- picks nonconflicting name
+-ALTER TABLE tt9 ADD CONSTRAINT foo CHECK(c > 3);
+-ALTER TABLE tt9 ADD CONSTRAINT foo CHECK(c > 4);  -- fail, dup name
+-ERROR:  constraint "foo" for relation "tt9" already exists
+-ALTER TABLE tt9 ADD UNIQUE(c);
+-ALTER TABLE tt9 ADD UNIQUE(c);  -- picks nonconflicting name
+-ALTER TABLE tt9 ADD CONSTRAINT tt9_c_key UNIQUE(c);  -- fail, dup name
+-ERROR:  relation "tt9_c_key" already exists
+-ALTER TABLE tt9 ADD CONSTRAINT foo UNIQUE(c);  -- fail, dup name
+-ERROR:  constraint "foo" for relation "tt9" already exists
+-ALTER TABLE tt9 ADD CONSTRAINT tt9_c_key CHECK(c > 5);  -- fail, dup name
+-ERROR:  constraint "tt9_c_key" for relation "tt9" already exists
+-ALTER TABLE tt9 ADD CONSTRAINT tt9_c_key2 CHECK(c > 6);
+-ALTER TABLE tt9 ADD UNIQUE(c);  -- picks nonconflicting name
+-\d tt9
+-                Table "public.tt9"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- c      | integer |           |          | 
+-Indexes:
+-    "tt9_c_key" UNIQUE CONSTRAINT, btree (c)
+-    "tt9_c_key1" UNIQUE CONSTRAINT, btree (c)
+-    "tt9_c_key3" UNIQUE CONSTRAINT, btree (c)
+-Check constraints:
+-    "foo" CHECK (c > 3)
+-    "tt9_c_check" CHECK (c > 1)
+-    "tt9_c_check1" CHECK (c > 2)
+-    "tt9_c_key2" CHECK (c > 6)
+-
+-DROP TABLE tt9;
+--- Check that comments on constraints and indexes are not lost at ALTER TABLE.
+-CREATE TABLE comment_test (
+-  id int,
+-  positive_col int CHECK (positive_col > 0),
+-  indexed_col int,
+-  CONSTRAINT comment_test_pk PRIMARY KEY (id));
+-CREATE INDEX comment_test_index ON comment_test(indexed_col);
+-COMMENT ON COLUMN comment_test.id IS 'Column ''id'' on comment_test';
+-COMMENT ON INDEX comment_test_index IS 'Simple index on comment_test';
+-COMMENT ON CONSTRAINT comment_test_positive_col_check ON comment_test IS 'CHECK constraint on comment_test.positive_col';
+-COMMENT ON CONSTRAINT comment_test_pk ON comment_test IS 'PRIMARY KEY constraint of comment_test';
+-COMMENT ON INDEX comment_test_pk IS 'Index backing the PRIMARY KEY of comment_test';
+-SELECT col_description('comment_test'::regclass, 1) as comment;
+-           comment           
+------------------------------
+- Column 'id' on comment_test
+-(1 row)
+-
+-SELECT indexrelid::regclass::text as index, obj_description(indexrelid, 'pg_class') as comment FROM pg_index where indrelid = 'comment_test'::regclass ORDER BY 1, 2;
+-       index        |                    comment                    
+---------------------+-----------------------------------------------
+- comment_test_index | Simple index on comment_test
+- comment_test_pk    | Index backing the PRIMARY KEY of comment_test
+-(2 rows)
+-
+-SELECT conname as constraint, obj_description(oid, 'pg_constraint') as comment FROM pg_constraint where conrelid = 'comment_test'::regclass ORDER BY 1, 2;
+-           constraint            |                    comment                    
+----------------------------------+-----------------------------------------------
+- comment_test_pk                 | PRIMARY KEY constraint of comment_test
+- comment_test_positive_col_check | CHECK constraint on comment_test.positive_col
+-(2 rows)
+-
+--- Change the datatype of all the columns. ALTER TABLE is optimized to not
+--- rebuild an index if the new data type is binary compatible with the old
+--- one. Check do a dummy ALTER TABLE that doesn't change the datatype
+--- first, to test that no-op codepath, and another one that does.
+-ALTER TABLE comment_test ALTER COLUMN indexed_col SET DATA TYPE int;
+-ALTER TABLE comment_test ALTER COLUMN indexed_col SET DATA TYPE text;
+-ALTER TABLE comment_test ALTER COLUMN id SET DATA TYPE int;
+-ALTER TABLE comment_test ALTER COLUMN id SET DATA TYPE text;
+-ALTER TABLE comment_test ALTER COLUMN positive_col SET DATA TYPE int;
+-ALTER TABLE comment_test ALTER COLUMN positive_col SET DATA TYPE bigint;
+--- Check that the comments are intact.
+-SELECT col_description('comment_test'::regclass, 1) as comment;
+-           comment           
+------------------------------
+- Column 'id' on comment_test
+-(1 row)
+-
+-SELECT indexrelid::regclass::text as index, obj_description(indexrelid, 'pg_class') as comment FROM pg_index where indrelid = 'comment_test'::regclass ORDER BY 1, 2;
+-       index        |                    comment                    
+---------------------+-----------------------------------------------
+- comment_test_index | Simple index on comment_test
+- comment_test_pk    | Index backing the PRIMARY KEY of comment_test
+-(2 rows)
+-
+-SELECT conname as constraint, obj_description(oid, 'pg_constraint') as comment FROM pg_constraint where conrelid = 'comment_test'::regclass ORDER BY 1, 2;
+-           constraint            |                    comment                    
+----------------------------------+-----------------------------------------------
+- comment_test_pk                 | PRIMARY KEY constraint of comment_test
+- comment_test_positive_col_check | CHECK constraint on comment_test.positive_col
+-(2 rows)
+-
+--- Check compatibility for foreign keys and comments. This is done
+--- separately as rebuilding the column type of the parent leads
+--- to an error and would reduce the test scope.
+-CREATE TABLE comment_test_child (
+-  id text CONSTRAINT comment_test_child_fk REFERENCES comment_test);
+-CREATE INDEX comment_test_child_fk ON comment_test_child(id);
+-COMMENT ON COLUMN comment_test_child.id IS 'Column ''id'' on comment_test_child';
+-COMMENT ON INDEX comment_test_child_fk IS 'Index backing the FOREIGN KEY of comment_test_child';
+-COMMENT ON CONSTRAINT comment_test_child_fk ON comment_test_child IS 'FOREIGN KEY constraint of comment_test_child';
+--- Change column type of parent
+-ALTER TABLE comment_test ALTER COLUMN id SET DATA TYPE text;
+-ALTER TABLE comment_test ALTER COLUMN id SET DATA TYPE int USING id::integer;
+-ERROR:  foreign key constraint "comment_test_child_fk" cannot be implemented
+-DETAIL:  Key columns "id" and "id" are of incompatible types: text and integer.
+--- Comments should be intact
+-SELECT col_description('comment_test_child'::regclass, 1) as comment;
+-              comment              
+------------------------------------
+- Column 'id' on comment_test_child
+-(1 row)
+-
+-SELECT indexrelid::regclass::text as index, obj_description(indexrelid, 'pg_class') as comment FROM pg_index where indrelid = 'comment_test_child'::regclass ORDER BY 1, 2;
+-         index         |                       comment                       
+------------------------+-----------------------------------------------------
+- comment_test_child_fk | Index backing the FOREIGN KEY of comment_test_child
+-(1 row)
+-
+-SELECT conname as constraint, obj_description(oid, 'pg_constraint') as comment FROM pg_constraint where conrelid = 'comment_test_child'::regclass ORDER BY 1, 2;
+-      constraint       |                   comment                    
+------------------------+----------------------------------------------
+- comment_test_child_fk | FOREIGN KEY constraint of comment_test_child
+-(1 row)
+-
+--- Check that we map relation oids to filenodes and back correctly.  Only
+--- display bad mappings so the test output doesn't change all the time.  A
+--- filenode function call can return NULL for a relation dropped concurrently
+--- with the call's surrounding query, so ignore a NULL mapped_oid for
+--- relations that no longer exist after all calls finish.
+-CREATE TEMP TABLE filenode_mapping AS
+-SELECT
+-    oid, mapped_oid, reltablespace, relfilenode, relname
+-FROM pg_class,
+-    pg_filenode_relation(reltablespace, pg_relation_filenode(oid)) AS mapped_oid
+-WHERE relkind IN ('r', 'i', 'S', 't', 'm') AND mapped_oid IS DISTINCT FROM oid;
+-SELECT m.* FROM filenode_mapping m LEFT JOIN pg_class c ON c.oid = m.oid
+-WHERE c.oid IS NOT NULL OR m.mapped_oid IS NOT NULL;
+- oid | mapped_oid | reltablespace | relfilenode | relname 
+------+------------+---------------+-------------+---------
+-(0 rows)
+-
+--- Checks on creating and manipulation of user defined relations in
+--- pg_catalog.
+-SHOW allow_system_table_mods;
+- allow_system_table_mods 
+--------------------------
+- off
+-(1 row)
+-
+--- disallowed because of search_path issues with pg_dump
+-CREATE TABLE pg_catalog.new_system_table();
+-ERROR:  permission denied to create "pg_catalog.new_system_table"
+-DETAIL:  System catalog modifications are currently disallowed.
+--- instead create in public first, move to catalog
+-CREATE TABLE new_system_table(id serial primary key, othercol text);
+-ALTER TABLE new_system_table SET SCHEMA pg_catalog;
+-ALTER TABLE new_system_table SET SCHEMA public;
+-ALTER TABLE new_system_table SET SCHEMA pg_catalog;
+--- will be ignored -- already there:
+-ALTER TABLE new_system_table SET SCHEMA pg_catalog;
+-ALTER TABLE new_system_table RENAME TO old_system_table;
+-CREATE INDEX old_system_table__othercol ON old_system_table (othercol);
+-INSERT INTO old_system_table(othercol) VALUES ('somedata'), ('otherdata');
+-UPDATE old_system_table SET id = -id;
+-DELETE FROM old_system_table WHERE othercol = 'somedata';
+-TRUNCATE old_system_table;
+-ALTER TABLE old_system_table DROP CONSTRAINT new_system_table_pkey;
+-ALTER TABLE old_system_table DROP COLUMN othercol;
+-DROP TABLE old_system_table;
+--- set logged
+-CREATE UNLOGGED TABLE unlogged1(f1 SERIAL PRIMARY KEY, f2 TEXT); -- has sequence, toast
+--- check relpersistence of an unlogged table
+-SELECT relname, relkind, relpersistence FROM pg_class WHERE relname ~ '^unlogged1'
+-UNION ALL
+-SELECT r.relname || ' toast table', t.relkind, t.relpersistence FROM pg_class r JOIN pg_class t ON t.oid = r.reltoastrelid WHERE r.relname ~ '^unlogged1'
+-UNION ALL
+-SELECT r.relname || ' toast index', ri.relkind, ri.relpersistence FROM pg_class r join pg_class t ON t.oid = r.reltoastrelid JOIN pg_index i ON i.indrelid = t.oid JOIN pg_class ri ON ri.oid = i.indexrelid WHERE r.relname ~ '^unlogged1'
+-ORDER BY relname;
+-        relname        | relkind | relpersistence 
+------------------------+---------+----------------
+- unlogged1             | r       | u
+- unlogged1 toast index | i       | u
+- unlogged1 toast table | t       | u
+- unlogged1_f1_seq      | S       | u
+- unlogged1_pkey        | i       | u
+-(5 rows)
+-
+-CREATE UNLOGGED TABLE unlogged2(f1 SERIAL PRIMARY KEY, f2 INTEGER REFERENCES unlogged1); -- foreign key
+-CREATE UNLOGGED TABLE unlogged3(f1 SERIAL PRIMARY KEY, f2 INTEGER REFERENCES unlogged3); -- self-referencing foreign key
+-ALTER TABLE unlogged3 SET LOGGED; -- skip self-referencing foreign key
+-ALTER TABLE unlogged2 SET LOGGED; -- fails because a foreign key to an unlogged table exists
+-ERROR:  could not change table "unlogged2" to logged because it references unlogged table "unlogged1"
+-ALTER TABLE unlogged1 SET LOGGED;
+--- check relpersistence of an unlogged table after changing to permanent
+-SELECT relname, relkind, relpersistence FROM pg_class WHERE relname ~ '^unlogged1'
+-UNION ALL
+-SELECT r.relname || ' toast table', t.relkind, t.relpersistence FROM pg_class r JOIN pg_class t ON t.oid = r.reltoastrelid WHERE r.relname ~ '^unlogged1'
+-UNION ALL
+-SELECT r.relname || ' toast index', ri.relkind, ri.relpersistence FROM pg_class r join pg_class t ON t.oid = r.reltoastrelid JOIN pg_index i ON i.indrelid = t.oid JOIN pg_class ri ON ri.oid = i.indexrelid WHERE r.relname ~ '^unlogged1'
+-ORDER BY relname;
+-        relname        | relkind | relpersistence 
+------------------------+---------+----------------
+- unlogged1             | r       | p
+- unlogged1 toast index | i       | p
+- unlogged1 toast table | t       | p
+- unlogged1_f1_seq      | S       | p
+- unlogged1_pkey        | i       | p
+-(5 rows)
+-
+-ALTER TABLE unlogged1 SET LOGGED; -- silently do nothing
+-DROP TABLE unlogged3;
+-DROP TABLE unlogged2;
+-DROP TABLE unlogged1;
+--- set unlogged
+-CREATE TABLE logged1(f1 SERIAL PRIMARY KEY, f2 TEXT); -- has sequence, toast
+--- check relpersistence of a permanent table
+-SELECT relname, relkind, relpersistence FROM pg_class WHERE relname ~ '^logged1'
+-UNION ALL
+-SELECT r.relname || ' toast table', t.relkind, t.relpersistence FROM pg_class r JOIN pg_class t ON t.oid = r.reltoastrelid WHERE r.relname ~ '^logged1'
+-UNION ALL
+-SELECT r.relname ||' toast index', ri.relkind, ri.relpersistence FROM pg_class r join pg_class t ON t.oid = r.reltoastrelid JOIN pg_index i ON i.indrelid = t.oid JOIN pg_class ri ON ri.oid = i.indexrelid WHERE r.relname ~ '^logged1'
+-ORDER BY relname;
+-       relname       | relkind | relpersistence 
+----------------------+---------+----------------
+- logged1             | r       | p
+- logged1 toast index | i       | p
+- logged1 toast table | t       | p
+- logged1_f1_seq      | S       | p
+- logged1_pkey        | i       | p
+-(5 rows)
+-
+-CREATE TABLE logged2(f1 SERIAL PRIMARY KEY, f2 INTEGER REFERENCES logged1); -- foreign key
+-CREATE TABLE logged3(f1 SERIAL PRIMARY KEY, f2 INTEGER REFERENCES logged3); -- self-referencing foreign key
+-ALTER TABLE logged1 SET UNLOGGED; -- fails because a foreign key from a permanent table exists
+-ERROR:  could not change table "logged1" to unlogged because it references logged table "logged2"
+-ALTER TABLE logged3 SET UNLOGGED; -- skip self-referencing foreign key
+-ALTER TABLE logged2 SET UNLOGGED;
+-ALTER TABLE logged1 SET UNLOGGED;
+--- check relpersistence of a permanent table after changing to unlogged
+-SELECT relname, relkind, relpersistence FROM pg_class WHERE relname ~ '^logged1'
+-UNION ALL
+-SELECT r.relname || ' toast table', t.relkind, t.relpersistence FROM pg_class r JOIN pg_class t ON t.oid = r.reltoastrelid WHERE r.relname ~ '^logged1'
+-UNION ALL
+-SELECT r.relname || ' toast index', ri.relkind, ri.relpersistence FROM pg_class r join pg_class t ON t.oid = r.reltoastrelid JOIN pg_index i ON i.indrelid = t.oid JOIN pg_class ri ON ri.oid = i.indexrelid WHERE r.relname ~ '^logged1'
+-ORDER BY relname;
+-       relname       | relkind | relpersistence 
+----------------------+---------+----------------
+- logged1             | r       | u
+- logged1 toast index | i       | u
+- logged1 toast table | t       | u
+- logged1_f1_seq      | S       | u
+- logged1_pkey        | i       | u
+-(5 rows)
+-
+-ALTER TABLE logged1 SET UNLOGGED; -- silently do nothing
+-DROP TABLE logged3;
+-DROP TABLE logged2;
+-DROP TABLE logged1;
+--- test ADD COLUMN IF NOT EXISTS
+-CREATE TABLE test_add_column(c1 integer);
+-\d test_add_column
+-          Table "public.test_add_column"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- c1     | integer |           |          | 
+-
+-ALTER TABLE test_add_column
+-	ADD COLUMN c2 integer;
+-\d test_add_column
+-          Table "public.test_add_column"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- c1     | integer |           |          | 
+- c2     | integer |           |          | 
+-
+-ALTER TABLE test_add_column
+-	ADD COLUMN c2 integer; -- fail because c2 already exists
+-ERROR:  column "c2" of relation "test_add_column" already exists
+-ALTER TABLE ONLY test_add_column
+-	ADD COLUMN c2 integer; -- fail because c2 already exists
+-ERROR:  column "c2" of relation "test_add_column" already exists
+-\d test_add_column
+-          Table "public.test_add_column"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- c1     | integer |           |          | 
+- c2     | integer |           |          | 
+-
+-ALTER TABLE test_add_column
+-	ADD COLUMN IF NOT EXISTS c2 integer; -- skipping because c2 already exists
+-NOTICE:  column "c2" of relation "test_add_column" already exists, skipping
+-ALTER TABLE ONLY test_add_column
+-	ADD COLUMN IF NOT EXISTS c2 integer; -- skipping because c2 already exists
+-NOTICE:  column "c2" of relation "test_add_column" already exists, skipping
+-\d test_add_column
+-          Table "public.test_add_column"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- c1     | integer |           |          | 
+- c2     | integer |           |          | 
+-
+-ALTER TABLE test_add_column
+-	ADD COLUMN c2 integer, -- fail because c2 already exists
+-	ADD COLUMN c3 integer primary key;
+-ERROR:  column "c2" of relation "test_add_column" already exists
+-\d test_add_column
+-          Table "public.test_add_column"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- c1     | integer |           |          | 
+- c2     | integer |           |          | 
+-
+-ALTER TABLE test_add_column
+-	ADD COLUMN IF NOT EXISTS c2 integer, -- skipping because c2 already exists
+-	ADD COLUMN c3 integer primary key;
+-NOTICE:  column "c2" of relation "test_add_column" already exists, skipping
+-\d test_add_column
+-          Table "public.test_add_column"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- c1     | integer |           |          | 
+- c2     | integer |           |          | 
+- c3     | integer |           | not null | 
+-Indexes:
+-    "test_add_column_pkey" PRIMARY KEY, btree (c3)
+-
+-ALTER TABLE test_add_column
+-	ADD COLUMN IF NOT EXISTS c2 integer, -- skipping because c2 already exists
+-	ADD COLUMN IF NOT EXISTS c3 integer primary key; -- skipping because c3 already exists
+-NOTICE:  column "c2" of relation "test_add_column" already exists, skipping
+-NOTICE:  column "c3" of relation "test_add_column" already exists, skipping
+-\d test_add_column
+-          Table "public.test_add_column"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- c1     | integer |           |          | 
+- c2     | integer |           |          | 
+- c3     | integer |           | not null | 
+-Indexes:
+-    "test_add_column_pkey" PRIMARY KEY, btree (c3)
+-
+-ALTER TABLE test_add_column
+-	ADD COLUMN IF NOT EXISTS c2 integer, -- skipping because c2 already exists
+-	ADD COLUMN IF NOT EXISTS c3 integer, -- skipping because c3 already exists
+-	ADD COLUMN c4 integer REFERENCES test_add_column;
+-NOTICE:  column "c2" of relation "test_add_column" already exists, skipping
+-NOTICE:  column "c3" of relation "test_add_column" already exists, skipping
+-\d test_add_column
+-          Table "public.test_add_column"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- c1     | integer |           |          | 
+- c2     | integer |           |          | 
+- c3     | integer |           | not null | 
+- c4     | integer |           |          | 
+-Indexes:
+-    "test_add_column_pkey" PRIMARY KEY, btree (c3)
+-Foreign-key constraints:
+-    "test_add_column_c4_fkey" FOREIGN KEY (c4) REFERENCES test_add_column(c3)
+-Referenced by:
+-    TABLE "test_add_column" CONSTRAINT "test_add_column_c4_fkey" FOREIGN KEY (c4) REFERENCES test_add_column(c3)
+-
+-ALTER TABLE test_add_column
+-	ADD COLUMN IF NOT EXISTS c4 integer REFERENCES test_add_column;
+-NOTICE:  column "c4" of relation "test_add_column" already exists, skipping
+-\d test_add_column
+-          Table "public.test_add_column"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- c1     | integer |           |          | 
+- c2     | integer |           |          | 
+- c3     | integer |           | not null | 
+- c4     | integer |           |          | 
+-Indexes:
+-    "test_add_column_pkey" PRIMARY KEY, btree (c3)
+-Foreign-key constraints:
+-    "test_add_column_c4_fkey" FOREIGN KEY (c4) REFERENCES test_add_column(c3)
+-Referenced by:
+-    TABLE "test_add_column" CONSTRAINT "test_add_column_c4_fkey" FOREIGN KEY (c4) REFERENCES test_add_column(c3)
+-
+-ALTER TABLE test_add_column
+-	ADD COLUMN IF NOT EXISTS c5 SERIAL CHECK (c5 > 8);
+-\d test_add_column
+-                            Table "public.test_add_column"
+- Column |  Type   | Collation | Nullable |                   Default                   
+---------+---------+-----------+----------+---------------------------------------------
+- c1     | integer |           |          | 
+- c2     | integer |           |          | 
+- c3     | integer |           | not null | 
+- c4     | integer |           |          | 
+- c5     | integer |           | not null | nextval('test_add_column_c5_seq'::regclass)
+-Indexes:
+-    "test_add_column_pkey" PRIMARY KEY, btree (c3)
+-Check constraints:
+-    "test_add_column_c5_check" CHECK (c5 > 8)
+-Foreign-key constraints:
+-    "test_add_column_c4_fkey" FOREIGN KEY (c4) REFERENCES test_add_column(c3)
+-Referenced by:
+-    TABLE "test_add_column" CONSTRAINT "test_add_column_c4_fkey" FOREIGN KEY (c4) REFERENCES test_add_column(c3)
+-
+-ALTER TABLE test_add_column
+-	ADD COLUMN IF NOT EXISTS c5 SERIAL CHECK (c5 > 10);
+-NOTICE:  column "c5" of relation "test_add_column" already exists, skipping
+-\d test_add_column*
+-                            Table "public.test_add_column"
+- Column |  Type   | Collation | Nullable |                   Default                   
+---------+---------+-----------+----------+---------------------------------------------
+- c1     | integer |           |          | 
+- c2     | integer |           |          | 
+- c3     | integer |           | not null | 
+- c4     | integer |           |          | 
+- c5     | integer |           | not null | nextval('test_add_column_c5_seq'::regclass)
+-Indexes:
+-    "test_add_column_pkey" PRIMARY KEY, btree (c3)
+-Check constraints:
+-    "test_add_column_c5_check" CHECK (c5 > 8)
+-Foreign-key constraints:
+-    "test_add_column_c4_fkey" FOREIGN KEY (c4) REFERENCES test_add_column(c3)
+-Referenced by:
+-    TABLE "test_add_column" CONSTRAINT "test_add_column_c4_fkey" FOREIGN KEY (c4) REFERENCES test_add_column(c3)
+-
+-               Sequence "public.test_add_column_c5_seq"
+-  Type   | Start | Minimum |  Maximum   | Increment | Cycles? | Cache 
+----------+-------+---------+------------+-----------+---------+-------
+- integer |     1 |       1 | 2147483647 |         1 | no      |     1
+-Owned by: public.test_add_column.c5
+-
+- Index "public.test_add_column_pkey"
+- Column |  Type   | Key? | Definition 
+---------+---------+------+------------
+- c3     | integer | yes  | c3
+-primary key, btree, for table "public.test_add_column"
+-
+-DROP TABLE test_add_column;
+-\d test_add_column*
+--- assorted cases with multiple ALTER TABLE steps
+-CREATE TABLE ataddindex(f1 INT);
+-INSERT INTO ataddindex VALUES (42), (43);
+-CREATE UNIQUE INDEX ataddindexi0 ON ataddindex(f1);
+-ALTER TABLE ataddindex
+-  ADD PRIMARY KEY USING INDEX ataddindexi0,
+-  ALTER f1 TYPE BIGINT;
+-\d ataddindex
+-            Table "public.ataddindex"
+- Column |  Type  | Collation | Nullable | Default 
+---------+--------+-----------+----------+---------
+- f1     | bigint |           | not null | 
+-Indexes:
+-    "ataddindexi0" PRIMARY KEY, btree (f1)
+-
+-DROP TABLE ataddindex;
+-CREATE TABLE ataddindex(f1 VARCHAR(10));
+-INSERT INTO ataddindex(f1) VALUES ('foo'), ('a');
+-ALTER TABLE ataddindex
+-  ALTER f1 SET DATA TYPE TEXT,
+-  ADD EXCLUDE ((f1 LIKE 'a') WITH =);
+-\d ataddindex
+-           Table "public.ataddindex"
+- Column | Type | Collation | Nullable | Default 
+---------+------+-----------+----------+---------
+- f1     | text |           |          | 
+-Indexes:
+-    "ataddindex_expr_excl" EXCLUDE USING btree ((f1 ~~ 'a'::text) WITH =)
+-
+-DROP TABLE ataddindex;
+-CREATE TABLE ataddindex(id int, ref_id int);
+-ALTER TABLE ataddindex
+-  ADD PRIMARY KEY (id),
+-  ADD FOREIGN KEY (ref_id) REFERENCES ataddindex;
+-\d ataddindex
+-             Table "public.ataddindex"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- id     | integer |           | not null | 
+- ref_id | integer |           |          | 
+-Indexes:
+-    "ataddindex_pkey" PRIMARY KEY, btree (id)
+-Foreign-key constraints:
+-    "ataddindex_ref_id_fkey" FOREIGN KEY (ref_id) REFERENCES ataddindex(id)
+-Referenced by:
+-    TABLE "ataddindex" CONSTRAINT "ataddindex_ref_id_fkey" FOREIGN KEY (ref_id) REFERENCES ataddindex(id)
+-
+-DROP TABLE ataddindex;
+-CREATE TABLE ataddindex(id int, ref_id int);
+-ALTER TABLE ataddindex
+-  ADD UNIQUE (id),
+-  ADD FOREIGN KEY (ref_id) REFERENCES ataddindex (id);
+-\d ataddindex
+-             Table "public.ataddindex"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- id     | integer |           |          | 
+- ref_id | integer |           |          | 
+-Indexes:
+-    "ataddindex_id_key" UNIQUE CONSTRAINT, btree (id)
+-Foreign-key constraints:
+-    "ataddindex_ref_id_fkey" FOREIGN KEY (ref_id) REFERENCES ataddindex(id)
+-Referenced by:
+-    TABLE "ataddindex" CONSTRAINT "ataddindex_ref_id_fkey" FOREIGN KEY (ref_id) REFERENCES ataddindex(id)
+-
+-DROP TABLE ataddindex;
+-CREATE TABLE atnotnull1 ();
+-ALTER TABLE atnotnull1
+-  ADD COLUMN a INT,
+-  ALTER a SET NOT NULL;
+-ALTER TABLE atnotnull1
+-  ADD COLUMN c INT,
+-  ADD PRIMARY KEY (c);
+-\d+ atnotnull1
+-                                Table "public.atnotnull1"
+- Column |  Type   | Collation | Nullable | Default | Storage | Stats target | Description 
+---------+---------+-----------+----------+---------+---------+--------------+-------------
+- a      | integer |           | not null |         | plain   |              | 
+- c      | integer |           | not null |         | plain   |              | 
+-Indexes:
+-    "atnotnull1_pkey" PRIMARY KEY, btree (c)
+-
+--- cannot drop column that is part of the partition key
+-CREATE TABLE partitioned (
+-	a int,
+-	b int
+-) PARTITION BY RANGE (a, (a+b+1));
+-ALTER TABLE partitioned DROP COLUMN a;
+-ERROR:  cannot drop column "a" because it is part of the partition key of relation "partitioned"
+-ALTER TABLE partitioned ALTER COLUMN a TYPE char(5);
+-ERROR:  cannot alter column "a" because it is part of the partition key of relation "partitioned"
+-ALTER TABLE partitioned DROP COLUMN b;
+-ERROR:  cannot drop column "b" because it is part of the partition key of relation "partitioned"
+-ALTER TABLE partitioned ALTER COLUMN b TYPE char(5);
+-ERROR:  cannot alter column "b" because it is part of the partition key of relation "partitioned"
+--- specifying storage parameters for partitioned tables is not supported
+-ALTER TABLE partitioned SET (fillfactor=100);
+-ERROR:  cannot specify storage parameters for a partitioned table
+-HINT:  Specify storage parameters for its leaf partitions instead.
+--- partitioned table cannot participate in regular inheritance
+-CREATE TABLE nonpartitioned (
+-	a int,
+-	b int
+-);
+-ALTER TABLE partitioned INHERIT nonpartitioned;
+-ERROR:  cannot change inheritance of partitioned table
+-ALTER TABLE nonpartitioned INHERIT partitioned;
+-ERROR:  cannot inherit from partitioned table "partitioned"
+--- cannot add NO INHERIT constraint to partitioned tables
+-ALTER TABLE partitioned ADD CONSTRAINT chk_a CHECK (a > 0) NO INHERIT;
+-ERROR:  cannot add NO INHERIT constraint to partitioned table "partitioned"
+-DROP TABLE partitioned, nonpartitioned;
+---
+--- ATTACH PARTITION
+---
+--- check that target table is partitioned
+-CREATE TABLE unparted (
+-	a int
+-);
+-CREATE TABLE fail_part (like unparted);
+-ALTER TABLE unparted ATTACH PARTITION fail_part FOR VALUES IN ('a');
+-ERROR:  table "unparted" is not partitioned
+-DROP TABLE unparted, fail_part;
+--- check that partition bound is compatible
+-CREATE TABLE list_parted (
+-	a int NOT NULL,
+-	b char(2) COLLATE "C",
+-	CONSTRAINT check_a CHECK (a > 0)
+-) PARTITION BY LIST (a);
+-CREATE TABLE fail_part (LIKE list_parted);
+-ALTER TABLE list_parted ATTACH PARTITION fail_part FOR VALUES FROM (1) TO (10);
+-ERROR:  invalid bound specification for a list partition
+-LINE 1: ...list_parted ATTACH PARTITION fail_part FOR VALUES FROM (1) T...
+-                                                             ^
+-DROP TABLE fail_part;
+--- check that the table being attached exists
+-ALTER TABLE list_parted ATTACH PARTITION nonexistent FOR VALUES IN (1);
+-ERROR:  relation "nonexistent" does not exist
+--- check ownership of the source table
+-CREATE ROLE regress_test_me;
+-CREATE ROLE regress_test_not_me;
+-CREATE TABLE not_owned_by_me (LIKE list_parted);
+-ALTER TABLE not_owned_by_me OWNER TO regress_test_not_me;
+-SET SESSION AUTHORIZATION regress_test_me;
+-CREATE TABLE owned_by_me (
+-	a int
+-) PARTITION BY LIST (a);
+-ALTER TABLE owned_by_me ATTACH PARTITION not_owned_by_me FOR VALUES IN (1);
+-ERROR:  must be owner of table not_owned_by_me
+-RESET SESSION AUTHORIZATION;
+-DROP TABLE owned_by_me, not_owned_by_me;
+-DROP ROLE regress_test_not_me;
+-DROP ROLE regress_test_me;
+--- check that the table being attached is not part of regular inheritance
+-CREATE TABLE parent (LIKE list_parted);
+-CREATE TABLE child () INHERITS (parent);
+-ALTER TABLE list_parted ATTACH PARTITION child FOR VALUES IN (1);
+-ERROR:  cannot attach inheritance child as partition
+-ALTER TABLE list_parted ATTACH PARTITION parent FOR VALUES IN (1);
+-ERROR:  cannot attach inheritance parent as partition
+-DROP TABLE child;
+--- now it should work, with a little tweak
+-ALTER TABLE parent ADD CONSTRAINT check_a CHECK (a > 0);
+-ALTER TABLE list_parted ATTACH PARTITION parent FOR VALUES IN (1);
+--- test insert/update, per bug #18550
+-INSERT INTO parent VALUES (1);
+-UPDATE parent SET a = 2 WHERE a = 1;
+-ERROR:  new row for relation "parent" violates partition constraint
+-DETAIL:  Failing row contains (2, null).
+-DROP TABLE parent CASCADE;
+--- check any TEMP-ness
+-CREATE TEMP TABLE temp_parted (a int) PARTITION BY LIST (a);
+-CREATE TABLE perm_part (a int);
+-ALTER TABLE temp_parted ATTACH PARTITION perm_part FOR VALUES IN (1);
+-ERROR:  cannot attach a permanent relation as partition of temporary relation "temp_parted"
+-DROP TABLE temp_parted, perm_part;
+--- check that the table being attached is not a typed table
+-CREATE TYPE mytype AS (a int);
+-CREATE TABLE fail_part OF mytype;
+-ALTER TABLE list_parted ATTACH PARTITION fail_part FOR VALUES IN (1);
+-ERROR:  cannot attach a typed table as partition
+-DROP TYPE mytype CASCADE;
+-NOTICE:  drop cascades to table fail_part
+--- check that the table being attached has only columns present in the parent
+-CREATE TABLE fail_part (like list_parted, c int);
+-ALTER TABLE list_parted ATTACH PARTITION fail_part FOR VALUES IN (1);
+-ERROR:  table "fail_part" contains column "c" not found in parent "list_parted"
+-DETAIL:  The new partition may contain only the columns present in parent.
+-DROP TABLE fail_part;
+--- check that the table being attached has every column of the parent
+-CREATE TABLE fail_part (a int NOT NULL);
+-ALTER TABLE list_parted ATTACH PARTITION fail_part FOR VALUES IN (1);
+-ERROR:  child table is missing column "b"
+-DROP TABLE fail_part;
+--- check that columns match in type, collation and NOT NULL status
+-CREATE TABLE fail_part (
+-	b char(3),
+-	a int NOT NULL
+-);
+-ALTER TABLE list_parted ATTACH PARTITION fail_part FOR VALUES IN (1);
+-ERROR:  child table "fail_part" has different type for column "b"
+-ALTER TABLE fail_part ALTER b TYPE char (2) COLLATE "POSIX";
+-ALTER TABLE list_parted ATTACH PARTITION fail_part FOR VALUES IN (1);
+-ERROR:  child table "fail_part" has different collation for column "b"
+-DROP TABLE fail_part;
+--- check that the table being attached has all constraints of the parent
+-CREATE TABLE fail_part (
+-	b char(2) COLLATE "C",
+-	a int NOT NULL
+-);
+-ALTER TABLE list_parted ATTACH PARTITION fail_part FOR VALUES IN (1);
+-ERROR:  child table is missing constraint "check_a"
+--- check that the constraint matches in definition with parent's constraint
+-ALTER TABLE fail_part ADD CONSTRAINT check_a CHECK (a >= 0);
+-ALTER TABLE list_parted ATTACH PARTITION fail_part FOR VALUES IN (1);
+-ERROR:  child table "fail_part" has different definition for check constraint "check_a"
+-DROP TABLE fail_part;
+--- check the attributes and constraints after partition is attached
+-CREATE TABLE part_1 (
+-	a int NOT NULL,
+-	b char(2) COLLATE "C",
+-	CONSTRAINT check_a CHECK (a > 0)
+-);
+-ALTER TABLE list_parted ATTACH PARTITION part_1 FOR VALUES IN (1);
+--- attislocal and conislocal are always false for merged attributes and constraints respectively.
+-SELECT attislocal, attinhcount FROM pg_attribute WHERE attrelid = 'part_1'::regclass AND attnum > 0;
+- attislocal | attinhcount 
+-------------+-------------
+- f          |           1
+- f          |           1
+-(2 rows)
+-
+-SELECT conislocal, coninhcount FROM pg_constraint WHERE conrelid = 'part_1'::regclass AND conname = 'check_a';
+- conislocal | coninhcount 
+-------------+-------------
+- f          |           1
+-(1 row)
+-
+--- check that the new partition won't overlap with an existing partition
+-CREATE TABLE fail_part (LIKE part_1 INCLUDING CONSTRAINTS);
+-ALTER TABLE list_parted ATTACH PARTITION fail_part FOR VALUES IN (1);
+-ERROR:  partition "fail_part" would overlap partition "part_1"
+-LINE 1: ...LE list_parted ATTACH PARTITION fail_part FOR VALUES IN (1);
+-                                                                    ^
+-DROP TABLE fail_part;
+--- check that an existing table can be attached as a default partition
+-CREATE TABLE def_part (LIKE list_parted INCLUDING CONSTRAINTS);
+-ALTER TABLE list_parted ATTACH PARTITION def_part DEFAULT;
+--- check attaching default partition fails if a default partition already
+--- exists
+-CREATE TABLE fail_def_part (LIKE part_1 INCLUDING CONSTRAINTS);
+-ALTER TABLE list_parted ATTACH PARTITION fail_def_part DEFAULT;
+-ERROR:  partition "fail_def_part" conflicts with existing default partition "def_part"
+-LINE 1: ...ER TABLE list_parted ATTACH PARTITION fail_def_part DEFAULT;
+-                                                               ^
+--- check validation when attaching list partitions
+-CREATE TABLE list_parted2 (
+-	a int,
+-	b char
+-) PARTITION BY LIST (a);
+--- check that violating rows are correctly reported
+-CREATE TABLE part_2 (LIKE list_parted2);
+-INSERT INTO part_2 VALUES (3, 'a');
+-ALTER TABLE list_parted2 ATTACH PARTITION part_2 FOR VALUES IN (2);
+-ERROR:  partition constraint of relation "part_2" is violated by some row
+--- should be ok after deleting the bad row
+-DELETE FROM part_2;
+-ALTER TABLE list_parted2 ATTACH PARTITION part_2 FOR VALUES IN (2);
+--- check partition cannot be attached if default has some row for its values
+-CREATE TABLE list_parted2_def PARTITION OF list_parted2 DEFAULT;
+-INSERT INTO list_parted2_def VALUES (11, 'z');
+-CREATE TABLE part_3 (LIKE list_parted2);
+-ALTER TABLE list_parted2 ATTACH PARTITION part_3 FOR VALUES IN (11);
+-ERROR:  updated partition constraint for default partition "list_parted2_def" would be violated by some row
+--- should be ok after deleting the bad row
+-DELETE FROM list_parted2_def WHERE a = 11;
+-ALTER TABLE list_parted2 ATTACH PARTITION part_3 FOR VALUES IN (11);
+--- adding constraints that describe the desired partition constraint
+--- (or more restrictive) will help skip the validation scan
+-CREATE TABLE part_3_4 (
+-	LIKE list_parted2,
+-	CONSTRAINT check_a CHECK (a IN (3))
+-);
+--- however, if a list partition does not accept nulls, there should be
+--- an explicit NOT NULL constraint on the partition key column for the
+--- validation scan to be skipped;
+-ALTER TABLE list_parted2 ATTACH PARTITION part_3_4 FOR VALUES IN (3, 4);
+--- adding a NOT NULL constraint will cause the scan to be skipped
+-ALTER TABLE list_parted2 DETACH PARTITION part_3_4;
+-ALTER TABLE part_3_4 ALTER a SET NOT NULL;
+-ALTER TABLE list_parted2 ATTACH PARTITION part_3_4 FOR VALUES IN (3, 4);
+--- check if default partition scan skipped
+-ALTER TABLE list_parted2_def ADD CONSTRAINT check_a CHECK (a IN (5, 6));
+-CREATE TABLE part_55_66 PARTITION OF list_parted2 FOR VALUES IN (55, 66);
+--- check validation when attaching range partitions
+-CREATE TABLE range_parted (
+-	a int,
+-	b int
+-) PARTITION BY RANGE (a, b);
+--- check that violating rows are correctly reported
+-CREATE TABLE part1 (
+-	a int NOT NULL CHECK (a = 1),
+-	b int NOT NULL CHECK (b >= 1 AND b <= 10)
+-);
+-INSERT INTO part1 VALUES (1, 10);
+--- Remember the TO bound is exclusive
+-ALTER TABLE range_parted ATTACH PARTITION part1 FOR VALUES FROM (1, 1) TO (1, 10);
+-ERROR:  partition constraint of relation "part1" is violated by some row
+--- should be ok after deleting the bad row
+-DELETE FROM part1;
+-ALTER TABLE range_parted ATTACH PARTITION part1 FOR VALUES FROM (1, 1) TO (1, 10);
+--- adding constraints that describe the desired partition constraint
+--- (or more restrictive) will help skip the validation scan
+-CREATE TABLE part2 (
+-	a int NOT NULL CHECK (a = 1),
+-	b int NOT NULL CHECK (b >= 10 AND b < 18)
+-);
+-ALTER TABLE range_parted ATTACH PARTITION part2 FOR VALUES FROM (1, 10) TO (1, 20);
+--- Create default partition
+-CREATE TABLE partr_def1 PARTITION OF range_parted DEFAULT;
+--- Only one default partition is allowed, hence, following should give error
+-CREATE TABLE partr_def2 (LIKE part1 INCLUDING CONSTRAINTS);
+-ALTER TABLE range_parted ATTACH PARTITION partr_def2 DEFAULT;
+-ERROR:  partition "partr_def2" conflicts with existing default partition "partr_def1"
+-LINE 1: ...LTER TABLE range_parted ATTACH PARTITION partr_def2 DEFAULT;
+-                                                               ^
+--- Overlapping partitions cannot be attached, hence, following should give error
+-INSERT INTO partr_def1 VALUES (2, 10);
+-CREATE TABLE part3 (LIKE range_parted);
+-ALTER TABLE range_parted ATTACH partition part3 FOR VALUES FROM (2, 10) TO (2, 20);
+-ERROR:  updated partition constraint for default partition "partr_def1" would be violated by some row
+--- Attaching partitions should be successful when there are no overlapping rows
+-ALTER TABLE range_parted ATTACH partition part3 FOR VALUES FROM (3, 10) TO (3, 20);
+--- check that leaf partitions are scanned when attaching a partitioned
+--- table
+-CREATE TABLE part_5 (
+-	LIKE list_parted2
+-) PARTITION BY LIST (b);
+--- check that violating rows are correctly reported
+-CREATE TABLE part_5_a PARTITION OF part_5 FOR VALUES IN ('a');
+-INSERT INTO part_5_a (a, b) VALUES (6, 'a');
+-ALTER TABLE list_parted2 ATTACH PARTITION part_5 FOR VALUES IN (5);
+-ERROR:  partition constraint of relation "part_5_a" is violated by some row
+--- delete the faulting row and also add a constraint to skip the scan
+-DELETE FROM part_5_a WHERE a NOT IN (3);
+-ALTER TABLE part_5 ADD CONSTRAINT check_a CHECK (a IS NOT NULL AND a = 5);
+-ALTER TABLE list_parted2 ATTACH PARTITION part_5 FOR VALUES IN (5);
+-ALTER TABLE list_parted2 DETACH PARTITION part_5;
+-ALTER TABLE part_5 DROP CONSTRAINT check_a;
+--- scan should again be skipped, even though NOT NULL is now a column property
+-ALTER TABLE part_5 ADD CONSTRAINT check_a CHECK (a IN (5)), ALTER a SET NOT NULL;
+-ALTER TABLE list_parted2 ATTACH PARTITION part_5 FOR VALUES IN (5);
+--- Check the case where attnos of the partitioning columns in the table being
+--- attached differs from the parent.  It should not affect the constraint-
+--- checking logic that allows to skip the scan.
+-CREATE TABLE part_6 (
+-	c int,
+-	LIKE list_parted2,
+-	CONSTRAINT check_a CHECK (a IS NOT NULL AND a = 6)
+-);
+-ALTER TABLE part_6 DROP c;
+-ALTER TABLE list_parted2 ATTACH PARTITION part_6 FOR VALUES IN (6);
+--- Similar to above, but the table being attached is a partitioned table
+--- whose partition has still different attnos for the root partitioning
+--- columns.
+-CREATE TABLE part_7 (
+-	LIKE list_parted2,
+-	CONSTRAINT check_a CHECK (a IS NOT NULL AND a = 7)
+-) PARTITION BY LIST (b);
+-CREATE TABLE part_7_a_null (
+-	c int,
+-	d int,
+-	e int,
+-	LIKE list_parted2,  -- 'a' will have attnum = 4
+-	CONSTRAINT check_b CHECK (b IS NULL OR b = 'a'),
+-	CONSTRAINT check_a CHECK (a IS NOT NULL AND a = 7)
+-);
+-ALTER TABLE part_7_a_null DROP c, DROP d, DROP e;
+-ALTER TABLE part_7 ATTACH PARTITION part_7_a_null FOR VALUES IN ('a', null);
+-ALTER TABLE list_parted2 ATTACH PARTITION part_7 FOR VALUES IN (7);
+--- Same example, but check this time that the constraint correctly detects
+--- violating rows
+-ALTER TABLE list_parted2 DETACH PARTITION part_7;
+-ALTER TABLE part_7 DROP CONSTRAINT check_a; -- thusly, scan won't be skipped
+-INSERT INTO part_7 (a, b) VALUES (8, null), (9, 'a');
+-SELECT tableoid::regclass, a, b FROM part_7 order by a;
+-   tableoid    | a | b 
+----------------+---+---
+- part_7_a_null | 8 | 
+- part_7_a_null | 9 | a
+-(2 rows)
+-
+-ALTER TABLE list_parted2 ATTACH PARTITION part_7 FOR VALUES IN (7);
+-ERROR:  partition constraint of relation "part_7_a_null" is violated by some row
+--- check that leaf partitions of default partition are scanned when
+--- attaching a partitioned table.
+-ALTER TABLE part_5 DROP CONSTRAINT check_a;
+-CREATE TABLE part5_def PARTITION OF part_5 DEFAULT PARTITION BY LIST(a);
+-CREATE TABLE part5_def_p1 PARTITION OF part5_def FOR VALUES IN (5);
+-INSERT INTO part5_def_p1 VALUES (5, 'y');
+-CREATE TABLE part5_p1 (LIKE part_5);
+-ALTER TABLE part_5 ATTACH PARTITION part5_p1 FOR VALUES IN ('y');
+-ERROR:  updated partition constraint for default partition "part5_def_p1" would be violated by some row
+--- should be ok after deleting the bad row
+-DELETE FROM part5_def_p1 WHERE b = 'y';
+-ALTER TABLE part_5 ATTACH PARTITION part5_p1 FOR VALUES IN ('y');
+--- check that the table being attached is not already a partition
+-ALTER TABLE list_parted2 ATTACH PARTITION part_2 FOR VALUES IN (2);
+-ERROR:  "part_2" is already a partition
+--- check that circular inheritance is not allowed
+-ALTER TABLE part_5 ATTACH PARTITION list_parted2 FOR VALUES IN ('b');
+-ERROR:  circular inheritance not allowed
+-DETAIL:  "part_5" is already a child of "list_parted2".
+-ALTER TABLE list_parted2 ATTACH PARTITION list_parted2 FOR VALUES IN (0);
+-ERROR:  circular inheritance not allowed
+-DETAIL:  "list_parted2" is already a child of "list_parted2".
+--- If a partitioned table being created or an existing table being attached
+--- as a partition does not have a constraint that would allow validation scan
+--- to be skipped, but an individual partition does, then the partition's
+--- validation scan is skipped.
+-CREATE TABLE quuux (a int, b text) PARTITION BY LIST (a);
+-CREATE TABLE quuux_default PARTITION OF quuux DEFAULT PARTITION BY LIST (b);
+-CREATE TABLE quuux_default1 PARTITION OF quuux_default (
+-	CONSTRAINT check_1 CHECK (a IS NOT NULL AND a = 1)
+-) FOR VALUES IN ('b');
+-CREATE TABLE quuux1 (a int, b text);
+-ALTER TABLE quuux ATTACH PARTITION quuux1 FOR VALUES IN (1); -- validate!
+-CREATE TABLE quuux2 (a int, b text);
+-ALTER TABLE quuux ATTACH PARTITION quuux2 FOR VALUES IN (2); -- skip validation
+-DROP TABLE quuux1, quuux2;
+--- should validate for quuux1, but not for quuux2
+-CREATE TABLE quuux1 PARTITION OF quuux FOR VALUES IN (1);
+-CREATE TABLE quuux2 PARTITION OF quuux FOR VALUES IN (2);
+-DROP TABLE quuux;
+--- check validation when attaching hash partitions
+--- Use hand-rolled hash functions and operator class to get predictable result
+--- on different machines. part_test_int4_ops is defined in test_setup.sql.
+--- check that the new partition won't overlap with an existing partition
+-CREATE TABLE hash_parted (
+-	a int,
+-	b int
+-) PARTITION BY HASH (a part_test_int4_ops);
+-CREATE TABLE hpart_1 PARTITION OF hash_parted FOR VALUES WITH (MODULUS 4, REMAINDER 0);
+-CREATE TABLE fail_part (LIKE hpart_1);
+-ALTER TABLE hash_parted ATTACH PARTITION fail_part FOR VALUES WITH (MODULUS 8, REMAINDER 4);
+-ERROR:  partition "fail_part" would overlap partition "hpart_1"
+-LINE 1: ...hash_parted ATTACH PARTITION fail_part FOR VALUES WITH (MODU...
+-                                                             ^
+-ALTER TABLE hash_parted ATTACH PARTITION fail_part FOR VALUES WITH (MODULUS 8, REMAINDER 0);
+-ERROR:  partition "fail_part" would overlap partition "hpart_1"
+-LINE 1: ...hash_parted ATTACH PARTITION fail_part FOR VALUES WITH (MODU...
+-                                                             ^
+-DROP TABLE fail_part;
+--- check validation when attaching hash partitions
+--- check that violating rows are correctly reported
+-CREATE TABLE hpart_2 (LIKE hash_parted);
+-INSERT INTO hpart_2 VALUES (3, 0);
+-ALTER TABLE hash_parted ATTACH PARTITION hpart_2 FOR VALUES WITH (MODULUS 4, REMAINDER 1);
+-ERROR:  partition constraint of relation "hpart_2" is violated by some row
+--- should be ok after deleting the bad row
+-DELETE FROM hpart_2;
+-ALTER TABLE hash_parted ATTACH PARTITION hpart_2 FOR VALUES WITH (MODULUS 4, REMAINDER 1);
+--- check that leaf partitions are scanned when attaching a partitioned
+--- table
+-CREATE TABLE hpart_5 (
+-	LIKE hash_parted
+-) PARTITION BY LIST (b);
+--- check that violating rows are correctly reported
+-CREATE TABLE hpart_5_a PARTITION OF hpart_5 FOR VALUES IN ('1', '2', '3');
+-INSERT INTO hpart_5_a (a, b) VALUES (7, 1);
+-ALTER TABLE hash_parted ATTACH PARTITION hpart_5 FOR VALUES WITH (MODULUS 4, REMAINDER 2);
+-ERROR:  partition constraint of relation "hpart_5_a" is violated by some row
+--- should be ok after deleting the bad row
+-DELETE FROM hpart_5_a;
+-ALTER TABLE hash_parted ATTACH PARTITION hpart_5 FOR VALUES WITH (MODULUS 4, REMAINDER 2);
+--- check that the table being attach is with valid modulus and remainder value
+-CREATE TABLE fail_part(LIKE hash_parted);
+-ALTER TABLE hash_parted ATTACH PARTITION fail_part FOR VALUES WITH (MODULUS 0, REMAINDER 1);
+-ERROR:  modulus for hash partition must be an integer value greater than zero
+-ALTER TABLE hash_parted ATTACH PARTITION fail_part FOR VALUES WITH (MODULUS 8, REMAINDER 8);
+-ERROR:  remainder for hash partition must be less than modulus
+-ALTER TABLE hash_parted ATTACH PARTITION fail_part FOR VALUES WITH (MODULUS 3, REMAINDER 2);
+-ERROR:  every hash partition modulus must be a factor of the next larger modulus
+-DETAIL:  The new modulus 3 is not a factor of 4, the modulus of existing partition "hpart_1".
+-DROP TABLE fail_part;
+---
+--- DETACH PARTITION
+---
+--- check that the table is partitioned at all
+-CREATE TABLE regular_table (a int);
+-ALTER TABLE regular_table DETACH PARTITION any_name;
+-ERROR:  table "regular_table" is not partitioned
+-DROP TABLE regular_table;
+--- check that the partition being detached exists at all
+-ALTER TABLE list_parted2 DETACH PARTITION part_4;
+-ERROR:  relation "part_4" does not exist
+-ALTER TABLE hash_parted DETACH PARTITION hpart_4;
+-ERROR:  relation "hpart_4" does not exist
+--- check that the partition being detached is actually a partition of the parent
+-CREATE TABLE not_a_part (a int);
+-ALTER TABLE list_parted2 DETACH PARTITION not_a_part;
+-ERROR:  relation "not_a_part" is not a partition of relation "list_parted2"
+-ALTER TABLE list_parted2 DETACH PARTITION part_1;
+-ERROR:  relation "part_1" is not a partition of relation "list_parted2"
+-ALTER TABLE hash_parted DETACH PARTITION not_a_part;
+-ERROR:  relation "not_a_part" is not a partition of relation "hash_parted"
+-DROP TABLE not_a_part;
+--- check that, after being detached, attinhcount/coninhcount is dropped to 0 and
+--- attislocal/conislocal is set to true
+-ALTER TABLE list_parted2 DETACH PARTITION part_3_4;
+-SELECT attinhcount, attislocal FROM pg_attribute WHERE attrelid = 'part_3_4'::regclass AND attnum > 0;
+- attinhcount | attislocal 
+--------------+------------
+-           0 | t
+-           0 | t
+-(2 rows)
+-
+-SELECT coninhcount, conislocal FROM pg_constraint WHERE conrelid = 'part_3_4'::regclass AND conname = 'check_a';
+- coninhcount | conislocal 
+--------------+------------
+-           0 | t
+-(1 row)
+-
+-DROP TABLE part_3_4;
+--- check that a detached partition is not dropped on dropping a partitioned table
+-CREATE TABLE range_parted2 (
+-    a int
+-) PARTITION BY RANGE(a);
+-CREATE TABLE part_rp PARTITION OF range_parted2 FOR VALUES FROM (0) to (100);
+-ALTER TABLE range_parted2 DETACH PARTITION part_rp;
+-DROP TABLE range_parted2;
+-SELECT * from part_rp;
+- a 
+----
+-(0 rows)
+-
+-DROP TABLE part_rp;
+--- concurrent detach
+-CREATE TABLE range_parted2 (
+-	a int
+-) PARTITION BY RANGE(a);
+-CREATE TABLE part_rp PARTITION OF range_parted2 FOR VALUES FROM (0) to (100);
+-BEGIN;
+--- doesn't work in a partition block
+-ALTER TABLE range_parted2 DETACH PARTITION part_rp CONCURRENTLY;
+-ERROR:  ALTER TABLE ... DETACH CONCURRENTLY cannot run inside a transaction block
+-COMMIT;
+-CREATE TABLE part_rpd PARTITION OF range_parted2 DEFAULT;
+--- doesn't work if there's a default partition
+-ALTER TABLE range_parted2 DETACH PARTITION part_rp CONCURRENTLY;
+-ERROR:  cannot detach partitions concurrently when a default partition exists
+--- doesn't work for the default partition
+-ALTER TABLE range_parted2 DETACH PARTITION part_rpd CONCURRENTLY;
+-ERROR:  cannot detach partitions concurrently when a default partition exists
+-DROP TABLE part_rpd;
+--- works fine
+-ALTER TABLE range_parted2 DETACH PARTITION part_rp CONCURRENTLY;
+-\d+ range_parted2
+-                         Partitioned table "public.range_parted2"
+- Column |  Type   | Collation | Nullable | Default | Storage | Stats target | Description 
+---------+---------+-----------+----------+---------+---------+--------------+-------------
+- a      | integer |           |          |         | plain   |              | 
+-Partition key: RANGE (a)
+-Number of partitions: 0
+-
+--- constraint should be created
+-\d part_rp
+-              Table "public.part_rp"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- a      | integer |           |          | 
+-Check constraints:
+-    "part_rp_a_check" CHECK (a IS NOT NULL AND a >= 0 AND a < 100)
+-
+-CREATE TABLE part_rp100 PARTITION OF range_parted2 (CHECK (a>=123 AND a<133 AND a IS NOT NULL)) FOR VALUES FROM (100) to (200);
+-ALTER TABLE range_parted2 DETACH PARTITION part_rp100 CONCURRENTLY;
+--- redundant constraint should not be created
+-\d part_rp100
+-             Table "public.part_rp100"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- a      | integer |           |          | 
+-Check constraints:
+-    "part_rp100_a_check" CHECK (a >= 123 AND a < 133 AND a IS NOT NULL)
+-
+-DROP TABLE range_parted2;
+--- Check ALTER TABLE commands for partitioned tables and partitions
+--- cannot add/drop column to/from *only* the parent
+-ALTER TABLE ONLY list_parted2 ADD COLUMN c int;
+-ERROR:  column must be added to child tables too
+-ALTER TABLE ONLY list_parted2 DROP COLUMN b;
+-ERROR:  cannot drop column from only the partitioned table when partitions exist
+-HINT:  Do not specify the ONLY keyword.
+--- cannot add a column to partition or drop an inherited one
+-ALTER TABLE part_2 ADD COLUMN c text;
+-ERROR:  cannot add column to a partition
+-ALTER TABLE part_2 DROP COLUMN b;
+-ERROR:  cannot drop inherited column "b"
+--- Nor rename, alter type
+-ALTER TABLE part_2 RENAME COLUMN b to c;
+-ERROR:  cannot rename inherited column "b"
+-ALTER TABLE part_2 ALTER COLUMN b TYPE text;
+-ERROR:  cannot alter inherited column "b"
+--- cannot add/drop NOT NULL or check constraints to *only* the parent, when
+--- partitions exist
+-ALTER TABLE ONLY list_parted2 ALTER b SET NOT NULL;
+-ERROR:  constraint must be added to child tables too
+-DETAIL:  Column "b" of relation "part_2" is not already NOT NULL.
+-HINT:  Do not specify the ONLY keyword.
+-ALTER TABLE ONLY list_parted2 ADD CONSTRAINT check_b CHECK (b <> 'zz');
+-ERROR:  constraint must be added to child tables too
+-ALTER TABLE list_parted2 ALTER b SET NOT NULL;
+-ALTER TABLE ONLY list_parted2 ALTER b DROP NOT NULL;
+-ERROR:  cannot remove constraint from only the partitioned table when partitions exist
+-HINT:  Do not specify the ONLY keyword.
+-ALTER TABLE list_parted2 ADD CONSTRAINT check_b CHECK (b <> 'zz');
+-ALTER TABLE ONLY list_parted2 DROP CONSTRAINT check_b;
+-ERROR:  cannot remove constraint from only the partitioned table when partitions exist
+-HINT:  Do not specify the ONLY keyword.
+--- It's alright though, if no partitions are yet created
+-CREATE TABLE parted_no_parts (a int) PARTITION BY LIST (a);
+-ALTER TABLE ONLY parted_no_parts ALTER a SET NOT NULL;
+-ALTER TABLE ONLY parted_no_parts ADD CONSTRAINT check_a CHECK (a > 0);
+-ALTER TABLE ONLY parted_no_parts ALTER a DROP NOT NULL;
+-ALTER TABLE ONLY parted_no_parts DROP CONSTRAINT check_a;
+-DROP TABLE parted_no_parts;
+--- cannot drop inherited NOT NULL or check constraints from partition
+-ALTER TABLE list_parted2 ALTER b SET NOT NULL, ADD CONSTRAINT check_a2 CHECK (a > 0);
+-ALTER TABLE part_2 ALTER b DROP NOT NULL;
+-ERROR:  column "b" is marked NOT NULL in parent table
+-ALTER TABLE part_2 DROP CONSTRAINT check_a2;
+-ERROR:  cannot drop inherited constraint "check_a2" of relation "part_2"
+--- Doesn't make sense to add NO INHERIT constraints on partitioned tables
+-ALTER TABLE list_parted2 add constraint check_b2 check (b <> 'zz') NO INHERIT;
+-ERROR:  cannot add NO INHERIT constraint to partitioned table "list_parted2"
+--- check that a partition cannot participate in regular inheritance
+-CREATE TABLE inh_test () INHERITS (part_2);
+-ERROR:  cannot inherit from partition "part_2"
+-CREATE TABLE inh_test (LIKE part_2);
+-ALTER TABLE inh_test INHERIT part_2;
+-ERROR:  cannot inherit from a partition
+-ALTER TABLE part_2 INHERIT inh_test;
+-ERROR:  cannot change inheritance of a partition
+--- cannot drop or alter type of partition key columns of lower level
+--- partitioned tables; for example, part_5, which is list_parted2's
+--- partition, is partitioned on b;
+-ALTER TABLE list_parted2 DROP COLUMN b;
+-ERROR:  cannot drop column "b" because it is part of the partition key of relation "part_5"
+-ALTER TABLE list_parted2 ALTER COLUMN b TYPE text;
+-ERROR:  cannot alter column "b" because it is part of the partition key of relation "part_5"
+--- dropping non-partition key columns should be allowed on the parent table.
+-ALTER TABLE list_parted DROP COLUMN b;
+-SELECT * FROM list_parted;
+- a 
+----
+-(0 rows)
+-
+--- cleanup
+-DROP TABLE list_parted, list_parted2, range_parted;
+-DROP TABLE fail_def_part;
+-DROP TABLE hash_parted;
+--- more tests for certain multi-level partitioning scenarios
+-create table p (a int, b int) partition by range (a, b);
+-create table p1 (b int, a int not null) partition by range (b);
+-create table p11 (like p1);
+-alter table p11 drop a;
+-alter table p11 add a int;
+-alter table p11 drop a;
+-alter table p11 add a int not null;
+--- attnum for key attribute 'a' is different in p, p1, and p11
+-select attrelid::regclass, attname, attnum
+-from pg_attribute
+-where attname = 'a'
+- and (attrelid = 'p'::regclass
+-   or attrelid = 'p1'::regclass
+-   or attrelid = 'p11'::regclass)
+-order by attrelid::regclass::text;
+- attrelid | attname | attnum 
+-----------+---------+--------
+- p        | a       |      1
+- p1       | a       |      2
+- p11      | a       |      4
+-(3 rows)
+-
+-alter table p1 attach partition p11 for values from (2) to (5);
+-insert into p1 (a, b) values (2, 3);
+--- check that partition validation scan correctly detects violating rows
+-alter table p attach partition p1 for values from (1, 2) to (1, 10);
+-ERROR:  partition constraint of relation "p11" is violated by some row
+--- cleanup
+-drop table p;
+-drop table p1;
+--- validate constraint on partitioned tables should only scan leaf partitions
+-create table parted_validate_test (a int) partition by list (a);
+-create table parted_validate_test_1 partition of parted_validate_test for values in (0, 1);
+-alter table parted_validate_test add constraint parted_validate_test_chka check (a > 0) not valid;
+-alter table parted_validate_test validate constraint parted_validate_test_chka;
+-drop table parted_validate_test;
+--- test alter column options
+-CREATE TABLE attmp(i integer);
+-INSERT INTO attmp VALUES (1);
+-ALTER TABLE attmp ALTER COLUMN i SET (n_distinct = 1, n_distinct_inherited = 2);
+-ALTER TABLE attmp ALTER COLUMN i RESET (n_distinct_inherited);
+-ANALYZE attmp;
+-DROP TABLE attmp;
+-DROP USER regress_alter_table_user1;
+--- check that violating rows are correctly reported when attaching as the
+--- default partition
+-create table defpart_attach_test (a int) partition by list (a);
+-create table defpart_attach_test1 partition of defpart_attach_test for values in (1);
+-create table defpart_attach_test_d (b int, a int);
+-alter table defpart_attach_test_d drop b;
+-insert into defpart_attach_test_d values (1), (2);
+--- error because its constraint as the default partition would be violated
+--- by the row containing 1
+-alter table defpart_attach_test attach partition defpart_attach_test_d default;
+-ERROR:  partition constraint of relation "defpart_attach_test_d" is violated by some row
+-delete from defpart_attach_test_d where a = 1;
+-alter table defpart_attach_test_d add check (a > 1);
+--- should be attached successfully and without needing to be scanned
+-alter table defpart_attach_test attach partition defpart_attach_test_d default;
+--- check that attaching a partition correctly reports any rows in the default
+--- partition that should not be there for the new partition to be attached
+--- successfully
+-create table defpart_attach_test_2 (like defpart_attach_test_d);
+-alter table defpart_attach_test attach partition defpart_attach_test_2 for values in (2);
+-ERROR:  updated partition constraint for default partition "defpart_attach_test_d" would be violated by some row
+-drop table defpart_attach_test;
+--- check combinations of temporary and permanent relations when attaching
+--- partitions.
+-create table perm_part_parent (a int) partition by list (a);
+-create temp table temp_part_parent (a int) partition by list (a);
+-create table perm_part_child (a int);
+-create temp table temp_part_child (a int);
+-alter table temp_part_parent attach partition perm_part_child default; -- error
+-ERROR:  cannot attach a permanent relation as partition of temporary relation "temp_part_parent"
+-alter table perm_part_parent attach partition temp_part_child default; -- error
+-ERROR:  cannot attach a temporary relation as partition of permanent relation "perm_part_parent"
+-alter table temp_part_parent attach partition temp_part_child default; -- ok
+-drop table perm_part_parent cascade;
+-drop table temp_part_parent cascade;
+--- check that attaching partitions to a table while it is being used is
+--- prevented
+-create table tab_part_attach (a int) partition by list (a);
+-create or replace function func_part_attach() returns trigger
+-  language plpgsql as $$
+-  begin
+-    execute 'create table tab_part_attach_1 (a int)';
+-    execute 'alter table tab_part_attach attach partition tab_part_attach_1 for values in (1)';
+-    return null;
+-  end $$;
+-create trigger trig_part_attach before insert on tab_part_attach
+-  for each statement execute procedure func_part_attach();
+-insert into tab_part_attach values (1);
+-ERROR:  cannot ALTER TABLE "tab_part_attach" because it is being used by active queries in this session
+-CONTEXT:  SQL statement "alter table tab_part_attach attach partition tab_part_attach_1 for values in (1)"
+-PL/pgSQL function func_part_attach() line 4 at EXECUTE
+-drop table tab_part_attach;
+-drop function func_part_attach();
+--- test case where the partitioning operator is a SQL function whose
+--- evaluation results in the table's relcache being rebuilt partway through
+--- the execution of an ATTACH PARTITION command
+-create function at_test_sql_partop (int4, int4) returns int language sql
+-as $$ select case when $1 = $2 then 0 when $1 > $2 then 1 else -1 end; $$;
+-create operator class at_test_sql_partop for type int4 using btree as
+-    operator 1 < (int4, int4), operator 2 <= (int4, int4),
+-    operator 3 = (int4, int4), operator 4 >= (int4, int4),
+-    operator 5 > (int4, int4), function 1 at_test_sql_partop(int4, int4);
+-create table at_test_sql_partop (a int) partition by range (a at_test_sql_partop);
+-create table at_test_sql_partop_1 (a int);
+-alter table at_test_sql_partop attach partition at_test_sql_partop_1 for values from (0) to (10);
+-drop table at_test_sql_partop;
+-drop operator class at_test_sql_partop using btree;
+-drop function at_test_sql_partop;
+-/* Test case for bug #16242 */
+--- We create a parent and child where the child has missing
+--- non-null attribute values, and arrange to pass them through
+--- tuple conversion from the child to the parent tupdesc
+-create table bar1 (a integer, b integer not null default 1)
+-  partition by range (a);
+-create table bar2 (a integer);
+-insert into bar2 values (1);
+-alter table bar2 add column b integer not null default 1;
+--- (at this point bar2 contains tuple with natts=1)
+-alter table bar1 attach partition bar2 default;
+--- this works:
+-select * from bar1;
+- a | b 
+----+---
+- 1 | 1
+-(1 row)
+-
+--- this exercises tuple conversion:
+-create function xtrig()
+-  returns trigger language plpgsql
+-as $$
+-  declare
+-    r record;
+-  begin
+-    for r in select * from old loop
+-      raise info 'a=%, b=%', r.a, r.b;
+-    end loop;
+-    return NULL;
+-  end;
+-$$;
+-create trigger xtrig
+-  after update on bar1
+-  referencing old table as old
+-  for each statement execute procedure xtrig();
+-update bar1 set a = a + 1;
+-INFO:  a=1, b=1
+-/* End test case for bug #16242 */
+-/* Test case for bug #17409 */
+-create table attbl (p1 int constraint pk_attbl primary key);
+-create table atref (c1 int references attbl(p1));
+-cluster attbl using pk_attbl;
+-alter table attbl alter column p1 set data type bigint;
+-alter table atref alter column c1 set data type bigint;
+-drop table attbl, atref;
+-create table attbl (p1 int constraint pk_attbl primary key);
+-alter table attbl replica identity using index pk_attbl;
+-create table atref (c1 int references attbl(p1));
+-alter table attbl alter column p1 set data type bigint;
+-alter table atref alter column c1 set data type bigint;
+-drop table attbl, atref;
+-/* End test case for bug #17409 */
+--- Test that ALTER TABLE rewrite preserves a clustered index
+--- for normal indexes and indexes on constraints.
+-create table alttype_cluster (a int);
+-alter table alttype_cluster add primary key (a);
+-create index alttype_cluster_ind on alttype_cluster (a);
+-alter table alttype_cluster cluster on alttype_cluster_ind;
+--- Normal index remains clustered.
+-select indexrelid::regclass, indisclustered from pg_index
+-  where indrelid = 'alttype_cluster'::regclass
+-  order by indexrelid::regclass::text;
+-      indexrelid      | indisclustered 
+-----------------------+----------------
+- alttype_cluster_ind  | t
+- alttype_cluster_pkey | f
+-(2 rows)
+-
+-alter table alttype_cluster alter a type bigint;
+-select indexrelid::regclass, indisclustered from pg_index
+-  where indrelid = 'alttype_cluster'::regclass
+-  order by indexrelid::regclass::text;
+-      indexrelid      | indisclustered 
+-----------------------+----------------
+- alttype_cluster_ind  | t
+- alttype_cluster_pkey | f
+-(2 rows)
+-
+--- Constraint index remains clustered.
+-alter table alttype_cluster cluster on alttype_cluster_pkey;
+-select indexrelid::regclass, indisclustered from pg_index
+-  where indrelid = 'alttype_cluster'::regclass
+-  order by indexrelid::regclass::text;
+-      indexrelid      | indisclustered 
+-----------------------+----------------
+- alttype_cluster_ind  | f
+- alttype_cluster_pkey | t
+-(2 rows)
+-
+-alter table alttype_cluster alter a type int;
+-select indexrelid::regclass, indisclustered from pg_index
+-  where indrelid = 'alttype_cluster'::regclass
+-  order by indexrelid::regclass::text;
+-      indexrelid      | indisclustered 
+-----------------------+----------------
+- alttype_cluster_ind  | f
+- alttype_cluster_pkey | t
+-(2 rows)
+-
+-drop table alttype_cluster;
+---
+--- Check that attaching or detaching a partitioned partition correctly leads
+--- to its partitions' constraint being updated to reflect the parent's
+--- newly added/removed constraint
+-create table target_parted (a int, b int) partition by list (a);
+-create table attach_parted (a int, b int) partition by list (b);
+-create table attach_parted_part1 partition of attach_parted for values in (1);
+--- insert a row directly into the leaf partition so that its partition
+--- constraint is built and stored in the relcache
+-insert into attach_parted_part1 values (1, 1);
+--- the following better invalidate the partition constraint of the leaf
+--- partition too...
+-alter table target_parted attach partition attach_parted for values in (1);
+--- ...such that the following insert fails
+-insert into attach_parted_part1 values (2, 1);
+-ERROR:  new row for relation "attach_parted_part1" violates partition constraint
+-DETAIL:  Failing row contains (2, 1).
+--- ...and doesn't when the partition is detached along with its own partition
+-alter table target_parted detach partition attach_parted;
+-insert into attach_parted_part1 values (2, 1);
+--- Test altering table having publication
+-create schema alter1;
+-create schema alter2;
+-create table alter1.t1 (a int);
+-set client_min_messages = 'ERROR';
+-create publication pub1 for table alter1.t1, tables in schema alter2;
+-reset client_min_messages;
+-alter table alter1.t1 set schema alter2;
+-\d+ alter2.t1
+-                                    Table "alter2.t1"
+- Column |  Type   | Collation | Nullable | Default | Storage | Stats target | Description 
+---------+---------+-----------+----------+---------+---------+--------------+-------------
+- a      | integer |           |          |         | plain   |              | 
+-Publications:
+-    "pub1"
+-
+-drop publication pub1;
+-drop schema alter1 cascade;
+-drop schema alter2 cascade;
+-NOTICE:  drop cascades to table alter2.t1
++WARNING:  terminating connection because of crash of another server process
++DETAIL:  The postmaster has commanded this server process to roll back the current transaction and exit, because another server process exited abnormally and possibly corrupted shared memory.
++HINT:  In a moment you should be able to reconnect to the database and repeat your command.
++server closed the connection unexpectedly
++	This probably means the server terminated abnormally
++	before or while processing the request.
++connection to server was lost
