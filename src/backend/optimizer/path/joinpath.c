@@ -141,15 +141,7 @@ static Path *create_optimized_mergejoin_path(PlannerInfo *root,
 											 RelOptInfo *other_rel,
 											 JoinPathExtraData *extra,
 											 MergePath *original_path);
-static Path *create_optimized_hashjoin_path(PlannerInfo *root,
-											RelOptInfo *joinrel,
-											JoinType jointype,
-											Path *limited_path,
-											Path *other_path,
-											RelOptInfo *preserved_rel,
-											RelOptInfo *other_rel,
-											JoinPathExtraData *extra,
-											HashPath *original_path);
+
 
 
 /*
@@ -2748,10 +2740,9 @@ create_optimized_outer_join_path(PlannerInfo *root,
 	}
 	else if (IsA(original_path, HashPath))
 	{
-		optimized_join_path = create_optimized_hashjoin_path(root, joinrel, jointype,
-															 limited_path, other_path,
-															 preserved_rel, other_rel, extra,
-															 (HashPath *) original_path);
+		/* Skip hash join optimization due to complex clause rebuilding requirements */
+		elog(DEBUG1, "Skipping hash join optimization due to clause rebuilding complexity");
+		optimized_join_path = NULL;
 	}
 
 	if (optimized_join_path)
@@ -2976,115 +2967,6 @@ create_optimized_mergejoin_path(PlannerInfo *root,
 										  mergeclauses,
 										  outersortkeys,
 										  innersortkeys);
-}
-
-/*
- * create_optimized_hashjoin_path
- *		Create a hash join path using the limited preserved relation.
- *		This function extracts hash clauses from the original path and
- *		creates a new hash join with the limited preserved relation.
- */
-static Path *
-create_optimized_hashjoin_path(PlannerInfo *root,
-							  RelOptInfo *joinrel,
-							  JoinType jointype,
-							  Path *limited_path,
-							  Path *other_path,
-							  RelOptInfo *preserved_rel,
-							  RelOptInfo *other_rel,
-							  JoinPathExtraData *extra,
-							  HashPath *original_path)
-{
-	JoinCostWorkspace workspace;
-	Relids		required_outer;
-	Path	   *outer_path, *inner_path;
-	List	   *hashclauses;
-	ListCell   *l;
-	bool		isouterjoin = IS_OUTER_JOIN(jointype);
-
-	elog(DEBUG1, "Creating optimized hash join path");
-
-	/* 
-	 * Rebuild hash clauses for the optimized path instead of reusing the original ones.
-	 * This is necessary because the relids in the RestrictInfo clauses must match 
-	 * the new path configuration.
-	 */
-	hashclauses = NIL;
-	foreach(l, extra->restrictlist)
-	{
-		RestrictInfo *restrictinfo = (RestrictInfo *) lfirst(l);
-
-		/*
-		 * If processing an outer join, only use its own join clauses for
-		 * hashing.  For inner joins we need not be so picky.
-		 */
-		if (isouterjoin && RINFO_IS_PUSHED_DOWN(restrictinfo, joinrel->relids))
-			continue;
-
-		if (!restrictinfo->can_join ||
-			restrictinfo->hashjoinoperator == InvalidOid)
-			continue;			/* not hashjoinable */
-
-		/*
-		 * Check if clause has the form "outer op inner" or "inner op outer".
-		 * We need to check this with the new preserved_rel and other_rel configuration.
-		 */
-		if (jointype == JOIN_LEFT)
-		{
-			if (!clause_sides_match_join(restrictinfo, preserved_rel, other_rel))
-			{
-				elog(DEBUG1, "Hash clause rejected for LEFT JOIN: clause doesn't match preserved_rel (outer) vs other_rel (inner)");
-				continue;			/* no good for these input relations */
-			}
-		}
-		else /* JOIN_RIGHT */
-		{
-			if (!clause_sides_match_join(restrictinfo, other_rel, preserved_rel))
-			{
-				elog(DEBUG1, "Hash clause rejected for RIGHT JOIN: clause doesn't match other_rel (outer) vs preserved_rel (inner)");
-				continue;			/* no good for these input relations */
-			}
-		}
-
-		elog(DEBUG1, "Adding hash clause to hashclauses list");
-
-		hashclauses = lappend(hashclauses, restrictinfo);
-	}
-
-	/* If we found no usable hashclauses, we can't create a hash join */
-	if (!hashclauses)
-	{
-		elog(DEBUG1, "No usable hash clauses found for optimized path");
-		return NULL;
-	}
-
-	/* Determine which path is outer and which is inner */
-	if (jointype == JOIN_LEFT)
-	{
-		outer_path = limited_path;
-		inner_path = other_path;
-	}
-	else /* JOIN_RIGHT */
-	{
-		outer_path = other_path;
-		inner_path = limited_path;
-	}
-
-	/* Calculate the required outer relations using same logic as standard hashjoin */
-	required_outer = calc_non_nestloop_required_outer(outer_path, inner_path);
-
-	/* Calculate join costs */
-	initial_cost_hashjoin(root, &workspace, jointype, hashclauses,
-						  outer_path, inner_path, extra, false);
-
-	/* Create the hash join path */
-	return (Path *) create_hashjoin_path(root, joinrel, jointype,
-										 &workspace, extra,
-										 outer_path, inner_path,
-										 false, /* parallel_hash */
-										 extra->restrictlist,
-										 required_outer,
-										 hashclauses);
 }
 
 /*

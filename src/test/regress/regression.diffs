@@ -1,3022 +1,698 @@
-diff -U3 /home/runner/work/postgres/postgres/src/test/regress/expected/partition_join.out /home/runner/work/postgres/postgres/src/test/regress/results/partition_join.out
---- /home/runner/work/postgres/postgres/src/test/regress/expected/partition_join.out	2025-09-12 09:25:55.817897119 +0000
-+++ /home/runner/work/postgres/postgres/src/test/regress/results/partition_join.out	2025-09-12 09:35:42.807271891 +0000
-@@ -5132,39 +5132,7 @@
- SET enable_partitionwise_join = on;
- EXPLAIN (COSTS OFF)
- SELECT x.id, y.id FROM fract_t x LEFT JOIN fract_t y USING (id) ORDER BY x.id ASC LIMIT 10;
--                              QUERY PLAN                               
-------------------------------------------------------------------------
-- Limit
--   ->  Merge Append
--         Sort Key: x.id
--         ->  Merge Left Join
--               Merge Cond: (x_1.id = y_1.id)
--               ->  Index Only Scan using fract_t0_pkey on fract_t0 x_1
--               ->  Index Only Scan using fract_t0_pkey on fract_t0 y_1
--         ->  Merge Left Join
--               Merge Cond: (x_2.id = y_2.id)
--               ->  Index Only Scan using fract_t1_pkey on fract_t1 x_2
--               ->  Index Only Scan using fract_t1_pkey on fract_t1 y_2
--(11 rows)
--
--EXPLAIN (COSTS OFF)
--SELECT x.id, y.id FROM fract_t x LEFT JOIN fract_t y USING (id) ORDER BY x.id DESC LIMIT 10;
--                                   QUERY PLAN                                   
----------------------------------------------------------------------------------
-- Limit
--   ->  Merge Append
--         Sort Key: x.id DESC
--         ->  Nested Loop Left Join
--               ->  Index Only Scan Backward using fract_t0_pkey on fract_t0 x_1
--               ->  Index Only Scan using fract_t0_pkey on fract_t0 y_1
--                     Index Cond: (id = x_1.id)
--         ->  Nested Loop Left Join
--               ->  Index Only Scan Backward using fract_t1_pkey on fract_t1 x_2
--               ->  Index Only Scan using fract_t1_pkey on fract_t1 y_2
--                     Index Cond: (id = x_2.id)
--(11 rows)
--
---- cleanup
--DROP TABLE fract_t;
--RESET max_parallel_workers_per_gather;
--RESET enable_partitionwise_join;
-+server closed the connection unexpectedly
-+	This probably means the server terminated abnormally
-+	before or while processing the request.
-+connection to server was lost
-diff -U3 /home/runner/work/postgres/postgres/src/test/regress/expected/oidjoins.out /home/runner/work/postgres/postgres/src/test/regress/results/oidjoins.out
---- /home/runner/work/postgres/postgres/src/test/regress/expected/oidjoins.out	2025-09-12 09:25:55.816897109 +0000
-+++ /home/runner/work/postgres/postgres/src/test/regress/results/oidjoins.out	2025-09-12 09:35:42.900272915 +0000
-@@ -1,268 +1 @@
----
---- Verify system catalog foreign key relationships
----
--DO $doblock$
--declare
--  fk record;
--  nkeys integer;
--  cmd text;
--  err record;
--begin
--  for fk in select * from pg_get_catalog_foreign_keys()
--  loop
--    raise notice 'checking % % => % %',
--      fk.fktable, fk.fkcols, fk.pktable, fk.pkcols;
--    nkeys := array_length(fk.fkcols, 1);
--    cmd := 'SELECT ctid';
--    for i in 1 .. nkeys loop
--      cmd := cmd || ', ' || quote_ident(fk.fkcols[i]);
--    end loop;
--    if fk.is_array then
--      cmd := cmd || ' FROM (SELECT ctid';
--      for i in 1 .. nkeys-1 loop
--        cmd := cmd || ', ' || quote_ident(fk.fkcols[i]);
--      end loop;
--      cmd := cmd || ', unnest(' || quote_ident(fk.fkcols[nkeys]);
--      cmd := cmd || ') as ' || quote_ident(fk.fkcols[nkeys]);
--      cmd := cmd || ' FROM ' || fk.fktable::text || ') fk WHERE ';
--    else
--      cmd := cmd || ' FROM ' || fk.fktable::text || ' fk WHERE ';
--    end if;
--    if fk.is_opt then
--      for i in 1 .. nkeys loop
--        cmd := cmd || quote_ident(fk.fkcols[i]) || ' != 0 AND ';
--      end loop;
--    end if;
--    cmd := cmd || 'NOT EXISTS(SELECT 1 FROM ' || fk.pktable::text || ' pk WHERE ';
--    for i in 1 .. nkeys loop
--      if i > 1 then cmd := cmd || ' AND '; end if;
--      cmd := cmd || 'pk.' || quote_ident(fk.pkcols[i]);
--      cmd := cmd || ' = fk.' || quote_ident(fk.fkcols[i]);
--    end loop;
--    cmd := cmd || ')';
--    -- raise notice 'cmd = %', cmd;
--    for err in execute cmd loop
--      raise warning 'FK VIOLATION IN %(%): %', fk.fktable, fk.fkcols, err;
--    end loop;
--  end loop;
--end
--$doblock$;
--NOTICE:  checking pg_proc {pronamespace} => pg_namespace {oid}
--NOTICE:  checking pg_proc {proowner} => pg_authid {oid}
--NOTICE:  checking pg_proc {prolang} => pg_language {oid}
--NOTICE:  checking pg_proc {provariadic} => pg_type {oid}
--NOTICE:  checking pg_proc {prosupport} => pg_proc {oid}
--NOTICE:  checking pg_proc {prorettype} => pg_type {oid}
--NOTICE:  checking pg_proc {proargtypes} => pg_type {oid}
--NOTICE:  checking pg_proc {proallargtypes} => pg_type {oid}
--NOTICE:  checking pg_proc {protrftypes} => pg_type {oid}
--NOTICE:  checking pg_type {typnamespace} => pg_namespace {oid}
--NOTICE:  checking pg_type {typowner} => pg_authid {oid}
--NOTICE:  checking pg_type {typrelid} => pg_class {oid}
--NOTICE:  checking pg_type {typsubscript} => pg_proc {oid}
--NOTICE:  checking pg_type {typelem} => pg_type {oid}
--NOTICE:  checking pg_type {typarray} => pg_type {oid}
--NOTICE:  checking pg_type {typinput} => pg_proc {oid}
--NOTICE:  checking pg_type {typoutput} => pg_proc {oid}
--NOTICE:  checking pg_type {typreceive} => pg_proc {oid}
--NOTICE:  checking pg_type {typsend} => pg_proc {oid}
--NOTICE:  checking pg_type {typmodin} => pg_proc {oid}
--NOTICE:  checking pg_type {typmodout} => pg_proc {oid}
--NOTICE:  checking pg_type {typanalyze} => pg_proc {oid}
--NOTICE:  checking pg_type {typbasetype} => pg_type {oid}
--NOTICE:  checking pg_type {typcollation} => pg_collation {oid}
--NOTICE:  checking pg_attribute {attrelid} => pg_class {oid}
--NOTICE:  checking pg_attribute {atttypid} => pg_type {oid}
--NOTICE:  checking pg_attribute {attcollation} => pg_collation {oid}
--NOTICE:  checking pg_class {relnamespace} => pg_namespace {oid}
--NOTICE:  checking pg_class {reltype} => pg_type {oid}
--NOTICE:  checking pg_class {reloftype} => pg_type {oid}
--NOTICE:  checking pg_class {relowner} => pg_authid {oid}
--NOTICE:  checking pg_class {relam} => pg_am {oid}
--NOTICE:  checking pg_class {reltablespace} => pg_tablespace {oid}
--NOTICE:  checking pg_class {reltoastrelid} => pg_class {oid}
--NOTICE:  checking pg_class {relrewrite} => pg_class {oid}
--NOTICE:  checking pg_attrdef {adrelid} => pg_class {oid}
--NOTICE:  checking pg_attrdef {adrelid,adnum} => pg_attribute {attrelid,attnum}
--NOTICE:  checking pg_constraint {connamespace} => pg_namespace {oid}
--NOTICE:  checking pg_constraint {conrelid} => pg_class {oid}
--NOTICE:  checking pg_constraint {contypid} => pg_type {oid}
--NOTICE:  checking pg_constraint {conindid} => pg_class {oid}
--NOTICE:  checking pg_constraint {conparentid} => pg_constraint {oid}
--NOTICE:  checking pg_constraint {confrelid} => pg_class {oid}
--NOTICE:  checking pg_constraint {conpfeqop} => pg_operator {oid}
--NOTICE:  checking pg_constraint {conppeqop} => pg_operator {oid}
--NOTICE:  checking pg_constraint {conffeqop} => pg_operator {oid}
--NOTICE:  checking pg_constraint {conexclop} => pg_operator {oid}
--NOTICE:  checking pg_constraint {conrelid,conkey} => pg_attribute {attrelid,attnum}
--NOTICE:  checking pg_constraint {confrelid,confkey} => pg_attribute {attrelid,attnum}
--NOTICE:  checking pg_inherits {inhrelid} => pg_class {oid}
--NOTICE:  checking pg_inherits {inhparent} => pg_class {oid}
--NOTICE:  checking pg_index {indexrelid} => pg_class {oid}
--NOTICE:  checking pg_index {indrelid} => pg_class {oid}
--NOTICE:  checking pg_index {indcollation} => pg_collation {oid}
--NOTICE:  checking pg_index {indclass} => pg_opclass {oid}
--NOTICE:  checking pg_index {indrelid,indkey} => pg_attribute {attrelid,attnum}
--NOTICE:  checking pg_operator {oprnamespace} => pg_namespace {oid}
--NOTICE:  checking pg_operator {oprowner} => pg_authid {oid}
--NOTICE:  checking pg_operator {oprleft} => pg_type {oid}
--NOTICE:  checking pg_operator {oprright} => pg_type {oid}
--NOTICE:  checking pg_operator {oprresult} => pg_type {oid}
--NOTICE:  checking pg_operator {oprcom} => pg_operator {oid}
--NOTICE:  checking pg_operator {oprnegate} => pg_operator {oid}
--NOTICE:  checking pg_operator {oprcode} => pg_proc {oid}
--NOTICE:  checking pg_operator {oprrest} => pg_proc {oid}
--NOTICE:  checking pg_operator {oprjoin} => pg_proc {oid}
--NOTICE:  checking pg_opfamily {opfmethod} => pg_am {oid}
--NOTICE:  checking pg_opfamily {opfnamespace} => pg_namespace {oid}
--NOTICE:  checking pg_opfamily {opfowner} => pg_authid {oid}
--NOTICE:  checking pg_opclass {opcmethod} => pg_am {oid}
--NOTICE:  checking pg_opclass {opcnamespace} => pg_namespace {oid}
--NOTICE:  checking pg_opclass {opcowner} => pg_authid {oid}
--NOTICE:  checking pg_opclass {opcfamily} => pg_opfamily {oid}
--NOTICE:  checking pg_opclass {opcintype} => pg_type {oid}
--NOTICE:  checking pg_opclass {opckeytype} => pg_type {oid}
--NOTICE:  checking pg_am {amhandler} => pg_proc {oid}
--NOTICE:  checking pg_amop {amopfamily} => pg_opfamily {oid}
--NOTICE:  checking pg_amop {amoplefttype} => pg_type {oid}
--NOTICE:  checking pg_amop {amoprighttype} => pg_type {oid}
--NOTICE:  checking pg_amop {amopopr} => pg_operator {oid}
--NOTICE:  checking pg_amop {amopmethod} => pg_am {oid}
--NOTICE:  checking pg_amop {amopsortfamily} => pg_opfamily {oid}
--NOTICE:  checking pg_amproc {amprocfamily} => pg_opfamily {oid}
--NOTICE:  checking pg_amproc {amproclefttype} => pg_type {oid}
--NOTICE:  checking pg_amproc {amprocrighttype} => pg_type {oid}
--NOTICE:  checking pg_amproc {amproc} => pg_proc {oid}
--NOTICE:  checking pg_language {lanowner} => pg_authid {oid}
--NOTICE:  checking pg_language {lanplcallfoid} => pg_proc {oid}
--NOTICE:  checking pg_language {laninline} => pg_proc {oid}
--NOTICE:  checking pg_language {lanvalidator} => pg_proc {oid}
--NOTICE:  checking pg_largeobject_metadata {lomowner} => pg_authid {oid}
--NOTICE:  checking pg_largeobject {loid} => pg_largeobject_metadata {oid}
--NOTICE:  checking pg_aggregate {aggfnoid} => pg_proc {oid}
--NOTICE:  checking pg_aggregate {aggtransfn} => pg_proc {oid}
--NOTICE:  checking pg_aggregate {aggfinalfn} => pg_proc {oid}
--NOTICE:  checking pg_aggregate {aggcombinefn} => pg_proc {oid}
--NOTICE:  checking pg_aggregate {aggserialfn} => pg_proc {oid}
--NOTICE:  checking pg_aggregate {aggdeserialfn} => pg_proc {oid}
--NOTICE:  checking pg_aggregate {aggmtransfn} => pg_proc {oid}
--NOTICE:  checking pg_aggregate {aggminvtransfn} => pg_proc {oid}
--NOTICE:  checking pg_aggregate {aggmfinalfn} => pg_proc {oid}
--NOTICE:  checking pg_aggregate {aggsortop} => pg_operator {oid}
--NOTICE:  checking pg_aggregate {aggtranstype} => pg_type {oid}
--NOTICE:  checking pg_aggregate {aggmtranstype} => pg_type {oid}
--NOTICE:  checking pg_statistic {starelid} => pg_class {oid}
--NOTICE:  checking pg_statistic {staop1} => pg_operator {oid}
--NOTICE:  checking pg_statistic {staop2} => pg_operator {oid}
--NOTICE:  checking pg_statistic {staop3} => pg_operator {oid}
--NOTICE:  checking pg_statistic {staop4} => pg_operator {oid}
--NOTICE:  checking pg_statistic {staop5} => pg_operator {oid}
--NOTICE:  checking pg_statistic {stacoll1} => pg_collation {oid}
--NOTICE:  checking pg_statistic {stacoll2} => pg_collation {oid}
--NOTICE:  checking pg_statistic {stacoll3} => pg_collation {oid}
--NOTICE:  checking pg_statistic {stacoll4} => pg_collation {oid}
--NOTICE:  checking pg_statistic {stacoll5} => pg_collation {oid}
--NOTICE:  checking pg_statistic {starelid,staattnum} => pg_attribute {attrelid,attnum}
--NOTICE:  checking pg_statistic_ext {stxrelid} => pg_class {oid}
--NOTICE:  checking pg_statistic_ext {stxnamespace} => pg_namespace {oid}
--NOTICE:  checking pg_statistic_ext {stxowner} => pg_authid {oid}
--NOTICE:  checking pg_statistic_ext {stxrelid,stxkeys} => pg_attribute {attrelid,attnum}
--NOTICE:  checking pg_statistic_ext_data {stxoid} => pg_statistic_ext {oid}
--NOTICE:  checking pg_rewrite {ev_class} => pg_class {oid}
--NOTICE:  checking pg_trigger {tgrelid} => pg_class {oid}
--NOTICE:  checking pg_trigger {tgparentid} => pg_trigger {oid}
--NOTICE:  checking pg_trigger {tgfoid} => pg_proc {oid}
--NOTICE:  checking pg_trigger {tgconstrrelid} => pg_class {oid}
--NOTICE:  checking pg_trigger {tgconstrindid} => pg_class {oid}
--NOTICE:  checking pg_trigger {tgconstraint} => pg_constraint {oid}
--NOTICE:  checking pg_trigger {tgrelid,tgattr} => pg_attribute {attrelid,attnum}
--NOTICE:  checking pg_event_trigger {evtowner} => pg_authid {oid}
--NOTICE:  checking pg_event_trigger {evtfoid} => pg_proc {oid}
--NOTICE:  checking pg_description {classoid} => pg_class {oid}
--NOTICE:  checking pg_cast {castsource} => pg_type {oid}
--NOTICE:  checking pg_cast {casttarget} => pg_type {oid}
--NOTICE:  checking pg_cast {castfunc} => pg_proc {oid}
--NOTICE:  checking pg_enum {enumtypid} => pg_type {oid}
--NOTICE:  checking pg_namespace {nspowner} => pg_authid {oid}
--NOTICE:  checking pg_conversion {connamespace} => pg_namespace {oid}
--NOTICE:  checking pg_conversion {conowner} => pg_authid {oid}
--NOTICE:  checking pg_conversion {conproc} => pg_proc {oid}
--NOTICE:  checking pg_depend {classid} => pg_class {oid}
--NOTICE:  checking pg_depend {refclassid} => pg_class {oid}
--NOTICE:  checking pg_database {datdba} => pg_authid {oid}
--NOTICE:  checking pg_database {dattablespace} => pg_tablespace {oid}
--NOTICE:  checking pg_db_role_setting {setdatabase} => pg_database {oid}
--NOTICE:  checking pg_db_role_setting {setrole} => pg_authid {oid}
--NOTICE:  checking pg_tablespace {spcowner} => pg_authid {oid}
--NOTICE:  checking pg_auth_members {roleid} => pg_authid {oid}
--NOTICE:  checking pg_auth_members {member} => pg_authid {oid}
--NOTICE:  checking pg_auth_members {grantor} => pg_authid {oid}
--NOTICE:  checking pg_shdepend {dbid} => pg_database {oid}
--NOTICE:  checking pg_shdepend {classid} => pg_class {oid}
--NOTICE:  checking pg_shdepend {refclassid} => pg_class {oid}
--NOTICE:  checking pg_shdescription {classoid} => pg_class {oid}
--NOTICE:  checking pg_ts_config {cfgnamespace} => pg_namespace {oid}
--NOTICE:  checking pg_ts_config {cfgowner} => pg_authid {oid}
--NOTICE:  checking pg_ts_config {cfgparser} => pg_ts_parser {oid}
--NOTICE:  checking pg_ts_config_map {mapcfg} => pg_ts_config {oid}
--NOTICE:  checking pg_ts_config_map {mapdict} => pg_ts_dict {oid}
--NOTICE:  checking pg_ts_dict {dictnamespace} => pg_namespace {oid}
--NOTICE:  checking pg_ts_dict {dictowner} => pg_authid {oid}
--NOTICE:  checking pg_ts_dict {dicttemplate} => pg_ts_template {oid}
--NOTICE:  checking pg_ts_parser {prsnamespace} => pg_namespace {oid}
--NOTICE:  checking pg_ts_parser {prsstart} => pg_proc {oid}
--NOTICE:  checking pg_ts_parser {prstoken} => pg_proc {oid}
--NOTICE:  checking pg_ts_parser {prsend} => pg_proc {oid}
--NOTICE:  checking pg_ts_parser {prsheadline} => pg_proc {oid}
--NOTICE:  checking pg_ts_parser {prslextype} => pg_proc {oid}
--NOTICE:  checking pg_ts_template {tmplnamespace} => pg_namespace {oid}
--NOTICE:  checking pg_ts_template {tmplinit} => pg_proc {oid}
--NOTICE:  checking pg_ts_template {tmpllexize} => pg_proc {oid}
--NOTICE:  checking pg_extension {extowner} => pg_authid {oid}
--NOTICE:  checking pg_extension {extnamespace} => pg_namespace {oid}
--NOTICE:  checking pg_extension {extconfig} => pg_class {oid}
--NOTICE:  checking pg_foreign_data_wrapper {fdwowner} => pg_authid {oid}
--NOTICE:  checking pg_foreign_data_wrapper {fdwhandler} => pg_proc {oid}
--NOTICE:  checking pg_foreign_data_wrapper {fdwvalidator} => pg_proc {oid}
--NOTICE:  checking pg_foreign_server {srvowner} => pg_authid {oid}
--NOTICE:  checking pg_foreign_server {srvfdw} => pg_foreign_data_wrapper {oid}
--NOTICE:  checking pg_user_mapping {umuser} => pg_authid {oid}
--NOTICE:  checking pg_user_mapping {umserver} => pg_foreign_server {oid}
--NOTICE:  checking pg_foreign_table {ftrelid} => pg_class {oid}
--NOTICE:  checking pg_foreign_table {ftserver} => pg_foreign_server {oid}
--NOTICE:  checking pg_policy {polrelid} => pg_class {oid}
--NOTICE:  checking pg_policy {polroles} => pg_authid {oid}
--NOTICE:  checking pg_default_acl {defaclrole} => pg_authid {oid}
--NOTICE:  checking pg_default_acl {defaclnamespace} => pg_namespace {oid}
--NOTICE:  checking pg_init_privs {classoid} => pg_class {oid}
--NOTICE:  checking pg_seclabel {classoid} => pg_class {oid}
--NOTICE:  checking pg_shseclabel {classoid} => pg_class {oid}
--NOTICE:  checking pg_collation {collnamespace} => pg_namespace {oid}
--NOTICE:  checking pg_collation {collowner} => pg_authid {oid}
--NOTICE:  checking pg_partitioned_table {partrelid} => pg_class {oid}
--NOTICE:  checking pg_partitioned_table {partdefid} => pg_class {oid}
--NOTICE:  checking pg_partitioned_table {partclass} => pg_opclass {oid}
--NOTICE:  checking pg_partitioned_table {partcollation} => pg_collation {oid}
--NOTICE:  checking pg_partitioned_table {partrelid,partattrs} => pg_attribute {attrelid,attnum}
--NOTICE:  checking pg_range {rngtypid} => pg_type {oid}
--NOTICE:  checking pg_range {rngsubtype} => pg_type {oid}
--NOTICE:  checking pg_range {rngmultitypid} => pg_type {oid}
--NOTICE:  checking pg_range {rngcollation} => pg_collation {oid}
--NOTICE:  checking pg_range {rngsubopc} => pg_opclass {oid}
--NOTICE:  checking pg_range {rngcanonical} => pg_proc {oid}
--NOTICE:  checking pg_range {rngsubdiff} => pg_proc {oid}
--NOTICE:  checking pg_transform {trftype} => pg_type {oid}
--NOTICE:  checking pg_transform {trflang} => pg_language {oid}
--NOTICE:  checking pg_transform {trffromsql} => pg_proc {oid}
--NOTICE:  checking pg_transform {trftosql} => pg_proc {oid}
--NOTICE:  checking pg_sequence {seqrelid} => pg_class {oid}
--NOTICE:  checking pg_sequence {seqtypid} => pg_type {oid}
--NOTICE:  checking pg_publication {pubowner} => pg_authid {oid}
--NOTICE:  checking pg_publication_namespace {pnpubid} => pg_publication {oid}
--NOTICE:  checking pg_publication_namespace {pnnspid} => pg_namespace {oid}
--NOTICE:  checking pg_publication_rel {prpubid} => pg_publication {oid}
--NOTICE:  checking pg_publication_rel {prrelid} => pg_class {oid}
--NOTICE:  checking pg_subscription {subdbid} => pg_database {oid}
--NOTICE:  checking pg_subscription {subowner} => pg_authid {oid}
--NOTICE:  checking pg_subscription_rel {srsubid} => pg_subscription {oid}
--NOTICE:  checking pg_subscription_rel {srrelid} => pg_class {oid}
-+psql: error: connection to server on socket "/tmp/pg_regress-7DSHQk/.s.PGSQL.55316" failed: FATAL:  the database system is in recovery mode
-diff -U3 /home/runner/work/postgres/postgres/src/test/regress/expected/event_trigger.out /home/runner/work/postgres/postgres/src/test/regress/results/event_trigger.out
---- /home/runner/work/postgres/postgres/src/test/regress/expected/event_trigger.out	2025-09-12 09:25:55.804896993 +0000
-+++ /home/runner/work/postgres/postgres/src/test/regress/results/event_trigger.out	2025-09-12 09:35:42.901272926 +0000
-@@ -1,742 +1 @@
---- should fail, return type mismatch
--create event trigger regress_event_trigger
--   on ddl_command_start
--   execute procedure pg_backend_pid();
--ERROR:  function pg_backend_pid must return type event_trigger
---- OK
--create function test_event_trigger() returns event_trigger as $$
--BEGIN
--    RAISE NOTICE 'test_event_trigger: % %', tg_event, tg_tag;
--END
--$$ language plpgsql;
---- should fail, can't call it as a plain function
--SELECT test_event_trigger();
--ERROR:  trigger functions can only be called as triggers
--CONTEXT:  compilation of PL/pgSQL function "test_event_trigger" near line 1
---- should fail, event triggers cannot have declared arguments
--create function test_event_trigger_arg(name text)
--returns event_trigger as $$ BEGIN RETURN 1; END $$ language plpgsql;
--ERROR:  event trigger functions cannot have declared arguments
--CONTEXT:  compilation of PL/pgSQL function "test_event_trigger_arg" near line 1
---- should fail, SQL functions cannot be event triggers
--create function test_event_trigger_sql() returns event_trigger as $$
--SELECT 1 $$ language sql;
--ERROR:  SQL functions cannot return type event_trigger
---- should fail, no elephant_bootstrap entry point
--create event trigger regress_event_trigger on elephant_bootstrap
--   execute procedure test_event_trigger();
--ERROR:  unrecognized event name "elephant_bootstrap"
---- OK
--create event trigger regress_event_trigger on ddl_command_start
--   execute procedure test_event_trigger();
---- OK
--create event trigger regress_event_trigger_end on ddl_command_end
--   execute function test_event_trigger();
---- should fail, food is not a valid filter variable
--create event trigger regress_event_trigger2 on ddl_command_start
--   when food in ('sandwich')
--   execute procedure test_event_trigger();
--ERROR:  unrecognized filter variable "food"
---- should fail, sandwich is not a valid command tag
--create event trigger regress_event_trigger2 on ddl_command_start
--   when tag in ('sandwich')
--   execute procedure test_event_trigger();
--ERROR:  filter value "sandwich" not recognized for filter variable "tag"
---- should fail, create skunkcabbage is not a valid command tag
--create event trigger regress_event_trigger2 on ddl_command_start
--   when tag in ('create table', 'create skunkcabbage')
--   execute procedure test_event_trigger();
--ERROR:  filter value "create skunkcabbage" not recognized for filter variable "tag"
---- should fail, can't have event triggers on event triggers
--create event trigger regress_event_trigger2 on ddl_command_start
--   when tag in ('DROP EVENT TRIGGER')
--   execute procedure test_event_trigger();
--ERROR:  event triggers are not supported for DROP EVENT TRIGGER
---- should fail, can't have event triggers on global objects
--create event trigger regress_event_trigger2 on ddl_command_start
--   when tag in ('CREATE ROLE')
--   execute procedure test_event_trigger();
--ERROR:  event triggers are not supported for CREATE ROLE
---- should fail, can't have event triggers on global objects
--create event trigger regress_event_trigger2 on ddl_command_start
--   when tag in ('CREATE DATABASE')
--   execute procedure test_event_trigger();
--ERROR:  event triggers are not supported for CREATE DATABASE
---- should fail, can't have event triggers on global objects
--create event trigger regress_event_trigger2 on ddl_command_start
--   when tag in ('CREATE TABLESPACE')
--   execute procedure test_event_trigger();
--ERROR:  event triggers are not supported for CREATE TABLESPACE
---- should fail, can't have same filter variable twice
--create event trigger regress_event_trigger2 on ddl_command_start
--   when tag in ('create table') and tag in ('CREATE FUNCTION')
--   execute procedure test_event_trigger();
--ERROR:  filter variable "tag" specified more than once
---- should fail, can't have arguments
--create event trigger regress_event_trigger2 on ddl_command_start
--   execute procedure test_event_trigger('argument not allowed');
--ERROR:  syntax error at or near "'argument not allowed'"
--LINE 2:    execute procedure test_event_trigger('argument not allowe...
--                                                ^
---- OK
--create event trigger regress_event_trigger2 on ddl_command_start
--   when tag in ('create table', 'CREATE FUNCTION')
--   execute procedure test_event_trigger();
---- OK
--comment on event trigger regress_event_trigger is 'test comment';
---- drop as non-superuser should fail
--create role regress_evt_user;
--set role regress_evt_user;
--create event trigger regress_event_trigger_noperms on ddl_command_start
--   execute procedure test_event_trigger();
--ERROR:  permission denied to create event trigger "regress_event_trigger_noperms"
--HINT:  Must be superuser to create an event trigger.
--reset role;
---- test enabling and disabling
--alter event trigger regress_event_trigger disable;
---- fires _trigger2 and _trigger_end should fire, but not _trigger
--create table event_trigger_fire1 (a int);
--NOTICE:  test_event_trigger: ddl_command_start CREATE TABLE
--NOTICE:  test_event_trigger: ddl_command_end CREATE TABLE
--alter event trigger regress_event_trigger enable;
--set session_replication_role = replica;
---- fires nothing
--create table event_trigger_fire2 (a int);
--alter event trigger regress_event_trigger enable replica;
---- fires only _trigger
--create table event_trigger_fire3 (a int);
--NOTICE:  test_event_trigger: ddl_command_start CREATE TABLE
--alter event trigger regress_event_trigger enable always;
---- fires only _trigger
--create table event_trigger_fire4 (a int);
--NOTICE:  test_event_trigger: ddl_command_start CREATE TABLE
--reset session_replication_role;
---- fires all three
--create table event_trigger_fire5 (a int);
--NOTICE:  test_event_trigger: ddl_command_start CREATE TABLE
--NOTICE:  test_event_trigger: ddl_command_start CREATE TABLE
--NOTICE:  test_event_trigger: ddl_command_end CREATE TABLE
---- non-top-level command
--create function f1() returns int
--language plpgsql
--as $$
--begin
--  create table event_trigger_fire6 (a int);
--  return 0;
--end $$;
--NOTICE:  test_event_trigger: ddl_command_start CREATE FUNCTION
--NOTICE:  test_event_trigger: ddl_command_start CREATE FUNCTION
--NOTICE:  test_event_trigger: ddl_command_end CREATE FUNCTION
--select f1();
--NOTICE:  test_event_trigger: ddl_command_start CREATE TABLE
--NOTICE:  test_event_trigger: ddl_command_start CREATE TABLE
--NOTICE:  test_event_trigger: ddl_command_end CREATE TABLE
-- f1 
------
--  0
+diff -U3 /home/runner/work/postgres/postgres/src/test/regress/expected/outer_join_limit_pushdown.out /home/runner/work/postgres/postgres/src/test/regress/results/outer_join_limit_pushdown.out
+--- /home/runner/work/postgres/postgres/src/test/regress/expected/outer_join_limit_pushdown.out	2025-09-12 11:59:03.036240253 +0000
++++ /home/runner/work/postgres/postgres/src/test/regress/results/outer_join_limit_pushdown.out	2025-09-12 12:09:55.848720765 +0000
+@@ -4,313 +4,352 @@
+ -- Validates that the same results are returned with optimization on/off
+ --
+ -- Create test tables with more data for comprehensive testing
+-CREATE TABLE oj_t1 (id integer, name text, value integer);
+-CREATE TABLE oj_t2 (id integer, category text, score integer);
+-CREATE TABLE oj_t3 (id integer, status text, priority integer);
+-CREATE TABLE oj_t4 (id integer, description text, flag boolean);
+--- Insert test data
++CREATE TABLE oj_t1 (id integer, name text, value integer, created_at timestamp);
++CREATE TABLE oj_t2 (id integer, category text, score integer, amount numeric(10,2));
++CREATE TABLE oj_t3 (id integer, status text, priority integer, active boolean);
++CREATE TABLE oj_t4 (id integer, description text, flag boolean, data jsonb);
++CREATE TABLE oj_t5 (id integer, type text, rank integer, tags text[]);
++-- Insert comprehensive test data with various patterns
+ INSERT INTO oj_t1 VALUES 
+-  (1, 'one', 10), (2, 'two', 20), (3, 'three', 30), (4, 'four', 40), 
+-  (5, 'five', 50), (6, 'six', 60), (7, 'seven', 70), (8, 'eight', 80);
++  (1, 'one', 10, '2023-01-01'::timestamp), (2, 'two', 20, '2023-01-02'::timestamp), 
++  (3, 'three', 30, '2023-01-03'::timestamp), (4, 'four', 40, '2023-01-04'::timestamp), 
++  (5, 'five', 50, '2023-01-05'::timestamp), (6, 'six', 60, '2023-01-06'::timestamp), 
++  (7, 'seven', 70, '2023-01-07'::timestamp), (8, 'eight', 80, '2023-01-08'::timestamp),
++  (9, 'nine', 90, '2023-01-09'::timestamp), (10, 'ten', 100, '2023-01-10'::timestamp),
++  (11, 'eleven', 15, '2023-01-11'::timestamp), (12, 'twelve', 25, '2023-01-12'::timestamp);
+ INSERT INTO oj_t2 VALUES 
+-  (1, 'cat1', 100), (2, 'cat2', 200), (3, 'cat3', 300), (5, 'cat5', 500), (7, 'cat7', 700);
++  (1, 'cat1', 100, 10.50), (2, 'cat2', 200, 20.75), (3, 'cat3', 300, 30.25), 
++  (5, 'cat5', 500, 50.00), (7, 'cat7', 700, 70.99), (9, 'cat9', 900, 90.10),
++  (11, 'cat11', 110, 11.11), (13, 'cat13', 130, 13.13);
+ INSERT INTO oj_t3 VALUES 
+-  (1, 'status1', 1), (3, 'status3', 3), (4, 'status4', 4), (6, 'status6', 6);
++  (1, 'active', 1, true), (3, 'pending', 3, false), (4, 'complete', 4, true), 
++  (6, 'inactive', 6, false), (8, 'review', 8, true), (10, 'archived', 10, false),
++  (12, 'new', 12, true), (14, 'expired', 14, false);
+ INSERT INTO oj_t4 VALUES 
+-  (2, 'desc2', true), (4, 'desc4', false), (6, 'desc6', true), (8, 'desc8', false);
++  (2, 'desc2', true, '{"key": "value2"}'::jsonb), (4, 'desc4', false, '{"key": "value4"}'::jsonb), 
++  (6, 'desc6', true, '{"key": "value6"}'::jsonb), (8, 'desc8', false, '{"key": "value8"}'::jsonb),
++  (10, 'desc10', true, '{"key": "value10"}'::jsonb), (12, 'desc12', false, '{"key": "value12"}'::jsonb);
++INSERT INTO oj_t5 VALUES 
++  (1, 'type1', 1, ARRAY['tag1', 'tag2']), (3, 'type3', 3, ARRAY['tag3']), 
++  (5, 'type5', 5, ARRAY['tag5', 'tag6', 'tag7']), (7, 'type7', 7, ARRAY['tag8']),
++  (9, 'type9', 9, ARRAY['tag9', 'tag10']), (11, 'type11', 11, ARRAY['tag11']);
+ -- Create indexes
+ CREATE INDEX oj_t1_id_idx ON oj_t1(id);
++CREATE INDEX oj_t1_value_idx ON oj_t1(value);
+ CREATE INDEX oj_t2_id_idx ON oj_t2(id);
++CREATE INDEX oj_t2_score_idx ON oj_t2(score);
+ CREATE INDEX oj_t3_id_idx ON oj_t3(id);
+ CREATE INDEX oj_t4_id_idx ON oj_t4(id);
++CREATE INDEX oj_t5_id_idx ON oj_t5(id);
+ -- Update statistics
+-ANALYZE oj_t1, oj_t2, oj_t3, oj_t4;
+--- Test Case 1: Simple LEFT JOIN - Verify same results with optimization on/off
+-SELECT 'Test 1: Simple LEFT JOIN validation' as test_description;
+-          test_description           
+--------------------------------------
+- Test 1: Simple LEFT JOIN validation
++ANALYZE oj_t1, oj_t2, oj_t3, oj_t4, oj_t5;
++-- Create a function to validate query results with optimization on/off
++CREATE OR REPLACE FUNCTION validate_query_results(
++    query_text text,
++    test_description text
++) RETURNS text AS $$
++DECLARE
++    results_match boolean := false;
++    enabled_count integer;
++    disabled_count integer;
++    difference_count integer;
++BEGIN
++    -- Create temporary tables for comparison
++    EXECUTE 'CREATE TEMPORARY TABLE temp_results_enabled AS ' || query_text;
++    
++    -- Disable optimization and run again
++    SET enable_outer_join_limit_pushdown = off;
++    EXECUTE 'CREATE TEMPORARY TABLE temp_results_disabled AS ' || query_text;
++    
++    -- Re-enable optimization
++    SET enable_outer_join_limit_pushdown = on;
++    
++    -- Check if row counts match
++    SELECT INTO enabled_count count(*) FROM temp_results_enabled;
++    SELECT INTO disabled_count count(*) FROM temp_results_disabled;
++    
++    -- Check for differences using EXCEPT
++    EXECUTE 'SELECT count(*) FROM (
++        (SELECT * FROM temp_results_enabled EXCEPT SELECT * FROM temp_results_disabled)
++        UNION ALL
++        (SELECT * FROM temp_results_disabled EXCEPT SELECT * FROM temp_results_enabled)
++    ) AS differences' INTO difference_count;
++    
++    -- Determine if results match
++    results_match := (enabled_count = disabled_count) AND (difference_count = 0);
++    
++    -- Clean up temporary tables
++    DROP TABLE temp_results_enabled, temp_results_disabled;
++    
++    -- Return validation result
++    IF results_match THEN
++        RETURN '✓ PASS: ' || test_description;
++    ELSE
++        RETURN '✗ FAIL: ' || test_description || ' (enabled: ' || enabled_count || ', disabled: ' || disabled_count || ', differences: ' || difference_count || ')';
++    END IF;
++END;
++$$ LANGUAGE plpgsql;
++-- Test suite using the validation function
++SELECT 'Running comprehensive ORDER BY LIMIT pushdown validation tests' as test_suite_header;
++                       test_suite_header                        
++----------------------------------------------------------------
++ Running comprehensive ORDER BY LIMIT pushdown validation tests
++(1 row)
++
++-- Basic join tests
++SELECT validate_query_results(
++    'SELECT t1.id, t1.name, t2.category FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id ORDER BY t1.id LIMIT 3',
++    'Simple LEFT JOIN with ORDER BY preserved side'
++);
++                validate_query_results                 
++-------------------------------------------------------
++ ✓ PASS: Simple LEFT JOIN with ORDER BY preserved side
++(1 row)
++
++SELECT validate_query_results(
++    'SELECT t1.id, t1.name, t2.category FROM oj_t1 t1 RIGHT JOIN oj_t2 t2 ON t1.id = t2.id ORDER BY t2.id LIMIT 4',
++    'Simple RIGHT JOIN with ORDER BY preserved side'
++);
++                 validate_query_results                 
++--------------------------------------------------------
++ ✓ PASS: Simple RIGHT JOIN with ORDER BY preserved side
++(1 row)
++
++-- Multiple join tests
++SELECT validate_query_results(
++    'SELECT t1.id, t1.name, t2.category, t3.status FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id LEFT JOIN oj_t3 t3 ON t1.id = t3.id ORDER BY t1.id LIMIT 5',
++    'Two-level LEFT JOINs with ORDER BY preserved side'
++);
++ERROR:  variable not found in subplan target lists
++CONTEXT:  SQL statement "CREATE TEMPORARY TABLE temp_results_enabled AS SELECT t1.id, t1.name, t2.category, t3.status FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id LEFT JOIN oj_t3 t3 ON t1.id = t3.id ORDER BY t1.id LIMIT 5"
++PL/pgSQL function validate_query_results(text,text) line 9 at EXECUTE
++SELECT validate_query_results(
++    'SELECT t1.id, t2.category, t3.status, t4.description FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id LEFT JOIN oj_t3 t3 ON t1.id = t3.id LEFT JOIN oj_t4 t4 ON t1.id = t4.id ORDER BY t1.id LIMIT 6',
++    'Three-level LEFT JOINs with ORDER BY preserved side'
++);
++ERROR:  variable not found in subplan target lists
++CONTEXT:  SQL statement "CREATE TEMPORARY TABLE temp_results_enabled AS SELECT t1.id, t2.category, t3.status, t4.description FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id LEFT JOIN oj_t3 t3 ON t1.id = t3.id LEFT JOIN oj_t4 t4 ON t1.id = t4.id ORDER BY t1.id LIMIT 6"
++PL/pgSQL function validate_query_results(text,text) line 9 at EXECUTE
++SELECT validate_query_results(
++    'SELECT t1.id, t2.category, t3.status, t4.description, t5.type FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id LEFT JOIN oj_t3 t3 ON t1.id = t3.id LEFT JOIN oj_t4 t4 ON t1.id = t4.id LEFT JOIN oj_t5 t5 ON t1.id = t5.id ORDER BY t1.id LIMIT 7',
++    'Four-level LEFT JOINs with ORDER BY preserved side'
++);
++ERROR:  variable not found in subplan target lists
++CONTEXT:  SQL statement "CREATE TEMPORARY TABLE temp_results_enabled AS SELECT t1.id, t2.category, t3.status, t4.description, t5.type FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id LEFT JOIN oj_t3 t3 ON t1.id = t3.id LEFT JOIN oj_t4 t4 ON t1.id = t4.id LEFT JOIN oj_t5 t5 ON t1.id = t5.id ORDER BY t1.id LIMIT 7"
++PL/pgSQL function validate_query_results(text,text) line 9 at EXECUTE
++-- ORDER BY variations
++SELECT validate_query_results(
++    'SELECT t1.id, t1.name, t2.score FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id ORDER BY t1.value DESC, t1.id ASC LIMIT 4',
++    'LEFT JOIN with multi-column ORDER BY'
++);
++            validate_query_results            
++----------------------------------------------
++ ✓ PASS: LEFT JOIN with multi-column ORDER BY
+ (1 row)
+ 
+--- Store results with optimization enabled
+-CREATE TEMPORARY TABLE results_enabled AS
+-SELECT t1.id, t1.name, t2.category 
+-FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id 
+-ORDER BY t1.id LIMIT 3;
+--- Store results with optimization disabled  
+-SET enable_outer_join_limit_pushdown = off;
+-CREATE TEMPORARY TABLE results_disabled AS
+-SELECT t1.id, t1.name, t2.category 
+-FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id 
+-ORDER BY t1.id LIMIT 3;
+--- Compare results
+-SELECT 
+-  CASE 
+-    WHEN (SELECT COUNT(*) FROM results_enabled) = (SELECT COUNT(*) FROM results_disabled)
+-         AND NOT EXISTS (
+-           (SELECT * FROM results_enabled EXCEPT SELECT * FROM results_disabled)
+-           UNION ALL
+-           (SELECT * FROM results_disabled EXCEPT SELECT * FROM results_enabled)
+-         )
+-    THEN '✓ PASS: Results match'
+-    ELSE '✗ FAIL: Results differ'
+-  END as validation_result;
+-   validation_result   
+------------------------
+- ✓ PASS: Results match
 -(1 row)
 -
---- non-top-level command
--create procedure p1()
--language plpgsql
--as $$
--begin
--  create table event_trigger_fire7 (a int);
--end $$;
--NOTICE:  test_event_trigger: ddl_command_start CREATE PROCEDURE
--NOTICE:  test_event_trigger: ddl_command_end CREATE PROCEDURE
--call p1();
--NOTICE:  test_event_trigger: ddl_command_start CREATE TABLE
--NOTICE:  test_event_trigger: ddl_command_start CREATE TABLE
--NOTICE:  test_event_trigger: ddl_command_end CREATE TABLE
---- clean up
--alter event trigger regress_event_trigger disable;
--drop table event_trigger_fire2, event_trigger_fire3, event_trigger_fire4, event_trigger_fire5, event_trigger_fire6, event_trigger_fire7;
--NOTICE:  test_event_trigger: ddl_command_end DROP TABLE
--drop routine f1(), p1();
--NOTICE:  test_event_trigger: ddl_command_end DROP ROUTINE
---- regress_event_trigger_end should fire on these commands
--grant all on table event_trigger_fire1 to public;
--NOTICE:  test_event_trigger: ddl_command_end GRANT
--comment on table event_trigger_fire1 is 'here is a comment';
--NOTICE:  test_event_trigger: ddl_command_end COMMENT
--revoke all on table event_trigger_fire1 from public;
--NOTICE:  test_event_trigger: ddl_command_end REVOKE
--drop table event_trigger_fire1;
--NOTICE:  test_event_trigger: ddl_command_end DROP TABLE
--create foreign data wrapper useless;
--NOTICE:  test_event_trigger: ddl_command_end CREATE FOREIGN DATA WRAPPER
--create server useless_server foreign data wrapper useless;
--NOTICE:  test_event_trigger: ddl_command_end CREATE SERVER
--create user mapping for regress_evt_user server useless_server;
--NOTICE:  test_event_trigger: ddl_command_end CREATE USER MAPPING
--alter default privileges for role regress_evt_user
-- revoke delete on tables from regress_evt_user;
--NOTICE:  test_event_trigger: ddl_command_end ALTER DEFAULT PRIVILEGES
---- alter owner to non-superuser should fail
--alter event trigger regress_event_trigger owner to regress_evt_user;
--ERROR:  permission denied to change owner of event trigger "regress_event_trigger"
--HINT:  The owner of an event trigger must be a superuser.
---- alter owner to superuser should work
--alter role regress_evt_user superuser;
--alter event trigger regress_event_trigger owner to regress_evt_user;
---- should fail, name collision
--alter event trigger regress_event_trigger rename to regress_event_trigger2;
--ERROR:  event trigger "regress_event_trigger2" already exists
---- OK
--alter event trigger regress_event_trigger rename to regress_event_trigger3;
---- should fail, doesn't exist any more
--drop event trigger regress_event_trigger;
--ERROR:  event trigger "regress_event_trigger" does not exist
---- should fail, regress_evt_user owns some objects
--drop role regress_evt_user;
--ERROR:  role "regress_evt_user" cannot be dropped because some objects depend on it
--DETAIL:  owner of event trigger regress_event_trigger3
--owner of user mapping for regress_evt_user on server useless_server
--owner of default privileges on new relations belonging to role regress_evt_user
---- cleanup before next test
---- these are all OK; the second one should emit a NOTICE
--drop event trigger if exists regress_event_trigger2;
--drop event trigger if exists regress_event_trigger2;
--NOTICE:  event trigger "regress_event_trigger2" does not exist, skipping
--drop event trigger regress_event_trigger3;
--drop event trigger regress_event_trigger_end;
---- test support for dropped objects
--CREATE SCHEMA schema_one authorization regress_evt_user;
--CREATE SCHEMA schema_two authorization regress_evt_user;
--CREATE SCHEMA audit_tbls authorization regress_evt_user;
--CREATE TEMP TABLE a_temp_tbl ();
--SET SESSION AUTHORIZATION regress_evt_user;
--CREATE TABLE schema_one.table_one(a int);
--CREATE TABLE schema_one."table two"(a int);
--CREATE TABLE schema_one.table_three(a int);
--CREATE TABLE audit_tbls.schema_one_table_two(the_value text);
--CREATE TABLE schema_two.table_two(a int);
--CREATE TABLE schema_two.table_three(a int, b text);
--CREATE TABLE audit_tbls.schema_two_table_three(the_value text);
--CREATE OR REPLACE FUNCTION schema_two.add(int, int) RETURNS int LANGUAGE plpgsql
--  CALLED ON NULL INPUT
--  AS $$ BEGIN RETURN coalesce($1,0) + coalesce($2,0); END; $$;
--CREATE AGGREGATE schema_two.newton
--  (BASETYPE = int, SFUNC = schema_two.add, STYPE = int);
--RESET SESSION AUTHORIZATION;
--CREATE TABLE undroppable_objs (
--	object_type text,
--	object_identity text
--);
--INSERT INTO undroppable_objs VALUES
--('table', 'schema_one.table_three'),
--('table', 'audit_tbls.schema_two_table_three');
--CREATE TABLE dropped_objects (
--	type text,
--	schema text,
--	object text
--);
---- This tests errors raised within event triggers; the one in audit_tbls
---- uses 2nd-level recursive invocation via test_evtrig_dropped_objects().
--CREATE OR REPLACE FUNCTION undroppable() RETURNS event_trigger
--LANGUAGE plpgsql AS $$
--DECLARE
--	obj record;
--BEGIN
--	PERFORM 1 FROM pg_tables WHERE tablename = 'undroppable_objs';
--	IF NOT FOUND THEN
--		RAISE NOTICE 'table undroppable_objs not found, skipping';
--		RETURN;
--	END IF;
--	FOR obj IN
--		SELECT * FROM pg_event_trigger_dropped_objects() JOIN
--			undroppable_objs USING (object_type, object_identity)
--	LOOP
--		RAISE EXCEPTION 'object % of type % cannot be dropped',
--			obj.object_identity, obj.object_type;
--	END LOOP;
--END;
--$$;
--CREATE EVENT TRIGGER undroppable ON sql_drop
--	EXECUTE PROCEDURE undroppable();
--CREATE OR REPLACE FUNCTION test_evtrig_dropped_objects() RETURNS event_trigger
--LANGUAGE plpgsql AS $$
--DECLARE
--    obj record;
--BEGIN
--    FOR obj IN SELECT * FROM pg_event_trigger_dropped_objects()
--    LOOP
--        IF obj.object_type = 'table' THEN
--                EXECUTE format('DROP TABLE IF EXISTS audit_tbls.%I',
--					format('%s_%s', obj.schema_name, obj.object_name));
--        END IF;
+-DROP TABLE results_enabled, results_disabled;
+-SET enable_outer_join_limit_pushdown = on;
+--- Test Case 2: RIGHT JOIN validation
+-SELECT 'Test 2: Simple RIGHT JOIN validation' as test_description;
+-           test_description           
+---------------------------------------
+- Test 2: Simple RIGHT JOIN validation
+-(1 row)
 -
--	INSERT INTO dropped_objects
--		(type, schema, object) VALUES
--		(obj.object_type, obj.schema_name, obj.object_identity);
--    END LOOP;
--END
--$$;
--CREATE EVENT TRIGGER regress_event_trigger_drop_objects ON sql_drop
--	WHEN TAG IN ('drop table', 'drop function', 'drop view',
--		'drop owned', 'drop schema', 'alter table')
--	EXECUTE PROCEDURE test_evtrig_dropped_objects();
--ALTER TABLE schema_one.table_one DROP COLUMN a;
--DROP SCHEMA schema_one, schema_two CASCADE;
--NOTICE:  drop cascades to 7 other objects
--DETAIL:  drop cascades to table schema_two.table_two
--drop cascades to table schema_two.table_three
--drop cascades to function schema_two.add(integer,integer)
--drop cascades to function schema_two.newton(integer)
--drop cascades to table schema_one.table_one
--drop cascades to table schema_one."table two"
--drop cascades to table schema_one.table_three
--NOTICE:  table "schema_two_table_two" does not exist, skipping
--NOTICE:  table "audit_tbls_schema_two_table_three" does not exist, skipping
--ERROR:  object audit_tbls.schema_two_table_three of type table cannot be dropped
--CONTEXT:  PL/pgSQL function undroppable() line 14 at RAISE
--SQL statement "DROP TABLE IF EXISTS audit_tbls.schema_two_table_three"
--PL/pgSQL function test_evtrig_dropped_objects() line 8 at EXECUTE
--DELETE FROM undroppable_objs WHERE object_identity = 'audit_tbls.schema_two_table_three';
--DROP SCHEMA schema_one, schema_two CASCADE;
--NOTICE:  drop cascades to 7 other objects
--DETAIL:  drop cascades to table schema_two.table_two
--drop cascades to table schema_two.table_three
--drop cascades to function schema_two.add(integer,integer)
--drop cascades to function schema_two.newton(integer)
--drop cascades to table schema_one.table_one
--drop cascades to table schema_one."table two"
--drop cascades to table schema_one.table_three
--NOTICE:  table "schema_two_table_two" does not exist, skipping
--NOTICE:  table "audit_tbls_schema_two_table_three" does not exist, skipping
--NOTICE:  table "schema_one_table_one" does not exist, skipping
--NOTICE:  table "schema_one_table two" does not exist, skipping
--NOTICE:  table "schema_one_table_three" does not exist, skipping
--ERROR:  object schema_one.table_three of type table cannot be dropped
--CONTEXT:  PL/pgSQL function undroppable() line 14 at RAISE
--DELETE FROM undroppable_objs WHERE object_identity = 'schema_one.table_three';
--DROP SCHEMA schema_one, schema_two CASCADE;
--NOTICE:  drop cascades to 7 other objects
--DETAIL:  drop cascades to table schema_two.table_two
--drop cascades to table schema_two.table_three
--drop cascades to function schema_two.add(integer,integer)
--drop cascades to function schema_two.newton(integer)
--drop cascades to table schema_one.table_one
--drop cascades to table schema_one."table two"
--drop cascades to table schema_one.table_three
--NOTICE:  table "schema_two_table_two" does not exist, skipping
--NOTICE:  table "audit_tbls_schema_two_table_three" does not exist, skipping
--NOTICE:  table "schema_one_table_one" does not exist, skipping
--NOTICE:  table "schema_one_table two" does not exist, skipping
--NOTICE:  table "schema_one_table_three" does not exist, skipping
--SELECT * FROM dropped_objects WHERE schema IS NULL OR schema <> 'pg_toast';
--     type     |   schema   |               object                
----------------+------------+-------------------------------------
-- table column | schema_one | schema_one.table_one.a
-- schema       |            | schema_two
-- table        | schema_two | schema_two.table_two
-- type         | schema_two | schema_two.table_two
-- type         | schema_two | schema_two.table_two[]
-- table        | audit_tbls | audit_tbls.schema_two_table_three
-- type         | audit_tbls | audit_tbls.schema_two_table_three
-- type         | audit_tbls | audit_tbls.schema_two_table_three[]
-- table        | schema_two | schema_two.table_three
-- type         | schema_two | schema_two.table_three
-- type         | schema_two | schema_two.table_three[]
-- function     | schema_two | schema_two.add(integer,integer)
-- aggregate    | schema_two | schema_two.newton(integer)
-- schema       |            | schema_one
-- table        | schema_one | schema_one.table_one
-- type         | schema_one | schema_one.table_one
-- type         | schema_one | schema_one.table_one[]
-- table        | schema_one | schema_one."table two"
-- type         | schema_one | schema_one."table two"
-- type         | schema_one | schema_one."table two"[]
-- table        | schema_one | schema_one.table_three
-- type         | schema_one | schema_one.table_three
-- type         | schema_one | schema_one.table_three[]
--(23 rows)
+-CREATE TEMPORARY TABLE results_enabled AS
+-SELECT t1.id, t1.name, t2.category 
+-FROM oj_t1 t1 RIGHT JOIN oj_t2 t2 ON t1.id = t2.id 
+-ORDER BY t2.id LIMIT 4;
+-SET enable_outer_join_limit_pushdown = off;
+-CREATE TEMPORARY TABLE results_disabled AS
+-SELECT t1.id, t1.name, t2.category 
+-FROM oj_t1 t1 RIGHT JOIN oj_t2 t2 ON t1.id = t2.id 
+-ORDER BY t2.id LIMIT 4;
+-SELECT 
+-  CASE 
+-    WHEN (SELECT COUNT(*) FROM results_enabled) = (SELECT COUNT(*) FROM results_disabled)
+-         AND NOT EXISTS (
+-           (SELECT * FROM results_enabled EXCEPT SELECT * FROM results_disabled)
+-           UNION ALL
+-           (SELECT * FROM results_disabled EXCEPT SELECT * FROM results_enabled)
+-         )
+-    THEN '✓ PASS: Results match'
+-    ELSE '✗ FAIL: Results differ'
+-  END as validation_result;
+-   validation_result   
+------------------------
+- ✓ PASS: Results match
+-(1 row)
 -
--DROP OWNED BY regress_evt_user;
--NOTICE:  schema "audit_tbls" does not exist, skipping
--SELECT * FROM dropped_objects WHERE type = 'schema';
--  type  | schema |   object   
----------+--------+------------
-- schema |        | schema_two
-- schema |        | schema_one
-- schema |        | audit_tbls
--(3 rows)
+-DROP TABLE results_enabled, results_disabled;
+-SET enable_outer_join_limit_pushdown = on;
+--- Test Case 3: Nested LEFT JOINs validation
+-SELECT 'Test 3: Nested LEFT JOINs validation' as test_description;
+-           test_description           
+---------------------------------------
+- Test 3: Nested LEFT JOINs validation
+-(1 row)
 -
--DROP ROLE regress_evt_user;
--DROP EVENT TRIGGER regress_event_trigger_drop_objects;
--DROP EVENT TRIGGER undroppable;
---- Event triggers on relations.
--CREATE OR REPLACE FUNCTION event_trigger_report_dropped()
-- RETURNS event_trigger
-- LANGUAGE plpgsql
--AS $$
--DECLARE r record;
--BEGIN
--    FOR r IN SELECT * from pg_event_trigger_dropped_objects()
--    LOOP
--    IF NOT r.normal AND NOT r.original THEN
--        CONTINUE;
--    END IF;
--    RAISE NOTICE 'NORMAL: orig=% normal=% istemp=% type=% identity=% name=% args=%',
--        r.original, r.normal, r.is_temporary, r.object_type,
--        r.object_identity, r.address_names, r.address_args;
--    END LOOP;
--END; $$;
--CREATE EVENT TRIGGER regress_event_trigger_report_dropped ON sql_drop
--    EXECUTE PROCEDURE event_trigger_report_dropped();
--CREATE OR REPLACE FUNCTION event_trigger_report_end()
-- RETURNS event_trigger
-- LANGUAGE plpgsql
--AS $$
--DECLARE r RECORD;
--BEGIN
--    FOR r IN SELECT * FROM pg_event_trigger_ddl_commands()
--    LOOP
--        RAISE NOTICE 'END: command_tag=% type=% identity=%',
--            r.command_tag, r.object_type, r.object_identity;
--    END LOOP;
--END; $$;
--CREATE EVENT TRIGGER regress_event_trigger_report_end ON ddl_command_end
--  EXECUTE PROCEDURE event_trigger_report_end();
--CREATE SCHEMA evttrig
--	CREATE TABLE one (col_a SERIAL PRIMARY KEY, col_b text DEFAULT 'forty two', col_c SERIAL)
--	CREATE INDEX one_idx ON one (col_b)
--	CREATE TABLE two (col_c INTEGER CHECK (col_c > 0) REFERENCES one DEFAULT 42)
--	CREATE TABLE id (col_d int NOT NULL GENERATED ALWAYS AS IDENTITY);
--NOTICE:  END: command_tag=CREATE SCHEMA type=schema identity=evttrig
--NOTICE:  END: command_tag=CREATE SEQUENCE type=sequence identity=evttrig.one_col_a_seq
--NOTICE:  END: command_tag=CREATE SEQUENCE type=sequence identity=evttrig.one_col_c_seq
--NOTICE:  END: command_tag=CREATE TABLE type=table identity=evttrig.one
--NOTICE:  END: command_tag=CREATE INDEX type=index identity=evttrig.one_pkey
--NOTICE:  END: command_tag=ALTER SEQUENCE type=sequence identity=evttrig.one_col_a_seq
--NOTICE:  END: command_tag=ALTER SEQUENCE type=sequence identity=evttrig.one_col_c_seq
--NOTICE:  END: command_tag=CREATE TABLE type=table identity=evttrig.two
--NOTICE:  END: command_tag=ALTER TABLE type=table identity=evttrig.two
--NOTICE:  END: command_tag=CREATE SEQUENCE type=sequence identity=evttrig.id_col_d_seq
--NOTICE:  END: command_tag=CREATE TABLE type=table identity=evttrig.id
--NOTICE:  END: command_tag=ALTER SEQUENCE type=sequence identity=evttrig.id_col_d_seq
--NOTICE:  END: command_tag=CREATE INDEX type=index identity=evttrig.one_idx
---- Partitioned tables with a partitioned index
--CREATE TABLE evttrig.parted (
--    id int PRIMARY KEY)
--    PARTITION BY RANGE (id);
--NOTICE:  END: command_tag=CREATE TABLE type=table identity=evttrig.parted
--NOTICE:  END: command_tag=CREATE INDEX type=index identity=evttrig.parted_pkey
--CREATE TABLE evttrig.part_1_10 PARTITION OF evttrig.parted (id)
--  FOR VALUES FROM (1) TO (10);
--NOTICE:  END: command_tag=CREATE TABLE type=table identity=evttrig.part_1_10
--CREATE TABLE evttrig.part_10_20 PARTITION OF evttrig.parted (id)
--  FOR VALUES FROM (10) TO (20) PARTITION BY RANGE (id);
--NOTICE:  END: command_tag=CREATE TABLE type=table identity=evttrig.part_10_20
--CREATE TABLE evttrig.part_10_15 PARTITION OF evttrig.part_10_20 (id)
--  FOR VALUES FROM (10) TO (15);
--NOTICE:  END: command_tag=CREATE TABLE type=table identity=evttrig.part_10_15
--CREATE TABLE evttrig.part_15_20 PARTITION OF evttrig.part_10_20 (id)
--  FOR VALUES FROM (15) TO (20);
--NOTICE:  END: command_tag=CREATE TABLE type=table identity=evttrig.part_15_20
--ALTER TABLE evttrig.two DROP COLUMN col_c;
--NOTICE:  NORMAL: orig=t normal=f istemp=f type=table column identity=evttrig.two.col_c name={evttrig,two,col_c} args={}
--NOTICE:  NORMAL: orig=f normal=t istemp=f type=table constraint identity=two_col_c_check on evttrig.two name={evttrig,two,two_col_c_check} args={}
--NOTICE:  END: command_tag=ALTER TABLE type=table identity=evttrig.two
--ALTER TABLE evttrig.one ALTER COLUMN col_b DROP DEFAULT;
--NOTICE:  NORMAL: orig=t normal=f istemp=f type=default value identity=for evttrig.one.col_b name={evttrig,one,col_b} args={}
--NOTICE:  END: command_tag=ALTER TABLE type=table identity=evttrig.one
--ALTER TABLE evttrig.one DROP CONSTRAINT one_pkey;
--NOTICE:  NORMAL: orig=t normal=f istemp=f type=table constraint identity=one_pkey on evttrig.one name={evttrig,one,one_pkey} args={}
--NOTICE:  END: command_tag=ALTER TABLE type=table identity=evttrig.one
--ALTER TABLE evttrig.one DROP COLUMN col_c;
--NOTICE:  NORMAL: orig=t normal=f istemp=f type=table column identity=evttrig.one.col_c name={evttrig,one,col_c} args={}
--NOTICE:  NORMAL: orig=f normal=t istemp=f type=default value identity=for evttrig.one.col_c name={evttrig,one,col_c} args={}
--NOTICE:  END: command_tag=ALTER TABLE type=table identity=evttrig.one
--ALTER TABLE evttrig.id ALTER COLUMN col_d SET DATA TYPE bigint;
--NOTICE:  END: command_tag=ALTER SEQUENCE type=sequence identity=evttrig.id_col_d_seq
--NOTICE:  END: command_tag=ALTER TABLE type=table identity=evttrig.id
--ALTER TABLE evttrig.id ALTER COLUMN col_d DROP IDENTITY,
--  ALTER COLUMN col_d SET DATA TYPE int;
--NOTICE:  END: command_tag=ALTER TABLE type=table identity=evttrig.id
--DROP INDEX evttrig.one_idx;
--NOTICE:  NORMAL: orig=t normal=f istemp=f type=index identity=evttrig.one_idx name={evttrig,one_idx} args={}
--DROP SCHEMA evttrig CASCADE;
--NOTICE:  drop cascades to 4 other objects
--DETAIL:  drop cascades to table evttrig.one
--drop cascades to table evttrig.two
--drop cascades to table evttrig.id
--drop cascades to table evttrig.parted
--NOTICE:  NORMAL: orig=t normal=f istemp=f type=schema identity=evttrig name={evttrig} args={}
--NOTICE:  NORMAL: orig=f normal=t istemp=f type=table identity=evttrig.one name={evttrig,one} args={}
--NOTICE:  NORMAL: orig=f normal=t istemp=f type=sequence identity=evttrig.one_col_a_seq name={evttrig,one_col_a_seq} args={}
--NOTICE:  NORMAL: orig=f normal=t istemp=f type=default value identity=for evttrig.one.col_a name={evttrig,one,col_a} args={}
--NOTICE:  NORMAL: orig=f normal=t istemp=f type=table identity=evttrig.two name={evttrig,two} args={}
--NOTICE:  NORMAL: orig=f normal=t istemp=f type=table identity=evttrig.id name={evttrig,id} args={}
--NOTICE:  NORMAL: orig=f normal=t istemp=f type=table identity=evttrig.parted name={evttrig,parted} args={}
--NOTICE:  NORMAL: orig=f normal=t istemp=f type=table identity=evttrig.part_1_10 name={evttrig,part_1_10} args={}
--NOTICE:  NORMAL: orig=f normal=t istemp=f type=table identity=evttrig.part_10_20 name={evttrig,part_10_20} args={}
--NOTICE:  NORMAL: orig=f normal=t istemp=f type=table identity=evttrig.part_10_15 name={evttrig,part_10_15} args={}
--NOTICE:  NORMAL: orig=f normal=t istemp=f type=table identity=evttrig.part_15_20 name={evttrig,part_15_20} args={}
--DROP TABLE a_temp_tbl;
--NOTICE:  NORMAL: orig=t normal=f istemp=t type=table identity=pg_temp.a_temp_tbl name={pg_temp,a_temp_tbl} args={}
---- CREATE OPERATOR CLASS without FAMILY clause should report
---- both CREATE OPERATOR FAMILY and CREATE OPERATOR CLASS
--CREATE OPERATOR CLASS evttrigopclass FOR TYPE int USING btree AS STORAGE int;
--NOTICE:  END: command_tag=CREATE OPERATOR FAMILY type=operator family identity=public.evttrigopclass USING btree
--NOTICE:  END: command_tag=CREATE OPERATOR CLASS type=operator class identity=public.evttrigopclass USING btree
--DROP EVENT TRIGGER regress_event_trigger_report_dropped;
--DROP EVENT TRIGGER regress_event_trigger_report_end;
---- only allowed from within an event trigger function, should fail
--select pg_event_trigger_table_rewrite_oid();
--ERROR:  pg_event_trigger_table_rewrite_oid() can only be called in a table_rewrite event trigger function
---- test Table Rewrite Event Trigger
--CREATE OR REPLACE FUNCTION test_evtrig_no_rewrite() RETURNS event_trigger
--LANGUAGE plpgsql AS $$
--BEGIN
--  RAISE EXCEPTION 'rewrites not allowed';
--END;
--$$;
--create event trigger no_rewrite_allowed on table_rewrite
--  execute procedure test_evtrig_no_rewrite();
--create table rewriteme (id serial primary key, foo float, bar timestamptz);
--insert into rewriteme
--     select x * 1.001 from generate_series(1, 500) as t(x);
--alter table rewriteme alter column foo type numeric;
--ERROR:  rewrites not allowed
--CONTEXT:  PL/pgSQL function test_evtrig_no_rewrite() line 3 at RAISE
--alter table rewriteme add column baz int default 0;
---- test with more than one reason to rewrite a single table
--CREATE OR REPLACE FUNCTION test_evtrig_no_rewrite() RETURNS event_trigger
--LANGUAGE plpgsql AS $$
--BEGIN
--  RAISE NOTICE 'Table ''%'' is being rewritten (reason = %)',
--               pg_event_trigger_table_rewrite_oid()::regclass,
--               pg_event_trigger_table_rewrite_reason();
--END;
--$$;
--alter table rewriteme
-- add column onemore int default 0,
-- add column another int default -1,
-- alter column foo type numeric(10,4);
--NOTICE:  Table 'rewriteme' is being rewritten (reason = 4)
---- matview rewrite when changing access method
--CREATE MATERIALIZED VIEW heapmv USING heap AS SELECT 1 AS a;
--ALTER MATERIALIZED VIEW heapmv SET ACCESS METHOD heap2;
--NOTICE:  Table 'heapmv' is being rewritten (reason = 8)
--DROP MATERIALIZED VIEW heapmv;
---- shouldn't trigger a table_rewrite event
--alter table rewriteme alter column foo type numeric(12,4);
--begin;
--set timezone to 'UTC';
--alter table rewriteme alter column bar type timestamp;
--set timezone to '0';
--alter table rewriteme alter column bar type timestamptz;
--set timezone to 'Europe/London';
--alter table rewriteme alter column bar type timestamp; -- does rewrite
--NOTICE:  Table 'rewriteme' is being rewritten (reason = 4)
--rollback;
---- typed tables are rewritten when their type changes.  Don't emit table
---- name, because firing order is not stable.
--CREATE OR REPLACE FUNCTION test_evtrig_no_rewrite() RETURNS event_trigger
--LANGUAGE plpgsql AS $$
--BEGIN
--  RAISE NOTICE 'Table is being rewritten (reason = %)',
--               pg_event_trigger_table_rewrite_reason();
--END;
--$$;
--create type rewritetype as (a int);
--create table rewritemetoo1 of rewritetype;
--create table rewritemetoo2 of rewritetype;
--alter type rewritetype alter attribute a type text cascade;
--NOTICE:  Table is being rewritten (reason = 4)
--NOTICE:  Table is being rewritten (reason = 4)
---- but this doesn't work
--create table rewritemetoo3 (a rewritetype);
--alter type rewritetype alter attribute a type varchar cascade;
--ERROR:  cannot alter type "rewritetype" because column "rewritemetoo3.a" uses it
--drop table rewriteme;
--drop event trigger no_rewrite_allowed;
--drop function test_evtrig_no_rewrite();
---- Tests for REINDEX
--CREATE OR REPLACE FUNCTION reindex_start_command()
--RETURNS event_trigger AS $$
--BEGIN
--    RAISE NOTICE 'REINDEX START: % %', tg_event, tg_tag;
--END;
--$$ LANGUAGE plpgsql;
--CREATE EVENT TRIGGER regress_reindex_start ON ddl_command_start
--    WHEN TAG IN ('REINDEX')
--    EXECUTE PROCEDURE reindex_start_command();
--CREATE FUNCTION reindex_end_command()
--RETURNS event_trigger AS $$
--DECLARE
--    obj record;
--BEGIN
--    FOR obj IN SELECT * FROM pg_event_trigger_ddl_commands()
--    LOOP
--        RAISE NOTICE 'REINDEX END: command_tag=% type=% identity=%',
--	    obj.command_tag, obj.object_type, obj.object_identity;
--    END LOOP;
--END;
--$$ LANGUAGE plpgsql;
--CREATE EVENT TRIGGER regress_reindex_end ON ddl_command_end
--    WHEN TAG IN ('REINDEX')
--    EXECUTE PROCEDURE reindex_end_command();
---- Extra event to force the use of a snapshot.
--CREATE FUNCTION reindex_end_command_snap() RETURNS EVENT_TRIGGER
--    AS $$ BEGIN PERFORM 1; END $$ LANGUAGE plpgsql;
--CREATE EVENT TRIGGER regress_reindex_end_snap ON ddl_command_end
--    EXECUTE FUNCTION reindex_end_command_snap();
---- With simple relation
--CREATE TABLE concur_reindex_tab (c1 int);
--CREATE INDEX concur_reindex_ind ON concur_reindex_tab (c1);
---- Both start and end triggers enabled.
--REINDEX INDEX concur_reindex_ind;
--NOTICE:  REINDEX START: ddl_command_start REINDEX
--NOTICE:  REINDEX END: command_tag=REINDEX type=index identity=public.concur_reindex_ind
--REINDEX TABLE concur_reindex_tab;
--NOTICE:  REINDEX START: ddl_command_start REINDEX
--NOTICE:  REINDEX END: command_tag=REINDEX type=index identity=public.concur_reindex_ind
--REINDEX INDEX CONCURRENTLY concur_reindex_ind;
--NOTICE:  REINDEX START: ddl_command_start REINDEX
--NOTICE:  REINDEX END: command_tag=REINDEX type=index identity=public.concur_reindex_ind
--REINDEX TABLE CONCURRENTLY concur_reindex_tab;
--NOTICE:  REINDEX START: ddl_command_start REINDEX
--NOTICE:  REINDEX END: command_tag=REINDEX type=index identity=public.concur_reindex_ind
---- with start trigger disabled.
--ALTER EVENT TRIGGER regress_reindex_start DISABLE;
--REINDEX INDEX concur_reindex_ind;
--NOTICE:  REINDEX END: command_tag=REINDEX type=index identity=public.concur_reindex_ind
--REINDEX INDEX CONCURRENTLY concur_reindex_ind;
--NOTICE:  REINDEX END: command_tag=REINDEX type=index identity=public.concur_reindex_ind
---- without an index
--DROP INDEX concur_reindex_ind;
--REINDEX TABLE concur_reindex_tab;
--NOTICE:  table "concur_reindex_tab" has no indexes to reindex
--REINDEX TABLE CONCURRENTLY concur_reindex_tab;
--NOTICE:  table "concur_reindex_tab" has no indexes that can be reindexed concurrently
---- With a Schema
--CREATE SCHEMA concur_reindex_schema;
---- No indexes
--REINDEX SCHEMA concur_reindex_schema;
--REINDEX SCHEMA CONCURRENTLY concur_reindex_schema;
--CREATE TABLE concur_reindex_schema.tab (a int);
--CREATE INDEX ind ON concur_reindex_schema.tab (a);
---- One index reported
--REINDEX SCHEMA concur_reindex_schema;
--NOTICE:  REINDEX END: command_tag=REINDEX type=index identity=concur_reindex_schema.ind
--REINDEX SCHEMA CONCURRENTLY concur_reindex_schema;
--NOTICE:  REINDEX END: command_tag=REINDEX type=index identity=concur_reindex_schema.ind
---- One table on schema but no indexes
--DROP INDEX concur_reindex_schema.ind;
--REINDEX SCHEMA concur_reindex_schema;
--REINDEX SCHEMA CONCURRENTLY concur_reindex_schema;
--DROP SCHEMA concur_reindex_schema CASCADE;
--NOTICE:  drop cascades to table concur_reindex_schema.tab
---- With a partitioned table, and nothing else.
--CREATE TABLE concur_reindex_part (id int) PARTITION BY RANGE (id);
--REINDEX TABLE concur_reindex_part;
--REINDEX TABLE CONCURRENTLY concur_reindex_part;
---- Partition that would be reindexed, still nothing.
--CREATE TABLE concur_reindex_child PARTITION OF concur_reindex_part
--  FOR VALUES FROM (0) TO (10);
--REINDEX TABLE concur_reindex_part;
--REINDEX TABLE CONCURRENTLY concur_reindex_part;
---- Now add some indexes.
--CREATE INDEX concur_reindex_partidx ON concur_reindex_part (id);
--REINDEX INDEX concur_reindex_partidx;
--NOTICE:  REINDEX END: command_tag=REINDEX type=index identity=public.concur_reindex_child_id_idx
--REINDEX INDEX CONCURRENTLY concur_reindex_partidx;
--NOTICE:  REINDEX END: command_tag=REINDEX type=index identity=public.concur_reindex_child_id_idx
--REINDEX TABLE concur_reindex_part;
--NOTICE:  REINDEX END: command_tag=REINDEX type=index identity=public.concur_reindex_child_id_idx
--REINDEX TABLE CONCURRENTLY concur_reindex_part;
--NOTICE:  REINDEX END: command_tag=REINDEX type=index identity=public.concur_reindex_child_id_idx
--DROP TABLE concur_reindex_part;
+-CREATE TEMPORARY TABLE results_enabled AS
+-SELECT t1.id, t1.name, t2.category, t3.status
+-FROM oj_t1 t1 
+-LEFT JOIN oj_t2 t2 ON t1.id = t2.id 
+-LEFT JOIN oj_t3 t3 ON t1.id = t3.id 
+-ORDER BY t1.id LIMIT 5;
+-ERROR:  variable not found in subplan target lists
+-SET enable_outer_join_limit_pushdown = off;
+-CREATE TEMPORARY TABLE results_disabled AS
+-SELECT t1.id, t1.name, t2.category, t3.status
+-FROM oj_t1 t1 
+-LEFT JOIN oj_t2 t2 ON t1.id = t2.id 
+-LEFT JOIN oj_t3 t3 ON t1.id = t3.id 
+-ORDER BY t1.id LIMIT 5;
+-SELECT 
+-  CASE 
+-    WHEN (SELECT COUNT(*) FROM results_enabled) = (SELECT COUNT(*) FROM results_disabled)
+-         AND NOT EXISTS (
+-           (SELECT * FROM results_enabled EXCEPT SELECT * FROM results_disabled)
+-           UNION ALL
+-           (SELECT * FROM results_disabled EXCEPT SELECT * FROM results_enabled)
+-         )
+-    THEN '✓ PASS: Results match'
+-    ELSE '✗ FAIL: Results differ'
+-  END as validation_result;
+-ERROR:  relation "results_enabled" does not exist
+-LINE 3:     WHEN (SELECT COUNT(*) FROM results_enabled) = (SELECT CO...
+-                                       ^
+-DROP TABLE results_enabled, results_disabled;
+-ERROR:  table "results_enabled" does not exist
+-SET enable_outer_join_limit_pushdown = on;
+--- Test Case 4: Three-level nested outer joins validation
+-SELECT 'Test 4: Three-level nested outer joins validation' as test_description;
+-                 test_description                  
+----------------------------------------------------
+- Test 4: Three-level nested outer joins validation
++SELECT validate_query_results(
++    'SELECT t1.id, t1.name, t2.category FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id ORDER BY t1.created_at DESC LIMIT 5',
++    'LEFT JOIN with ORDER BY timestamp column'
++);
++              validate_query_results              
++--------------------------------------------------
++ ✓ PASS: LEFT JOIN with ORDER BY timestamp column
++(1 row)
++
++-- OFFSET and LIMIT combinations
++SELECT validate_query_results(
++    'SELECT t1.id, t1.name, t2.category FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id ORDER BY t1.id LIMIT 3 OFFSET 2',
++    'LEFT JOIN with OFFSET and LIMIT'
++);
++         validate_query_results          
++-----------------------------------------
++ ✓ PASS: LEFT JOIN with OFFSET and LIMIT
++(1 row)
++
++SELECT validate_query_results(
++    'SELECT t1.id, t1.name, t2.category FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id ORDER BY t1.id LIMIT 10 OFFSET 5',
++    'LEFT JOIN with larger OFFSET and LIMIT'
++);
++             validate_query_results             
++------------------------------------------------
++ ✓ PASS: LEFT JOIN with larger OFFSET and LIMIT
+ (1 row)
+ 
+-CREATE TEMPORARY TABLE results_enabled AS
+-SELECT t1.id, t2.category, t3.status, t4.description
+-FROM oj_t1 t1 
+-LEFT JOIN oj_t2 t2 ON t1.id = t2.id 
+-LEFT JOIN oj_t3 t3 ON t1.id = t3.id
+-LEFT JOIN oj_t4 t4 ON t1.id = t4.id
+-ORDER BY t1.id LIMIT 6;
+-ERROR:  variable not found in subplan target lists
+-SET enable_outer_join_limit_pushdown = off;
+-CREATE TEMPORARY TABLE results_disabled AS
+-SELECT t1.id, t2.category, t3.status, t4.description
+-FROM oj_t1 t1 
+-LEFT JOIN oj_t2 t2 ON t1.id = t2.id 
+-LEFT JOIN oj_t3 t3 ON t1.id = t3.id
+-LEFT JOIN oj_t4 t4 ON t1.id = t4.id
+-ORDER BY t1.id LIMIT 6;
+-ERROR:  relation "results_disabled" already exists
+-SELECT 
+-  CASE 
+-    WHEN (SELECT COUNT(*) FROM results_enabled) = (SELECT COUNT(*) FROM results_disabled)
+-         AND NOT EXISTS (
+-           (SELECT * FROM results_enabled EXCEPT SELECT * FROM results_disabled)
+-           UNION ALL
+-           (SELECT * FROM results_disabled EXCEPT SELECT * FROM results_enabled)
+-         )
+-    THEN '✓ PASS: Results match'
+-    ELSE '✗ FAIL: Results differ'
+-  END as validation_result;
+-ERROR:  relation "results_enabled" does not exist
+-LINE 3:     WHEN (SELECT COUNT(*) FROM results_enabled) = (SELECT CO...
+-                                       ^
+-DROP TABLE results_enabled, results_disabled;
+-ERROR:  table "results_enabled" does not exist
+-SET enable_outer_join_limit_pushdown = on;
+--- Test Case 5: ORDER BY multiple columns validation
+-SELECT 'Test 5: ORDER BY multiple columns validation' as test_description;
+-               test_description               
+-----------------------------------------------
+- Test 5: ORDER BY multiple columns validation
++-- Mixed join types
++SELECT validate_query_results(
++    'SELECT t1.id, t2.category, t3.status FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id RIGHT JOIN oj_t3 t3 ON t1.id = t3.id ORDER BY t3.id LIMIT 6',
++    'LEFT JOIN followed by RIGHT JOIN'
++);
++          validate_query_results          
++------------------------------------------
++ ✓ PASS: LEFT JOIN followed by RIGHT JOIN
++(1 row)
++
++SELECT validate_query_results(
++    'SELECT t1.id, t2.category, t3.status FROM oj_t1 t1 RIGHT JOIN oj_t2 t2 ON t1.id = t2.id LEFT JOIN oj_t3 t3 ON t2.id = t3.id ORDER BY t2.id LIMIT 4',
++    'RIGHT JOIN followed by LEFT JOIN'
++);
++          validate_query_results          
++------------------------------------------
++ ✓ PASS: RIGHT JOIN followed by LEFT JOIN
++(1 row)
++
++-- Aggregate functions with GROUP BY
++SELECT validate_query_results(
++    'SELECT t1.id, COUNT(t2.id) as join_count, SUM(t2.score) as total_score FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id GROUP BY t1.id ORDER BY t1.id LIMIT 5',
++    'LEFT JOIN with aggregates and GROUP BY'
++);
++             validate_query_results             
++------------------------------------------------
++ ✓ PASS: LEFT JOIN with aggregates and GROUP BY
+ (1 row)
+ 
+-CREATE TEMPORARY TABLE results_enabled AS
+-SELECT t1.id, t1.name, t2.score
+-FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id 
+-ORDER BY t1.value DESC, t1.id ASC LIMIT 4;
+-SET enable_outer_join_limit_pushdown = off;
+-CREATE TEMPORARY TABLE results_disabled AS
+-SELECT t1.id, t1.name, t2.score
+-FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id 
+-ORDER BY t1.value DESC, t1.id ASC LIMIT 4;
+-ERROR:  relation "results_disabled" already exists
+-SELECT 
+-  CASE 
+-    WHEN (SELECT COUNT(*) FROM results_enabled) = (SELECT COUNT(*) FROM results_disabled)
+-         AND NOT EXISTS (
+-           (SELECT * FROM results_enabled EXCEPT SELECT * FROM results_disabled)
+-           UNION ALL
+-           (SELECT * FROM results_disabled EXCEPT SELECT * FROM results_enabled)
+-         )
+-    THEN '✓ PASS: Results match'
+-    ELSE '✗ FAIL: Results differ'
+-  END as validation_result;
+-ERROR:  each EXCEPT query must have the same number of columns
+-LINE 5: ...     (SELECT * FROM results_enabled EXCEPT SELECT * FROM res...
+-                                                             ^
+-DROP TABLE results_enabled, results_disabled;
+-SET enable_outer_join_limit_pushdown = on;
+--- Test Case 6: OFFSET with LIMIT validation
+-SELECT 'Test 6: OFFSET with LIMIT validation' as test_description;
+-           test_description           
+---------------------------------------
+- Test 6: OFFSET with LIMIT validation
+-(1 row)
+-
+-CREATE TEMPORARY TABLE results_enabled AS
+-SELECT t1.id, t1.name, t2.category
+-FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id 
+-ORDER BY t1.id LIMIT 3 OFFSET 2;
+-SET enable_outer_join_limit_pushdown = off;
+-CREATE TEMPORARY TABLE results_disabled AS
+-SELECT t1.id, t1.name, t2.category
+-FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id 
+-ORDER BY t1.id LIMIT 3 OFFSET 2;
+-SELECT 
+-  CASE 
+-    WHEN (SELECT COUNT(*) FROM results_enabled) = (SELECT COUNT(*) FROM results_disabled)
+-         AND NOT EXISTS (
+-           (SELECT * FROM results_enabled EXCEPT SELECT * FROM results_disabled)
+-           UNION ALL
+-           (SELECT * FROM results_disabled EXCEPT SELECT * FROM results_enabled)
+-         )
+-    THEN '✓ PASS: Results match'
+-    ELSE '✗ FAIL: Results differ'
+-  END as validation_result;
+-   validation_result   
+------------------------
+- ✓ PASS: Results match
+-(1 row)
+-
+-DROP TABLE results_enabled, results_disabled;
+-SET enable_outer_join_limit_pushdown = on;
+--- Test Case 7: Negative case - ORDER BY non-preserved side (should still produce same results)
+-SELECT 'Test 7: ORDER BY non-preserved side validation' as test_description;
+-                test_description                
++-- Different data types and expressions
++SELECT validate_query_results(
++    'SELECT t1.id, t2.amount, t3.active, t4.data FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id LEFT JOIN oj_t3 t3 ON t1.id = t3.id LEFT JOIN oj_t4 t4 ON t1.id = t4.id ORDER BY t2.amount DESC NULLS LAST LIMIT 6',
++    'Multi-join with numeric, boolean, and jsonb columns'
++);
++                   validate_query_results                    
++-------------------------------------------------------------
++ ✓ PASS: Multi-join with numeric, boolean, and jsonb columns
++(1 row)
++
++SELECT validate_query_results(
++    'SELECT t1.id, t5.tags, array_length(t5.tags, 1) as tag_count FROM oj_t1 t1 LEFT JOIN oj_t5 t5 ON t1.id = t5.id ORDER BY t1.id LIMIT 8',
++    'LEFT JOIN with array columns and functions'
++);
++               validate_query_results               
++----------------------------------------------------
++ ✓ PASS: LEFT JOIN with array columns and functions
++(1 row)
++
++-- Subqueries with outer joins
++SELECT validate_query_results(
++    'SELECT sub.id, sub.name, t2.category FROM (SELECT id, name, value FROM oj_t1 WHERE value > 30) sub LEFT JOIN oj_t2 t2 ON sub.id = t2.id ORDER BY sub.id LIMIT 4',
++    'Subquery with LEFT JOIN'
++);
++     validate_query_results      
++---------------------------------
++ ✓ PASS: Subquery with LEFT JOIN
++(1 row)
++
++SELECT validate_query_results(
++    'SELECT t1.id, t1.name, sub.avg_score FROM oj_t1 t1 LEFT JOIN (SELECT id, AVG(score) as avg_score FROM oj_t2 GROUP BY id) sub ON t1.id = sub.id ORDER BY t1.id LIMIT 5',
++    'LEFT JOIN with aggregated subquery'
++);
++           validate_query_results           
++--------------------------------------------
++ ✓ PASS: LEFT JOIN with aggregated subquery
++(1 row)
++
++-- Complex WHERE conditions
++SELECT validate_query_results(
++    'SELECT t1.id, t2.category, t3.status FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id LEFT JOIN oj_t3 t3 ON t1.id = t3.id WHERE t1.value BETWEEN 20 AND 80 ORDER BY t1.id LIMIT 6',
++    'Multi-join with WHERE clause on preserved side'
++);
++                 validate_query_results                 
++--------------------------------------------------------
++ ✓ PASS: Multi-join with WHERE clause on preserved side
++(1 row)
++
++SELECT validate_query_results(
++    'SELECT t1.id, t2.category FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id WHERE t2.score IS NULL OR t2.score > 300 ORDER BY t1.id LIMIT 5',
++    'LEFT JOIN with complex WHERE condition'
++);
++             validate_query_results             
+ ------------------------------------------------
+- Test 7: ORDER BY non-preserved side validation
++ ✓ PASS: LEFT JOIN with complex WHERE condition
+ (1 row)
+ 
+-CREATE TEMPORARY TABLE results_enabled AS
+-SELECT t1.id, t1.name, t2.category
+-FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id 
+-WHERE t2.category IS NOT NULL
+-ORDER BY t2.category LIMIT 3;
+-SET enable_outer_join_limit_pushdown = off;
+-CREATE TEMPORARY TABLE results_disabled AS
+-SELECT t1.id, t1.name, t2.category
+-FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id 
+-WHERE t2.category IS NOT NULL
+-ORDER BY t2.category LIMIT 3;
+-SELECT 
+-  CASE 
+-    WHEN (SELECT COUNT(*) FROM results_enabled) = (SELECT COUNT(*) FROM results_disabled)
+-         AND NOT EXISTS (
+-           (SELECT * FROM results_enabled EXCEPT SELECT * FROM results_disabled)
+-           UNION ALL
+-           (SELECT * FROM results_disabled EXCEPT SELECT * FROM results_enabled)
+-         )
+-    THEN '✓ PASS: Results match'
+-    ELSE '✗ FAIL: Results differ'
+-  END as validation_result;
+-   validation_result   
+------------------------
+- ✓ PASS: Results match
+-(1 row)
+-
+-DROP TABLE results_enabled, results_disabled;
+-SET enable_outer_join_limit_pushdown = on;
+--- Test Case 8: Negative case - INNER JOIN (should still produce same results)
+-SELECT 'Test 8: INNER JOIN validation' as test_description;
+-       test_description        
+--------------------------------
+- Test 8: INNER JOIN validation
+-(1 row)
+-
+-CREATE TEMPORARY TABLE results_enabled AS
+-SELECT t1.id, t1.name, t2.category
+-FROM oj_t1 t1 INNER JOIN oj_t2 t2 ON t1.id = t2.id 
+-ORDER BY t1.id LIMIT 3;
+-SET enable_outer_join_limit_pushdown = off;
+-CREATE TEMPORARY TABLE results_disabled AS
+-SELECT t1.id, t1.name, t2.category
+-FROM oj_t1 t1 INNER JOIN oj_t2 t2 ON t1.id = t2.id 
+-ORDER BY t1.id LIMIT 3;
+-SELECT 
+-  CASE 
+-    WHEN (SELECT COUNT(*) FROM results_enabled) = (SELECT COUNT(*) FROM results_disabled)
+-         AND NOT EXISTS (
+-           (SELECT * FROM results_enabled EXCEPT SELECT * FROM results_disabled)
+-           UNION ALL
+-           (SELECT * FROM results_disabled EXCEPT SELECT * FROM results_enabled)
+-         )
+-    THEN '✓ PASS: Results match'
+-    ELSE '✗ FAIL: Results differ'
+-  END as validation_result;
+-   validation_result   
+------------------------
+- ✓ PASS: Results match
++-- CTE (Common Table Expression) tests
++SELECT validate_query_results(
++    'WITH ranked_t1 AS (SELECT id, name, value, ROW_NUMBER() OVER (ORDER BY value) as rn FROM oj_t1) SELECT r.id, r.name, t2.category FROM ranked_t1 r LEFT JOIN oj_t2 t2 ON r.id = t2.id ORDER BY r.id LIMIT 4',
++    'CTE with LEFT JOIN and window function'
++);
++             validate_query_results             
++------------------------------------------------
++ ✓ PASS: CTE with LEFT JOIN and window function
++(1 row)
++
++-- Different join conditions
++SELECT validate_query_results(
++    'SELECT t1.id, t2.category FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.value / 10 = t2.id ORDER BY t1.id LIMIT 5',
++    'LEFT JOIN with expression-based join condition'
++);
++                 validate_query_results                 
++--------------------------------------------------------
++ ✓ PASS: LEFT JOIN with expression-based join condition
++(1 row)
++
++-- Negative test cases (optimization should not apply)
++SELECT validate_query_results(
++    'SELECT t1.id, t1.name, t2.category FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id WHERE t2.category IS NOT NULL ORDER BY t2.category LIMIT 3',
++    'ORDER BY non-preserved side (optimization disabled)'
++);
++                   validate_query_results                    
++-------------------------------------------------------------
++ ✓ PASS: ORDER BY non-preserved side (optimization disabled)
++(1 row)
++
++SELECT validate_query_results(
++    'SELECT t1.id, t1.name, t2.category FROM oj_t1 t1 INNER JOIN oj_t2 t2 ON t1.id = t2.id ORDER BY t1.id LIMIT 3',
++    'INNER JOIN (optimization disabled)'
++);
++           validate_query_results           
++--------------------------------------------
++ ✓ PASS: INNER JOIN (optimization disabled)
++(1 row)
++
++SELECT validate_query_results(
++    'SELECT t1.id, t2.category FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id ORDER BY t2.score DESC NULLS LAST LIMIT 4',
++    'ORDER BY nullable column from non-preserved side (optimization disabled)'
++);
++                              validate_query_results                              
++----------------------------------------------------------------------------------
++ ✓ PASS: ORDER BY nullable column from non-preserved side (optimization disabled)
++(1 row)
++
++-- Force different join algorithms to test all code paths
++SET enable_nestloop = off;
++SET enable_hashjoin = on;
++SET enable_mergejoin = off;
++SELECT validate_query_results(
++    'SELECT t1.id, t2.category FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id ORDER BY t1.id LIMIT 4',
++    'LEFT JOIN with forced hash join algorithm'
++);
++              validate_query_results               
++---------------------------------------------------
++ ✓ PASS: LEFT JOIN with forced hash join algorithm
+ (1 row)
+ 
+-DROP TABLE results_enabled, results_disabled;
++SET enable_nestloop = off;
++SET enable_hashjoin = off; 
++SET enable_mergejoin = on;
++SELECT validate_query_results(
++    'SELECT t1.id, t2.category FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id ORDER BY t1.id LIMIT 4',
++    'LEFT JOIN with forced merge join algorithm'
++);
++               validate_query_results               
++----------------------------------------------------
++ ✓ PASS: LEFT JOIN with forced merge join algorithm
++(1 row)
++
++SET enable_nestloop = on;
++SET enable_hashjoin = off;
++SET enable_mergejoin = off;
++SELECT validate_query_results(
++    'SELECT t1.id, t2.category FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id ORDER BY t1.id LIMIT 4',
++    'LEFT JOIN with forced nested loop algorithm'
++);
++               validate_query_results                
++-----------------------------------------------------
++ ✓ PASS: LEFT JOIN with forced nested loop algorithm
++(1 row)
++
++-- Reset join settings
++RESET enable_nestloop;
++RESET enable_hashjoin;
++RESET enable_mergejoin;
+ -- Test GUC parameter functionality
+ SELECT 'Testing GUC parameter functionality' as test_name;
+               test_name              
+@@ -321,7 +360,7 @@
+ SHOW enable_outer_join_limit_pushdown;
+  enable_outer_join_limit_pushdown 
+ ----------------------------------
+- off
++ on
+ (1 row)
+ 
+ SET enable_outer_join_limit_pushdown = off;
+@@ -338,7 +377,44 @@
+  on
+ (1 row)
+ 
 --- Clean up
--DROP EVENT TRIGGER regress_reindex_start;
--DROP EVENT TRIGGER regress_reindex_end;
--DROP EVENT TRIGGER regress_reindex_end_snap;
--DROP FUNCTION reindex_end_command();
--DROP FUNCTION reindex_end_command_snap();
--DROP FUNCTION reindex_start_command();
--DROP TABLE concur_reindex_tab;
---- test Row Security Event Trigger
--RESET SESSION AUTHORIZATION;
--CREATE TABLE event_trigger_test (a integer, b text);
--CREATE OR REPLACE FUNCTION start_command()
--RETURNS event_trigger AS $$
--BEGIN
--RAISE NOTICE '% - ddl_command_start', tg_tag;
--END;
--$$ LANGUAGE plpgsql;
--CREATE OR REPLACE FUNCTION end_command()
--RETURNS event_trigger AS $$
--BEGIN
--RAISE NOTICE '% - ddl_command_end', tg_tag;
--END;
--$$ LANGUAGE plpgsql;
--CREATE OR REPLACE FUNCTION drop_sql_command()
--RETURNS event_trigger AS $$
--BEGIN
--RAISE NOTICE '% - sql_drop', tg_tag;
--END;
--$$ LANGUAGE plpgsql;
--CREATE EVENT TRIGGER start_rls_command ON ddl_command_start
--    WHEN TAG IN ('CREATE POLICY', 'ALTER POLICY', 'DROP POLICY') EXECUTE PROCEDURE start_command();
--CREATE EVENT TRIGGER end_rls_command ON ddl_command_end
--    WHEN TAG IN ('CREATE POLICY', 'ALTER POLICY', 'DROP POLICY') EXECUTE PROCEDURE end_command();
--CREATE EVENT TRIGGER sql_drop_command ON sql_drop
--    WHEN TAG IN ('DROP POLICY') EXECUTE PROCEDURE drop_sql_command();
--CREATE POLICY p1 ON event_trigger_test USING (FALSE);
--NOTICE:  CREATE POLICY - ddl_command_start
--NOTICE:  CREATE POLICY - ddl_command_end
--ALTER POLICY p1 ON event_trigger_test USING (TRUE);
--NOTICE:  ALTER POLICY - ddl_command_start
--NOTICE:  ALTER POLICY - ddl_command_end
--ALTER POLICY p1 ON event_trigger_test RENAME TO p2;
--NOTICE:  ALTER POLICY - ddl_command_start
--NOTICE:  ALTER POLICY - ddl_command_end
--DROP POLICY p2 ON event_trigger_test;
--NOTICE:  DROP POLICY - ddl_command_start
--NOTICE:  DROP POLICY - sql_drop
--NOTICE:  DROP POLICY - ddl_command_end
---- Check the object addresses of all the event triggers.
--SELECT
--    e.evtname,
--    pg_describe_object('pg_event_trigger'::regclass, e.oid, 0) as descr,
--    b.type, b.object_names, b.object_args,
--    pg_identify_object(a.classid, a.objid, a.objsubid) as ident
--  FROM pg_event_trigger as e,
--    LATERAL pg_identify_object_as_address('pg_event_trigger'::regclass, e.oid, 0) as b,
--    LATERAL pg_get_object_address(b.type, b.object_names, b.object_args) as a
--  ORDER BY e.evtname;
--      evtname      |              descr              |     type      |    object_names     | object_args |                         ident                          
---------------------+---------------------------------+---------------+---------------------+-------------+--------------------------------------------------------
-- end_rls_command   | event trigger end_rls_command   | event trigger | {end_rls_command}   | {}          | ("event trigger",,end_rls_command,end_rls_command)
-- sql_drop_command  | event trigger sql_drop_command  | event trigger | {sql_drop_command}  | {}          | ("event trigger",,sql_drop_command,sql_drop_command)
-- start_rls_command | event trigger start_rls_command | event trigger | {start_rls_command} | {}          | ("event trigger",,start_rls_command,start_rls_command)
--(3 rows)
--
--DROP EVENT TRIGGER start_rls_command;
--DROP EVENT TRIGGER end_rls_command;
--DROP EVENT TRIGGER sql_drop_command;
---- Check the GUC for disabling event triggers
--CREATE FUNCTION test_event_trigger_guc() RETURNS event_trigger
--LANGUAGE plpgsql AS $$
--DECLARE
--	obj record;
--BEGIN
--	FOR obj IN SELECT * FROM pg_event_trigger_dropped_objects()
--	LOOP
--		RAISE NOTICE '% dropped %', tg_tag, obj.object_type;
--	END LOOP;
--END;
--$$;
--CREATE EVENT TRIGGER test_event_trigger_guc
--	ON sql_drop
--	WHEN TAG IN ('DROP POLICY') EXECUTE FUNCTION test_event_trigger_guc();
--SET event_triggers = 'on';
--CREATE POLICY pguc ON event_trigger_test USING (FALSE);
--DROP POLICY pguc ON event_trigger_test;
--NOTICE:  DROP POLICY dropped policy
--CREATE POLICY pguc ON event_trigger_test USING (FALSE);
--SET event_triggers = 'off';
--DROP POLICY pguc ON event_trigger_test;
-+psql: error: connection to server on socket "/tmp/pg_regress-7DSHQk/.s.PGSQL.55316" failed: FATAL:  the database system is in recovery mode
-diff -U3 /home/runner/work/postgres/postgres/src/test/regress/expected/event_trigger_login.out /home/runner/work/postgres/postgres/src/test/regress/results/event_trigger_login.out
---- /home/runner/work/postgres/postgres/src/test/regress/expected/event_trigger_login.out	2025-09-12 09:25:55.804896993 +0000
-+++ /home/runner/work/postgres/postgres/src/test/regress/results/event_trigger_login.out	2025-09-12 09:35:42.917273102 +0000
-@@ -1,39 +1 @@
---- Login event triggers
--CREATE TABLE user_logins(id serial, who text);
--GRANT SELECT ON user_logins TO public;
--CREATE FUNCTION on_login_proc() RETURNS event_trigger AS $$
--BEGIN
--  INSERT INTO user_logins (who) VALUES (SESSION_USER);
--  RAISE NOTICE 'You are welcome!';
--END;
--$$ LANGUAGE plpgsql;
--CREATE EVENT TRIGGER on_login_trigger ON login EXECUTE PROCEDURE on_login_proc();
--ALTER EVENT TRIGGER on_login_trigger ENABLE ALWAYS;
--\c
--NOTICE:  You are welcome!
--SELECT COUNT(*) FROM user_logins;
-- count 
---------
--     1
--(1 row)
--
--\c
--NOTICE:  You are welcome!
--SELECT COUNT(*) FROM user_logins;
-- count 
---------
--     2
--(1 row)
--
---- Check dathasloginevt in system catalog
--SELECT dathasloginevt FROM pg_database WHERE datname= :'DBNAME';
-- dathasloginevt 
------------------
-- t
--(1 row)
--
---- Cleanup
--DROP TABLE user_logins;
--DROP EVENT TRIGGER on_login_trigger;
--DROP FUNCTION on_login_proc();
--\c
-+psql: error: connection to server on socket "/tmp/pg_regress-7DSHQk/.s.PGSQL.55316" failed: FATAL:  the database system is in recovery mode
-diff -U3 /home/runner/work/postgres/postgres/src/test/regress/expected/fast_default.out /home/runner/work/postgres/postgres/src/test/regress/results/fast_default.out
---- /home/runner/work/postgres/postgres/src/test/regress/expected/fast_default.out	2025-09-12 09:25:55.804896993 +0000
-+++ /home/runner/work/postgres/postgres/src/test/regress/results/fast_default.out	2025-09-12 09:35:42.927273212 +0000
-@@ -1,926 +1,2 @@
----
---- ALTER TABLE ADD COLUMN DEFAULT test
----
--SET search_path = fast_default;
--CREATE SCHEMA fast_default;
--CREATE TABLE m(id OID);
--INSERT INTO m VALUES (NULL::OID);
--CREATE FUNCTION set(tabname name) RETURNS VOID
--AS $$
--BEGIN
--  UPDATE m
--  SET id = (SELECT c.relfilenode
--            FROM pg_class AS c, pg_namespace AS s
--            WHERE c.relname = tabname
--                AND c.relnamespace = s.oid
--                AND s.nspname = 'fast_default');
--END;
--$$ LANGUAGE 'plpgsql';
--CREATE FUNCTION comp() RETURNS TEXT
--AS $$
--BEGIN
--  RETURN (SELECT CASE
--               WHEN m.id = c.relfilenode THEN 'Unchanged'
--               ELSE 'Rewritten'
--               END
--           FROM m, pg_class AS c, pg_namespace AS s
--           WHERE c.relname = 't'
--               AND c.relnamespace = s.oid
--               AND s.nspname = 'fast_default');
--END;
--$$ LANGUAGE 'plpgsql';
--CREATE FUNCTION log_rewrite() RETURNS event_trigger
--LANGUAGE plpgsql as
--$func$
--
--declare
--   this_schema text;
--begin
--    select into this_schema relnamespace::regnamespace::text
--    from pg_class
--    where oid = pg_event_trigger_table_rewrite_oid();
--    if this_schema = 'fast_default'
--    then
--        RAISE NOTICE 'rewriting table % for reason %',
--          pg_event_trigger_table_rewrite_oid()::regclass,
--          pg_event_trigger_table_rewrite_reason();
--    end if;
--end;
--$func$;
--CREATE TABLE has_volatile AS
--SELECT * FROM generate_series(1,10) id;
--CREATE EVENT TRIGGER has_volatile_rewrite
--                  ON table_rewrite
--   EXECUTE PROCEDURE log_rewrite();
---- only the last of these should trigger a rewrite
--ALTER TABLE has_volatile ADD col1 int;
--ALTER TABLE has_volatile ADD col2 int DEFAULT 1;
--ALTER TABLE has_volatile ADD col3 timestamptz DEFAULT current_timestamp;
--ALTER TABLE has_volatile ADD col4 int DEFAULT (random() * 10000)::int;
--NOTICE:  rewriting table has_volatile for reason 2
---- Test a large sample of different datatypes
--CREATE TABLE T(pk INT NOT NULL PRIMARY KEY, c_int INT DEFAULT 1);
--SELECT set('t');
-- set 
-------
-- 
--(1 row)
--
--INSERT INTO T VALUES (1), (2);
--ALTER TABLE T ADD COLUMN c_bpchar BPCHAR(5) DEFAULT 'hello',
--              ALTER COLUMN c_int SET DEFAULT 2;
--INSERT INTO T VALUES (3), (4);
--ALTER TABLE T ADD COLUMN c_text TEXT  DEFAULT 'world',
--              ALTER COLUMN c_bpchar SET DEFAULT 'dog';
--INSERT INTO T VALUES (5), (6);
--ALTER TABLE T ADD COLUMN c_date DATE DEFAULT '2016-06-02',
--              ALTER COLUMN c_text SET DEFAULT 'cat';
--INSERT INTO T VALUES (7), (8);
--ALTER TABLE T ADD COLUMN c_timestamp TIMESTAMP DEFAULT '2016-09-01 12:00:00',
--              ADD COLUMN c_timestamp_null TIMESTAMP,
--              ALTER COLUMN c_date SET DEFAULT '2010-01-01';
--INSERT INTO T VALUES (9), (10);
--ALTER TABLE T ADD COLUMN c_array TEXT[]
--                  DEFAULT '{"This", "is", "the", "real", "world"}',
--              ALTER COLUMN c_timestamp SET DEFAULT '1970-12-31 11:12:13',
--              ALTER COLUMN c_timestamp_null SET DEFAULT '2016-09-29 12:00:00';
--INSERT INTO T VALUES (11), (12);
--ALTER TABLE T ADD COLUMN c_small SMALLINT DEFAULT -5,
--              ADD COLUMN c_small_null SMALLINT,
--              ALTER COLUMN c_array
--                  SET DEFAULT '{"This", "is", "no", "fantasy"}';
--INSERT INTO T VALUES (13), (14);
--ALTER TABLE T ADD COLUMN c_big BIGINT DEFAULT 180000000000018,
--              ALTER COLUMN c_small SET DEFAULT 9,
--              ALTER COLUMN c_small_null SET DEFAULT 13;
--INSERT INTO T VALUES (15), (16);
--ALTER TABLE T ADD COLUMN c_num NUMERIC DEFAULT 1.00000000001,
--              ALTER COLUMN c_big SET DEFAULT -9999999999999999;
--INSERT INTO T VALUES (17), (18);
--ALTER TABLE T ADD COLUMN c_time TIME DEFAULT '12:00:00',
--              ALTER COLUMN c_num SET DEFAULT 2.000000000000002;
--INSERT INTO T VALUES (19), (20);
--ALTER TABLE T ADD COLUMN c_interval INTERVAL DEFAULT '1 day',
--              ALTER COLUMN c_time SET DEFAULT '23:59:59';
--INSERT INTO T VALUES (21), (22);
--ALTER TABLE T ADD COLUMN c_hugetext TEXT DEFAULT repeat('abcdefg',1000),
--              ALTER COLUMN c_interval SET DEFAULT '3 hours';
--INSERT INTO T VALUES (23), (24);
--ALTER TABLE T ALTER COLUMN c_interval DROP DEFAULT,
--              ALTER COLUMN c_hugetext SET DEFAULT repeat('poiuyt', 1000);
--INSERT INTO T VALUES (25), (26);
--ALTER TABLE T ALTER COLUMN c_bpchar    DROP DEFAULT,
--              ALTER COLUMN c_date      DROP DEFAULT,
--              ALTER COLUMN c_text      DROP DEFAULT,
--              ALTER COLUMN c_timestamp DROP DEFAULT,
--              ALTER COLUMN c_array     DROP DEFAULT,
--              ALTER COLUMN c_small     DROP DEFAULT,
--              ALTER COLUMN c_big       DROP DEFAULT,
--              ALTER COLUMN c_num       DROP DEFAULT,
--              ALTER COLUMN c_time      DROP DEFAULT,
--              ALTER COLUMN c_hugetext  DROP DEFAULT;
--INSERT INTO T VALUES (27), (28);
--SELECT pk, c_int, c_bpchar, c_text, c_date, c_timestamp,
--       c_timestamp_null, c_array, c_small, c_small_null,
--       c_big, c_num, c_time, c_interval,
--       c_hugetext = repeat('abcdefg',1000) as c_hugetext_origdef,
--       c_hugetext = repeat('poiuyt', 1000) as c_hugetext_newdef
--FROM T ORDER BY pk;
-- pk | c_int | c_bpchar | c_text |   c_date   |       c_timestamp        |     c_timestamp_null     |         c_array          | c_small | c_small_null |       c_big       |       c_num       |  c_time  | c_interval | c_hugetext_origdef | c_hugetext_newdef 
------+-------+----------+--------+------------+--------------------------+--------------------------+--------------------------+---------+--------------+-------------------+-------------------+----------+------------+--------------------+-------------------
--  1 |     1 | hello    | world  | 06-02-2016 | Thu Sep 01 12:00:00 2016 |                          | {This,is,the,real,world} |      -5 |              |   180000000000018 |     1.00000000001 | 12:00:00 | @ 1 day    | t                  | f
--  2 |     1 | hello    | world  | 06-02-2016 | Thu Sep 01 12:00:00 2016 |                          | {This,is,the,real,world} |      -5 |              |   180000000000018 |     1.00000000001 | 12:00:00 | @ 1 day    | t                  | f
--  3 |     2 | hello    | world  | 06-02-2016 | Thu Sep 01 12:00:00 2016 |                          | {This,is,the,real,world} |      -5 |              |   180000000000018 |     1.00000000001 | 12:00:00 | @ 1 day    | t                  | f
--  4 |     2 | hello    | world  | 06-02-2016 | Thu Sep 01 12:00:00 2016 |                          | {This,is,the,real,world} |      -5 |              |   180000000000018 |     1.00000000001 | 12:00:00 | @ 1 day    | t                  | f
--  5 |     2 | dog      | world  | 06-02-2016 | Thu Sep 01 12:00:00 2016 |                          | {This,is,the,real,world} |      -5 |              |   180000000000018 |     1.00000000001 | 12:00:00 | @ 1 day    | t                  | f
--  6 |     2 | dog      | world  | 06-02-2016 | Thu Sep 01 12:00:00 2016 |                          | {This,is,the,real,world} |      -5 |              |   180000000000018 |     1.00000000001 | 12:00:00 | @ 1 day    | t                  | f
--  7 |     2 | dog      | cat    | 06-02-2016 | Thu Sep 01 12:00:00 2016 |                          | {This,is,the,real,world} |      -5 |              |   180000000000018 |     1.00000000001 | 12:00:00 | @ 1 day    | t                  | f
--  8 |     2 | dog      | cat    | 06-02-2016 | Thu Sep 01 12:00:00 2016 |                          | {This,is,the,real,world} |      -5 |              |   180000000000018 |     1.00000000001 | 12:00:00 | @ 1 day    | t                  | f
--  9 |     2 | dog      | cat    | 01-01-2010 | Thu Sep 01 12:00:00 2016 |                          | {This,is,the,real,world} |      -5 |              |   180000000000018 |     1.00000000001 | 12:00:00 | @ 1 day    | t                  | f
-- 10 |     2 | dog      | cat    | 01-01-2010 | Thu Sep 01 12:00:00 2016 |                          | {This,is,the,real,world} |      -5 |              |   180000000000018 |     1.00000000001 | 12:00:00 | @ 1 day    | t                  | f
-- 11 |     2 | dog      | cat    | 01-01-2010 | Thu Dec 31 11:12:13 1970 | Thu Sep 29 12:00:00 2016 | {This,is,the,real,world} |      -5 |              |   180000000000018 |     1.00000000001 | 12:00:00 | @ 1 day    | t                  | f
-- 12 |     2 | dog      | cat    | 01-01-2010 | Thu Dec 31 11:12:13 1970 | Thu Sep 29 12:00:00 2016 | {This,is,the,real,world} |      -5 |              |   180000000000018 |     1.00000000001 | 12:00:00 | @ 1 day    | t                  | f
-- 13 |     2 | dog      | cat    | 01-01-2010 | Thu Dec 31 11:12:13 1970 | Thu Sep 29 12:00:00 2016 | {This,is,no,fantasy}     |      -5 |              |   180000000000018 |     1.00000000001 | 12:00:00 | @ 1 day    | t                  | f
-- 14 |     2 | dog      | cat    | 01-01-2010 | Thu Dec 31 11:12:13 1970 | Thu Sep 29 12:00:00 2016 | {This,is,no,fantasy}     |      -5 |              |   180000000000018 |     1.00000000001 | 12:00:00 | @ 1 day    | t                  | f
-- 15 |     2 | dog      | cat    | 01-01-2010 | Thu Dec 31 11:12:13 1970 | Thu Sep 29 12:00:00 2016 | {This,is,no,fantasy}     |       9 |           13 |   180000000000018 |     1.00000000001 | 12:00:00 | @ 1 day    | t                  | f
-- 16 |     2 | dog      | cat    | 01-01-2010 | Thu Dec 31 11:12:13 1970 | Thu Sep 29 12:00:00 2016 | {This,is,no,fantasy}     |       9 |           13 |   180000000000018 |     1.00000000001 | 12:00:00 | @ 1 day    | t                  | f
-- 17 |     2 | dog      | cat    | 01-01-2010 | Thu Dec 31 11:12:13 1970 | Thu Sep 29 12:00:00 2016 | {This,is,no,fantasy}     |       9 |           13 | -9999999999999999 |     1.00000000001 | 12:00:00 | @ 1 day    | t                  | f
-- 18 |     2 | dog      | cat    | 01-01-2010 | Thu Dec 31 11:12:13 1970 | Thu Sep 29 12:00:00 2016 | {This,is,no,fantasy}     |       9 |           13 | -9999999999999999 |     1.00000000001 | 12:00:00 | @ 1 day    | t                  | f
-- 19 |     2 | dog      | cat    | 01-01-2010 | Thu Dec 31 11:12:13 1970 | Thu Sep 29 12:00:00 2016 | {This,is,no,fantasy}     |       9 |           13 | -9999999999999999 | 2.000000000000002 | 12:00:00 | @ 1 day    | t                  | f
-- 20 |     2 | dog      | cat    | 01-01-2010 | Thu Dec 31 11:12:13 1970 | Thu Sep 29 12:00:00 2016 | {This,is,no,fantasy}     |       9 |           13 | -9999999999999999 | 2.000000000000002 | 12:00:00 | @ 1 day    | t                  | f
-- 21 |     2 | dog      | cat    | 01-01-2010 | Thu Dec 31 11:12:13 1970 | Thu Sep 29 12:00:00 2016 | {This,is,no,fantasy}     |       9 |           13 | -9999999999999999 | 2.000000000000002 | 23:59:59 | @ 1 day    | t                  | f
-- 22 |     2 | dog      | cat    | 01-01-2010 | Thu Dec 31 11:12:13 1970 | Thu Sep 29 12:00:00 2016 | {This,is,no,fantasy}     |       9 |           13 | -9999999999999999 | 2.000000000000002 | 23:59:59 | @ 1 day    | t                  | f
-- 23 |     2 | dog      | cat    | 01-01-2010 | Thu Dec 31 11:12:13 1970 | Thu Sep 29 12:00:00 2016 | {This,is,no,fantasy}     |       9 |           13 | -9999999999999999 | 2.000000000000002 | 23:59:59 | @ 3 hours  | t                  | f
-- 24 |     2 | dog      | cat    | 01-01-2010 | Thu Dec 31 11:12:13 1970 | Thu Sep 29 12:00:00 2016 | {This,is,no,fantasy}     |       9 |           13 | -9999999999999999 | 2.000000000000002 | 23:59:59 | @ 3 hours  | t                  | f
-- 25 |     2 | dog      | cat    | 01-01-2010 | Thu Dec 31 11:12:13 1970 | Thu Sep 29 12:00:00 2016 | {This,is,no,fantasy}     |       9 |           13 | -9999999999999999 | 2.000000000000002 | 23:59:59 |            | f                  | t
-- 26 |     2 | dog      | cat    | 01-01-2010 | Thu Dec 31 11:12:13 1970 | Thu Sep 29 12:00:00 2016 | {This,is,no,fantasy}     |       9 |           13 | -9999999999999999 | 2.000000000000002 | 23:59:59 |            | f                  | t
-- 27 |     2 |          |        |            |                          | Thu Sep 29 12:00:00 2016 |                          |         |           13 |                   |                   |          |            |                    | 
-- 28 |     2 |          |        |            |                          | Thu Sep 29 12:00:00 2016 |                          |         |           13 |                   |                   |          |            |                    | 
--(28 rows)
--
--SELECT comp();
--   comp    
-------------
-- Unchanged
--(1 row)
--
--DROP TABLE T;
---- Test expressions in the defaults
--CREATE OR REPLACE FUNCTION foo(a INT) RETURNS TEXT AS $$
--DECLARE res TEXT := '';
--        i INT;
--BEGIN
--  i := 0;
--  WHILE (i < a) LOOP
--    res := res || chr(ascii('a') + i);
--    i := i + 1;
--  END LOOP;
--  RETURN res;
--END; $$ LANGUAGE PLPGSQL STABLE;
--CREATE TABLE T(pk INT NOT NULL PRIMARY KEY, c_int INT DEFAULT LENGTH(foo(6)));
--SELECT set('t');
-- set 
-------
-- 
--(1 row)
--
--INSERT INTO T VALUES (1), (2);
--ALTER TABLE T ADD COLUMN c_bpchar BPCHAR(5) DEFAULT foo(4),
--              ALTER COLUMN c_int SET DEFAULT LENGTH(foo(8));
--INSERT INTO T VALUES (3), (4);
--ALTER TABLE T ADD COLUMN c_text TEXT  DEFAULT foo(6),
--              ALTER COLUMN c_bpchar SET DEFAULT foo(3);
--INSERT INTO T VALUES (5), (6);
--ALTER TABLE T ADD COLUMN c_date DATE
--                  DEFAULT '2016-06-02'::DATE  + LENGTH(foo(10)),
--              ALTER COLUMN c_text SET DEFAULT foo(12);
--INSERT INTO T VALUES (7), (8);
--ALTER TABLE T ADD COLUMN c_timestamp TIMESTAMP
--                  DEFAULT '2016-09-01'::DATE + LENGTH(foo(10)),
--              ALTER COLUMN c_date
--                  SET DEFAULT '2010-01-01'::DATE - LENGTH(foo(4));
--INSERT INTO T VALUES (9), (10);
--ALTER TABLE T ADD COLUMN c_array TEXT[]
--                  DEFAULT ('{"This", "is", "' || foo(4) ||
--                           '","the", "real", "world"}')::TEXT[],
--              ALTER COLUMN c_timestamp
--                  SET DEFAULT '1970-12-31'::DATE + LENGTH(foo(30));
--INSERT INTO T VALUES (11), (12);
--ALTER TABLE T ALTER COLUMN c_int DROP DEFAULT,
--              ALTER COLUMN c_array
--                  SET DEFAULT ('{"This", "is", "' || foo(1) ||
--                               '", "fantasy"}')::text[];
--INSERT INTO T VALUES (13), (14);
--ALTER TABLE T ALTER COLUMN c_bpchar    DROP DEFAULT,
--              ALTER COLUMN c_date      DROP DEFAULT,
--              ALTER COLUMN c_text      DROP DEFAULT,
--              ALTER COLUMN c_timestamp DROP DEFAULT,
--              ALTER COLUMN c_array     DROP DEFAULT;
--INSERT INTO T VALUES (15), (16);
--SELECT * FROM T;
-- pk | c_int | c_bpchar |    c_text    |   c_date   |       c_timestamp        |            c_array            
------+-------+----------+--------------+------------+--------------------------+-------------------------------
--  1 |     6 | abcd     | abcdef       | 06-12-2016 | Sun Sep 11 00:00:00 2016 | {This,is,abcd,the,real,world}
--  2 |     6 | abcd     | abcdef       | 06-12-2016 | Sun Sep 11 00:00:00 2016 | {This,is,abcd,the,real,world}
--  3 |     8 | abcd     | abcdef       | 06-12-2016 | Sun Sep 11 00:00:00 2016 | {This,is,abcd,the,real,world}
--  4 |     8 | abcd     | abcdef       | 06-12-2016 | Sun Sep 11 00:00:00 2016 | {This,is,abcd,the,real,world}
--  5 |     8 | abc      | abcdef       | 06-12-2016 | Sun Sep 11 00:00:00 2016 | {This,is,abcd,the,real,world}
--  6 |     8 | abc      | abcdef       | 06-12-2016 | Sun Sep 11 00:00:00 2016 | {This,is,abcd,the,real,world}
--  7 |     8 | abc      | abcdefghijkl | 06-12-2016 | Sun Sep 11 00:00:00 2016 | {This,is,abcd,the,real,world}
--  8 |     8 | abc      | abcdefghijkl | 06-12-2016 | Sun Sep 11 00:00:00 2016 | {This,is,abcd,the,real,world}
--  9 |     8 | abc      | abcdefghijkl | 12-28-2009 | Sun Sep 11 00:00:00 2016 | {This,is,abcd,the,real,world}
-- 10 |     8 | abc      | abcdefghijkl | 12-28-2009 | Sun Sep 11 00:00:00 2016 | {This,is,abcd,the,real,world}
-- 11 |     8 | abc      | abcdefghijkl | 12-28-2009 | Sat Jan 30 00:00:00 1971 | {This,is,abcd,the,real,world}
-- 12 |     8 | abc      | abcdefghijkl | 12-28-2009 | Sat Jan 30 00:00:00 1971 | {This,is,abcd,the,real,world}
-- 13 |       | abc      | abcdefghijkl | 12-28-2009 | Sat Jan 30 00:00:00 1971 | {This,is,a,fantasy}
-- 14 |       | abc      | abcdefghijkl | 12-28-2009 | Sat Jan 30 00:00:00 1971 | {This,is,a,fantasy}
-- 15 |       |          |              |            |                          | 
-- 16 |       |          |              |            |                          | 
--(16 rows)
--
--SELECT comp();
--   comp    
-------------
-- Unchanged
--(1 row)
--
--DROP TABLE T;
---- Test domains with default value for table rewrite.
--CREATE DOMAIN domain1 AS int DEFAULT 11;  -- constant
--CREATE DOMAIN domain2 AS int DEFAULT random(min=>10, max=>100);  -- volatile
--CREATE DOMAIN domain3 AS text DEFAULT foo(4);  -- stable
--CREATE DOMAIN domain4 AS text[]
--  DEFAULT ('{"This", "is", "' || foo(4) || '","the", "real", "world"}')::TEXT[];
--CREATE TABLE t2 (a domain1);
--INSERT INTO t2 VALUES (1),(2);
---- no table rewrite
--ALTER TABLE t2 ADD COLUMN b domain1 default 3;
--SELECT attnum, attname, atthasmissing, atthasdef, attmissingval
--FROM pg_attribute
--WHERE attnum > 0 AND attrelid = 't2'::regclass
--ORDER BY attnum;
-- attnum | attname | atthasmissing | atthasdef | attmissingval 
----------+---------+---------------+-----------+---------------
--      1 | a       | f             | f         | 
--      2 | b       | t             | t         | {3}
--(2 rows)
--
---- table rewrite should happen
--ALTER TABLE t2 ADD COLUMN c domain3 default left(random()::text,3);
--NOTICE:  rewriting table t2 for reason 2
---- no table rewrite
--ALTER TABLE t2 ADD COLUMN d domain4;
--SELECT attnum, attname, atthasmissing, atthasdef, attmissingval
--FROM pg_attribute
--WHERE attnum > 0 AND attrelid = 't2'::regclass
--ORDER BY attnum;
-- attnum | attname | atthasmissing | atthasdef |           attmissingval           
----------+---------+---------------+-----------+-----------------------------------
--      1 | a       | f             | f         | 
--      2 | b       | f             | t         | 
--      3 | c       | f             | t         | 
--      4 | d       | t             | f         | {"{This,is,abcd,the,real,world}"}
--(4 rows)
--
---- table rewrite should happen
--ALTER TABLE t2 ADD COLUMN e domain2;
--NOTICE:  rewriting table t2 for reason 2
--SELECT attnum, attname, atthasmissing, atthasdef, attmissingval
--FROM pg_attribute
--WHERE attnum > 0 AND attrelid = 't2'::regclass
--ORDER BY attnum;
-- attnum | attname | atthasmissing | atthasdef | attmissingval 
----------+---------+---------------+-----------+---------------
--      1 | a       | f             | f         | 
--      2 | b       | f             | t         | 
--      3 | c       | f             | t         | 
--      4 | d       | f             | f         | 
--      5 | e       | f             | f         | 
--(5 rows)
--
--SELECT a, b, length(c) = 3 as c_ok, d, e >= 10 as e_ok FROM t2;
-- a | b | c_ok |               d               | e_ok 
-----+---+------+-------------------------------+------
-- 1 | 3 | t    | {This,is,abcd,the,real,world} | t
-- 2 | 3 | t    | {This,is,abcd,the,real,world} | t
--(2 rows)
--
--DROP TABLE t2;
--DROP DOMAIN domain1;
--DROP DOMAIN domain2;
--DROP DOMAIN domain3;
--DROP DOMAIN domain4;
--DROP FUNCTION foo(INT);
---- Fall back to full rewrite for volatile expressions
--CREATE TABLE T(pk INT NOT NULL PRIMARY KEY);
--INSERT INTO T VALUES (1);
--SELECT set('t');
-- set 
-------
-- 
--(1 row)
--
---- now() is stable, because it returns the transaction timestamp
--ALTER TABLE T ADD COLUMN c1 TIMESTAMP DEFAULT now();
--SELECT comp();
--   comp    
-------------
-- Unchanged
--(1 row)
--
---- clock_timestamp() is volatile
--ALTER TABLE T ADD COLUMN c2 TIMESTAMP DEFAULT clock_timestamp();
--NOTICE:  rewriting table t for reason 2
--SELECT comp();
--   comp    
-------------
-- Rewritten
--(1 row)
--
---- check that we notice insertion of a volatile default argument
--CREATE FUNCTION foolme(timestamptz DEFAULT clock_timestamp())
--  RETURNS timestamptz
--  IMMUTABLE AS 'select $1' LANGUAGE sql;
--ALTER TABLE T ADD COLUMN c3 timestamptz DEFAULT foolme();
--NOTICE:  rewriting table t for reason 2
--SELECT attname, atthasmissing, attmissingval FROM pg_attribute
--  WHERE attrelid = 't'::regclass AND attnum > 0
--  ORDER BY attnum;
-- attname | atthasmissing | attmissingval 
-----------+---------------+---------------
-- pk      | f             | 
-- c1      | f             | 
-- c2      | f             | 
-- c3      | f             | 
--(4 rows)
--
--DROP TABLE T;
--DROP FUNCTION foolme(timestamptz);
---- Simple querie
--CREATE TABLE T (pk INT NOT NULL PRIMARY KEY);
--SELECT set('t');
-- set 
-------
-- 
--(1 row)
--
--INSERT INTO T SELECT * FROM generate_series(1, 10) a;
--ALTER TABLE T ADD COLUMN c_bigint BIGINT NOT NULL DEFAULT -1;
--INSERT INTO T SELECT b, b - 10 FROM generate_series(11, 20) a(b);
--ALTER TABLE T ADD COLUMN c_text TEXT DEFAULT 'hello';
--INSERT INTO T SELECT b, b - 10, (b + 10)::text FROM generate_series(21, 30) a(b);
---- WHERE clause
--SELECT c_bigint, c_text FROM T WHERE c_bigint = -1 LIMIT 1;
-- c_bigint | c_text 
------------+--------
--       -1 | hello
--(1 row)
--
--EXPLAIN (VERBOSE TRUE, COSTS FALSE)
--SELECT c_bigint, c_text FROM T WHERE c_bigint = -1 LIMIT 1;
--                  QUERY PLAN                  
------------------------------------------------
-- Limit
--   Output: c_bigint, c_text
--   ->  Seq Scan on fast_default.t
--         Output: c_bigint, c_text
--         Filter: (t.c_bigint = '-1'::integer)
--(5 rows)
--
--SELECT c_bigint, c_text FROM T WHERE c_text = 'hello' LIMIT 1;
-- c_bigint | c_text 
------------+--------
--       -1 | hello
--(1 row)
--
--EXPLAIN (VERBOSE TRUE, COSTS FALSE) SELECT c_bigint, c_text FROM T WHERE c_text = 'hello' LIMIT 1;
--                 QUERY PLAN                 
----------------------------------------------
-- Limit
--   Output: c_bigint, c_text
--   ->  Seq Scan on fast_default.t
--         Output: c_bigint, c_text
--         Filter: (t.c_text = 'hello'::text)
--(5 rows)
--
---- COALESCE
--SELECT COALESCE(c_bigint, pk), COALESCE(c_text, pk::text)
--FROM T
--ORDER BY pk LIMIT 10;
-- coalesce | coalesce 
------------+----------
--       -1 | hello
--       -1 | hello
--       -1 | hello
--       -1 | hello
--       -1 | hello
--       -1 | hello
--       -1 | hello
--       -1 | hello
--       -1 | hello
--       -1 | hello
--(10 rows)
--
---- Aggregate function
--SELECT SUM(c_bigint), MAX(c_text COLLATE "C" ), MIN(c_text COLLATE "C") FROM T;
-- sum |  max  | min 
-------+-------+-----
-- 200 | hello | 31
--(1 row)
--
---- ORDER BY
--SELECT * FROM T ORDER BY c_bigint, c_text, pk LIMIT 10;
-- pk | c_bigint | c_text 
------+----------+--------
--  1 |       -1 | hello
--  2 |       -1 | hello
--  3 |       -1 | hello
--  4 |       -1 | hello
--  5 |       -1 | hello
--  6 |       -1 | hello
--  7 |       -1 | hello
--  8 |       -1 | hello
--  9 |       -1 | hello
-- 10 |       -1 | hello
--(10 rows)
--
--EXPLAIN (VERBOSE TRUE, COSTS FALSE)
--SELECT * FROM T ORDER BY c_bigint, c_text, pk LIMIT 10;
--                  QUERY PLAN                  
------------------------------------------------
-- Limit
--   Output: pk, c_bigint, c_text
--   ->  Sort
--         Output: pk, c_bigint, c_text
--         Sort Key: t.c_bigint, t.c_text, t.pk
--         ->  Seq Scan on fast_default.t
--               Output: pk, c_bigint, c_text
--(7 rows)
--
---- LIMIT
--SELECT * FROM T WHERE c_bigint > -1 ORDER BY c_bigint, c_text, pk LIMIT 10;
-- pk | c_bigint | c_text 
------+----------+--------
-- 11 |        1 | hello
-- 12 |        2 | hello
-- 13 |        3 | hello
-- 14 |        4 | hello
-- 15 |        5 | hello
-- 16 |        6 | hello
-- 17 |        7 | hello
-- 18 |        8 | hello
-- 19 |        9 | hello
-- 20 |       10 | hello
--(10 rows)
--
--EXPLAIN (VERBOSE TRUE, COSTS FALSE)
--SELECT * FROM T WHERE c_bigint > -1 ORDER BY c_bigint, c_text, pk LIMIT 10;
--                     QUERY PLAN                     
------------------------------------------------------
-- Limit
--   Output: pk, c_bigint, c_text
--   ->  Sort
--         Output: pk, c_bigint, c_text
--         Sort Key: t.c_bigint, t.c_text, t.pk
--         ->  Seq Scan on fast_default.t
--               Output: pk, c_bigint, c_text
--               Filter: (t.c_bigint > '-1'::integer)
--(8 rows)
--
----  DELETE with RETURNING
--DELETE FROM T WHERE pk BETWEEN 10 AND 20 RETURNING *;
-- pk | c_bigint | c_text 
------+----------+--------
-- 10 |       -1 | hello
-- 11 |        1 | hello
-- 12 |        2 | hello
-- 13 |        3 | hello
-- 14 |        4 | hello
-- 15 |        5 | hello
-- 16 |        6 | hello
-- 17 |        7 | hello
-- 18 |        8 | hello
-- 19 |        9 | hello
-- 20 |       10 | hello
--(11 rows)
--
--EXPLAIN (VERBOSE TRUE, COSTS FALSE)
--DELETE FROM T WHERE pk BETWEEN 10 AND 20 RETURNING *;
--                        QUERY PLAN                         
-------------------------------------------------------------
-- Delete on fast_default.t
--   Output: pk, c_bigint, c_text
--   ->  Bitmap Heap Scan on fast_default.t
--         Output: ctid
--         Recheck Cond: ((t.pk >= 10) AND (t.pk <= 20))
--         ->  Bitmap Index Scan on t_pkey
--               Index Cond: ((t.pk >= 10) AND (t.pk <= 20))
--(7 rows)
--
---- UPDATE
--UPDATE T SET c_text = '"' || c_text || '"'  WHERE pk < 10;
--SELECT * FROM T WHERE c_text LIKE '"%"' ORDER BY PK;
-- pk | c_bigint | c_text  
------+----------+---------
--  1 |       -1 | "hello"
--  2 |       -1 | "hello"
--  3 |       -1 | "hello"
--  4 |       -1 | "hello"
--  5 |       -1 | "hello"
--  6 |       -1 | "hello"
--  7 |       -1 | "hello"
--  8 |       -1 | "hello"
--  9 |       -1 | "hello"
--(9 rows)
--
--SELECT comp();
--   comp    
-------------
-- Unchanged
--(1 row)
--
--DROP TABLE T;
---- Combine with other DDL
--CREATE TABLE T(pk INT NOT NULL PRIMARY KEY);
--SELECT set('t');
-- set 
-------
-- 
--(1 row)
--
--INSERT INTO T VALUES (1), (2);
--ALTER TABLE T ADD COLUMN c_int INT NOT NULL DEFAULT -1;
--INSERT INTO T VALUES (3), (4);
--ALTER TABLE T ADD COLUMN c_text TEXT DEFAULT 'Hello';
--INSERT INTO T VALUES (5), (6);
--ALTER TABLE T ALTER COLUMN c_text SET DEFAULT 'world',
--              ALTER COLUMN c_int  SET DEFAULT 1;
--INSERT INTO T VALUES (7), (8);
--SELECT * FROM T ORDER BY pk;
-- pk | c_int | c_text 
------+-------+--------
--  1 |    -1 | Hello
--  2 |    -1 | Hello
--  3 |    -1 | Hello
--  4 |    -1 | Hello
--  5 |    -1 | Hello
--  6 |    -1 | Hello
--  7 |     1 | world
--  8 |     1 | world
--(8 rows)
--
---- Add an index
--CREATE INDEX i ON T(c_int, c_text);
--SELECT c_text FROM T WHERE c_int = -1;
-- c_text 
----------
-- Hello
-- Hello
-- Hello
-- Hello
-- Hello
-- Hello
--(6 rows)
--
--SELECT comp();
--   comp    
-------------
-- Unchanged
--(1 row)
--
---- query to exercise expand_tuple function
--CREATE TABLE t1 AS
--SELECT 1::int AS a , 2::int AS b
--FROM generate_series(1,20) q;
--ALTER TABLE t1 ADD COLUMN c text;
--SELECT a,
--       stddev(cast((SELECT sum(1) FROM generate_series(1,20) x) AS float4))
--          OVER (PARTITION BY a,b,c ORDER BY b)
--       AS z
--FROM t1;
-- a | z 
-----+---
-- 1 | 0
-- 1 | 0
-- 1 | 0
-- 1 | 0
-- 1 | 0
-- 1 | 0
-- 1 | 0
-- 1 | 0
-- 1 | 0
-- 1 | 0
-- 1 | 0
-- 1 | 0
-- 1 | 0
-- 1 | 0
-- 1 | 0
-- 1 | 0
-- 1 | 0
-- 1 | 0
-- 1 | 0
-- 1 | 0
--(20 rows)
--
--DROP TABLE T;
---- test that we account for missing columns without defaults correctly
---- in expand_tuple, and that rows are correctly expanded for triggers
--CREATE FUNCTION test_trigger()
--RETURNS trigger
--LANGUAGE plpgsql
--AS $$
--
--begin
--    raise notice 'old tuple: %', to_json(OLD)::text;
--    if TG_OP = 'DELETE'
--    then
--       return OLD;
--    else
--       return NEW;
--    end if;
--end;
--
--$$;
---- 2 new columns, both have defaults
--CREATE TABLE t (id serial PRIMARY KEY, a int, b int, c int);
--INSERT INTO t (a,b,c) VALUES (1,2,3);
--ALTER TABLE t ADD COLUMN x int NOT NULL DEFAULT 4;
--ALTER TABLE t ADD COLUMN y int NOT NULL DEFAULT 5;
--CREATE TRIGGER a BEFORE UPDATE ON t FOR EACH ROW EXECUTE PROCEDURE test_trigger();
--SELECT * FROM t;
-- id | a | b | c | x | y 
------+---+---+---+---+---
--  1 | 1 | 2 | 3 | 4 | 5
--(1 row)
--
--UPDATE t SET y = 2;
--NOTICE:  old tuple: {"id":1,"a":1,"b":2,"c":3,"x":4,"y":5}
--SELECT * FROM t;
-- id | a | b | c | x | y 
------+---+---+---+---+---
--  1 | 1 | 2 | 3 | 4 | 2
--(1 row)
--
--DROP TABLE t;
---- 2 new columns, first has default
--CREATE TABLE t (id serial PRIMARY KEY, a int, b int, c int);
--INSERT INTO t (a,b,c) VALUES (1,2,3);
--ALTER TABLE t ADD COLUMN x int NOT NULL DEFAULT 4;
--ALTER TABLE t ADD COLUMN y int;
--CREATE TRIGGER a BEFORE UPDATE ON t FOR EACH ROW EXECUTE PROCEDURE test_trigger();
--SELECT * FROM t;
-- id | a | b | c | x | y 
------+---+---+---+---+---
--  1 | 1 | 2 | 3 | 4 |  
--(1 row)
--
--UPDATE t SET y = 2;
--NOTICE:  old tuple: {"id":1,"a":1,"b":2,"c":3,"x":4,"y":null}
--SELECT * FROM t;
-- id | a | b | c | x | y 
------+---+---+---+---+---
--  1 | 1 | 2 | 3 | 4 | 2
--(1 row)
--
--DROP TABLE t;
---- 2 new columns, second has default
--CREATE TABLE t (id serial PRIMARY KEY, a int, b int, c int);
--INSERT INTO t (a,b,c) VALUES (1,2,3);
--ALTER TABLE t ADD COLUMN x int;
--ALTER TABLE t ADD COLUMN y int NOT NULL DEFAULT 5;
--CREATE TRIGGER a BEFORE UPDATE ON t FOR EACH ROW EXECUTE PROCEDURE test_trigger();
--SELECT * FROM t;
-- id | a | b | c | x | y 
------+---+---+---+---+---
--  1 | 1 | 2 | 3 |   | 5
--(1 row)
--
--UPDATE t SET y = 2;
--NOTICE:  old tuple: {"id":1,"a":1,"b":2,"c":3,"x":null,"y":5}
--SELECT * FROM t;
-- id | a | b | c | x | y 
------+---+---+---+---+---
--  1 | 1 | 2 | 3 |   | 2
--(1 row)
--
--DROP TABLE t;
---- 2 new columns, neither has default
--CREATE TABLE t (id serial PRIMARY KEY, a int, b int, c int);
--INSERT INTO t (a,b,c) VALUES (1,2,3);
--ALTER TABLE t ADD COLUMN x int;
--ALTER TABLE t ADD COLUMN y int;
--CREATE TRIGGER a BEFORE UPDATE ON t FOR EACH ROW EXECUTE PROCEDURE test_trigger();
--SELECT * FROM t;
-- id | a | b | c | x | y 
------+---+---+---+---+---
--  1 | 1 | 2 | 3 |   |  
--(1 row)
--
--UPDATE t SET y = 2;
--NOTICE:  old tuple: {"id":1,"a":1,"b":2,"c":3,"x":null,"y":null}
--SELECT * FROM t;
-- id | a | b | c | x | y 
------+---+---+---+---+---
--  1 | 1 | 2 | 3 |   | 2
--(1 row)
--
--DROP TABLE t;
---- same as last 4 tests but here the last original column has a NULL value
---- 2 new columns, both have defaults
--CREATE TABLE t (id serial PRIMARY KEY, a int, b int, c int);
--INSERT INTO t (a,b,c) VALUES (1,2,NULL);
--ALTER TABLE t ADD COLUMN x int NOT NULL DEFAULT 4;
--ALTER TABLE t ADD COLUMN y int NOT NULL DEFAULT 5;
--CREATE TRIGGER a BEFORE UPDATE ON t FOR EACH ROW EXECUTE PROCEDURE test_trigger();
--SELECT * FROM t;
-- id | a | b | c | x | y 
------+---+---+---+---+---
--  1 | 1 | 2 |   | 4 | 5
--(1 row)
--
--UPDATE t SET y = 2;
--NOTICE:  old tuple: {"id":1,"a":1,"b":2,"c":null,"x":4,"y":5}
--SELECT * FROM t;
-- id | a | b | c | x | y 
------+---+---+---+---+---
--  1 | 1 | 2 |   | 4 | 2
--(1 row)
--
--DROP TABLE t;
---- 2 new columns, first has default
--CREATE TABLE t (id serial PRIMARY KEY, a int, b int, c int);
--INSERT INTO t (a,b,c) VALUES (1,2,NULL);
--ALTER TABLE t ADD COLUMN x int NOT NULL DEFAULT 4;
--ALTER TABLE t ADD COLUMN y int;
--CREATE TRIGGER a BEFORE UPDATE ON t FOR EACH ROW EXECUTE PROCEDURE test_trigger();
--SELECT * FROM t;
-- id | a | b | c | x | y 
------+---+---+---+---+---
--  1 | 1 | 2 |   | 4 |  
--(1 row)
--
--UPDATE t SET y = 2;
--NOTICE:  old tuple: {"id":1,"a":1,"b":2,"c":null,"x":4,"y":null}
--SELECT * FROM t;
-- id | a | b | c | x | y 
------+---+---+---+---+---
--  1 | 1 | 2 |   | 4 | 2
--(1 row)
--
--DROP TABLE t;
---- 2 new columns, second has default
--CREATE TABLE t (id serial PRIMARY KEY, a int, b int, c int);
--INSERT INTO t (a,b,c) VALUES (1,2,NULL);
--ALTER TABLE t ADD COLUMN x int;
--ALTER TABLE t ADD COLUMN y int NOT NULL DEFAULT 5;
--CREATE TRIGGER a BEFORE UPDATE ON t FOR EACH ROW EXECUTE PROCEDURE test_trigger();
--SELECT * FROM t;
-- id | a | b | c | x | y 
------+---+---+---+---+---
--  1 | 1 | 2 |   |   | 5
--(1 row)
--
--UPDATE t SET y = 2;
--NOTICE:  old tuple: {"id":1,"a":1,"b":2,"c":null,"x":null,"y":5}
--SELECT * FROM t;
-- id | a | b | c | x | y 
------+---+---+---+---+---
--  1 | 1 | 2 |   |   | 2
--(1 row)
--
--DROP TABLE t;
---- 2 new columns, neither has default
--CREATE TABLE t (id serial PRIMARY KEY, a int, b int, c int);
--INSERT INTO t (a,b,c) VALUES (1,2,NULL);
--ALTER TABLE t ADD COLUMN x int;
--ALTER TABLE t ADD COLUMN y int;
--CREATE TRIGGER a BEFORE UPDATE ON t FOR EACH ROW EXECUTE PROCEDURE test_trigger();
--SELECT * FROM t;
-- id | a | b | c | x | y 
------+---+---+---+---+---
--  1 | 1 | 2 |   |   |  
--(1 row)
--
--UPDATE t SET y = 2;
--NOTICE:  old tuple: {"id":1,"a":1,"b":2,"c":null,"x":null,"y":null}
--SELECT * FROM t;
-- id | a | b | c | x | y 
------+---+---+---+---+---
--  1 | 1 | 2 |   |   | 2
--(1 row)
--
--DROP TABLE t;
---- make sure expanded tuple has correct self pointer
---- it will be required by the RI trigger doing the cascading delete
--CREATE TABLE leader (a int PRIMARY KEY, b int);
--CREATE TABLE follower (a int REFERENCES leader ON DELETE CASCADE, b int);
--INSERT INTO leader VALUES (1, 1), (2, 2);
--ALTER TABLE leader ADD c int;
--ALTER TABLE leader DROP c;
--DELETE FROM leader;
---- check that ALTER TABLE ... ALTER TYPE does the right thing
--CREATE TABLE vtype( a integer);
--INSERT INTO vtype VALUES (1);
--ALTER TABLE vtype ADD COLUMN b DOUBLE PRECISION DEFAULT 0.2;
--ALTER TABLE vtype ADD COLUMN c BOOLEAN DEFAULT true;
--SELECT * FROM vtype;
-- a |  b  | c 
-----+-----+---
-- 1 | 0.2 | t
--(1 row)
--
--ALTER TABLE vtype
--      ALTER b TYPE text USING b::text,
--      ALTER c TYPE text USING c::text;
--NOTICE:  rewriting table vtype for reason 4
--SELECT * FROM vtype;
-- a |  b  |  c   
-----+-----+------
-- 1 | 0.2 | true
--(1 row)
--
---- also check the case that doesn't rewrite the table
--CREATE TABLE vtype2 (a int);
--INSERT INTO vtype2 VALUES (1);
--ALTER TABLE vtype2 ADD COLUMN b varchar(10) DEFAULT 'xxx';
--ALTER TABLE vtype2 ALTER COLUMN b SET DEFAULT 'yyy';
--INSERT INTO vtype2 VALUES (2);
--ALTER TABLE vtype2 ALTER COLUMN b TYPE varchar(20) USING b::varchar(20);
--SELECT * FROM vtype2;
-- a |  b  
-----+-----
-- 1 | xxx
-- 2 | yyy
--(2 rows)
--
---- Ensure that defaults are checked when evaluating whether HOT update
---- is possible, this was broken for a while:
---- https://postgr.es/m/20190202133521.ylauh3ckqa7colzj%40alap3.anarazel.de
--BEGIN;
--CREATE TABLE t();
--INSERT INTO t DEFAULT VALUES;
--ALTER TABLE t ADD COLUMN a int DEFAULT 1;
--CREATE INDEX ON t(a);
---- set column with a default 1 to NULL, due to a bug that wasn't
---- noticed has heap_getattr buggily returned NULL for default columns
--UPDATE t SET a = NULL;
---- verify that index and non-index scans show the same result
--SET LOCAL enable_seqscan = true;
--SELECT * FROM t WHERE a IS NULL;
-- a 
-----
--  
--(1 row)
--
--SET LOCAL enable_seqscan = false;
--SELECT * FROM t WHERE a IS NULL;
-- a 
-----
--  
--(1 row)
--
--ROLLBACK;
---- verify that a default set on a non-plain table doesn't set a missing
---- value on the attribute
--CREATE FOREIGN DATA WRAPPER dummy;
--CREATE SERVER s0 FOREIGN DATA WRAPPER dummy;
--CREATE FOREIGN TABLE ft1 (c1 integer NOT NULL) SERVER s0;
--ALTER FOREIGN TABLE ft1 ADD COLUMN c8 integer DEFAULT 0;
--ALTER FOREIGN TABLE ft1 ALTER COLUMN c8 TYPE char(10);
--SELECT count(*)
--  FROM pg_attribute
--  WHERE attrelid = 'ft1'::regclass AND
--    (attmissingval IS NOT NULL OR atthasmissing);
-- count 
---------
--     0
--(1 row)
--
---- cleanup
--DROP FOREIGN TABLE ft1;
--DROP SERVER s0;
--DROP FOREIGN DATA WRAPPER dummy;
--DROP TABLE vtype;
--DROP TABLE vtype2;
--DROP TABLE follower;
--DROP TABLE leader;
--DROP FUNCTION test_trigger();
--DROP TABLE t1;
--DROP FUNCTION set(name);
--DROP FUNCTION comp();
--DROP TABLE m;
--DROP TABLE has_volatile;
--DROP EVENT TRIGGER has_volatile_rewrite;
--DROP FUNCTION log_rewrite;
--DROP SCHEMA fast_default;
---- Leave a table with an active fast default in place, for pg_upgrade testing
--set search_path = public;
--create table has_fast_default(f1 int);
--insert into has_fast_default values(1);
--alter table has_fast_default add column f2 int default 42;
--table has_fast_default;
-- f1 | f2 
------+----
--  1 | 42
--(1 row)
--
-+psql: error: connection to server on socket "/tmp/pg_regress-7DSHQk/.s.PGSQL.55316" failed: FATAL:  the database system is not yet accepting connections
-+DETAIL:  Consistent recovery state has not been yet reached.
-diff -U3 /home/runner/work/postgres/postgres/src/test/regress/expected/tablespace.out /home/runner/work/postgres/postgres/src/test/regress/results/tablespace.out
---- /home/runner/work/postgres/postgres/src/test/regress/expected/tablespace.out	2025-09-12 09:25:55.826897206 +0000
-+++ /home/runner/work/postgres/postgres/src/test/regress/results/tablespace.out	2025-09-12 09:35:42.937273322 +0000
-@@ -1,973 +1,2 @@
---- relative tablespace locations are not allowed
--CREATE TABLESPACE regress_tblspace LOCATION 'relative'; -- fail
--ERROR:  tablespace location must be an absolute path
---- empty tablespace locations are not usually allowed
--CREATE TABLESPACE regress_tblspace LOCATION ''; -- fail
--ERROR:  tablespace location must be an absolute path
---- as a special developer-only option to allow us to use tablespaces
---- with streaming replication on the same server, an empty location
---- can be allowed as a way to say that the tablespace should be created
---- as a directory in pg_tblspc, rather than being a symlink
--SET allow_in_place_tablespaces = true;
---- create a tablespace using WITH clause
--CREATE TABLESPACE regress_tblspacewith LOCATION '' WITH (some_nonexistent_parameter = true); -- fail
--ERROR:  unrecognized parameter "some_nonexistent_parameter"
--CREATE TABLESPACE regress_tblspacewith LOCATION '' WITH (random_page_cost = 3.0); -- ok
---- check to see the parameter was used
--SELECT spcoptions FROM pg_tablespace WHERE spcname = 'regress_tblspacewith';
--       spcoptions       
--------------------------
-- {random_page_cost=3.0}
--(1 row)
--
---- drop the tablespace so we can re-use the location
--DROP TABLESPACE regress_tblspacewith;
---- This returns a relative path as of an effect of allow_in_place_tablespaces,
---- masking the tablespace OID used in the path name.
--SELECT regexp_replace(pg_tablespace_location(oid), '(pg_tblspc)/(\d+)', '\1/NNN')
--  FROM pg_tablespace  WHERE spcname = 'regress_tblspace';
-- regexp_replace 
------------------
-- pg_tblspc/NNN
--(1 row)
--
---- try setting and resetting some properties for the new tablespace
--ALTER TABLESPACE regress_tblspace SET (random_page_cost = 1.0, seq_page_cost = 1.1);
--ALTER TABLESPACE regress_tblspace SET (some_nonexistent_parameter = true);  -- fail
--ERROR:  unrecognized parameter "some_nonexistent_parameter"
--ALTER TABLESPACE regress_tblspace RESET (random_page_cost = 2.0); -- fail
--ERROR:  RESET must not include values for parameters
--ALTER TABLESPACE regress_tblspace RESET (random_page_cost, effective_io_concurrency); -- ok
---- REINDEX (TABLESPACE)
---- catalogs and system tablespaces
---- system catalog, fail
--REINDEX (TABLESPACE regress_tblspace) TABLE pg_am;
--ERROR:  cannot move system relation "pg_am_name_index"
--REINDEX (TABLESPACE regress_tblspace) TABLE CONCURRENTLY pg_am;
--ERROR:  cannot reindex system catalogs concurrently
---- shared catalog, fail
--REINDEX (TABLESPACE regress_tblspace) TABLE pg_authid;
--ERROR:  cannot move system relation "pg_authid_rolname_index"
--REINDEX (TABLESPACE regress_tblspace) TABLE CONCURRENTLY pg_authid;
--ERROR:  cannot reindex system catalogs concurrently
---- toast relations, fail
--REINDEX (TABLESPACE regress_tblspace) INDEX pg_toast.pg_toast_1260_index;
--ERROR:  cannot move system relation "pg_toast_1260_index"
--REINDEX (TABLESPACE regress_tblspace) INDEX CONCURRENTLY pg_toast.pg_toast_1260_index;
--ERROR:  cannot reindex system catalogs concurrently
--REINDEX (TABLESPACE regress_tblspace) TABLE pg_toast.pg_toast_1260;
--ERROR:  cannot move system relation "pg_toast_1260_index"
--REINDEX (TABLESPACE regress_tblspace) TABLE CONCURRENTLY pg_toast.pg_toast_1260;
--ERROR:  cannot reindex system catalogs concurrently
---- system catalog, fail
--REINDEX (TABLESPACE pg_global) TABLE pg_authid;
--ERROR:  cannot move system relation "pg_authid_rolname_index"
--REINDEX (TABLESPACE pg_global) TABLE CONCURRENTLY pg_authid;
--ERROR:  cannot reindex system catalogs concurrently
---- table with toast relation
--CREATE TABLE regress_tblspace_test_tbl (num1 bigint, num2 double precision, t text);
--INSERT INTO regress_tblspace_test_tbl (num1, num2, t)
--  SELECT round(random()*100), random(), 'text'
--  FROM generate_series(1, 10) s(i);
--CREATE INDEX regress_tblspace_test_tbl_idx ON regress_tblspace_test_tbl (num1);
---- move to global tablespace, fail
--REINDEX (TABLESPACE pg_global) INDEX regress_tblspace_test_tbl_idx;
--ERROR:  only shared relations can be placed in pg_global tablespace
--REINDEX (TABLESPACE pg_global) INDEX CONCURRENTLY regress_tblspace_test_tbl_idx;
--ERROR:  cannot move non-shared relation to tablespace "pg_global"
---- check transactional behavior of REINDEX (TABLESPACE)
--BEGIN;
--REINDEX (TABLESPACE regress_tblspace) INDEX regress_tblspace_test_tbl_idx;
--REINDEX (TABLESPACE regress_tblspace) TABLE regress_tblspace_test_tbl;
--ROLLBACK;
---- no relation moved to the new tablespace
--SELECT c.relname FROM pg_class c, pg_tablespace s
--  WHERE c.reltablespace = s.oid AND s.spcname = 'regress_tblspace';
-- relname 
-----------
--(0 rows)
--
---- check that all indexes are moved to a new tablespace with different
---- relfilenode.
---- Save first the existing relfilenode for the toast and main relations.
--SELECT relfilenode as main_filenode FROM pg_class
--  WHERE relname = 'regress_tblspace_test_tbl_idx' \gset
--SELECT relfilenode as toast_filenode FROM pg_class
--  WHERE oid =
--    (SELECT i.indexrelid
--       FROM pg_class c,
--            pg_index i
--       WHERE i.indrelid = c.reltoastrelid AND
--             c.relname = 'regress_tblspace_test_tbl') \gset
--REINDEX (TABLESPACE regress_tblspace) TABLE regress_tblspace_test_tbl;
--SELECT c.relname FROM pg_class c, pg_tablespace s
--  WHERE c.reltablespace = s.oid AND s.spcname = 'regress_tblspace'
--  ORDER BY c.relname;
--            relname            
---------------------------------
-- regress_tblspace_test_tbl_idx
--(1 row)
--
--ALTER TABLE regress_tblspace_test_tbl SET TABLESPACE regress_tblspace;
--ALTER TABLE regress_tblspace_test_tbl SET TABLESPACE pg_default;
--SELECT c.relname FROM pg_class c, pg_tablespace s
--  WHERE c.reltablespace = s.oid AND s.spcname = 'regress_tblspace'
--  ORDER BY c.relname;
--            relname            
---------------------------------
-- regress_tblspace_test_tbl_idx
--(1 row)
--
---- Move back to the default tablespace.
--ALTER INDEX regress_tblspace_test_tbl_idx SET TABLESPACE pg_default;
--SELECT c.relname FROM pg_class c, pg_tablespace s
--  WHERE c.reltablespace = s.oid AND s.spcname = 'regress_tblspace'
--  ORDER BY c.relname;
-- relname 
-----------
--(0 rows)
--
--REINDEX (TABLESPACE regress_tblspace, CONCURRENTLY) TABLE regress_tblspace_test_tbl;
--SELECT c.relname FROM pg_class c, pg_tablespace s
--  WHERE c.reltablespace = s.oid AND s.spcname = 'regress_tblspace'
--  ORDER BY c.relname;
--            relname            
---------------------------------
-- regress_tblspace_test_tbl_idx
--(1 row)
--
--SELECT relfilenode = :main_filenode AS main_same FROM pg_class
--  WHERE relname = 'regress_tblspace_test_tbl_idx';
-- main_same 
-------------
-- f
--(1 row)
--
--SELECT relfilenode = :toast_filenode as toast_same FROM pg_class
--  WHERE oid =
--    (SELECT i.indexrelid
--       FROM pg_class c,
--            pg_index i
--       WHERE i.indrelid = c.reltoastrelid AND
--             c.relname = 'regress_tblspace_test_tbl');
-- toast_same 
--------------
-- f
--(1 row)
--
--DROP TABLE regress_tblspace_test_tbl;
---- REINDEX (TABLESPACE) with partitions
---- Create a partition tree and check the set of relations reindexed
---- with their new tablespace.
--CREATE TABLE tbspace_reindex_part (c1 int, c2 int) PARTITION BY RANGE (c1);
--CREATE TABLE tbspace_reindex_part_0 PARTITION OF tbspace_reindex_part
--  FOR VALUES FROM (0) TO (10) PARTITION BY list (c2);
--CREATE TABLE tbspace_reindex_part_0_1 PARTITION OF tbspace_reindex_part_0
--  FOR VALUES IN (1);
--CREATE TABLE tbspace_reindex_part_0_2 PARTITION OF tbspace_reindex_part_0
--  FOR VALUES IN (2);
---- This partitioned table will have no partitions.
--CREATE TABLE tbspace_reindex_part_10 PARTITION OF tbspace_reindex_part
--   FOR VALUES FROM (10) TO (20) PARTITION BY list (c2);
---- Create some partitioned indexes
--CREATE INDEX tbspace_reindex_part_index ON ONLY tbspace_reindex_part (c1);
--CREATE INDEX tbspace_reindex_part_index_0 ON ONLY tbspace_reindex_part_0 (c1);
--ALTER INDEX tbspace_reindex_part_index ATTACH PARTITION tbspace_reindex_part_index_0;
---- This partitioned index will have no partitions.
--CREATE INDEX tbspace_reindex_part_index_10 ON ONLY tbspace_reindex_part_10 (c1);
--ALTER INDEX tbspace_reindex_part_index ATTACH PARTITION tbspace_reindex_part_index_10;
--CREATE INDEX tbspace_reindex_part_index_0_1 ON ONLY tbspace_reindex_part_0_1 (c1);
--ALTER INDEX tbspace_reindex_part_index_0 ATTACH PARTITION tbspace_reindex_part_index_0_1;
--CREATE INDEX tbspace_reindex_part_index_0_2 ON ONLY tbspace_reindex_part_0_2 (c1);
--ALTER INDEX tbspace_reindex_part_index_0 ATTACH PARTITION tbspace_reindex_part_index_0_2;
--SELECT relid, parentrelid, level FROM pg_partition_tree('tbspace_reindex_part_index')
--  ORDER BY relid, level;
--             relid              |         parentrelid          | level 
----------------------------------+------------------------------+-------
-- tbspace_reindex_part_index     |                              |     0
-- tbspace_reindex_part_index_0   | tbspace_reindex_part_index   |     1
-- tbspace_reindex_part_index_10  | tbspace_reindex_part_index   |     1
-- tbspace_reindex_part_index_0_1 | tbspace_reindex_part_index_0 |     2
-- tbspace_reindex_part_index_0_2 | tbspace_reindex_part_index_0 |     2
--(5 rows)
--
---- Track the original tablespace, relfilenode and OID of each index
---- in the tree.
--CREATE TEMP TABLE reindex_temp_before AS
--  SELECT oid, relname, relfilenode, reltablespace
--  FROM pg_class
--    WHERE relname ~ 'tbspace_reindex_part_index';
--REINDEX (TABLESPACE regress_tblspace, CONCURRENTLY) TABLE tbspace_reindex_part;
---- REINDEX CONCURRENTLY changes the OID of the old relation, hence a check
---- based on the relation name below.
--SELECT b.relname,
--       CASE WHEN a.relfilenode = b.relfilenode THEN 'relfilenode is unchanged'
--       ELSE 'relfilenode has changed' END AS filenode,
--       CASE WHEN a.reltablespace = b.reltablespace THEN 'reltablespace is unchanged'
--       ELSE 'reltablespace has changed' END AS tbspace
--  FROM reindex_temp_before b JOIN pg_class a ON b.relname = a.relname
--  ORDER BY 1;
--            relname             |         filenode         |          tbspace           
----------------------------------+--------------------------+----------------------------
-- tbspace_reindex_part_index     | relfilenode is unchanged | reltablespace is unchanged
-- tbspace_reindex_part_index_0   | relfilenode is unchanged | reltablespace is unchanged
-- tbspace_reindex_part_index_0_1 | relfilenode has changed  | reltablespace has changed
-- tbspace_reindex_part_index_0_2 | relfilenode has changed  | reltablespace has changed
-- tbspace_reindex_part_index_10  | relfilenode is unchanged | reltablespace is unchanged
--(5 rows)
--
--DROP TABLE tbspace_reindex_part;
---- create a schema we can use
--CREATE SCHEMA testschema;
---- try a table
--CREATE TABLE testschema.foo (i int) TABLESPACE regress_tblspace;
--SELECT relname, spcname FROM pg_catalog.pg_tablespace t, pg_catalog.pg_class c
--    where c.reltablespace = t.oid AND c.relname = 'foo';
-- relname |     spcname      
-----------+------------------
-- foo     | regress_tblspace
--(1 row)
--
--INSERT INTO testschema.foo VALUES(1);
--INSERT INTO testschema.foo VALUES(2);
---- tables from dynamic sources
--CREATE TABLE testschema.asselect TABLESPACE regress_tblspace AS SELECT 1;
--SELECT relname, spcname FROM pg_catalog.pg_tablespace t, pg_catalog.pg_class c
--    where c.reltablespace = t.oid AND c.relname = 'asselect';
-- relname  |     spcname      
------------+------------------
-- asselect | regress_tblspace
--(1 row)
--
--PREPARE selectsource(int) AS SELECT $1;
--CREATE TABLE testschema.asexecute TABLESPACE regress_tblspace
--    AS EXECUTE selectsource(2);
--SELECT relname, spcname FROM pg_catalog.pg_tablespace t, pg_catalog.pg_class c
--    where c.reltablespace = t.oid AND c.relname = 'asexecute';
--  relname  |     spcname      
-------------+------------------
-- asexecute | regress_tblspace
--(1 row)
--
---- index
--CREATE INDEX foo_idx on testschema.foo(i) TABLESPACE regress_tblspace;
--SELECT relname, spcname FROM pg_catalog.pg_tablespace t, pg_catalog.pg_class c
--    where c.reltablespace = t.oid AND c.relname = 'foo_idx';
-- relname |     spcname      
-----------+------------------
-- foo_idx | regress_tblspace
--(1 row)
--
---- check \d output
--\d testschema.foo
--              Table "testschema.foo"
-- Column |  Type   | Collation | Nullable | Default 
----------+---------+-----------+----------+---------
-- i      | integer |           |          | 
--Indexes:
--    "foo_idx" btree (i), tablespace "regress_tblspace"
--Tablespace: "regress_tblspace"
--
--\d testschema.foo_idx
--      Index "testschema.foo_idx"
-- Column |  Type   | Key? | Definition 
----------+---------+------+------------
-- i      | integer | yes  | i
--btree, for table "testschema.foo"
--Tablespace: "regress_tblspace"
--
----
---- partitioned table
----
--CREATE TABLE testschema.part (a int) PARTITION BY LIST (a);
--SET default_tablespace TO pg_global;
--CREATE TABLE testschema.part_1 PARTITION OF testschema.part FOR VALUES IN (1);
--ERROR:  only shared relations can be placed in pg_global tablespace
--RESET default_tablespace;
--CREATE TABLE testschema.part_1 PARTITION OF testschema.part FOR VALUES IN (1);
--SET default_tablespace TO regress_tblspace;
--CREATE TABLE testschema.part_2 PARTITION OF testschema.part FOR VALUES IN (2);
--SET default_tablespace TO pg_global;
--CREATE TABLE testschema.part_3 PARTITION OF testschema.part FOR VALUES IN (3);
--ERROR:  only shared relations can be placed in pg_global tablespace
--ALTER TABLE testschema.part SET TABLESPACE regress_tblspace;
--CREATE TABLE testschema.part_3 PARTITION OF testschema.part FOR VALUES IN (3);
--CREATE TABLE testschema.part_4 PARTITION OF testschema.part FOR VALUES IN (4)
--  TABLESPACE pg_default;
--CREATE TABLE testschema.part_56 PARTITION OF testschema.part FOR VALUES IN (5, 6)
--  PARTITION BY LIST (a);
--ALTER TABLE testschema.part SET TABLESPACE pg_default;
--CREATE TABLE testschema.part_78 PARTITION OF testschema.part FOR VALUES IN (7, 8)
--  PARTITION BY LIST (a);
--ERROR:  only shared relations can be placed in pg_global tablespace
--CREATE TABLE testschema.part_910 PARTITION OF testschema.part FOR VALUES IN (9, 10)
--  PARTITION BY LIST (a) TABLESPACE regress_tblspace;
--RESET default_tablespace;
--CREATE TABLE testschema.part_78 PARTITION OF testschema.part FOR VALUES IN (7, 8)
--  PARTITION BY LIST (a);
--SELECT relname, spcname FROM pg_catalog.pg_class c
--    JOIN pg_catalog.pg_namespace n ON (c.relnamespace = n.oid)
--    LEFT JOIN pg_catalog.pg_tablespace t ON c.reltablespace = t.oid
--    where c.relname LIKE 'part%' AND n.nspname = 'testschema' order by relname;
-- relname  |     spcname      
------------+------------------
-- part     | 
-- part_1   | 
-- part_2   | regress_tblspace
-- part_3   | regress_tblspace
-- part_4   | 
-- part_56  | regress_tblspace
-- part_78  | 
-- part_910 | regress_tblspace
--(8 rows)
--
--RESET default_tablespace;
--DROP TABLE testschema.part;
---- partitioned index
--CREATE TABLE testschema.part (a int) PARTITION BY LIST (a);
--CREATE TABLE testschema.part1 PARTITION OF testschema.part FOR VALUES IN (1);
--CREATE INDEX part_a_idx ON testschema.part (a) TABLESPACE regress_tblspace;
--CREATE TABLE testschema.part2 PARTITION OF testschema.part FOR VALUES IN (2);
--SELECT relname, spcname FROM pg_catalog.pg_tablespace t, pg_catalog.pg_class c
--    where c.reltablespace = t.oid AND c.relname LIKE 'part%_idx' ORDER BY relname;
--   relname   |     spcname      
---------------+------------------
-- part1_a_idx | regress_tblspace
-- part2_a_idx | regress_tblspace
-- part_a_idx  | regress_tblspace
--(3 rows)
--
--\d testschema.part
--        Partitioned table "testschema.part"
-- Column |  Type   | Collation | Nullable | Default 
----------+---------+-----------+----------+---------
-- a      | integer |           |          | 
--Partition key: LIST (a)
--Indexes:
--    "part_a_idx" btree (a), tablespace "regress_tblspace"
--Number of partitions: 2 (Use \d+ to list them.)
--
--\d+ testschema.part
--                           Partitioned table "testschema.part"
-- Column |  Type   | Collation | Nullable | Default | Storage | Stats target | Description 
----------+---------+-----------+----------+---------+---------+--------------+-------------
-- a      | integer |           |          |         | plain   |              | 
--Partition key: LIST (a)
--Indexes:
--    "part_a_idx" btree (a), tablespace "regress_tblspace"
--Partitions: testschema.part1 FOR VALUES IN (1),
--            testschema.part2 FOR VALUES IN (2)
--
--\d testschema.part1
--             Table "testschema.part1"
-- Column |  Type   | Collation | Nullable | Default 
----------+---------+-----------+----------+---------
-- a      | integer |           |          | 
--Partition of: testschema.part FOR VALUES IN (1)
--Indexes:
--    "part1_a_idx" btree (a), tablespace "regress_tblspace"
--
--\d+ testschema.part1
--                                 Table "testschema.part1"
-- Column |  Type   | Collation | Nullable | Default | Storage | Stats target | Description 
----------+---------+-----------+----------+---------+---------+--------------+-------------
-- a      | integer |           |          |         | plain   |              | 
--Partition of: testschema.part FOR VALUES IN (1)
--Partition constraint: ((a IS NOT NULL) AND (a = 1))
--Indexes:
--    "part1_a_idx" btree (a), tablespace "regress_tblspace"
--
--\d testschema.part_a_idx
--Partitioned index "testschema.part_a_idx"
-- Column |  Type   | Key? | Definition 
----------+---------+------+------------
-- a      | integer | yes  | a
--btree, for table "testschema.part"
--Number of partitions: 2 (Use \d+ to list them.)
--Tablespace: "regress_tblspace"
--
--\d+ testschema.part_a_idx
--           Partitioned index "testschema.part_a_idx"
-- Column |  Type   | Key? | Definition | Storage | Stats target 
----------+---------+------+------------+---------+--------------
-- a      | integer | yes  | a          | plain   | 
--btree, for table "testschema.part"
--Partitions: testschema.part1_a_idx,
--            testschema.part2_a_idx
--Tablespace: "regress_tblspace"
--
---- partitioned rels cannot specify the default tablespace.  These fail:
--CREATE TABLE testschema.dflt (a int PRIMARY KEY) PARTITION BY LIST (a) TABLESPACE pg_default;
--ERROR:  cannot specify default tablespace for partitioned relations
--CREATE TABLE testschema.dflt (a int PRIMARY KEY USING INDEX TABLESPACE pg_default) PARTITION BY LIST (a);
--ERROR:  cannot specify default tablespace for partitioned relations
--SET default_tablespace TO 'pg_default';
--CREATE TABLE testschema.dflt (a int PRIMARY KEY) PARTITION BY LIST (a) TABLESPACE regress_tblspace;
--ERROR:  cannot specify default tablespace for partitioned relations
--CREATE TABLE testschema.dflt (a int PRIMARY KEY USING INDEX TABLESPACE regress_tblspace) PARTITION BY LIST (a);
--ERROR:  cannot specify default tablespace for partitioned relations
---- but these work:
--CREATE TABLE testschema.dflt (a int PRIMARY KEY USING INDEX TABLESPACE regress_tblspace) PARTITION BY LIST (a) TABLESPACE regress_tblspace;
--SET default_tablespace TO '';
--CREATE TABLE testschema.dflt2 (a int PRIMARY KEY) PARTITION BY LIST (a);
--DROP TABLE testschema.dflt, testschema.dflt2;
---- check that default_tablespace doesn't affect ALTER TABLE index rebuilds
--CREATE TABLE testschema.test_default_tab(id bigint) TABLESPACE regress_tblspace;
--INSERT INTO testschema.test_default_tab VALUES (1);
--CREATE INDEX test_index1 on testschema.test_default_tab (id);
--CREATE INDEX test_index2 on testschema.test_default_tab (id) TABLESPACE regress_tblspace;
--ALTER TABLE testschema.test_default_tab ADD CONSTRAINT test_index3 PRIMARY KEY (id);
--ALTER TABLE testschema.test_default_tab ADD CONSTRAINT test_index4 UNIQUE (id) USING INDEX TABLESPACE regress_tblspace;
--\d testschema.test_index1
--   Index "testschema.test_index1"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- id     | bigint | yes  | id
--btree, for table "testschema.test_default_tab"
--
--\d testschema.test_index2
--   Index "testschema.test_index2"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- id     | bigint | yes  | id
--btree, for table "testschema.test_default_tab"
--Tablespace: "regress_tblspace"
--
--\d testschema.test_index3
--   Index "testschema.test_index3"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- id     | bigint | yes  | id
--primary key, btree, for table "testschema.test_default_tab"
--
--\d testschema.test_index4
--   Index "testschema.test_index4"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- id     | bigint | yes  | id
--unique, btree, for table "testschema.test_default_tab"
--Tablespace: "regress_tblspace"
--
---- use a custom tablespace for default_tablespace
--SET default_tablespace TO regress_tblspace;
---- tablespace should not change if no rewrite
--ALTER TABLE testschema.test_default_tab ALTER id TYPE bigint;
--\d testschema.test_index1
--   Index "testschema.test_index1"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- id     | bigint | yes  | id
--btree, for table "testschema.test_default_tab"
--
--\d testschema.test_index2
--   Index "testschema.test_index2"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- id     | bigint | yes  | id
--btree, for table "testschema.test_default_tab"
--Tablespace: "regress_tblspace"
--
--\d testschema.test_index3
--   Index "testschema.test_index3"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- id     | bigint | yes  | id
--primary key, btree, for table "testschema.test_default_tab"
--
--\d testschema.test_index4
--   Index "testschema.test_index4"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- id     | bigint | yes  | id
--unique, btree, for table "testschema.test_default_tab"
--Tablespace: "regress_tblspace"
--
--SELECT * FROM testschema.test_default_tab;
-- id 
------
--  1
--(1 row)
--
---- tablespace should not change even if there is an index rewrite
--ALTER TABLE testschema.test_default_tab ALTER id TYPE int;
--\d testschema.test_index1
--    Index "testschema.test_index1"
-- Column |  Type   | Key? | Definition 
----------+---------+------+------------
-- id     | integer | yes  | id
--btree, for table "testschema.test_default_tab"
--
--\d testschema.test_index2
--    Index "testschema.test_index2"
-- Column |  Type   | Key? | Definition 
----------+---------+------+------------
-- id     | integer | yes  | id
--btree, for table "testschema.test_default_tab"
--Tablespace: "regress_tblspace"
--
--\d testschema.test_index3
--    Index "testschema.test_index3"
-- Column |  Type   | Key? | Definition 
----------+---------+------+------------
-- id     | integer | yes  | id
--primary key, btree, for table "testschema.test_default_tab"
--
--\d testschema.test_index4
--    Index "testschema.test_index4"
-- Column |  Type   | Key? | Definition 
----------+---------+------+------------
-- id     | integer | yes  | id
--unique, btree, for table "testschema.test_default_tab"
--Tablespace: "regress_tblspace"
--
--SELECT * FROM testschema.test_default_tab;
-- id 
------
--  1
--(1 row)
--
---- now use the default tablespace for default_tablespace
--SET default_tablespace TO '';
---- tablespace should not change if no rewrite
--ALTER TABLE testschema.test_default_tab ALTER id TYPE int;
--\d testschema.test_index1
--    Index "testschema.test_index1"
-- Column |  Type   | Key? | Definition 
----------+---------+------+------------
-- id     | integer | yes  | id
--btree, for table "testschema.test_default_tab"
--
--\d testschema.test_index2
--    Index "testschema.test_index2"
-- Column |  Type   | Key? | Definition 
----------+---------+------+------------
-- id     | integer | yes  | id
--btree, for table "testschema.test_default_tab"
--Tablespace: "regress_tblspace"
--
--\d testschema.test_index3
--    Index "testschema.test_index3"
-- Column |  Type   | Key? | Definition 
----------+---------+------+------------
-- id     | integer | yes  | id
--primary key, btree, for table "testschema.test_default_tab"
--
--\d testschema.test_index4
--    Index "testschema.test_index4"
-- Column |  Type   | Key? | Definition 
----------+---------+------+------------
-- id     | integer | yes  | id
--unique, btree, for table "testschema.test_default_tab"
--Tablespace: "regress_tblspace"
--
---- tablespace should not change even if there is an index rewrite
--ALTER TABLE testschema.test_default_tab ALTER id TYPE bigint;
--\d testschema.test_index1
--   Index "testschema.test_index1"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- id     | bigint | yes  | id
--btree, for table "testschema.test_default_tab"
--
--\d testschema.test_index2
--   Index "testschema.test_index2"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- id     | bigint | yes  | id
--btree, for table "testschema.test_default_tab"
--Tablespace: "regress_tblspace"
--
--\d testschema.test_index3
--   Index "testschema.test_index3"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- id     | bigint | yes  | id
--primary key, btree, for table "testschema.test_default_tab"
--
--\d testschema.test_index4
--   Index "testschema.test_index4"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- id     | bigint | yes  | id
--unique, btree, for table "testschema.test_default_tab"
--Tablespace: "regress_tblspace"
--
--DROP TABLE testschema.test_default_tab;
---- check that default_tablespace doesn't affect ALTER TABLE index rebuilds
---- (this time with a partitioned table)
--CREATE TABLE testschema.test_default_tab_p(id bigint, val bigint)
--    PARTITION BY LIST (id) TABLESPACE regress_tblspace;
--CREATE TABLE testschema.test_default_tab_p1 PARTITION OF testschema.test_default_tab_p
--    FOR VALUES IN (1);
--INSERT INTO testschema.test_default_tab_p VALUES (1);
--CREATE INDEX test_index1 on testschema.test_default_tab_p (val);
--CREATE INDEX test_index2 on testschema.test_default_tab_p (val) TABLESPACE regress_tblspace;
--ALTER TABLE testschema.test_default_tab_p ADD CONSTRAINT test_index3 PRIMARY KEY (id);
--ALTER TABLE testschema.test_default_tab_p ADD CONSTRAINT test_index4 UNIQUE (id) USING INDEX TABLESPACE regress_tblspace;
--\d testschema.test_index1
--Partitioned index "testschema.test_index1"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- val    | bigint | yes  | val
--btree, for table "testschema.test_default_tab_p"
--Number of partitions: 1 (Use \d+ to list them.)
--
--\d testschema.test_index2
--Partitioned index "testschema.test_index2"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- val    | bigint | yes  | val
--btree, for table "testschema.test_default_tab_p"
--Number of partitions: 1 (Use \d+ to list them.)
--Tablespace: "regress_tblspace"
--
--\d testschema.test_index3
--Partitioned index "testschema.test_index3"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- id     | bigint | yes  | id
--primary key, btree, for table "testschema.test_default_tab_p"
--Number of partitions: 1 (Use \d+ to list them.)
--
--\d testschema.test_index4
--Partitioned index "testschema.test_index4"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- id     | bigint | yes  | id
--unique, btree, for table "testschema.test_default_tab_p"
--Number of partitions: 1 (Use \d+ to list them.)
--Tablespace: "regress_tblspace"
--
---- use a custom tablespace for default_tablespace
--SET default_tablespace TO regress_tblspace;
---- tablespace should not change if no rewrite
--ALTER TABLE testschema.test_default_tab_p ALTER val TYPE bigint;
--\d testschema.test_index1
--Partitioned index "testschema.test_index1"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- val    | bigint | yes  | val
--btree, for table "testschema.test_default_tab_p"
--Number of partitions: 1 (Use \d+ to list them.)
--
--\d testschema.test_index2
--Partitioned index "testschema.test_index2"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- val    | bigint | yes  | val
--btree, for table "testschema.test_default_tab_p"
--Number of partitions: 1 (Use \d+ to list them.)
--Tablespace: "regress_tblspace"
--
--\d testschema.test_index3
--Partitioned index "testschema.test_index3"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- id     | bigint | yes  | id
--primary key, btree, for table "testschema.test_default_tab_p"
--Number of partitions: 1 (Use \d+ to list them.)
--
--\d testschema.test_index4
--Partitioned index "testschema.test_index4"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- id     | bigint | yes  | id
--unique, btree, for table "testschema.test_default_tab_p"
--Number of partitions: 1 (Use \d+ to list them.)
--Tablespace: "regress_tblspace"
--
--SELECT * FROM testschema.test_default_tab_p;
-- id | val 
------+-----
--  1 |    
--(1 row)
--
---- tablespace should not change even if there is an index rewrite
--ALTER TABLE testschema.test_default_tab_p ALTER val TYPE int;
--\d testschema.test_index1
--Partitioned index "testschema.test_index1"
-- Column |  Type   | Key? | Definition 
----------+---------+------+------------
-- val    | integer | yes  | val
--btree, for table "testschema.test_default_tab_p"
--Number of partitions: 1 (Use \d+ to list them.)
--
--\d testschema.test_index2
--Partitioned index "testschema.test_index2"
-- Column |  Type   | Key? | Definition 
----------+---------+------+------------
-- val    | integer | yes  | val
--btree, for table "testschema.test_default_tab_p"
--Number of partitions: 1 (Use \d+ to list them.)
--Tablespace: "regress_tblspace"
--
--\d testschema.test_index3
--Partitioned index "testschema.test_index3"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- id     | bigint | yes  | id
--primary key, btree, for table "testschema.test_default_tab_p"
--Number of partitions: 1 (Use \d+ to list them.)
--
--\d testschema.test_index4
--Partitioned index "testschema.test_index4"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- id     | bigint | yes  | id
--unique, btree, for table "testschema.test_default_tab_p"
--Number of partitions: 1 (Use \d+ to list them.)
--Tablespace: "regress_tblspace"
--
--SELECT * FROM testschema.test_default_tab_p;
-- id | val 
------+-----
--  1 |    
--(1 row)
--
---- now use the default tablespace for default_tablespace
--SET default_tablespace TO '';
---- tablespace should not change if no rewrite
--ALTER TABLE testschema.test_default_tab_p ALTER val TYPE int;
--\d testschema.test_index1
--Partitioned index "testschema.test_index1"
-- Column |  Type   | Key? | Definition 
----------+---------+------+------------
-- val    | integer | yes  | val
--btree, for table "testschema.test_default_tab_p"
--Number of partitions: 1 (Use \d+ to list them.)
--
--\d testschema.test_index2
--Partitioned index "testschema.test_index2"
-- Column |  Type   | Key? | Definition 
----------+---------+------+------------
-- val    | integer | yes  | val
--btree, for table "testschema.test_default_tab_p"
--Number of partitions: 1 (Use \d+ to list them.)
--Tablespace: "regress_tblspace"
--
--\d testschema.test_index3
--Partitioned index "testschema.test_index3"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- id     | bigint | yes  | id
--primary key, btree, for table "testschema.test_default_tab_p"
--Number of partitions: 1 (Use \d+ to list them.)
--
--\d testschema.test_index4
--Partitioned index "testschema.test_index4"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- id     | bigint | yes  | id
--unique, btree, for table "testschema.test_default_tab_p"
--Number of partitions: 1 (Use \d+ to list them.)
--Tablespace: "regress_tblspace"
--
---- tablespace should not change even if there is an index rewrite
--ALTER TABLE testschema.test_default_tab_p ALTER val TYPE bigint;
--\d testschema.test_index1
--Partitioned index "testschema.test_index1"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- val    | bigint | yes  | val
--btree, for table "testschema.test_default_tab_p"
--Number of partitions: 1 (Use \d+ to list them.)
--
--\d testschema.test_index2
--Partitioned index "testschema.test_index2"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- val    | bigint | yes  | val
--btree, for table "testschema.test_default_tab_p"
--Number of partitions: 1 (Use \d+ to list them.)
--Tablespace: "regress_tblspace"
--
--\d testschema.test_index3
--Partitioned index "testschema.test_index3"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- id     | bigint | yes  | id
--primary key, btree, for table "testschema.test_default_tab_p"
--Number of partitions: 1 (Use \d+ to list them.)
--
--\d testschema.test_index4
--Partitioned index "testschema.test_index4"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- id     | bigint | yes  | id
--unique, btree, for table "testschema.test_default_tab_p"
--Number of partitions: 1 (Use \d+ to list them.)
--Tablespace: "regress_tblspace"
--
--DROP TABLE testschema.test_default_tab_p;
---- check that default_tablespace affects index additions in ALTER TABLE
--CREATE TABLE testschema.test_tab(id int) TABLESPACE regress_tblspace;
--INSERT INTO testschema.test_tab VALUES (1);
--SET default_tablespace TO regress_tblspace;
--ALTER TABLE testschema.test_tab ADD CONSTRAINT test_tab_unique UNIQUE (id);
--SET default_tablespace TO '';
--ALTER TABLE testschema.test_tab ADD CONSTRAINT test_tab_pkey PRIMARY KEY (id);
--\d testschema.test_tab_unique
--  Index "testschema.test_tab_unique"
-- Column |  Type   | Key? | Definition 
----------+---------+------+------------
-- id     | integer | yes  | id
--unique, btree, for table "testschema.test_tab"
--Tablespace: "regress_tblspace"
--
--\d testschema.test_tab_pkey
--   Index "testschema.test_tab_pkey"
-- Column |  Type   | Key? | Definition 
----------+---------+------+------------
-- id     | integer | yes  | id
--primary key, btree, for table "testschema.test_tab"
--
--SELECT * FROM testschema.test_tab;
-- id 
------
--  1
--(1 row)
--
--DROP TABLE testschema.test_tab;
---- check that default_tablespace is handled correctly by multi-command
---- ALTER TABLE that includes a tablespace-preserving rewrite
--CREATE TABLE testschema.test_tab(a int, b int, c int);
--SET default_tablespace TO regress_tblspace;
--ALTER TABLE testschema.test_tab ADD CONSTRAINT test_tab_unique UNIQUE (a);
--CREATE INDEX test_tab_a_idx ON testschema.test_tab (a);
--SET default_tablespace TO '';
--CREATE INDEX test_tab_b_idx ON testschema.test_tab (b);
--\d testschema.test_tab_unique
--  Index "testschema.test_tab_unique"
-- Column |  Type   | Key? | Definition 
----------+---------+------+------------
-- a      | integer | yes  | a
--unique, btree, for table "testschema.test_tab"
--Tablespace: "regress_tblspace"
--
--\d testschema.test_tab_a_idx
--  Index "testschema.test_tab_a_idx"
-- Column |  Type   | Key? | Definition 
----------+---------+------+------------
-- a      | integer | yes  | a
--btree, for table "testschema.test_tab"
--Tablespace: "regress_tblspace"
--
--\d testschema.test_tab_b_idx
--  Index "testschema.test_tab_b_idx"
-- Column |  Type   | Key? | Definition 
----------+---------+------+------------
-- b      | integer | yes  | b
--btree, for table "testschema.test_tab"
--
--ALTER TABLE testschema.test_tab ALTER b TYPE bigint, ADD UNIQUE (c);
--\d testschema.test_tab_unique
--  Index "testschema.test_tab_unique"
-- Column |  Type   | Key? | Definition 
----------+---------+------+------------
-- a      | integer | yes  | a
--unique, btree, for table "testschema.test_tab"
--Tablespace: "regress_tblspace"
--
--\d testschema.test_tab_a_idx
--  Index "testschema.test_tab_a_idx"
-- Column |  Type   | Key? | Definition 
----------+---------+------+------------
-- a      | integer | yes  | a
--btree, for table "testschema.test_tab"
--Tablespace: "regress_tblspace"
--
--\d testschema.test_tab_b_idx
--  Index "testschema.test_tab_b_idx"
-- Column |  Type  | Key? | Definition 
----------+--------+------+------------
-- b      | bigint | yes  | b
--btree, for table "testschema.test_tab"
--
--DROP TABLE testschema.test_tab;
---- let's try moving a table from one place to another
--CREATE TABLE testschema.atable AS VALUES (1), (2);
--CREATE UNIQUE INDEX anindex ON testschema.atable(column1);
--ALTER TABLE testschema.atable SET TABLESPACE regress_tblspace;
--ALTER INDEX testschema.anindex SET TABLESPACE regress_tblspace;
--ALTER INDEX testschema.part_a_idx SET TABLESPACE pg_global;
--ERROR:  only shared relations can be placed in pg_global tablespace
--ALTER INDEX testschema.part_a_idx SET TABLESPACE pg_default;
--ALTER INDEX testschema.part_a_idx SET TABLESPACE regress_tblspace;
--INSERT INTO testschema.atable VALUES(3);	-- ok
--INSERT INTO testschema.atable VALUES(1);	-- fail (checks index)
--ERROR:  duplicate key value violates unique constraint "anindex"
--DETAIL:  Key (column1)=(1) already exists.
--SELECT COUNT(*) FROM testschema.atable;		-- checks heap
-- count 
---------
--     3
--(1 row)
--
---- let's try moving a materialized view from one place to another
--CREATE MATERIALIZED VIEW testschema.amv AS SELECT * FROM testschema.atable;
--ALTER MATERIALIZED VIEW testschema.amv SET TABLESPACE regress_tblspace;
--REFRESH MATERIALIZED VIEW testschema.amv;
--SELECT COUNT(*) FROM testschema.amv;
-- count 
---------
--     3
--(1 row)
--
---- Will fail with bad path
--CREATE TABLESPACE regress_badspace LOCATION '/no/such/location';
--ERROR:  directory "/no/such/location" does not exist
---- No such tablespace
--CREATE TABLE bar (i int) TABLESPACE regress_nosuchspace;
--ERROR:  tablespace "regress_nosuchspace" does not exist
---- Fail, in use for some partitioned object
--DROP TABLESPACE regress_tblspace;
--ERROR:  tablespace "regress_tblspace" cannot be dropped because some objects depend on it
--DETAIL:  tablespace for index testschema.part_a_idx
--ALTER INDEX testschema.part_a_idx SET TABLESPACE pg_default;
---- Fail, not empty
--DROP TABLESPACE regress_tblspace;
--ERROR:  tablespace "regress_tblspace" is not empty
---- Adequate cache initialization before GRANT
--\c -
--BEGIN;
--GRANT ALL ON TABLESPACE regress_tblspace TO PUBLIC;
--ROLLBACK;
--CREATE ROLE regress_tablespace_user1 login;
--CREATE ROLE regress_tablespace_user2 login;
--GRANT USAGE ON SCHEMA testschema TO regress_tablespace_user2;
--ALTER TABLESPACE regress_tblspace OWNER TO regress_tablespace_user1;
--CREATE TABLE testschema.tablespace_acl (c int);
---- new owner lacks permission to create this index from scratch
--CREATE INDEX k ON testschema.tablespace_acl (c) TABLESPACE regress_tblspace;
--ALTER TABLE testschema.tablespace_acl OWNER TO regress_tablespace_user2;
--SET SESSION ROLE regress_tablespace_user2;
--CREATE TABLE tablespace_table (i int) TABLESPACE regress_tblspace; -- fail
--ERROR:  permission denied for tablespace regress_tblspace
--ALTER TABLE testschema.tablespace_acl ALTER c TYPE bigint;
--REINDEX (TABLESPACE regress_tblspace) TABLE tablespace_table; -- fail
--ERROR:  permission denied for tablespace regress_tblspace
--REINDEX (TABLESPACE regress_tblspace, CONCURRENTLY) TABLE tablespace_table; -- fail
--ERROR:  permission denied for tablespace regress_tblspace
--RESET ROLE;
--ALTER TABLESPACE regress_tblspace RENAME TO regress_tblspace_renamed;
--ALTER TABLE ALL IN TABLESPACE regress_tblspace_renamed SET TABLESPACE pg_default;
--ALTER INDEX ALL IN TABLESPACE regress_tblspace_renamed SET TABLESPACE pg_default;
--ALTER MATERIALIZED VIEW ALL IN TABLESPACE regress_tblspace_renamed SET TABLESPACE pg_default;
---- Should show notice that nothing was done
--ALTER TABLE ALL IN TABLESPACE regress_tblspace_renamed SET TABLESPACE pg_default;
--NOTICE:  no matching relations in tablespace "regress_tblspace_renamed" found
--ALTER MATERIALIZED VIEW ALL IN TABLESPACE regress_tblspace_renamed SET TABLESPACE pg_default;
--NOTICE:  no matching relations in tablespace "regress_tblspace_renamed" found
---- Should succeed
--DROP TABLESPACE regress_tblspace_renamed;
--DROP SCHEMA testschema CASCADE;
--NOTICE:  drop cascades to 7 other objects
--DETAIL:  drop cascades to table testschema.foo
--drop cascades to table testschema.asselect
--drop cascades to table testschema.asexecute
--drop cascades to table testschema.part
--drop cascades to table testschema.atable
--drop cascades to materialized view testschema.amv
--drop cascades to table testschema.tablespace_acl
--DROP ROLE regress_tablespace_user1;
--DROP ROLE regress_tablespace_user2;
-+psql: error: connection to server on socket "/tmp/pg_regress-7DSHQk/.s.PGSQL.55316" failed: FATAL:  the database system is not yet accepting connections
-+DETAIL:  Consistent recovery state has not been yet reached.
+-DROP TABLE oj_t1, oj_t2, oj_t3, oj_t4;
++-- Performance test with larger result set to ensure optimization is working
++SELECT 'Performance validation with larger dataset' as test_name;
++                 test_name                  
++--------------------------------------------
++ Performance validation with larger dataset
++(1 row)
++
++SELECT validate_query_results(
++    'SELECT t1.id, t2.category, t3.status FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id LEFT JOIN oj_t3 t3 ON t1.id = t3.id ORDER BY t1.id LIMIT 20',
++    'Large result set validation'
++);
++       validate_query_results        
++-------------------------------------
++ ✓ PASS: Large result set validation
++(1 row)
++
++-- Edge case: LIMIT larger than available rows
++SELECT validate_query_results(
++    'SELECT t1.id, t2.category FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id ORDER BY t1.id LIMIT 1000',
++    'LIMIT larger than available rows'
++);
++          validate_query_results          
++------------------------------------------
++ ✓ PASS: LIMIT larger than available rows
++(1 row)
++
++-- Edge case: LIMIT 0
++SELECT validate_query_results(
++    'SELECT t1.id, t2.category FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id ORDER BY t1.id LIMIT 0',
++    'LIMIT 0 edge case'
++);
++  validate_query_results   
++---------------------------
++ ✓ PASS: LIMIT 0 edge case
++(1 row)
++
++-- Clean up validation function and tables
++DROP FUNCTION validate_query_results(text, text);
++DROP TABLE oj_t1, oj_t2, oj_t3, oj_t4, oj_t5;
+ -- Reset settings
+ RESET enable_outer_join_limit_pushdown;
