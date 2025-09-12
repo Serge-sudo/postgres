@@ -2764,11 +2764,23 @@ create_limited_path_for_relation(PlannerInfo *root,
 	Path	   *sorted_path;
 	Path	   *limited_path;
 	Node	   *limitCount;
+	int64		limit_value;
+
+	/*
+	 * For the pushdown optimization, we want to apply the LIMIT count plus 
+	 * any OFFSET to ensure we get enough rows. However, we apply no OFFSET 
+	 * at this level - the top level LIMIT will handle the OFFSET.
+	 * 
+	 * root->limit_tuples already contains count + offset if both are present,
+	 * which is exactly what we need for the pushdown.
+	 */
+	limit_value = (int64) root->limit_tuples;
+	elog(DEBUG1, "Using limit_tuples for pushdown: %ld", limit_value);
 
 	/* Create the limit count constant */
 	limitCount = (Node *) makeConst(INT8OID, -1, InvalidOid,
 									sizeof(int64),
-									Int64GetDatum(root->limit_tuples),
+									Int64GetDatum(limit_value),
 									false, FLOAT8PASSBYVAL);
 
 	/* Check if we need to sort first */
@@ -2776,17 +2788,17 @@ create_limited_path_for_relation(PlannerInfo *root,
 	{
 		/* Already sorted correctly, just add limit */
 		limited_path = (Path *) create_limit_path(root, rel, base_path,
-												  NULL, /* offset */
+												  NULL, /* offset - never apply offset in pushdown */
 												  limitCount,
 												  LIMIT_OPTION_COUNT,
-												  0, root->limit_tuples);
+												  0, limit_value);
 	}
 	else
 	{
 		/* Need to sort first, then limit */
 		sorted_path = (Path *) create_sort_path(root, rel, base_path,
 												root->sort_pathkeys,
-												root->limit_tuples);
+												limit_value);
 		
 		if (!sorted_path)
 		{
@@ -2795,10 +2807,10 @@ create_limited_path_for_relation(PlannerInfo *root,
 		}
 		
 		limited_path = (Path *) create_limit_path(root, rel, sorted_path,
-												  NULL, /* offset */
+												  NULL, /* offset - never apply offset in pushdown */
 												  limitCount,
 												  LIMIT_OPTION_COUNT,
-												  0, root->limit_tuples);
+												  0, limit_value);
 	}
 
 	return limited_path;
@@ -3007,13 +3019,21 @@ create_optimized_hashjoin_path(PlannerInfo *root,
 		if (jointype == JOIN_LEFT)
 		{
 			if (!clause_sides_match_join(restrictinfo, preserved_rel, other_rel))
+			{
+				elog(DEBUG1, "Hash clause rejected for LEFT JOIN: clause doesn't match preserved_rel (outer) vs other_rel (inner)");
 				continue;			/* no good for these input relations */
+			}
 		}
 		else /* JOIN_RIGHT */
 		{
 			if (!clause_sides_match_join(restrictinfo, other_rel, preserved_rel))
+			{
+				elog(DEBUG1, "Hash clause rejected for RIGHT JOIN: clause doesn't match other_rel (outer) vs preserved_rel (inner)");
 				continue;			/* no good for these input relations */
+			}
 		}
+
+		elog(DEBUG1, "Adding hash clause to hashclauses list");
 
 		hashclauses = lappend(hashclauses, restrictinfo);
 	}
