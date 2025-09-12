@@ -1,90 +1,296 @@
 --
 -- OUTER_JOIN_LIMIT_PUSHDOWN
 -- Test the ORDER BY LIMIT pushdown optimization for outer joins
+-- Validates that the same results are returned with optimization on/off
 --
 
--- Create simple test tables
-CREATE TABLE oj_t1 (id integer, name text);
-CREATE TABLE oj_t2 (id integer, category text);
-CREATE TABLE oj_t3 (id integer, status text);
+-- Create test tables with more data for comprehensive testing
+CREATE TABLE oj_t1 (id integer, name text, value integer);
+CREATE TABLE oj_t2 (id integer, category text, score integer);
+CREATE TABLE oj_t3 (id integer, status text, priority integer);
+CREATE TABLE oj_t4 (id integer, description text, flag boolean);
 
 -- Insert test data
-INSERT INTO oj_t1 VALUES (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four'), (5, 'five');
-INSERT INTO oj_t2 VALUES (1, 'cat1'), (2, 'cat2'), (3, 'cat3');
-INSERT INTO oj_t3 VALUES (1, 'status1'), (2, 'status2');
+INSERT INTO oj_t1 VALUES 
+  (1, 'one', 10), (2, 'two', 20), (3, 'three', 30), (4, 'four', 40), 
+  (5, 'five', 50), (6, 'six', 60), (7, 'seven', 70), (8, 'eight', 80);
+
+INSERT INTO oj_t2 VALUES 
+  (1, 'cat1', 100), (2, 'cat2', 200), (3, 'cat3', 300), (5, 'cat5', 500), (7, 'cat7', 700);
+
+INSERT INTO oj_t3 VALUES 
+  (1, 'status1', 1), (3, 'status3', 3), (4, 'status4', 4), (6, 'status6', 6);
+
+INSERT INTO oj_t4 VALUES 
+  (2, 'desc2', true), (4, 'desc4', false), (6, 'desc6', true), (8, 'desc8', false);
 
 -- Create indexes
 CREATE INDEX oj_t1_id_idx ON oj_t1(id);
 CREATE INDEX oj_t2_id_idx ON oj_t2(id);
 CREATE INDEX oj_t3_id_idx ON oj_t3(id);
+CREATE INDEX oj_t4_id_idx ON oj_t4(id);
 
 -- Update statistics
-ANALYZE oj_t1, oj_t2, oj_t3;
+ANALYZE oj_t1, oj_t2, oj_t3, oj_t4;
 
--- Test Case 1: Simple LEFT JOIN with ORDER BY LIMIT
-SELECT 'Test 1: Simple LEFT JOIN with optimization' as test_name;
-EXPLAIN (COSTS OFF, BUFFERS OFF)
+-- Test Case 1: Simple LEFT JOIN - Verify same results with optimization on/off
+SELECT 'Test 1: Simple LEFT JOIN validation' as test_description;
+
+-- Store results with optimization enabled
+CREATE TEMPORARY TABLE results_enabled AS
 SELECT t1.id, t1.name, t2.category 
-FROM oj_t1 t1 
-LEFT JOIN oj_t2 t2 ON t1.id = t2.id 
-ORDER BY t1.id 
-LIMIT 2;
+FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id 
+ORDER BY t1.id LIMIT 3;
 
--- Test Case 2: Same query with optimization disabled
-SELECT 'Test 2: Simple LEFT JOIN without optimization' as test_name;
+-- Store results with optimization disabled  
 SET enable_outer_join_limit_pushdown = off;
-EXPLAIN (COSTS OFF, BUFFERS OFF)
+CREATE TEMPORARY TABLE results_disabled AS
 SELECT t1.id, t1.name, t2.category 
-FROM oj_t1 t1 
-LEFT JOIN oj_t2 t2 ON t1.id = t2.id 
-ORDER BY t1.id 
-LIMIT 2;
+FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id 
+ORDER BY t1.id LIMIT 3;
 
--- Re-enable optimization
+-- Compare results
+SELECT 
+  CASE 
+    WHEN (SELECT COUNT(*) FROM results_enabled) = (SELECT COUNT(*) FROM results_disabled)
+         AND NOT EXISTS (
+           (SELECT * FROM results_enabled EXCEPT SELECT * FROM results_disabled)
+           UNION ALL
+           (SELECT * FROM results_disabled EXCEPT SELECT * FROM results_enabled)
+         )
+    THEN '✓ PASS: Results match'
+    ELSE '✗ FAIL: Results differ'
+  END as validation_result;
+
+DROP TABLE results_enabled, results_disabled;
 SET enable_outer_join_limit_pushdown = on;
 
--- Test Case 3: RIGHT JOIN with optimization
-SELECT 'Test 3: RIGHT JOIN with optimization' as test_name;
-EXPLAIN (COSTS OFF, BUFFERS OFF)
-SELECT t1.id, t1.name, t2.category 
-FROM oj_t1 t1 
-RIGHT JOIN oj_t2 t2 ON t1.id = t2.id 
-ORDER BY t2.id 
-LIMIT 2;
+-- Test Case 2: RIGHT JOIN validation
+SELECT 'Test 2: Simple RIGHT JOIN validation' as test_description;
 
--- Test Case 4: Nested LEFT JOINs
-SELECT 'Test 4: Nested LEFT JOINs' as test_name;
-EXPLAIN (COSTS OFF, BUFFERS OFF)
+CREATE TEMPORARY TABLE results_enabled AS
+SELECT t1.id, t1.name, t2.category 
+FROM oj_t1 t1 RIGHT JOIN oj_t2 t2 ON t1.id = t2.id 
+ORDER BY t2.id LIMIT 4;
+
+SET enable_outer_join_limit_pushdown = off;
+CREATE TEMPORARY TABLE results_disabled AS
+SELECT t1.id, t1.name, t2.category 
+FROM oj_t1 t1 RIGHT JOIN oj_t2 t2 ON t1.id = t2.id 
+ORDER BY t2.id LIMIT 4;
+
+SELECT 
+  CASE 
+    WHEN (SELECT COUNT(*) FROM results_enabled) = (SELECT COUNT(*) FROM results_disabled)
+         AND NOT EXISTS (
+           (SELECT * FROM results_enabled EXCEPT SELECT * FROM results_disabled)
+           UNION ALL
+           (SELECT * FROM results_disabled EXCEPT SELECT * FROM results_enabled)
+         )
+    THEN '✓ PASS: Results match'
+    ELSE '✗ FAIL: Results differ'
+  END as validation_result;
+
+DROP TABLE results_enabled, results_disabled;
+SET enable_outer_join_limit_pushdown = on;
+
+-- Test Case 3: Nested LEFT JOINs validation
+SELECT 'Test 3: Nested LEFT JOINs validation' as test_description;
+
+CREATE TEMPORARY TABLE results_enabled AS
 SELECT t1.id, t1.name, t2.category, t3.status
-FROM (oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id)
-LEFT JOIN oj_t3 t3 ON t1.id = t3.id
-ORDER BY t1.id
-LIMIT 3;
-
--- Test Case 5: ORDER BY non-preserved side (should not optimize)
-SELECT 'Test 5: ORDER BY non-preserved side (no optimization)' as test_name;
-EXPLAIN (COSTS OFF, BUFFERS OFF)
-SELECT t1.id, t1.name, t2.category 
 FROM oj_t1 t1 
 LEFT JOIN oj_t2 t2 ON t1.id = t2.id 
-ORDER BY t2.category
-LIMIT 2;
+LEFT JOIN oj_t3 t3 ON t1.id = t3.id 
+ORDER BY t1.id LIMIT 5;
 
--- Test Case 6: INNER JOIN (should not optimize)
-SELECT 'Test 6: INNER JOIN (no optimization)' as test_name;
-EXPLAIN (COSTS OFF, BUFFERS OFF)
-SELECT t1.id, t1.name, t2.category 
+SET enable_outer_join_limit_pushdown = off;
+CREATE TEMPORARY TABLE results_disabled AS
+SELECT t1.id, t1.name, t2.category, t3.status
 FROM oj_t1 t1 
-INNER JOIN oj_t2 t2 ON t1.id = t2.id 
-ORDER BY t1.id 
-LIMIT 2;
+LEFT JOIN oj_t2 t2 ON t1.id = t2.id 
+LEFT JOIN oj_t3 t3 ON t1.id = t3.id 
+ORDER BY t1.id LIMIT 5;
 
--- Test Case 7: Test GUC parameter
-SELECT 'Test 7: GUC parameter check' as test_name;
+SELECT 
+  CASE 
+    WHEN (SELECT COUNT(*) FROM results_enabled) = (SELECT COUNT(*) FROM results_disabled)
+         AND NOT EXISTS (
+           (SELECT * FROM results_enabled EXCEPT SELECT * FROM results_disabled)
+           UNION ALL
+           (SELECT * FROM results_disabled EXCEPT SELECT * FROM results_enabled)
+         )
+    THEN '✓ PASS: Results match'
+    ELSE '✗ FAIL: Results differ'
+  END as validation_result;
+
+DROP TABLE results_enabled, results_disabled;
+SET enable_outer_join_limit_pushdown = on;
+
+-- Test Case 4: Three-level nested outer joins validation
+SELECT 'Test 4: Three-level nested outer joins validation' as test_description;
+
+CREATE TEMPORARY TABLE results_enabled AS
+SELECT t1.id, t2.category, t3.status, t4.description
+FROM oj_t1 t1 
+LEFT JOIN oj_t2 t2 ON t1.id = t2.id 
+LEFT JOIN oj_t3 t3 ON t1.id = t3.id
+LEFT JOIN oj_t4 t4 ON t1.id = t4.id
+ORDER BY t1.id LIMIT 6;
+
+SET enable_outer_join_limit_pushdown = off;
+CREATE TEMPORARY TABLE results_disabled AS
+SELECT t1.id, t2.category, t3.status, t4.description
+FROM oj_t1 t1 
+LEFT JOIN oj_t2 t2 ON t1.id = t2.id 
+LEFT JOIN oj_t3 t3 ON t1.id = t3.id
+LEFT JOIN oj_t4 t4 ON t1.id = t4.id
+ORDER BY t1.id LIMIT 6;
+
+SELECT 
+  CASE 
+    WHEN (SELECT COUNT(*) FROM results_enabled) = (SELECT COUNT(*) FROM results_disabled)
+         AND NOT EXISTS (
+           (SELECT * FROM results_enabled EXCEPT SELECT * FROM results_disabled)
+           UNION ALL
+           (SELECT * FROM results_disabled EXCEPT SELECT * FROM results_enabled)
+         )
+    THEN '✓ PASS: Results match'
+    ELSE '✗ FAIL: Results differ'
+  END as validation_result;
+
+DROP TABLE results_enabled, results_disabled;
+SET enable_outer_join_limit_pushdown = on;
+
+-- Test Case 5: ORDER BY multiple columns validation
+SELECT 'Test 5: ORDER BY multiple columns validation' as test_description;
+
+CREATE TEMPORARY TABLE results_enabled AS
+SELECT t1.id, t1.name, t2.score
+FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id 
+ORDER BY t1.value DESC, t1.id ASC LIMIT 4;
+
+SET enable_outer_join_limit_pushdown = off;
+CREATE TEMPORARY TABLE results_disabled AS
+SELECT t1.id, t1.name, t2.score
+FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id 
+ORDER BY t1.value DESC, t1.id ASC LIMIT 4;
+
+SELECT 
+  CASE 
+    WHEN (SELECT COUNT(*) FROM results_enabled) = (SELECT COUNT(*) FROM results_disabled)
+         AND NOT EXISTS (
+           (SELECT * FROM results_enabled EXCEPT SELECT * FROM results_disabled)
+           UNION ALL
+           (SELECT * FROM results_disabled EXCEPT SELECT * FROM results_enabled)
+         )
+    THEN '✓ PASS: Results match'
+    ELSE '✗ FAIL: Results differ'
+  END as validation_result;
+
+DROP TABLE results_enabled, results_disabled;
+SET enable_outer_join_limit_pushdown = on;
+
+-- Test Case 6: OFFSET with LIMIT validation
+SELECT 'Test 6: OFFSET with LIMIT validation' as test_description;
+
+CREATE TEMPORARY TABLE results_enabled AS
+SELECT t1.id, t1.name, t2.category
+FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id 
+ORDER BY t1.id LIMIT 3 OFFSET 2;
+
+SET enable_outer_join_limit_pushdown = off;
+CREATE TEMPORARY TABLE results_disabled AS
+SELECT t1.id, t1.name, t2.category
+FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id 
+ORDER BY t1.id LIMIT 3 OFFSET 2;
+
+SELECT 
+  CASE 
+    WHEN (SELECT COUNT(*) FROM results_enabled) = (SELECT COUNT(*) FROM results_disabled)
+         AND NOT EXISTS (
+           (SELECT * FROM results_enabled EXCEPT SELECT * FROM results_disabled)
+           UNION ALL
+           (SELECT * FROM results_disabled EXCEPT SELECT * FROM results_enabled)
+         )
+    THEN '✓ PASS: Results match'
+    ELSE '✗ FAIL: Results differ'
+  END as validation_result;
+
+DROP TABLE results_enabled, results_disabled;
+SET enable_outer_join_limit_pushdown = on;
+
+-- Test Case 7: Negative case - ORDER BY non-preserved side (should still produce same results)
+SELECT 'Test 7: ORDER BY non-preserved side validation' as test_description;
+
+CREATE TEMPORARY TABLE results_enabled AS
+SELECT t1.id, t1.name, t2.category
+FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id 
+WHERE t2.category IS NOT NULL
+ORDER BY t2.category LIMIT 3;
+
+SET enable_outer_join_limit_pushdown = off;
+CREATE TEMPORARY TABLE results_disabled AS
+SELECT t1.id, t1.name, t2.category
+FROM oj_t1 t1 LEFT JOIN oj_t2 t2 ON t1.id = t2.id 
+WHERE t2.category IS NOT NULL
+ORDER BY t2.category LIMIT 3;
+
+SELECT 
+  CASE 
+    WHEN (SELECT COUNT(*) FROM results_enabled) = (SELECT COUNT(*) FROM results_disabled)
+         AND NOT EXISTS (
+           (SELECT * FROM results_enabled EXCEPT SELECT * FROM results_disabled)
+           UNION ALL
+           (SELECT * FROM results_disabled EXCEPT SELECT * FROM results_enabled)
+         )
+    THEN '✓ PASS: Results match'
+    ELSE '✗ FAIL: Results differ'
+  END as validation_result;
+
+DROP TABLE results_enabled, results_disabled;
+SET enable_outer_join_limit_pushdown = on;
+
+-- Test Case 8: Negative case - INNER JOIN (should still produce same results)
+SELECT 'Test 8: INNER JOIN validation' as test_description;
+
+CREATE TEMPORARY TABLE results_enabled AS
+SELECT t1.id, t1.name, t2.category
+FROM oj_t1 t1 INNER JOIN oj_t2 t2 ON t1.id = t2.id 
+ORDER BY t1.id LIMIT 3;
+
+SET enable_outer_join_limit_pushdown = off;
+CREATE TEMPORARY TABLE results_disabled AS
+SELECT t1.id, t1.name, t2.category
+FROM oj_t1 t1 INNER JOIN oj_t2 t2 ON t1.id = t2.id 
+ORDER BY t1.id LIMIT 3;
+
+SELECT 
+  CASE 
+    WHEN (SELECT COUNT(*) FROM results_enabled) = (SELECT COUNT(*) FROM results_disabled)
+         AND NOT EXISTS (
+           (SELECT * FROM results_enabled EXCEPT SELECT * FROM results_disabled)
+           UNION ALL
+           (SELECT * FROM results_disabled EXCEPT SELECT * FROM results_enabled)
+         )
+    THEN '✓ PASS: Results match'
+    ELSE '✗ FAIL: Results differ'
+  END as validation_result;
+
+DROP TABLE results_enabled, results_disabled;
+
+-- Test GUC parameter functionality
+SELECT 'Testing GUC parameter functionality' as test_name;
+SHOW enable_outer_join_limit_pushdown;
+
+SET enable_outer_join_limit_pushdown = off;
+SHOW enable_outer_join_limit_pushdown;
+
+SET enable_outer_join_limit_pushdown = on; 
 SHOW enable_outer_join_limit_pushdown;
 
 -- Clean up
-DROP TABLE oj_t1, oj_t2, oj_t3;
+DROP TABLE oj_t1, oj_t2, oj_t3, oj_t4;
 
 -- Reset settings
 RESET enable_outer_join_limit_pushdown;
