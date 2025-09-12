@@ -2874,11 +2874,34 @@ create_optimized_mergejoin_path(PlannerInfo *root,
 	List	   *outersortkeys = NIL;
 	List	   *innersortkeys = NIL;
 	List	   *pathkeys;
+	bool		mergejoin_allowed = true;
 
 	elog(DEBUG1, "Creating optimized merge join path");
 
-	/* Extract merge clauses from the original path */
-	mergeclauses = original_path->path_mergeclauses;
+	/* 
+	 * Rebuild merge clauses for the optimized path instead of reusing the original ones.
+	 * This is necessary because the relids in the RestrictInfo clauses must match 
+	 * the new path configuration.
+	 */
+	if (jointype == JOIN_LEFT)
+	{
+		mergeclauses = select_mergejoin_clauses(root, joinrel, preserved_rel, other_rel,
+											   extra->restrictlist, jointype, 
+											   &mergejoin_allowed);
+	}
+	else /* JOIN_RIGHT */
+	{
+		mergeclauses = select_mergejoin_clauses(root, joinrel, other_rel, preserved_rel,
+											   extra->restrictlist, jointype, 
+											   &mergejoin_allowed);
+	}
+
+	/* If we found no usable merge clauses or merge join is not allowed, we can't create a merge join */
+	if (!mergeclauses || !mergejoin_allowed)
+	{
+		elog(DEBUG1, "No usable merge clauses found for optimized path or merge join not allowed");
+		return NULL;
+	}
 
 	/* Determine which path is outer and which is inner */
 	if (jointype == JOIN_LEFT)
@@ -2951,11 +2974,56 @@ create_optimized_hashjoin_path(PlannerInfo *root,
 	Relids		required_outer;
 	Path	   *outer_path, *inner_path;
 	List	   *hashclauses;
+	ListCell   *l;
+	bool		isouterjoin = IS_OUTER_JOIN(jointype);
 
 	elog(DEBUG1, "Creating optimized hash join path");
 
-	/* Extract hash clauses from the original path */
-	hashclauses = original_path->path_hashclauses;
+	/* 
+	 * Rebuild hash clauses for the optimized path instead of reusing the original ones.
+	 * This is necessary because the relids in the RestrictInfo clauses must match 
+	 * the new path configuration.
+	 */
+	hashclauses = NIL;
+	foreach(l, extra->restrictlist)
+	{
+		RestrictInfo *restrictinfo = (RestrictInfo *) lfirst(l);
+
+		/*
+		 * If processing an outer join, only use its own join clauses for
+		 * hashing.  For inner joins we need not be so picky.
+		 */
+		if (isouterjoin && RINFO_IS_PUSHED_DOWN(restrictinfo, joinrel->relids))
+			continue;
+
+		if (!restrictinfo->can_join ||
+			restrictinfo->hashjoinoperator == InvalidOid)
+			continue;			/* not hashjoinable */
+
+		/*
+		 * Check if clause has the form "outer op inner" or "inner op outer".
+		 * We need to check this with the new preserved_rel and other_rel configuration.
+		 */
+		if (jointype == JOIN_LEFT)
+		{
+			if (!clause_sides_match_join(restrictinfo, preserved_rel, other_rel))
+				continue;			/* no good for these input relations */
+		}
+		else /* JOIN_RIGHT */
+		{
+			if (!clause_sides_match_join(restrictinfo, other_rel, preserved_rel))
+				continue;			/* no good for these input relations */
+		}
+
+		hashclauses = lappend(hashclauses, restrictinfo);
+	}
+
+	/* If we found no usable hashclauses, we can't create a hash join */
+	if (!hashclauses)
+	{
+		elog(DEBUG1, "No usable hash clauses found for optimized path");
+		return NULL;
+	}
 
 	/* Determine which path is outer and which is inner */
 	if (jointype == JOIN_LEFT)
