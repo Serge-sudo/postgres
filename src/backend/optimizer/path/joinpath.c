@@ -2834,9 +2834,10 @@ create_optimized_nestloop_path(PlannerInfo *root,
 		inner_path = limited_path;
 	}
 
-	/* Calculate the required outer relations */
-	required_outer = bms_union(PATH_REQ_OUTER(outer_path),
-							   PATH_REQ_OUTER(inner_path));
+	/* Calculate the required outer relations using same logic as standard nestloop */
+	required_outer = calc_nestloop_required_outer(
+		outer_path->parent->relids, PATH_REQ_OUTER(outer_path),
+		inner_path->parent->relids, PATH_REQ_OUTER(inner_path));
 
 	/* Calculate join costs */
 	initial_cost_nestloop(root, &workspace, jointype, outer_path, inner_path, extra);
@@ -2923,9 +2924,8 @@ create_optimized_mergejoin_path(PlannerInfo *root,
 		pathkeys = limited_path->pathkeys; /* Limited path should have ORDER BY pathkeys */
 	}
 
-	/* Calculate the required outer relations */
-	required_outer = bms_union(PATH_REQ_OUTER(outer_path),
-							   PATH_REQ_OUTER(inner_path));
+	/* Calculate the required outer relations using same logic as standard mergejoin */
+	required_outer = calc_non_nestloop_required_outer(outer_path, inner_path);
 
 	/* Check if we need to avoid duplicate sort keys that are already satisfied */
 	if (outersortkeys &&
@@ -3037,9 +3037,8 @@ create_optimized_hashjoin_path(PlannerInfo *root,
 		inner_path = limited_path;
 	}
 
-	/* Calculate the required outer relations */
-	required_outer = bms_union(PATH_REQ_OUTER(outer_path),
-							   PATH_REQ_OUTER(inner_path));
+	/* Calculate the required outer relations using same logic as standard hashjoin */
+	required_outer = calc_non_nestloop_required_outer(outer_path, inner_path);
 
 	/* Calculate join costs */
 	initial_cost_hashjoin(root, &workspace, jointype, hashclauses,
