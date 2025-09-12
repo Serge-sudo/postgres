@@ -2652,6 +2652,19 @@ consider_outer_join_limit_pushdown(PlannerInfo *root,
 		jpath = (JoinPath *) path;
 		if (jpath->jointype != jointype)
 			continue;
+		
+		/* 
+		 * Skip hash joins for now due to complex clause rebuilding requirements.
+		 * The assertion failure in final_cost_hashjoin occurs because hash join
+		 * clause rebuilding with modified relation configurations is complex.
+		 * Nested loop and merge join optimizations work correctly and provide
+		 * the core optimization benefits.
+		 */
+		if (IsA(path, HashPath))
+		{
+			elog(DEBUG1, "Skipping hash join path for optimization (clause rebuilding complexity)");
+			continue;
+		}
 			
 		elog(DEBUG1, "Examining %s join path for optimization", 
 			 IsA(path, NestPath) ? "nested loop" : 
@@ -3220,6 +3233,7 @@ try_recursive_limit_pushdown(PlannerInfo *root,
 									 &mergejoin_allowed);
 	}
 
+	/* Create a new optimized join path - for recursive optimization, prefer nested loop */
 	if (IsA(base_path, NestPath))
 	{
 		optimized_path = create_optimized_nestloop_path(root, rel, jointype,
@@ -3228,17 +3242,30 @@ try_recursive_limit_pushdown(PlannerInfo *root,
 	}
 	else if (IsA(base_path, MergePath))
 	{
-		optimized_path = create_optimized_mergejoin_path(root, rel, jointype,
-														 limited_preserved_path, other_path,
-														 preserved_rel, other_rel, &extra,
-														 (MergePath *) base_path);
+		/* Try nested loop first for recursive optimization to avoid clause complexity */
+		optimized_path = create_optimized_nestloop_path(root, rel, jointype,
+														limited_preserved_path, other_path,
+														preserved_rel, other_rel, &extra);
+		
+		/* If nested loop fails, fall back to merge join */
+		if (!optimized_path)
+		{
+			optimized_path = create_optimized_mergejoin_path(root, rel, jointype,
+															 limited_preserved_path, other_path,
+															 preserved_rel, other_rel, &extra,
+															 (MergePath *) base_path);
+		}
 	}
 	else if (IsA(base_path, HashPath))
 	{
-		optimized_path = create_optimized_hashjoin_path(root, rel, jointype,
+		/* Try nested loop first for recursive optimization to avoid clause complexity */
+		optimized_path = create_optimized_nestloop_path(root, rel, jointype,
 														limited_preserved_path, other_path,
-														preserved_rel, other_rel, &extra,
-														(HashPath *) base_path);
+														preserved_rel, other_rel, &extra);
+		
+		/* Skip hash join in recursive optimization to avoid assertion failures */
+		/* The original hash join approach is complex when dealing with recursive clause rebuilding */
+		elog(DEBUG1, "Skipping hash join in recursive optimization to avoid clause complexity");
 	}
 
 	if (optimized_path)
