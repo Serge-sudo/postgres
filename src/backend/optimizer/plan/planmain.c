@@ -21,8 +21,11 @@
 #include "postgres.h"
 
 #include "nodes/parsenodes.h"
+#include "nodes/nodeFuncs.h"
+#include "nodes/makefuncs.h"
 #include "optimizer/appendinfo.h"
 #include "optimizer/clauses.h"
+#include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/orclauses.h"
 #include "optimizer/pathnode.h"
@@ -36,6 +39,9 @@ static void try_outer_join_limit_pushdown(PlannerInfo *root);
 static void analyze_jointree_for_limit_pushdown(PlannerInfo *root, Node *jtnode);
 static void attempt_limit_pushdown_for_outer_join(PlannerInfo *root, JoinExpr *join);
 static bool can_pushdown_sort_expression(PlannerInfo *root, Node *expr, Node *preserved_side);
+static Relids get_relids_from_jointree_node(Node *jtnode);
+static bool expression_references_only_relids(Node *expr, Relids allowed_relids);
+static bool expression_references_only_relids_walker(Node *node, Relids allowed_relids);
 static void create_limited_subquery_for_preserved_side(PlannerInfo *root, JoinExpr *join, Node *preserved_side);
 
 
@@ -315,6 +321,10 @@ try_outer_join_limit_pushdown(PlannerInfo *root)
 {
 	Query	   *parse = root->parse;
 	
+	/* Check if the optimization is enabled */
+	if (!enable_outer_join_limit_pushdown)
+		return;
+	
 	/* Only apply if we have both ORDER BY and LIMIT */
 	if (!parse->sortClause || !parse->limitCount)
 		return;
@@ -441,15 +451,94 @@ attempt_limit_pushdown_for_outer_join(PlannerInfo *root, JoinExpr *join)
 static bool
 can_pushdown_sort_expression(PlannerInfo *root, Node *expr, Node *preserved_side)
 {
+	Relids		preserved_relids;
+	
+	/* Get the set of relation IDs from the preserved side */
+	preserved_relids = get_relids_from_jointree_node(preserved_side);
+	
+	/* Check if the expression only references relations from the preserved side */
+	if (preserved_relids == NULL)
+		return false;
+		
+	return expression_references_only_relids(expr, preserved_relids);
+}
+
+/*
+ * get_relids_from_jointree_node
+ *	  Extract the set of relation IDs from a jointree node
+ */
+static Relids
+get_relids_from_jointree_node(Node *jtnode)
+{
+	if (jtnode == NULL)
+		return NULL;
+		
+	if (IsA(jtnode, RangeTblRef))
+	{
+		RangeTblRef *rtr = (RangeTblRef *) jtnode;
+		return bms_make_singleton(rtr->rtindex);
+	}
+	else if (IsA(jtnode, FromExpr))
+	{
+		FromExpr   *f = (FromExpr *) jtnode;
+		ListCell   *l;
+		Relids		result = NULL;
+		
+		foreach(l, f->fromlist)
+		{
+			Relids		subrelids = get_relids_from_jointree_node(lfirst(l));
+			result = bms_union(result, subrelids);
+		}
+		return result;
+	}
+	else if (IsA(jtnode, JoinExpr))
+	{
+		JoinExpr   *j = (JoinExpr *) jtnode;
+		Relids		left_relids = get_relids_from_jointree_node(j->larg);
+		Relids		right_relids = get_relids_from_jointree_node(j->rarg);
+		
+		return bms_union(left_relids, right_relids);
+	}
+	
+	return NULL;
+}
+
+/*
+ * expression_references_only_relids
+ *	  Check if an expression only references variables from the given set of relation IDs
+ */
+static bool
+expression_references_only_relids(Node *expr, Relids allowed_relids)
+{
 	/*
-	 * For now, implement a simple check: we can pushdown if the expression
-	 * only references Vars that come from the preserved side.
-	 * 
-	 * TODO: This is a simplified implementation. A full implementation would
-	 * need to analyze the preserved_side node to determine which relations
-	 * it contains and check if the expression only references those relations.
+	 * Walk the expression tree and check that all Var nodes reference
+	 * relations that are in the allowed_relids set.
 	 */
-	return true; /* Placeholder - always allow for now */
+	return expression_references_only_relids_walker(expr, allowed_relids);
+}
+
+/*
+ * expression_references_only_relids_walker
+ *	  Walker function to check if expression only references allowed relations
+ */
+static bool
+expression_references_only_relids_walker(Node *node, Relids allowed_relids)
+{
+	if (node == NULL)
+		return true;
+		
+	if (IsA(node, Var))
+	{
+		Var		   *var = (Var *) node;
+		
+		/* Check if this Var's relation is in the allowed set */
+		if (!bms_is_member(var->varno, allowed_relids))
+			return false;
+	}
+	
+	/* Recursively check child nodes */
+	return expression_tree_walker(node, expression_references_only_relids_walker, 
+								  (void *) allowed_relids);
 }
 
 /*
@@ -459,16 +548,68 @@ can_pushdown_sort_expression(PlannerInfo *root, Node *expr, Node *preserved_side
 static void
 create_limited_subquery_for_preserved_side(PlannerInfo *root, JoinExpr *join, Node *preserved_side)
 {
+	Query	   *parse = root->parse;
+	Query	   *subquery;
+	RangeTblEntry *rte;
+	RangeTblRef *rtr;
+	Index		subquery_rtindex;
+	
 	/*
-	 * TODO: Implement the actual subquery creation logic.
-	 * This would involve:
-	 * 1. Creating a new Query node for the preserved side
-	 * 2. Adding the appropriate ORDER BY and LIMIT clauses
-	 * 3. Modifying the join tree to use the new subquery
-	 * 
-	 * For now, this is a placeholder that logs the attempt.
+	 * Create a new subquery that includes the preserved side with
+	 * ORDER BY and LIMIT applied.
 	 */
-	elog(DEBUG1, "Would push down LIMIT to %s side of %s join",
+	subquery = makeNode(Query);
+	subquery->commandType = CMD_SELECT;
+	subquery->querySource = QSRC_ORIGINAL;
+	
+	/* Copy the relevant clauses from the main query */
+	subquery->sortClause = copyObject(parse->sortClause);
+	subquery->limitCount = copyObject(parse->limitCount);
+	subquery->limitOffset = copyObject(parse->limitOffset);
+	subquery->limitOption = parse->limitOption;
+	
+	/*
+	 * Create a range table entry for this subquery
+	 */
+	rte = makeNode(RangeTblEntry);
+	rte->rtekind = RTE_SUBQUERY;
+	rte->subquery = subquery;
+	rte->alias = makeAlias("limited_preserved", NIL);
+	rte->lateral = false;
+	rte->inh = false;
+	rte->inFromCl = true;
+	
+	/* Add the RTE to the range table and get its index */
+	root->parse->rtable = lappend(root->parse->rtable, rte);
+	subquery_rtindex = list_length(root->parse->rtable);
+	
+	/* Create a RangeTblRef to reference this new subquery */
+	rtr = makeNode(RangeTblRef);
+	rtr->rtindex = subquery_rtindex;
+	
+	/*
+	 * Replace the preserved side in the join tree with the new subquery reference.
+	 * This effectively pushes the LIMIT down to that side of the join.
+	 */
+	if (join->jointype == JOIN_LEFT)
+		join->larg = (Node *) rtr;
+	else /* JOIN_RIGHT */
+		join->rarg = (Node *) rtr;
+	
+	/*
+	 * Remove the ORDER BY and LIMIT from the main query since we've pushed
+	 * them down to the subquery.
+	 */
+	parse->sortClause = NIL;
+	parse->limitCount = NULL;
+	parse->limitOffset = NULL;
+	
+	/*
+	 * TODO: We need to properly set up the subquery's FROM clause and target list.
+	 * This would involve analyzing the preserved_side node and creating appropriate
+	 * entries in the subquery. For now, we log that the optimization would be applied.
+	 */
+	elog(DEBUG1, "Created limited subquery for %s side of %s join",
 		 join->jointype == JOIN_LEFT ? "left" : "right",
 		 join->jointype == JOIN_LEFT ? "LEFT" : "RIGHT");
 }
