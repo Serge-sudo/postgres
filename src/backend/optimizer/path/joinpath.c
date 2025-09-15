@@ -18,7 +18,6 @@
 
 #include "executor/executor.h"
 #include "foreign/fdwapi.h"
-#include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
@@ -96,53 +95,6 @@ static void generate_mergejoin_paths(PlannerInfo *root,
 									 Path *inner_cheapest_total,
 									 List *merge_pathkeys,
 									 bool is_partial);
-static bool should_apply_limit_pushdown_optimization(PlannerInfo *root,
-													RelOptInfo *joinrel,
-													RelOptInfo *outerrel,
-													RelOptInfo *innerrel,
-													JoinType jointype,
-													RelOptInfo **preserved_rel_out,
-													RelOptInfo **other_rel_out);
-static void create_optimized_outer_join_path(PlannerInfo *root,
-											 RelOptInfo *joinrel,
-											 JoinPath *original_path,
-											 RelOptInfo *preserved_rel,
-											 RelOptInfo *other_rel,
-											 JoinType jointype,
-											 JoinPathExtraData *extra);
-static Path *create_limited_path_for_relation(PlannerInfo *root,
-											  RelOptInfo *rel,
-											  Path *base_path);
-static Path *try_recursive_limit_pushdown(PlannerInfo *root,
-										  RelOptInfo *rel,
-										  Path *base_path);
-static void populate_joinpath_extra_data(PlannerInfo *root,
-										  RelOptInfo *joinrel,
-										  RelOptInfo *outerrel,
-										  RelOptInfo *innerrel,
-										  SpecialJoinInfo *sjinfo,
-										  JoinType jointype,
-										  List *restrictlist,
-										  JoinPathExtraData *extra,
-										  bool *mergejoin_allowed);
-static Path *create_optimized_nestloop_path(PlannerInfo *root,
-											RelOptInfo *joinrel,
-											JoinType jointype,
-											Path *limited_path,
-											Path *other_path,
-											RelOptInfo *preserved_rel,
-											RelOptInfo *other_rel,
-											JoinPathExtraData *extra);
-static Path *create_optimized_mergejoin_path(PlannerInfo *root,
-											 RelOptInfo *joinrel,
-											 JoinType jointype,
-											 Path *limited_path,
-											 Path *other_path,
-											 RelOptInfo *preserved_rel,
-											 RelOptInfo *other_rel,
-											 JoinPathExtraData *extra,
-											 MergePath *original_path);
-
 
 
 /*
@@ -179,13 +131,149 @@ add_paths_to_joinrel(PlannerInfo *root,
 {
 	JoinPathExtraData extra;
 	bool		mergejoin_allowed = true;
+	ListCell   *lc;
+	Relids		joinrelids;
 
-	/* Populate the JoinPathExtraData structure */
-	populate_joinpath_extra_data(root, joinrel, outerrel, innerrel,
-								 sjinfo, jointype, restrictlist, &extra,
-								 &mergejoin_allowed);
+	/*
+	 * PlannerInfo doesn't contain the SpecialJoinInfos created for joins
+	 * between child relations, even if there is a SpecialJoinInfo node for
+	 * the join between the topmost parents. So, while calculating Relids set
+	 * representing the restriction, consider relids of topmost parent of
+	 * partitions.
+	 */
+	if (joinrel->reloptkind == RELOPT_OTHER_JOINREL)
+		joinrelids = joinrel->top_parent_relids;
+	else
+		joinrelids = joinrel->relids;
 
+	extra.restrictlist = restrictlist;
+	extra.mergeclause_list = NIL;
+	extra.sjinfo = sjinfo;
+	extra.param_source_rels = NULL;
 
+	/*
+	 * See if the inner relation is provably unique for this outer rel.
+	 *
+	 * We have some special cases: for JOIN_SEMI and JOIN_ANTI, it doesn't
+	 * matter since the executor can make the equivalent optimization anyway;
+	 * we need not expend planner cycles on proofs.  For JOIN_UNIQUE_INNER, we
+	 * must be considering a semijoin whose inner side is not provably unique
+	 * (else reduce_unique_semijoins would've simplified it), so there's no
+	 * point in calling innerrel_is_unique.  However, if the LHS covers all of
+	 * the semijoin's min_lefthand, then it's appropriate to set inner_unique
+	 * because the path produced by create_unique_path will be unique relative
+	 * to the LHS.  (If we have an LHS that's only part of the min_lefthand,
+	 * that is *not* true.)  For JOIN_UNIQUE_OUTER, pass JOIN_INNER to avoid
+	 * letting that value escape this module.
+	 */
+	switch (jointype)
+	{
+		case JOIN_SEMI:
+		case JOIN_ANTI:
+
+			/*
+			 * XXX it may be worth proving this to allow a Memoize to be
+			 * considered for Nested Loop Semi/Anti Joins.
+			 */
+			extra.inner_unique = false; /* well, unproven */
+			break;
+		case JOIN_UNIQUE_INNER:
+			extra.inner_unique = bms_is_subset(sjinfo->min_lefthand,
+											   outerrel->relids);
+			break;
+		case JOIN_UNIQUE_OUTER:
+			extra.inner_unique = innerrel_is_unique(root,
+													joinrel->relids,
+													outerrel->relids,
+													innerrel,
+													JOIN_INNER,
+													restrictlist,
+													false);
+			break;
+		default:
+			extra.inner_unique = innerrel_is_unique(root,
+													joinrel->relids,
+													outerrel->relids,
+													innerrel,
+													jointype,
+													restrictlist,
+													false);
+			break;
+	}
+
+	/*
+	 * Find potential mergejoin clauses.  We can skip this if we are not
+	 * interested in doing a mergejoin.  However, mergejoin may be our only
+	 * way of implementing a full outer join, so override enable_mergejoin if
+	 * it's a full join.
+	 */
+	if (enable_mergejoin || jointype == JOIN_FULL)
+		extra.mergeclause_list = select_mergejoin_clauses(root,
+														  joinrel,
+														  outerrel,
+														  innerrel,
+														  restrictlist,
+														  jointype,
+														  &mergejoin_allowed);
+
+	/*
+	 * If it's SEMI, ANTI, or inner_unique join, compute correction factors
+	 * for cost estimation.  These will be the same for all paths.
+	 */
+	if (jointype == JOIN_SEMI || jointype == JOIN_ANTI || extra.inner_unique)
+		compute_semi_anti_join_factors(root, joinrel, outerrel, innerrel,
+									   jointype, sjinfo, restrictlist,
+									   &extra.semifactors);
+
+	/*
+	 * Decide whether it's sensible to generate parameterized paths for this
+	 * joinrel, and if so, which relations such paths should require.  There
+	 * is usually no need to create a parameterized result path unless there
+	 * is a join order restriction that prevents joining one of our input rels
+	 * directly to the parameter source rel instead of joining to the other
+	 * input rel.  (But see allow_star_schema_join().)	This restriction
+	 * reduces the number of parameterized paths we have to deal with at
+	 * higher join levels, without compromising the quality of the resulting
+	 * plan.  We express the restriction as a Relids set that must overlap the
+	 * parameterization of any proposed join path.  Note: param_source_rels
+	 * should contain only baserels, not OJ relids, so starting from
+	 * all_baserels not all_query_rels is correct.
+	 */
+	foreach(lc, root->join_info_list)
+	{
+		SpecialJoinInfo *sjinfo2 = (SpecialJoinInfo *) lfirst(lc);
+
+		/*
+		 * SJ is relevant to this join if we have some part of its RHS
+		 * (possibly not all of it), and haven't yet joined to its LHS.  (This
+		 * test is pretty simplistic, but should be sufficient considering the
+		 * join has already been proven legal.)  If the SJ is relevant, it
+		 * presents constraints for joining to anything not in its RHS.
+		 */
+		if (bms_overlap(joinrelids, sjinfo2->min_righthand) &&
+			!bms_overlap(joinrelids, sjinfo2->min_lefthand))
+			extra.param_source_rels = bms_join(extra.param_source_rels,
+											   bms_difference(root->all_baserels,
+															  sjinfo2->min_righthand));
+
+		/* full joins constrain both sides symmetrically */
+		if (sjinfo2->jointype == JOIN_FULL &&
+			bms_overlap(joinrelids, sjinfo2->min_lefthand) &&
+			!bms_overlap(joinrelids, sjinfo2->min_righthand))
+			extra.param_source_rels = bms_join(extra.param_source_rels,
+											   bms_difference(root->all_baserels,
+															  sjinfo2->min_lefthand));
+	}
+
+	/*
+	 * However, when a LATERAL subquery is involved, there will simply not be
+	 * any paths for the joinrel that aren't parameterized by whatever the
+	 * subquery is parameterized by, unless its parameterization is resolved
+	 * within the joinrel.  So we might as well allow additional dependencies
+	 * on whatever residual lateral dependencies the joinrel will have.
+	 */
+	extra.param_source_rels = bms_add_members(extra.param_source_rels,
+											  joinrel->lateral_relids);
 
 	/*
 	 * 1. Consider mergejoin paths where both relations must be explicitly
@@ -245,8 +333,6 @@ add_paths_to_joinrel(PlannerInfo *root,
 												 outerrel, innerrel,
 												 jointype, &extra);
 
-
-
 	/*
 	 * 6. Finally, give extensions a chance to manipulate the path list.  They
 	 * could add new paths (such as CustomPaths) by calling add_path(), or
@@ -284,173 +370,6 @@ allow_star_schema_join(PlannerInfo *root,
 	 */
 	return (bms_overlap(inner_paramrels, outerrelids) &&
 			bms_nonempty_difference(inner_paramrels, outerrelids));
-}
-
-/*
- * populate_joinpath_extra_data
- *		Fill in JoinPathExtraData structure with all necessary information
- *		for creating join paths.
- *
- * This function encapsulates the common logic for initializing JoinPathExtraData
- * that is used in both add_paths_to_joinrel and try_recursive_limit_pushdown
- * to avoid code duplication.
- */
-static void
-populate_joinpath_extra_data(PlannerInfo *root,
-							  RelOptInfo *joinrel,
-							  RelOptInfo *outerrel,
-							  RelOptInfo *innerrel,
-							  SpecialJoinInfo *sjinfo,
-							  JoinType jointype,
-							  List *restrictlist,
-							  JoinPathExtraData *extra,
-							  bool *mergejoin_allowed)
-{
-	ListCell   *lc;
-	Relids		joinrelids;
-
-	/*
-	 * PlannerInfo doesn't contain the SpecialJoinInfos created for joins
-	 * between child relations, even if there is a SpecialJoinInfo node for
-	 * the join between the topmost parents. So, while calculating Relids set
-	 * representing the restriction, consider relids of topmost parent of
-	 * partitions.
-	 */
-	if (joinrel->reloptkind == RELOPT_OTHER_JOINREL)
-		joinrelids = joinrel->top_parent_relids;
-	else
-		joinrelids = joinrel->relids;
-
-	extra->restrictlist = restrictlist;
-	extra->mergeclause_list = NIL;
-	extra->sjinfo = sjinfo;
-	extra->param_source_rels = NULL;
-
-	/*
-	 * See if the inner relation is provably unique for this outer rel.
-	 *
-	 * We have some special cases: for JOIN_SEMI and JOIN_ANTI, it doesn't
-	 * matter since the executor can make the equivalent optimization anyway;
-	 * we need not expend planner cycles on proofs.  For JOIN_UNIQUE_INNER, we
-	 * must be considering a semijoin whose inner side is not provably unique
-	 * (else reduce_unique_semijoins would've simplified it), so there's no
-	 * point in calling innerrel_is_unique.  However, if the LHS covers all of
-	 * the semijoin's min_lefthand, then it's appropriate to set inner_unique
-	 * because the path produced by create_unique_path will be unique relative
-	 * to the LHS.  (If we have an LHS that's only part of the min_lefthand,
-	 * that is *not* true.)  For JOIN_UNIQUE_OUTER, pass JOIN_INNER to avoid
-	 * letting that value escape this module.
-	 */
-	switch (jointype)
-	{
-		case JOIN_SEMI:
-		case JOIN_ANTI:
-
-			/*
-			 * XXX it may be worth proving this to allow a Memoize to be
-			 * considered for Nested Loop Semi/Anti Joins.
-			 */
-			extra->inner_unique = false; /* well, unproven */
-			break;
-		case JOIN_UNIQUE_INNER:
-			extra->inner_unique = bms_is_subset(sjinfo->min_lefthand,
-											   outerrel->relids);
-			break;
-		case JOIN_UNIQUE_OUTER:
-			extra->inner_unique = innerrel_is_unique(root,
-													joinrel->relids,
-													outerrel->relids,
-													innerrel,
-													JOIN_INNER,
-													restrictlist,
-													false);
-			break;
-		default:
-			extra->inner_unique = innerrel_is_unique(root,
-													joinrel->relids,
-													outerrel->relids,
-													innerrel,
-													jointype,
-													restrictlist,
-													false);
-			break;
-	}
-
-	/*
-	 * Find potential mergejoin clauses.  We can skip this if we are not
-	 * interested in doing a mergejoin.  However, mergejoin may be our only
-	 * way of implementing a full outer join, so override enable_mergejoin if
-	 * it's a full join.
-	 */
-	if (mergejoin_allowed && (enable_mergejoin || jointype == JOIN_FULL))
-	{
-		extra->mergeclause_list = select_mergejoin_clauses(root,
-														  joinrel,
-														  outerrel,
-														  innerrel,
-														  restrictlist,
-														  jointype,
-														  mergejoin_allowed);
-	}
-
-	/*
-	 * If it's SEMI, ANTI, or inner_unique join, compute correction factors
-	 * for cost estimation.  These will be the same for all paths.
-	 */
-	if (jointype == JOIN_SEMI || jointype == JOIN_ANTI || extra->inner_unique)
-		compute_semi_anti_join_factors(root, joinrel, outerrel, innerrel,
-									   jointype, sjinfo, restrictlist,
-									   &extra->semifactors);
-
-	/*
-	 * Decide whether it's sensible to generate parameterized paths for this
-	 * joinrel, and if so, which relations such paths should require.  There
-	 * is usually no need to create a parameterized result path unless there
-	 * is a join order restriction that prevents joining one of our input rels
-	 * directly to the parameter source rel instead of joining to the other
-	 * input rel.  (But see allow_star_schema_join().)	This restriction
-	 * reduces the number of parameterized paths we have to deal with at
-	 * higher join levels, without compromising the quality of the resulting
-	 * plan.  We express the restriction as a Relids set that must overlap the
-	 * parameterization of any proposed join path.  Note: param_source_rels
-	 * should contain only baserels, not OJ relids, so starting from
-	 * all_baserels not all_query_rels is correct.
-	 */
-	foreach(lc, root->join_info_list)
-	{
-		SpecialJoinInfo *sjinfo2 = (SpecialJoinInfo *) lfirst(lc);
-
-		/*
-		 * SJ is relevant to this join if we have some part of its RHS
-		 * (possibly not all of it), and haven't yet joined to its LHS.  (This
-		 * test is pretty simplistic, but should be sufficient considering the
-		 * join has already been proven legal.)  If the SJ is relevant, it
-		 * presents constraints for joining to anything not in its RHS.
-		 */
-		if (bms_overlap(joinrelids, sjinfo2->min_righthand) &&
-			!bms_overlap(joinrelids, sjinfo2->min_lefthand))
-			extra->param_source_rels = bms_join(extra->param_source_rels,
-											   bms_difference(root->all_baserels,
-															  sjinfo2->min_righthand));
-
-		/* full joins constrain both sides symmetrically */
-		if (sjinfo2->jointype == JOIN_FULL &&
-			bms_overlap(joinrelids, sjinfo2->min_lefthand) &&
-			!bms_overlap(joinrelids, sjinfo2->min_righthand))
-			extra->param_source_rels = bms_join(extra->param_source_rels,
-											   bms_difference(root->all_baserels,
-															  sjinfo2->min_lefthand));
-	}
-
-	/*
-	 * However, when a LATERAL subquery is involved, there will simply not be
-	 * any paths for the joinrel that aren't parameterized by whatever the
-	 * subquery is parameterized by, unless its parameterization is resolved
-	 * within the joinrel.  So we might as well allow additional dependencies
-	 * on whatever residual lateral dependencies the joinrel will have.
-	 */
-	extra->param_source_rels = bms_add_members(extra->param_source_rels,
-											  joinrel->lateral_relids);
 }
 
 /*
@@ -907,38 +826,6 @@ try_nestloop_path(PlannerInfo *root,
 									  extra->restrictlist,
 									  pathkeys,
 									  required_outer));
-
-		/* Also try to create an optimized version with LIMIT pushdown */
-		{
-			RelOptInfo *preserved_rel, *other_rel;
-			if (should_apply_limit_pushdown_optimization(root, joinrel, 
-														outer_path->parent, inner_path->parent,
-														jointype, &preserved_rel, &other_rel))
-			{
-				Path *limited_preserved_path;
-				Path *preserved_path = (jointype == JOIN_LEFT) ? outer_path : inner_path;
-				Path *other_path = (jointype == JOIN_LEFT) ? inner_path : outer_path;
-
-				/* Add defensive checks */
-				if (!preserved_rel || !other_rel || !preserved_path || !other_path)
-				{
-					elog(DEBUG1, "Skipping optimization due to NULL parameters");
-					goto skip_optimization_nestloop;
-				}
-
-				/* Create a limited version of the preserved relation path */
-				limited_preserved_path = create_limited_path_for_relation(root, preserved_rel, preserved_path);
-				if (limited_preserved_path)
-				{
-					Path *optimized_path = create_optimized_nestloop_path(root, joinrel, jointype,
-																		 limited_preserved_path, other_path,
-																		 preserved_rel, other_rel, extra);
-					if (optimized_path)
-						add_path(joinrel, optimized_path);
-				}
-			}
-		}
-skip_optimization_nestloop:
 	}
 	else
 	{
@@ -1108,7 +995,7 @@ try_mergejoin_path(PlannerInfo *root,
 						  workspace.startup_cost, workspace.total_cost,
 						  pathkeys, required_outer))
 	{
-		MergePath *mergepath = (MergePath *)
+		add_path(joinrel, (Path *)
 				 create_mergejoin_path(root,
 									   joinrel,
 									   jointype,
@@ -1121,41 +1008,7 @@ try_mergejoin_path(PlannerInfo *root,
 									   required_outer,
 									   mergeclauses,
 									   outersortkeys,
-									   innersortkeys);
-		add_path(joinrel, (Path *) mergepath);
-
-		/* Also try to create an optimized version with LIMIT pushdown */
-		{
-			RelOptInfo *preserved_rel, *other_rel;
-			if (should_apply_limit_pushdown_optimization(root, joinrel, 
-														outer_path->parent, inner_path->parent,
-														jointype, &preserved_rel, &other_rel))
-			{
-				Path *limited_preserved_path;
-				Path *preserved_path = (jointype == JOIN_LEFT) ? outer_path : inner_path;
-				Path *other_path_opt = (jointype == JOIN_LEFT) ? inner_path : outer_path;
-
-				/* Add defensive checks */
-				if (!preserved_rel || !other_rel || !preserved_path || !other_path_opt)
-				{
-					elog(DEBUG1, "Skipping optimization due to NULL parameters");
-					goto skip_optimization_mergejoin;
-				}
-
-				/* Create a limited version of the preserved relation path */
-				limited_preserved_path = create_limited_path_for_relation(root, preserved_rel, preserved_path);
-				if (limited_preserved_path)
-				{
-					Path *optimized_path = create_optimized_mergejoin_path(root, joinrel, jointype,
-																		  limited_preserved_path, other_path_opt,
-																		  preserved_rel, other_rel, extra,
-																		  mergepath);
-					if (optimized_path)
-						add_path(joinrel, optimized_path);
-				}
-			}
-		}
-skip_optimization_mergejoin:
+									   innersortkeys));
 	}
 	else
 	{
@@ -2577,729 +2430,4 @@ select_mergejoin_clauses(PlannerInfo *root,
 	}
 
 	return result_list;
-}
-
-/*
- * should_apply_limit_pushdown_optimization
- *		Check if ORDER BY ... LIMIT pushdown optimization should be applied
- *		to the given outer join.
- *
- * Returns true if the optimization should be applied, and sets preserved_rel_out
- * and other_rel_out to the appropriate relations.
- */
-static bool
-should_apply_limit_pushdown_optimization(PlannerInfo *root,
-										 RelOptInfo *joinrel,
-										 RelOptInfo *outerrel,
-										 RelOptInfo *innerrel,
-										 JoinType jointype,
-										 RelOptInfo **preserved_rel_out,
-										 RelOptInfo **other_rel_out)
-{
-	RelOptInfo *preserved_rel;
-	RelOptInfo *other_rel;
-	Bitmapset  *preserved_relids;
-	bool		can_pushdown = true;
-	Query	   *parse = root->parse;
-	ListCell   *sc;
-	Relids		base_relids;
-
-	/* 
-	 * TEMPORARY: Disable optimization to prevent segmentation faults during refactoring.
-	 * Need to debug the issue with multi-level joins before re-enabling.
-	 */
-	return false;
-
-	/* Quick check: is the optimization enabled and applicable? */
-	if (!enable_outer_join_limit_pushdown ||
-		(jointype != JOIN_LEFT && jointype != JOIN_RIGHT) ||
-		root->limit_tuples <= 0 || 
-		root->sort_pathkeys == NIL)
-		return false;
-
-	/* Check if this join covers all base relations */
-	base_relids = bms_difference(joinrel->relids, root->outer_join_rels);
-	if (!bms_equal(base_relids, root->all_baserels))
-	{
-		bms_free(base_relids);
-		return false;
-	}
-	bms_free(base_relids);
-
-	/* Determine which relation is preserved in this outer join */
-	if (jointype == JOIN_LEFT)
-	{
-		preserved_rel = outerrel;
-		other_rel = innerrel;
-		preserved_relids = outerrel->relids;
-	}
-	else /* JOIN_RIGHT */
-	{
-		preserved_rel = innerrel;
-		other_rel = outerrel;
-		preserved_relids = innerrel->relids;
-	}
-
-	/*
-	 * Check if all ORDER BY expressions reference only the preserved relation.
-	 */
-	foreach(sc, parse->sortClause)
-	{
-		SortGroupClause *sortcl = (SortGroupClause *) lfirst(sc);
-		TargetEntry *tle;
-		Bitmapset  *expr_relids;
-
-		/* Get the target entry for this sort group reference */
-		tle = get_sortgroupref_tle(sortcl->tleSortGroupRef, parse->targetList);
-		if (!tle)
-		{
-			can_pushdown = false;
-			break;
-		}
-
-		/* Check which relations this expression references */
-		expr_relids = pull_varnos(root, (Node *) tle->expr);
-		if (!bms_is_subset(expr_relids, preserved_relids))
-		{
-			can_pushdown = false;
-			bms_free(expr_relids);
-			break;
-		}
-		bms_free(expr_relids);
-	}
-
-	if (can_pushdown)
-	{
-		*preserved_rel_out = preserved_rel;
-		*other_rel_out = other_rel;
-	}
-
-	return can_pushdown;
-}
-
-/*
- * consider_outer_join_limit_pushdown
- *		Examine existing join paths and create optimized versions that push
- *		ORDER BY ... LIMIT down to the preserved side of an outer join.
- *
- * For LEFT OUTER JOIN: preserved side is outerrel (left)
- * For RIGHT OUTER JOIN: preserved side is innerrel (right) 
- *
- * The optimization works by:
- * 1. Checking if ORDER BY references only columns from the preserved side
- * 2. For each existing join path, creating a modified version where the
- *    preserved side has the limit applied before the join
- * 3. This reduces the number of tuples processed in the join
- */
-static void
-consider_outer_join_limit_pushdown(PlannerInfo *root,
-								   RelOptInfo *joinrel,
-								   RelOptInfo *outerrel,
-								   RelOptInfo *innerrel,
-								   JoinType jointype,
-								   JoinPathExtraData *extra)
-{
-	RelOptInfo *preserved_rel;
-	RelOptInfo *other_rel;
-	Bitmapset  *preserved_relids;
-	ListCell   *lc;
-	bool		can_pushdown = true;
-	Query	   *parse = root->parse;
-	ListCell   *sc;
-
-	elog(DEBUG1, "Consider outer join limit pushdown called for jointype %d", jointype);
-
-	/* Determine which relation is preserved in this outer join */
-	if (jointype == JOIN_LEFT)
-	{
-		preserved_rel = outerrel;
-		other_rel = innerrel;
-		preserved_relids = outerrel->relids;
-	}
-	else if (jointype == JOIN_RIGHT)
-	{
-		preserved_rel = innerrel;
-		other_rel = outerrel;
-		preserved_relids = innerrel->relids;
-	}
-	else
-	{
-		/* Should not happen given our caller's check */
-		return;
-	}
-
-	/*
-	 * Check if all ORDER BY expressions reference only the preserved relation.
-	 * We'll do this by checking the actual sort clause expressions.
-	 */
-	
-	foreach(sc, parse->sortClause)
-	{
-		SortGroupClause *sortcl = (SortGroupClause *) lfirst(sc);
-		TargetEntry *tle;
-		Bitmapset  *expr_relids;
-
-		elog(DEBUG1, "Checking sort clause for pushdown eligibility");
-
-		/* Get the target entry for this sort group reference */
-		tle = get_sortgroupref_tle(sortcl->tleSortGroupRef, parse->targetList);
-		if (!tle)
-		{
-			elog(DEBUG1, "Cannot find target entry for sort group reference");
-			can_pushdown = false;
-			break;
-		}
-
-		/* Check which relations this expression references */
-		expr_relids = pull_varnos(root, (Node *) tle->expr);
-		if (!bms_is_subset(expr_relids, preserved_relids))
-		{
-			elog(DEBUG1, "Sort expression references non-preserved relations");
-			can_pushdown = false;
-			bms_free(expr_relids);
-			break;
-		}
-		bms_free(expr_relids);
-		
-		elog(DEBUG1, "Sort expression is suitable for pushdown");
-	}
-
-	if (!can_pushdown)
-	{
-		elog(DEBUG1, "Cannot pushdown: ORDER BY expressions not suitable");
-		return;
-	}
-
-	/*
-	 * Now iterate over existing join paths and create optimized versions.
-	 * We need to examine the paths that have already been added to joinrel.
-	 */
-	foreach(lc, joinrel->pathlist)
-	{
-		Path *path = (Path *) lfirst(lc);
-		JoinPath *jpath;
-		
-		/* Only consider join paths (not scan paths) */
-		if (!IsA(path, NestPath) && !IsA(path, MergePath) && !IsA(path, HashPath))
-			continue;
-			
-		/* Only consider outer join paths of the right type */
-		jpath = (JoinPath *) path;
-		if (jpath->jointype != jointype)
-			continue;
-		
-		/* 
-		 * Skip hash joins for now due to complex clause rebuilding requirements.
-		 * The assertion failure in final_cost_hashjoin occurs because hash join
-		 * clause rebuilding with modified relation configurations is complex.
-		 * Nested loop and merge join optimizations work correctly and provide
-		 * the core optimization benefits.
-		 */
-		if (IsA(path, HashPath))
-		{
-			elog(DEBUG1, "Skipping hash join path for optimization (clause rebuilding complexity)");
-			continue;
-		}
-			
-		elog(DEBUG1, "Examining %s join path for optimization", 
-			 IsA(path, NestPath) ? "nested loop" : 
-			 IsA(path, MergePath) ? "merge" : "hash");
-		
-		/* Create an optimized version of this path with limit pushdown */
-		create_optimized_outer_join_path(root, joinrel, jpath, preserved_rel, 
-										 other_rel, jointype, extra);
-	}
-}
-
-/*
- * create_optimized_outer_join_path
- *		Create an optimized version of an existing join path that pushes
- *		ORDER BY ... LIMIT down to the preserved side.
- *
- * This function takes an existing join path and creates a modified version
- * where the preserved relation has the limit applied before the join.
- */
-static void
-create_optimized_outer_join_path(PlannerInfo *root,
-								 RelOptInfo *joinrel,
-								 JoinPath *original_path,
-								 RelOptInfo *preserved_rel,
-								 RelOptInfo *other_rel,
-								 JoinType jointype,
-								 JoinPathExtraData *extra)
-{
-	Path	   *preserved_path;
-	Path	   *other_path;
-	Path	   *limited_path;
-	Path	   *optimized_join_path = NULL;
-
-	elog(DEBUG1, "Creating optimized version of join path");
-
-	/* Extract the paths from the original join */
-	if (jointype == JOIN_LEFT)
-	{
-		preserved_path = original_path->outerjoinpath;
-		other_path = original_path->innerjoinpath;
-	}
-	else /* JOIN_RIGHT */
-	{
-		preserved_path = original_path->innerjoinpath;
-		other_path = original_path->outerjoinpath;
-	}
-
-	/* 
-	 * Recursively apply LIMIT pushdown if the preserved relation is also 
-	 * an outer join that can benefit from the optimization 
-	 * 
-	 * Temporarily disabled due to "variable not found in subplan target lists" errors
-	 * in complex nested outer joins. This optimization needs further investigation.
-	 */
-	/* recursive_path = try_recursive_limit_pushdown(root, preserved_rel, preserved_path);
-	if (recursive_path)
-	{
-		elog(DEBUG1, "Applied recursive LIMIT pushdown to preserved relation");
-		preserved_path = recursive_path;
-	} */
-
-	/* Create a limited version of the preserved relation path */
-	limited_path = create_limited_path_for_relation(root, preserved_rel, preserved_path);
-	if (!limited_path)
-	{
-		elog(DEBUG1, "Failed to create limited path for preserved relation");
-		return;
-	}
-
-	/* Create a new join path using the limited preserved path */
-	if (IsA(original_path, NestPath))
-	{
-		optimized_join_path = create_optimized_nestloop_path(root, joinrel, jointype,
-															 limited_path, other_path,
-															 preserved_rel, other_rel, extra);
-	}
-	else if (IsA(original_path, MergePath))
-	{
-		optimized_join_path = create_optimized_mergejoin_path(root, joinrel, jointype,
-															  limited_path, other_path,
-															  preserved_rel, other_rel, extra,
-															  (MergePath *) original_path);
-	}
-	else if (IsA(original_path, HashPath))
-	{
-		/* Skip hash join optimization due to complex clause rebuilding requirements */
-		elog(DEBUG1, "Skipping hash join optimization due to clause rebuilding complexity");
-		optimized_join_path = NULL;
-	}
-
-	if (optimized_join_path)
-	{
-		add_path(joinrel, optimized_join_path);
-		elog(DEBUG1, "Added optimized outer join path with ORDER BY LIMIT pushdown");
-	}
-	else
-	{
-		elog(DEBUG1, "Failed to create optimized join path");
-	}
-}
-
-/*
- * create_limited_path_for_relation
- *		Create a path that applies the ORDER BY ... LIMIT to a relation.
- */
-static Path *
-create_limited_path_for_relation(PlannerInfo *root,
-								 RelOptInfo *rel,
-								 Path *base_path)
-{
-	Path	   *sorted_path;
-	Path	   *limited_path;
-	Node	   *limitCount;
-	int64		limit_value;
-
-	/*
-	 * For the pushdown optimization, we want to apply the LIMIT count plus 
-	 * any OFFSET to ensure we get enough rows. However, we apply no OFFSET 
-	 * at this level - the top level LIMIT will handle the OFFSET.
-	 * 
-	 * root->limit_tuples already contains count + offset if both are present,
-	 * which is exactly what we need for the pushdown.
-	 */
-	limit_value = (int64) root->limit_tuples;
-	elog(DEBUG1, "Using limit_tuples for pushdown: %ld", limit_value);
-
-	/* Create the limit count constant */
-	limitCount = (Node *) makeConst(INT8OID, -1, InvalidOid,
-									sizeof(int64),
-									Int64GetDatum(limit_value),
-									false, FLOAT8PASSBYVAL);
-
-	/* Check if we need to sort first */
-	if (pathkeys_contained_in(root->sort_pathkeys, base_path->pathkeys))
-	{
-		/* Already sorted correctly, just add limit */
-		limited_path = (Path *) create_limit_path(root, rel, base_path,
-												  NULL, /* offset - never apply offset in pushdown */
-												  limitCount,
-												  LIMIT_OPTION_COUNT,
-												  0, limit_value);
-	}
-	else
-	{
-		/* Need to sort first, then limit */
-		sorted_path = (Path *) create_sort_path(root, rel, base_path,
-												root->sort_pathkeys,
-												limit_value);
-		
-		if (!sorted_path)
-		{
-			elog(DEBUG1, "Failed to create sorted path");
-			return NULL;
-		}
-		
-		limited_path = (Path *) create_limit_path(root, rel, sorted_path,
-												  NULL, /* offset - never apply offset in pushdown */
-												  limitCount,
-												  LIMIT_OPTION_COUNT,
-												  0, limit_value);
-	}
-
-	return limited_path;
-}
-
-/*
- * create_optimized_nestloop_path
- *		Create a nested loop join path using the limited preserved relation.
- */
-static Path *
-create_optimized_nestloop_path(PlannerInfo *root,
-							   RelOptInfo *joinrel,
-							   JoinType jointype,
-							   Path *limited_path,
-							   Path *other_path,
-							   RelOptInfo *preserved_rel,
-							   RelOptInfo *other_rel,
-							   JoinPathExtraData *extra)
-{
-	JoinCostWorkspace workspace;
-	Relids		required_outer;
-	Path	   *outer_path, *inner_path;
-
-	/* Determine which path is outer and which is inner */
-	if (jointype == JOIN_LEFT)
-	{
-		outer_path = limited_path;
-		inner_path = other_path;
-	}
-	else /* JOIN_RIGHT */
-	{
-		outer_path = other_path;
-		inner_path = limited_path;
-	}
-
-	/* Calculate the required outer relations using same logic as standard nestloop */
-	required_outer = calc_nestloop_required_outer(
-		outer_path->parent->relids, PATH_REQ_OUTER(outer_path),
-		inner_path->parent->relids, PATH_REQ_OUTER(inner_path));
-
-	/* Calculate join costs */
-	initial_cost_nestloop(root, &workspace, jointype, outer_path, inner_path, extra);
-
-	/* Create the nested loop path */
-	return (Path *) create_nestloop_path(root, joinrel, jointype,
-										 &workspace, extra,
-										 outer_path, inner_path,
-										 extra->restrictlist,
-										 outer_path->pathkeys,
-										 required_outer);
-}
-
-/*
- * create_optimized_mergejoin_path
- *		Create a merge join path using the limited preserved relation.
- *		This function extracts merge clauses from the original path and 
- *		creates a new merge join with the limited preserved relation.
- */
-static Path *
-create_optimized_mergejoin_path(PlannerInfo *root,
-							   RelOptInfo *joinrel,
-							   JoinType jointype,
-							   Path *limited_path,
-							   Path *other_path,
-							   RelOptInfo *preserved_rel,
-							   RelOptInfo *other_rel,
-							   JoinPathExtraData *extra,
-							   MergePath *original_path)
-{
-	JoinCostWorkspace workspace;
-	Relids		required_outer;
-	Path	   *outer_path, *inner_path;
-	List	   *mergeclauses;
-	List	   *outersortkeys = NIL;
-	List	   *innersortkeys = NIL;
-	List	   *pathkeys;
-	bool		mergejoin_allowed = true;
-
-	elog(DEBUG1, "Creating optimized merge join path");
-
-	/* 
-	 * Rebuild merge clauses for the optimized path instead of reusing the original ones.
-	 * This is necessary because the relids in the RestrictInfo clauses must match 
-	 * the new path configuration.
-	 */
-	if (jointype == JOIN_LEFT)
-	{
-		mergeclauses = select_mergejoin_clauses(root, joinrel, preserved_rel, other_rel,
-											   extra->restrictlist, jointype, 
-											   &mergejoin_allowed);
-	}
-	else /* JOIN_RIGHT */
-	{
-		mergeclauses = select_mergejoin_clauses(root, joinrel, other_rel, preserved_rel,
-											   extra->restrictlist, jointype, 
-											   &mergejoin_allowed);
-	}
-
-	/* If we found no usable merge clauses or merge join is not allowed, we can't create a merge join */
-	if (!mergeclauses || !mergejoin_allowed)
-	{
-		elog(DEBUG1, "No usable merge clauses found for optimized path or merge join not allowed");
-		return NULL;
-	}
-
-	/* Determine which path is outer and which is inner */
-	if (jointype == JOIN_LEFT)
-	{
-		outer_path = limited_path;
-		inner_path = other_path;
-		/* Use original sort keys, but adjust for the limited path */
-		outersortkeys = original_path->outersortkeys;
-		innersortkeys = original_path->innersortkeys;
-		pathkeys = limited_path->pathkeys; /* Limited path should have ORDER BY pathkeys */
-	}
-	else /* JOIN_RIGHT */
-	{
-		outer_path = other_path;
-		inner_path = limited_path;
-		/* Use original sort keys, but adjust for the limited path */
-		outersortkeys = original_path->outersortkeys;
-		innersortkeys = original_path->innersortkeys;
-		pathkeys = limited_path->pathkeys; /* Limited path should have ORDER BY pathkeys */
-	}
-
-	/* Calculate the required outer relations using same logic as standard mergejoin */
-	required_outer = calc_non_nestloop_required_outer(outer_path, inner_path);
-
-	/* Check if we need to avoid duplicate sort keys that are already satisfied */
-	if (outersortkeys &&
-		pathkeys_contained_in(outersortkeys, outer_path->pathkeys))
-		outersortkeys = NIL;
-	if (innersortkeys &&
-		pathkeys_contained_in(innersortkeys, inner_path->pathkeys))
-		innersortkeys = NIL;
-
-	/* Calculate join costs */
-	initial_cost_mergejoin(root, &workspace, jointype, mergeclauses,
-						   outer_path, inner_path,
-						   outersortkeys, innersortkeys,
-						   extra);
-
-	/* Create the merge join path */
-	return (Path *) create_mergejoin_path(root, joinrel, jointype,
-										  &workspace, extra,
-										  outer_path, inner_path,
-										  extra->restrictlist,
-										  pathkeys,
-										  required_outer,
-										  mergeclauses,
-										  outersortkeys,
-										  innersortkeys);
-}
-
-/*
- * try_recursive_limit_pushdown
- *		Check if the input path is an outer join that can benefit from
- *		recursive LIMIT pushdown optimization.
- *
- * This function examines the input path and if it's an outer join path,
- * it tries to create an optimized version with LIMIT pushdown applied
- * recursively to the preserved side.
- */
-static Path *
-try_recursive_limit_pushdown(PlannerInfo *root,
-							 RelOptInfo *rel,
-							 Path *base_path)
-{
-	JoinPath   *jpath;
-	RelOptInfo *preserved_rel;
-	RelOptInfo *other_rel;
-	Path	   *preserved_path;
-	Path	   *other_path;
-	JoinType	jointype;
-	Query	   *parse = root->parse;
-	ListCell   *sc;
-	ListCell   *lc;
-	bool		can_pushdown = true;
-	bool		mergejoin_allowed = true;
-	Bitmapset  *preserved_relids;
-	Path	   *recursive_preserved_path;
-	Path	   *limited_preserved_path;
-	Path	   *optimized_path = NULL;
-	SpecialJoinInfo *found_sjinfo = NULL;
-	JoinPathExtraData extra;
-
-	/* Only consider join paths for recursive optimization */
-	if (!IsA(base_path, NestPath) && !IsA(base_path, MergePath) && !IsA(base_path, HashPath))
-		return NULL;
-
-	jpath = (JoinPath *) base_path;
-	jointype = jpath->jointype;
-
-	/* Only apply to outer joins */
-	if (jointype != JOIN_LEFT && jointype != JOIN_RIGHT)
-		return NULL;
-
-	elog(DEBUG1, "Trying recursive LIMIT pushdown for %s join", 
-		 jointype == JOIN_LEFT ? "LEFT" : "RIGHT");
-
-	/* Determine which relation is preserved in this outer join */
-	if (jointype == JOIN_LEFT)
-	{
-		preserved_rel = jpath->outerjoinpath->parent;
-		other_rel = jpath->innerjoinpath->parent;
-		preserved_path = jpath->outerjoinpath;
-		other_path = jpath->innerjoinpath;
-		preserved_relids = preserved_rel->relids;
-	}
-	else /* JOIN_RIGHT */
-	{
-		preserved_rel = jpath->innerjoinpath->parent;
-		other_rel = jpath->outerjoinpath->parent;
-		preserved_path = jpath->innerjoinpath;
-		other_path = jpath->outerjoinpath;
-		preserved_relids = preserved_rel->relids;
-	}
-
-	/*
-	 * Check if all ORDER BY expressions reference only the preserved relation.
-	 * This is the same check as in the main optimization function.
-	 */
-	foreach(sc, parse->sortClause)
-	{
-		SortGroupClause *sortcl = (SortGroupClause *) lfirst(sc);
-		TargetEntry *tle;
-		Bitmapset  *expr_relids;
-
-		/* Get the target entry for this sort group reference */
-		tle = get_sortgroupref_tle(sortcl->tleSortGroupRef, parse->targetList);
-		if (!tle)
-		{
-			can_pushdown = false;
-			break;
-		}
-
-		/* Check which relations this expression references */
-		expr_relids = pull_varnos(root, (Node *) tle->expr);
-		if (!bms_is_subset(expr_relids, preserved_relids))
-		{
-			can_pushdown = false;
-			bms_free(expr_relids);
-			break;
-		}
-		bms_free(expr_relids);
-	}
-
-	if (!can_pushdown)
-	{
-		elog(DEBUG1, "Recursive pushdown not possible: ORDER BY expressions not suitable");
-		return NULL;
-	}
-
-	/* Recursively try to optimize the preserved path */
-	recursive_preserved_path = try_recursive_limit_pushdown(root, preserved_rel, preserved_path);
-	if (recursive_preserved_path)
-		preserved_path = recursive_preserved_path;
-
-	/* Create a limited version of the preserved relation path */
-	limited_preserved_path = create_limited_path_for_relation(root, preserved_rel, preserved_path);
-	if (!limited_preserved_path)
-	{
-		elog(DEBUG1, "Failed to create limited path for recursive optimization");
-		return NULL;
-	}
-
-	/* Create a new optimized join path */
-	/* First, find the SpecialJoinInfo for this join */
-	
-	foreach(lc, root->join_info_list)
-	{
-		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
-		
-		/* Check if this sjinfo matches our join */
-		if (bms_equal(sjinfo->syn_righthand, other_rel->relids) &&
-			sjinfo->jointype == jointype)
-		{
-			found_sjinfo = sjinfo;
-			break;
-		}
-	}
-
-	/* Populate JoinPathExtraData using the shared function */
-	if (jointype == JOIN_LEFT)
-	{
-		/* LEFT JOIN: preserved=outer, other=inner */
-		populate_joinpath_extra_data(root, rel, preserved_rel, other_rel,
-									 found_sjinfo, jointype, 
-									 jpath->joinrestrictinfo, &extra,
-									 &mergejoin_allowed);
-	}
-	else /* JOIN_RIGHT */
-	{
-		/* RIGHT JOIN: other=outer, preserved=inner */
-		populate_joinpath_extra_data(root, rel, other_rel, preserved_rel,
-									 found_sjinfo, jointype,
-									 jpath->joinrestrictinfo, &extra,
-									 &mergejoin_allowed);
-	}
-
-	/* Create a new optimized join path - for recursive optimization, prefer nested loop */
-	if (IsA(base_path, NestPath))
-	{
-		optimized_path = create_optimized_nestloop_path(root, rel, jointype,
-														limited_preserved_path, other_path,
-														preserved_rel, other_rel, &extra);
-	}
-	else if (IsA(base_path, MergePath))
-	{
-		/* Try nested loop first for recursive optimization to avoid clause complexity */
-		optimized_path = create_optimized_nestloop_path(root, rel, jointype,
-														limited_preserved_path, other_path,
-														preserved_rel, other_rel, &extra);
-		
-		/* If nested loop fails, fall back to merge join */
-		if (!optimized_path)
-		{
-			optimized_path = create_optimized_mergejoin_path(root, rel, jointype,
-															 limited_preserved_path, other_path,
-															 preserved_rel, other_rel, &extra,
-															 (MergePath *) base_path);
-		}
-	}
-	else if (IsA(base_path, HashPath))
-	{
-		/* Try nested loop first for recursive optimization to avoid clause complexity */
-		optimized_path = create_optimized_nestloop_path(root, rel, jointype,
-														limited_preserved_path, other_path,
-														preserved_rel, other_rel, &extra);
-		
-		/* Skip hash join in recursive optimization to avoid assertion failures */
-		/* The original hash join approach is complex when dealing with recursive clause rebuilding */
-		elog(DEBUG1, "Skipping hash join in recursive optimization to avoid clause complexity");
-	}
-
-	if (optimized_path)
-	{
-		elog(DEBUG1, "Successfully created recursive optimized path");
-		return optimized_path;
-	}
-
-	return NULL;
 }

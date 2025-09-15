@@ -20,6 +20,7 @@
  */
 #include "postgres.h"
 
+#include "nodes/parsenodes.h"
 #include "optimizer/appendinfo.h"
 #include "optimizer/clauses.h"
 #include "optimizer/optimizer.h"
@@ -28,6 +29,14 @@
 #include "optimizer/paths.h"
 #include "optimizer/placeholder.h"
 #include "optimizer/planmain.h"
+#include "optimizer/tlist.h"
+
+/* Static function declarations */
+static void try_outer_join_limit_pushdown(PlannerInfo *root);
+static void analyze_jointree_for_limit_pushdown(PlannerInfo *root, Node *jtnode);
+static void attempt_limit_pushdown_for_outer_join(PlannerInfo *root, JoinExpr *join);
+static bool can_pushdown_sort_expression(PlannerInfo *root, Node *expr, Node *preserved_side);
+static void create_limited_subquery_for_preserved_side(PlannerInfo *root, JoinExpr *join, Node *preserved_side);
 
 
 /*
@@ -275,6 +284,11 @@ query_planner(PlannerInfo *root,
 	distribute_row_identity_vars(root);
 
 	/*
+	 * Check if we can push down ORDER BY LIMIT to outer join relations
+	 */
+	try_outer_join_limit_pushdown(root);
+
+	/*
 	 * Ready to do the primary planning.
 	 */
 	final_rel = make_one_rel(root, joinlist);
@@ -285,4 +299,176 @@ query_planner(PlannerInfo *root,
 		elog(ERROR, "failed to construct the join relation");
 
 	return final_rel;
+}
+
+/*
+ * try_outer_join_limit_pushdown
+ *	  Attempt to push down ORDER BY LIMIT to outer join relations
+ *
+ * This function analyzes the query to see if we can push LIMIT and ORDER BY
+ * clauses down to the preserved side of outer joins. This optimization can
+ * significantly improve performance by reducing the number of rows that need
+ * to be processed in the join.
+ */
+static void
+try_outer_join_limit_pushdown(PlannerInfo *root)
+{
+	Query	   *parse = root->parse;
+	
+	/* Only apply if we have both ORDER BY and LIMIT */
+	if (!parse->sortClause || !parse->limitCount)
+		return;
+		
+	/* Don't apply for set operations */
+	if (parse->setOperations)
+		return;
+		
+	/* Don't apply if we have OFFSET without LIMIT optimization */
+	if (parse->limitOffset && !parse->limitCount)
+		return;
+		
+	/* Don't apply if we have grouping or aggregation */
+	if (parse->groupClause || parse->hasAggs || parse->havingQual)
+		return;
+		
+	/* Don't apply if we have window functions */
+	if (parse->windowClause || parse->hasWindowFuncs)
+		return;
+		
+	/* Don't apply if we have DISTINCT */
+	if (parse->distinctClause)
+		return;
+
+	/*
+	 * Analyze the join tree to see if we can push down the limit.
+	 * We'll walk the jointree recursively to find outer joins where
+	 * the ORDER BY references only the preserved side.
+	 */
+	analyze_jointree_for_limit_pushdown(root, (Node *) parse->jointree);
+}
+
+/*
+ * analyze_jointree_for_limit_pushdown
+ *	  Recursively analyze the jointree to find opportunities for LIMIT pushdown
+ */
+static void
+analyze_jointree_for_limit_pushdown(PlannerInfo *root, Node *jtnode)
+{
+	if (jtnode == NULL)
+		return;
+		
+	if (IsA(jtnode, RangeTblRef))
+	{
+		/* Base relation - nothing to do */
+		return;
+	}
+	else if (IsA(jtnode, FromExpr))
+	{
+		FromExpr   *f = (FromExpr *) jtnode;
+		ListCell   *l;
+		
+		/* Recursively process all items in the FROM list */
+		foreach(l, f->fromlist)
+		{
+			analyze_jointree_for_limit_pushdown(root, lfirst(l));
+		}
+	}
+	else if (IsA(jtnode, JoinExpr))
+	{
+		JoinExpr   *j = (JoinExpr *) jtnode;
+		
+		/* Check if this is an outer join where we can push down LIMIT */
+		if (j->jointype == JOIN_LEFT || j->jointype == JOIN_RIGHT)
+		{
+			attempt_limit_pushdown_for_outer_join(root, j);
+		}
+		
+		/* Recursively process left and right subtrees */
+		analyze_jointree_for_limit_pushdown(root, j->larg);
+		analyze_jointree_for_limit_pushdown(root, j->rarg);
+	}
+}
+
+/*
+ * attempt_limit_pushdown_for_outer_join
+ *	  Try to push LIMIT down to the preserved side of an outer join
+ */
+static void
+attempt_limit_pushdown_for_outer_join(PlannerInfo *root, JoinExpr *join)
+{
+	Query	   *parse = root->parse;
+	Node	   *preserved_side;
+	bool		can_pushdown = true;
+	ListCell   *lc;
+	
+	/* Determine which side is preserved */
+	if (join->jointype == JOIN_LEFT)
+		preserved_side = join->larg;
+	else /* JOIN_RIGHT */
+		preserved_side = join->rarg;
+		
+	/*
+	 * Check if ORDER BY clauses reference only columns from the preserved side.
+	 * If any ORDER BY expression references the non-preserved side, we cannot
+	 * push down the limit.
+	 */
+	foreach(lc, parse->sortClause)
+	{
+		SortGroupClause *sortcl = (SortGroupClause *) lfirst(lc);
+		TargetEntry *tle = get_sortgroupclause_tle(sortcl, parse->targetList);
+		
+		if (!can_pushdown_sort_expression(root, (Node *) tle->expr, preserved_side))
+		{
+			can_pushdown = false;
+			break;
+		}
+	}
+	
+	if (can_pushdown)
+	{
+		/* 
+		 * We can push down the LIMIT. Create a modified subquery for the
+		 * preserved side that includes the ORDER BY and LIMIT.
+		 */
+		create_limited_subquery_for_preserved_side(root, join, preserved_side);
+	}
+}
+
+/*
+ * can_pushdown_sort_expression
+ *	  Check if a sort expression can be pushed down to the preserved side
+ */
+static bool
+can_pushdown_sort_expression(PlannerInfo *root, Node *expr, Node *preserved_side)
+{
+	/*
+	 * For now, implement a simple check: we can pushdown if the expression
+	 * only references Vars that come from the preserved side.
+	 * 
+	 * TODO: This is a simplified implementation. A full implementation would
+	 * need to analyze the preserved_side node to determine which relations
+	 * it contains and check if the expression only references those relations.
+	 */
+	return true; /* Placeholder - always allow for now */
+}
+
+/*
+ * create_limited_subquery_for_preserved_side
+ *	  Create a subquery with LIMIT applied to the preserved side
+ */
+static void
+create_limited_subquery_for_preserved_side(PlannerInfo *root, JoinExpr *join, Node *preserved_side)
+{
+	/*
+	 * TODO: Implement the actual subquery creation logic.
+	 * This would involve:
+	 * 1. Creating a new Query node for the preserved side
+	 * 2. Adding the appropriate ORDER BY and LIMIT clauses
+	 * 3. Modifying the join tree to use the new subquery
+	 * 
+	 * For now, this is a placeholder that logs the attempt.
+	 */
+	elog(DEBUG1, "Would push down LIMIT to %s side of %s join",
+		 join->jointype == JOIN_LEFT ? "left" : "right",
+		 join->jointype == JOIN_LEFT ? "LEFT" : "RIGHT");
 }

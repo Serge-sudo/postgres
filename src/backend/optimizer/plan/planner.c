@@ -141,8 +141,6 @@ static List *preprocess_groupclause(PlannerInfo *root, List *force);
 static List *extract_rollup_sets(List *groupingSets);
 static List *reorder_grouping_sets(List *groupingSets, List *sortclause);
 static void standard_qp_callback(PlannerInfo *root, void *extra);
-static bool can_pushdown_outer_join_limit(PlannerInfo *root);
-static void setup_outer_join_limit_pushdown(PlannerInfo *root);
 static double get_number_of_groups(PlannerInfo *root,
 								   double path_rows,
 								   grouping_sets_data *gd,
@@ -1501,13 +1499,6 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 			root->limit_tuples = -1.0;
 		else
 			root->limit_tuples = limit_tuples;
-
-		/*
-		 * Check if ORDER BY ... LIMIT can be pushed down in outer joins
-		 * for optimization. This analysis helps inform later join planning.
-		 */
-		if (can_pushdown_outer_join_limit(root))
-			setup_outer_join_limit_pushdown(root);
 
 		/* Set up data needed by standard_qp_callback */
 		qp_extra.activeWindows = activeWindows;
@@ -8144,157 +8135,4 @@ generate_setop_child_grouplist(SetOperationStmt *op, List *targetlist)
 	Assert(ct == NULL);
 
 	return grouplist;
-}
-
-/*
- * can_pushdown_outer_join_limit
- *		Check if ORDER BY ... LIMIT can be pushed down in an outer join
- *
- * This function determines if we can push down ORDER BY ... LIMIT
- * to the preserved side of an outer join for optimization.
- *
- * Requirements:
- * 1. Query has LIMIT clause
- * 2. Query has ORDER BY clause  
- * 3. Query involves outer joins (LEFT or RIGHT)
- * 4. ORDER BY references only columns from the preserved side
- *
- * Returns true if pushdown optimization is applicable.
- */
-static bool
-can_pushdown_outer_join_limit(PlannerInfo *root)
-{
-	Query	   *parse = root->parse;
-	ListCell   *lc;
-
-	elog(DEBUG1, "Checking if can pushdown outer join limit");
-
-	/* Must have both ORDER BY and LIMIT */
-	if (!parse->sortClause || (!parse->limitCount && !parse->limitOffset))
-	{
-		elog(DEBUG1, "No ORDER BY or LIMIT clause found");
-		return false;
-	}
-
-	/* Must have more than one relation in FROM clause for joins */
-	if (list_length(parse->rtable) < 2)
-	{
-		elog(DEBUG1, "Less than 2 relations in FROM clause");
-		return false;
-	}
-
-	/* Look for outer joins in the join info list */
-	foreach(lc, root->join_info_list)
-	{
-		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
-		
-		/* Check for LEFT or RIGHT outer joins */
-		if (sjinfo->jointype == JOIN_LEFT || sjinfo->jointype == JOIN_RIGHT)
-		{
-			/* 
-			 * For now, return true if we find any outer join.
-			 * More sophisticated analysis of ORDER BY columns vs.
-			 * preserved side will be done in setup function.
-			 */
-			elog(DEBUG1, "Found outer join, can attempt pushdown optimization");
-			return true;
-		}
-	}
-
-	elog(DEBUG1, "No outer joins found");
-	return false;
-}
-
-/*
- * setup_outer_join_limit_pushdown
- *		Set up information needed for outer join LIMIT pushdown optimization
- *
- * This function analyzes the query to determine if and how ORDER BY ... LIMIT
- * can be pushed down to the preserved side of outer joins.
- * 
- * For LEFT OUTER JOIN: preserved side is the left relation
- * For RIGHT OUTER JOIN: preserved side is the right relation
- *
- * The optimization works by:
- * 1. Identifying which relations are on the preserved side
- * 2. Checking if ORDER BY references only preserved side columns
- * 3. Setting up planning hints to prefer this optimization
- */
-static void
-setup_outer_join_limit_pushdown(PlannerInfo *root)
-{
-	Query	   *parse = root->parse;
-	ListCell   *lc;
-	ListCell   *sc;
-	Bitmapset  *preserved_relids = NULL;
-	bool		can_pushdown = true;
-
-	/* 
-	 * Find all relations that are on the preserved side of outer joins.
-	 * For LEFT JOIN: left side is preserved
-	 * For RIGHT JOIN: right side is preserved
-	 */
-	foreach(lc, root->join_info_list)
-	{
-		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
-		
-		if (sjinfo->jointype == JOIN_LEFT)
-		{
-			/* Left side is preserved in LEFT JOIN */
-			preserved_relids = bms_union(preserved_relids, sjinfo->min_lefthand);
-		}
-		else if (sjinfo->jointype == JOIN_RIGHT)
-		{
-			/* Right side is preserved in RIGHT JOIN */
-			preserved_relids = bms_union(preserved_relids, sjinfo->min_righthand);
-		}
-	}
-
-	/* If no preserved relations found, optimization not applicable */
-	if (bms_is_empty(preserved_relids))
-	{
-		bms_free(preserved_relids);
-		return;
-	}
-
-	/*
-	 * Check if all ORDER BY expressions reference only columns from
-	 * the preserved side relations.
-	 */
-	foreach(sc, parse->sortClause)
-	{
-		SortGroupClause *sortcl = (SortGroupClause *) lfirst(sc);
-		TargetEntry *tle = get_sortgroupref_tle(sortcl->tleSortGroupRef, 
-												parse->targetList);
-		Bitmapset  *expr_relids;
-
-		/* Get all relation IDs referenced in this sort expression */
-		expr_relids = pull_varnos(root, (Node *) tle->expr);
-
-		/* Check if expression references only preserved relations */
-		if (!bms_is_subset(expr_relids, preserved_relids))
-		{
-			can_pushdown = false;
-			bms_free(expr_relids);
-			break;
-		}
-		bms_free(expr_relids);
-	}
-
-	bms_free(preserved_relids);
-
-	/*
-	 * If pushdown is feasible, we could set additional planning hints here.
-	 * For now, we just make a note that this optimization was considered.
-	 * The actual optimization will be implemented in the join path generation.
-	 */
-	if (can_pushdown)
-	{
-		/* 
-		 * The optimization will be detected during join path generation
-		 * by checking the conditions again with the actual join structure.
-		 * For now, we rely on the existing limit_tuples being set.
-		 */
-		elog(DEBUG1, "Outer join ORDER BY LIMIT pushdown may be applicable");
-	}
 }
