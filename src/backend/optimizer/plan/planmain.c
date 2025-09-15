@@ -33,6 +33,7 @@
 #include "optimizer/placeholder.h"
 #include "optimizer/planmain.h"
 #include "optimizer/tlist.h"
+#include "utils/lsyscache.h"
 
 /* Static function declarations */
 static void try_outer_join_limit_pushdown(PlannerInfo *root);
@@ -72,6 +73,8 @@ query_planner(PlannerInfo *root,
 	Query	   *parse = root->parse;
 	List	   *joinlist;
 	RelOptInfo *final_rel;
+
+	elog(LOG, "query_planner: Starting for command type %d", parse->commandType);
 
 	/*
 	 * Init planner lists to empty.
@@ -321,33 +324,63 @@ try_outer_join_limit_pushdown(PlannerInfo *root)
 {
 	Query	   *parse = root->parse;
 	
+	elog(LOG, "try_outer_join_limit_pushdown: Starting optimization check");
+	elog(LOG, "try_outer_join_limit_pushdown: Checking basic conditions");
+	elog(LOG, "try_outer_join_limit_pushdown: sortClause=%p, limitCount=%p", 
+		 parse->sortClause, parse->limitCount);
+	
 	/* Check if the optimization is enabled */
 	if (!enable_outer_join_limit_pushdown)
+	{
+		elog(LOG, "try_outer_join_limit_pushdown: Optimization disabled");
 		return;
+	}
 	
 	/* Only apply if we have both ORDER BY and LIMIT */
 	if (!parse->sortClause || !parse->limitCount)
+	{
+		elog(LOG, "try_outer_join_limit_pushdown: Missing ORDER BY (%s) or LIMIT (%s)", 
+			 parse->sortClause ? "present" : "missing",
+			 parse->limitCount ? "present" : "missing");
 		return;
+	}
 		
 	/* Don't apply for set operations */
 	if (parse->setOperations)
+	{
+		elog(DEBUG1, "try_outer_join_limit_pushdown: Set operations present");
 		return;
+	}
 		
 	/* Don't apply if we have OFFSET without LIMIT optimization */
 	if (parse->limitOffset && !parse->limitCount)
+	{
+		elog(DEBUG1, "try_outer_join_limit_pushdown: OFFSET without LIMIT");
 		return;
+	}
 		
 	/* Don't apply if we have grouping or aggregation */
 	if (parse->groupClause || parse->hasAggs || parse->havingQual)
+	{
+		elog(DEBUG1, "try_outer_join_limit_pushdown: Grouping or aggregation present");
 		return;
+	}
 		
 	/* Don't apply if we have window functions */
 	if (parse->windowClause || parse->hasWindowFuncs)
+	{
+		elog(DEBUG1, "try_outer_join_limit_pushdown: Window functions present");
 		return;
+	}
 		
 	/* Don't apply if we have DISTINCT */
 	if (parse->distinctClause)
+	{
+		elog(DEBUG1, "try_outer_join_limit_pushdown: DISTINCT clause present");
 		return;
+	}
+
+	elog(DEBUG1, "try_outer_join_limit_pushdown: All conditions met, analyzing jointree");
 
 	/*
 	 * Analyze the join tree to see if we can push down the limit.
@@ -367,15 +400,21 @@ analyze_jointree_for_limit_pushdown(PlannerInfo *root, Node *jtnode)
 	if (jtnode == NULL)
 		return;
 		
+	elog(DEBUG1, "analyze_jointree_for_limit_pushdown: Analyzing node type %d", nodeTag(jtnode));
+		
 	if (IsA(jtnode, RangeTblRef))
 	{
 		/* Base relation - nothing to do */
+		elog(DEBUG1, "analyze_jointree_for_limit_pushdown: Found base relation");
 		return;
 	}
 	else if (IsA(jtnode, FromExpr))
 	{
 		FromExpr   *f = (FromExpr *) jtnode;
 		ListCell   *l;
+		
+		elog(DEBUG1, "analyze_jointree_for_limit_pushdown: Found FromExpr with %d items", 
+			 list_length(f->fromlist));
 		
 		/* Recursively process all items in the FROM list */
 		foreach(l, f->fromlist)
@@ -387,9 +426,12 @@ analyze_jointree_for_limit_pushdown(PlannerInfo *root, Node *jtnode)
 	{
 		JoinExpr   *j = (JoinExpr *) jtnode;
 		
+		elog(DEBUG1, "analyze_jointree_for_limit_pushdown: Found JoinExpr with type %d", j->jointype);
+		
 		/* Check if this is an outer join where we can push down LIMIT */
 		if (j->jointype == JOIN_LEFT || j->jointype == JOIN_RIGHT)
 		{
+			elog(DEBUG1, "analyze_jointree_for_limit_pushdown: Found outer join, attempting pushdown");
 			attempt_limit_pushdown_for_outer_join(root, j);
 		}
 		
@@ -411,11 +453,17 @@ attempt_limit_pushdown_for_outer_join(PlannerInfo *root, JoinExpr *join)
 	bool		can_pushdown = true;
 	ListCell   *lc;
 	
+	elog(DEBUG1, "attempt_limit_pushdown_for_outer_join: Checking %s join", 
+		 join->jointype == JOIN_LEFT ? "LEFT" : "RIGHT");
+	
 	/* Determine which side is preserved */
 	if (join->jointype == JOIN_LEFT)
 		preserved_side = join->larg;
 	else /* JOIN_RIGHT */
 		preserved_side = join->rarg;
+		
+	elog(DEBUG1, "attempt_limit_pushdown_for_outer_join: Preserved side node type %d", 
+		 nodeTag(preserved_side));
 		
 	/*
 	 * Check if ORDER BY clauses reference only columns from the preserved side.
@@ -427,8 +475,11 @@ attempt_limit_pushdown_for_outer_join(PlannerInfo *root, JoinExpr *join)
 		SortGroupClause *sortcl = (SortGroupClause *) lfirst(lc);
 		TargetEntry *tle = get_sortgroupclause_tle(sortcl, parse->targetList);
 		
+		elog(DEBUG1, "attempt_limit_pushdown_for_outer_join: Checking sort expression");
+		
 		if (!can_pushdown_sort_expression(root, (Node *) tle->expr, preserved_side))
 		{
+			elog(DEBUG1, "attempt_limit_pushdown_for_outer_join: Cannot pushdown - sort expression references non-preserved side");
 			can_pushdown = false;
 			break;
 		}
@@ -436,11 +487,16 @@ attempt_limit_pushdown_for_outer_join(PlannerInfo *root, JoinExpr *join)
 	
 	if (can_pushdown)
 	{
+		elog(DEBUG1, "attempt_limit_pushdown_for_outer_join: Can pushdown - creating subquery");
 		/* 
 		 * We can push down the LIMIT. Create a modified subquery for the
 		 * preserved side that includes the ORDER BY and LIMIT.
 		 */
 		create_limited_subquery_for_preserved_side(root, join, preserved_side);
+	}
+	else
+	{
+		elog(DEBUG1, "attempt_limit_pushdown_for_outer_join: Cannot pushdown");
 	}
 }
 
@@ -553,6 +609,16 @@ create_limited_subquery_for_preserved_side(PlannerInfo *root, JoinExpr *join, No
 	RangeTblEntry *rte;
 	RangeTblRef *rtr;
 	Index		subquery_rtindex;
+	Relids		preserved_relids;
+	ListCell   *lc;
+	List	   *preserved_targetlist = NIL;
+	List	   *preserved_sortclause = NIL;
+	int			tle_index = 1;
+	
+	/* Get the set of relation IDs from the preserved side */
+	preserved_relids = get_relids_from_jointree_node(preserved_side);
+	if (preserved_relids == NULL)
+		return;
 	
 	/*
 	 * Create a new subquery that includes the preserved side with
@@ -561,35 +627,78 @@ create_limited_subquery_for_preserved_side(PlannerInfo *root, JoinExpr *join, No
 	subquery = makeNode(Query);
 	subquery->commandType = CMD_SELECT;
 	subquery->querySource = QSRC_ORIGINAL;
+	subquery->canSetTag = false;
 	
-	/* Copy the relevant clauses from the main query */
-	subquery->sortClause = copyObject(parse->sortClause);
+	/* Copy the entire range table for simplicity */
+	subquery->rtable = copyObject(parse->rtable);
+	
+	/*
+	 * Create the subquery's target list with only columns from preserved relations.
+	 */
+	foreach(lc, parse->targetList)
+	{
+		TargetEntry *orig_tle = (TargetEntry *) lfirst(lc);
+		Relids expr_relids = pull_varnos(root, (Node *) orig_tle->expr);
+		
+		/* Include this target entry if it only references preserved relations */
+		if (bms_is_subset(expr_relids, preserved_relids))
+		{
+			TargetEntry *new_tle = copyObject(orig_tle);
+			new_tle->resno = tle_index++;
+			
+			/* Set up sort group reference if needed */
+			if (orig_tle->ressortgroupref > 0)
+				new_tle->ressortgroupref = orig_tle->ressortgroupref;
+			
+			preserved_targetlist = lappend(preserved_targetlist, new_tle);
+		}
+	}
+	
+	/* If no target entries were preserved, create a simple one */
+	if (preserved_targetlist == NIL)
+	{
+		TargetEntry *dummy_tle = makeNode(TargetEntry);
+		Const *dummy_const = makeConst(INT4OID, -1, InvalidOid, 4, 
+									   Int32GetDatum(1), false, true);
+		dummy_tle->expr = (Expr *) dummy_const;
+		dummy_tle->resno = 1;
+		dummy_tle->resname = pstrdup("dummy");
+		dummy_tle->ressortgroupref = 0;
+		dummy_tle->resorigtbl = InvalidOid;
+		dummy_tle->resorigcol = 0;
+		dummy_tle->resjunk = false;
+		preserved_targetlist = list_make1(dummy_tle);
+	}
+	
+	subquery->targetList = preserved_targetlist;
+	
+	/*
+	 * Copy the ORDER BY clause, keeping only sort clauses that reference preserved relations.
+	 */
+	foreach(lc, parse->sortClause)
+	{
+		SortGroupClause *orig_sortcl = (SortGroupClause *) lfirst(lc);
+		TargetEntry *orig_tle = get_sortgroupclause_tle(orig_sortcl, parse->targetList);
+		
+		if (can_pushdown_sort_expression(root, (Node *) orig_tle->expr, preserved_side))
+		{
+			SortGroupClause *new_sortcl = copyObject(orig_sortcl);
+			preserved_sortclause = lappend(preserved_sortclause, new_sortcl);
+		}
+	}
+	subquery->sortClause = preserved_sortclause;
+	
+	/* Copy LIMIT and OFFSET to the subquery */
 	subquery->limitCount = copyObject(parse->limitCount);
 	subquery->limitOffset = copyObject(parse->limitOffset);
 	subquery->limitOption = parse->limitOption;
 	
 	/*
-	 * Set up the subquery's FROM clause to include only the preserved side.
-	 * We need to copy the relevant range table entries and create a new jointree.
+	 * Set up the subquery's FROM clause with the preserved side
 	 */
-	subquery->rtable = NIL;
 	subquery->jointree = makeNode(FromExpr);
 	subquery->jointree->fromlist = list_make1(copyObject(preserved_side));
 	subquery->jointree->quals = NULL;
-	
-	/*
-	 * Copy relevant range table entries from the main query.
-	 * This is a simplified approach - we copy all entries since we need to maintain
-	 * the same rtindex values that are referenced in the preserved_side.
-	 */
-	subquery->rtable = copyObject(parse->rtable);
-	
-	/*
-	 * Create a simple target list that includes all columns from the preserved side.
-	 * For now, we'll use a placeholder that selects all columns.
-	 * TODO: This should be refined to only include columns actually needed.
-	 */
-	subquery->targetList = copyObject(parse->targetList);
 	
 	/*
 	 * Create a range table entry for this subquery
@@ -601,6 +710,15 @@ create_limited_subquery_for_preserved_side(PlannerInfo *root, JoinExpr *join, No
 	rte->lateral = false;
 	rte->inh = false;
 	rte->inFromCl = true;
+	
+	/* Set up column names for the subquery RTE */
+	rte->eref = makeAlias("limited_preserved", NIL);
+	foreach(lc, preserved_targetlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+		char *colname = tle->resname ? tle->resname : "?column?";
+		rte->eref->colnames = lappend(rte->eref->colnames, makeString(pstrdup(colname)));
+	}
 	
 	/* Add the RTE to the range table and get its index */
 	root->parse->rtable = lappend(root->parse->rtable, rte);
@@ -620,19 +738,15 @@ create_limited_subquery_for_preserved_side(PlannerInfo *root, JoinExpr *join, No
 		join->rarg = (Node *) rtr;
 	
 	/*
-	 * Remove the ORDER BY and LIMIT from the main query since we've pushed
-	 * them down to the subquery.
+	 * Important: Keep the ORDER BY and LIMIT in the main query as well, because after 
+	 * the join the number of rows may increase if there are multiple matches for each row.
+	 * This ensures we still get the correct final result.
+	 * 
+	 * The optimization works by limiting the input to the join, but we still need
+	 * the final LIMIT to get the correct number of output rows.
 	 */
-	parse->sortClause = NIL;
-	parse->limitCount = NULL;
-	parse->limitOffset = NULL;
 	
-	/*
-	 * TODO: We need to properly set up the subquery's FROM clause and target list.
-	 * This would involve analyzing the preserved_side node and creating appropriate
-	 * entries in the subquery. For now, we log that the optimization would be applied.
-	 */
-	elog(DEBUG1, "Created limited subquery for %s side of %s join",
+	elog(DEBUG1, "Created limited subquery for %s side of %s join, keeping upper LIMIT",
 		 join->jointype == JOIN_LEFT ? "left" : "right",
 		 join->jointype == JOIN_LEFT ? "LEFT" : "RIGHT");
 }
