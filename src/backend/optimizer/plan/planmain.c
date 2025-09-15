@@ -569,6 +569,29 @@ create_limited_subquery_for_preserved_side(PlannerInfo *root, JoinExpr *join, No
 	subquery->limitOption = parse->limitOption;
 	
 	/*
+	 * Set up the subquery's FROM clause to include only the preserved side.
+	 * We need to copy the relevant range table entries and create a new jointree.
+	 */
+	subquery->rtable = NIL;
+	subquery->jointree = makeNode(FromExpr);
+	subquery->jointree->fromlist = list_make1(copyObject(preserved_side));
+	subquery->jointree->quals = NULL;
+	
+	/*
+	 * Copy relevant range table entries from the main query.
+	 * This is a simplified approach - we copy all entries since we need to maintain
+	 * the same rtindex values that are referenced in the preserved_side.
+	 */
+	subquery->rtable = copyObject(parse->rtable);
+	
+	/*
+	 * Create a simple target list that includes all columns from the preserved side.
+	 * For now, we'll use a placeholder that selects all columns.
+	 * TODO: This should be refined to only include columns actually needed.
+	 */
+	subquery->targetList = copyObject(parse->targetList);
+	
+	/*
 	 * Create a range table entry for this subquery
 	 */
 	rte = makeNode(RangeTblEntry);
