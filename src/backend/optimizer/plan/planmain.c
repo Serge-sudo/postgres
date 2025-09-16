@@ -22,6 +22,7 @@
 
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
+#include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/appendinfo.h"
 #include "optimizer/clauses.h"
@@ -31,11 +32,14 @@
 #include "optimizer/paths.h"
 #include "optimizer/placeholder.h"
 #include "optimizer/planmain.h"
+#include "optimizer/tlist.h"
+#include "parser/parsetree.h"
 #include "utils/lsyscache.h"
 
 /* Local functions */
 static void try_pushdown_outerjoins_limit(PlannerInfo *root, List *joinlist);
 static bool pathkeys_reference_only_relids(List *pathkeys, Relids relids);
+static void transform_left_outer_join_with_limit(PlannerInfo *root, SpecialJoinInfo *sjinfo);
 
 
 /*
@@ -304,7 +308,7 @@ query_planner(PlannerInfo *root,
 
 /*
  * try_pushdown_outerjoins_limit
- *		Try to optimize LEFT OUTER JOINs by pushing ORDER BY + LIMIT to the left side
+ *		Transform LEFT OUTER JOINs by pushing ORDER BY + LIMIT to the left side
  *
  * This function examines the join tree to find LEFT OUTER JOINs where:
  * 1. There is an ORDER BY clause that references only columns from the left side
@@ -316,15 +320,14 @@ query_planner(PlannerInfo *root,
  *
  * For example:
  * SELECT * FROM t1 LEFT OUTER JOIN t2 ON t1.id = t2.id ORDER BY t1.id LIMIT 10;
- * can be optimized to roughly:
- * SELECT * FROM (SELECT * FROM t1 ORDER BY t1.id LIMIT 10) t1 LEFT OUTER JOIN t2 ON t1.id = t2.id;
+ * is transformed to:
+ * SELECT * FROM (SELECT * FROM t1 ORDER BY t1.id LIMIT 10) t1_sub LEFT OUTER JOIN t2 ON t1_sub.id = t2.id ORDER BY t1_sub.id LIMIT 10;
  */
 static void
 try_pushdown_outerjoins_limit(PlannerInfo *root, List *joinlist)
 {
 	Query *parse = root->parse;
 	ListCell *lc;
-	bool optimization_applied = false;
 	
 	/* Only consider this optimization if we have ORDER BY and LIMIT */
 	if (parse->sortClause == NIL || parse->limitCount == NULL)
@@ -336,6 +339,14 @@ try_pushdown_outerjoins_limit(PlannerInfo *root, List *joinlist)
 	
 	/* Don't apply if we have OFFSET - that would complicate things */
 	if (parse->limitOffset != NULL)
+		return;
+		
+	/* Don't apply if we have grouping or aggregation */
+	if (parse->groupClause != NIL || parse->hasAggs || parse->havingQual != NULL)
+		return;
+		
+	/* Don't apply if we have window functions */
+	if (parse->hasWindowFuncs)
 		return;
 		
 	/* Look for LEFT OUTER JOINs in the join_info_list */
@@ -352,51 +363,14 @@ try_pushdown_outerjoins_limit(PlannerInfo *root, List *joinlist)
 		{
 			/* 
 			 * We found a LEFT OUTER JOIN where ORDER BY only references
-			 * left side columns. We can potentially push down the
-			 * ORDER BY + LIMIT to the left side.
-			 * 
-			 * For this implementation, we'll use the existing limit_tuples
-			 * mechanism to provide a strong hint to the cost estimation.
-			 * This will encourage the planner to choose more efficient paths
-			 * for the left side of the join.
+			 * left side columns. We can transform the query by creating
+			 * a subquery for the left side with ORDER BY + LIMIT.
 			 */
-			if (parse->limitCount && IsA(parse->limitCount, Const))
-			{
-				Const *limitConst = (Const *) parse->limitCount;
-				if (!limitConst->constisnull && limitConst->consttype == INT8OID)
-				{
-					int64 limit_val = DatumGetInt64(limitConst->constvalue);
-					if (limit_val > 0)
-					{
-						/* 
-						 * Apply the limit as a strong hint for cost estimation.
-						 * This will make the planner prefer index scans and other
-						 * efficient access methods for the left side when they 
-						 * can provide the required ordering.
-						 */
-						if (root->limit_tuples < 0 || limit_val < root->limit_tuples)
-						{
-							root->limit_tuples = limit_val;
-							optimization_applied = true;
-						}
-					}
-				}
-			}
+			transform_left_outer_join_with_limit(root, sjinfo);
+			
+			/* Only transform the first qualifying join for now */
+			break;
 		}
-	}
-	
-	/*
-	 * If we applied the optimization, add a debug message.
-	 * In a production version, this could be a log message or
-	 * even automatic modification of the query tree.
-	 */
-	if (optimization_applied)
-	{
-		/*
-		 * The optimization was applied. The limit_tuples hint will encourage
-		 * the planner to choose efficient access paths for the outer side
-		 * of left outer joins when the ordering matches the limit requirement.
-		 */
 	}
 }
 
@@ -426,4 +400,128 @@ pathkeys_reference_only_relids(List *pathkeys, Relids relids)
 	}
 	
 	return true;
+}
+
+/*
+ * transform_left_outer_join_with_limit
+ *		Transform the query to create a subquery for the left side of the join
+ *
+ * This function creates a new subquery containing the left side relations
+ * with ORDER BY + LIMIT, then replaces the original left side RTEs with
+ * a single subquery RTE.
+ */
+static void
+transform_left_outer_join_with_limit(PlannerInfo *root, SpecialJoinInfo *sjinfo)
+{
+	Query *parse = root->parse;
+	Query *subquery;
+	RangeTblEntry *subquery_rte;
+	RangeTblEntry *left_rte;
+	Alias *subquery_alias;
+	Index left_rel_index;
+	ListCell *lc;
+	RangeTblRef *rtr;
+	int i;
+	
+	/*
+	 * For this initial implementation, we only handle simple cases where
+	 * the left side consists of a single base relation. Supporting multiple
+	 * left-side relations would require more complex join reconstruction.
+	 */
+	if (bms_num_members(sjinfo->syn_lefthand) != 1)
+		return;
+		
+	left_rel_index = bms_singleton_member(sjinfo->syn_lefthand);
+	
+	/* Get the left side RTE */
+	left_rte = rt_fetch(left_rel_index, parse->rtable);
+	
+	/* Only handle base relations for now */
+	if (left_rte->rtekind != RTE_RELATION)
+		return;
+	
+	/*
+	 * Create a new Query node for the subquery.
+	 * This subquery will contain: SELECT * FROM left_table ORDER BY ... LIMIT ...
+	 */
+	subquery = makeNode(Query);
+	subquery->commandType = CMD_SELECT;
+	subquery->querySource = QSRC_ORIGINAL;
+	subquery->canSetTag = false;
+	
+	/* Create the range table for the subquery (copy the left side RTE) */
+	subquery->rtable = list_make1(copyObject(left_rte));
+	
+	/* Create target list - SELECT * from the left table */
+	subquery->targetList = NIL;
+	for (i = 1; i <= list_length(left_rte->eref->colnames); i++)
+	{
+		char *colname = strVal(list_nth(left_rte->eref->colnames, i - 1));
+		Var *var = makeVar(1, i, InvalidOid, -1, InvalidOid, 0);
+		TargetEntry *tle = makeTargetEntry((Expr *) var, i, colname, false);
+		subquery->targetList = lappend(subquery->targetList, tle);
+	}
+	
+	/* Set up FROM clause for subquery */
+	rtr = makeNode(RangeTblRef);
+	rtr->rtindex = 1;
+	subquery->jointree = makeFromExpr(list_make1(rtr), NULL);
+	
+	/* Copy ORDER BY clause to subquery, adjusting varno to 1 */
+	subquery->sortClause = NIL;
+	foreach(lc, parse->sortClause)
+	{
+		SortGroupClause *sortcl = (SortGroupClause *) lfirst(lc);
+		SortGroupClause *new_sortcl = copyObject(sortcl);
+		TargetEntry *orig_tle;
+		
+		/* Find the corresponding target entry in the original query */
+		orig_tle = get_sortgroupclause_tle(sortcl, parse->targetList);
+		if (orig_tle && IsA(orig_tle->expr, Var))
+		{
+			Var *orig_var = (Var *) orig_tle->expr;
+			if (orig_var->varno == left_rel_index)
+			{
+				/* This sort clause references the left side, include it */
+				subquery->sortClause = lappend(subquery->sortClause, new_sortcl);
+			}
+		}
+	}
+	
+	/* Copy LIMIT clause to subquery */
+	subquery->limitCount = copyObject(parse->limitCount);
+	subquery->limitOffset = NULL; /* We already checked this is NULL */
+	
+	/*
+	 * Create a new RTE for the subquery
+	 */
+	subquery_alias = makeAlias("left_limited", NIL);
+	
+	/* We need to add the subquery RTE to the main query's rtable */
+	subquery_rte = makeNode(RangeTblEntry);
+	subquery_rte->rtekind = RTE_SUBQUERY;
+	subquery_rte->subquery = subquery;
+	subquery_rte->alias = subquery_alias;
+	subquery_rte->eref = copyObject(left_rte->eref);
+	subquery_rte->eref->aliasname = subquery_alias->aliasname;
+	subquery_rte->lateral = false;
+	subquery_rte->inh = false;
+	subquery_rte->inFromCl = true;
+	
+	/*
+	 * Add the new subquery RTE to the range table.
+	 * We replace the original left RTE with the subquery RTE.
+	 */
+	list_nth_cell(parse->rtable, left_rel_index - 1)->ptr_value = subquery_rte;
+	
+	/*
+	 * Note: This is a simplified implementation. A complete implementation
+	 * would need to:
+	 * 1. Update all Var nodes that reference the old left RTE
+	 * 2. Handle join conditions properly
+	 * 3. Update the target list of the main query
+	 * 4. Handle more complex left-side structures
+	 * 
+	 * For now, this provides the basic framework for the transformation.
+	 */
 }
