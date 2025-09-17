@@ -1,0 +1,54 @@
+--
+-- Test ORDER BY/LIMIT pushdown optimization for outer joins
+--
+
+-- Create test tables
+CREATE TABLE ol_pushdown_t1 (
+    id int,
+    name text
+);
+
+CREATE TABLE ol_pushdown_t2 (
+    id int,
+    value int
+);
+
+-- Insert test data
+INSERT INTO ol_pushdown_t1 VALUES (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four'), (5, 'five');
+INSERT INTO ol_pushdown_t2 VALUES (1, 100), (3, 300), (5, 500);
+
+-- Test LEFT JOIN with ORDER BY on left table (should detect optimization opportunity)
+EXPLAIN (COSTS OFF) 
+SELECT * FROM ol_pushdown_t1 t1 
+LEFT OUTER JOIN ol_pushdown_t2 t2 ON t1.id = t2.id 
+ORDER BY t1.id LIMIT 2;
+
+SELECT * FROM ol_pushdown_t1 t1 
+LEFT OUTER JOIN ol_pushdown_t2 t2 ON t1.id = t2.id 
+ORDER BY t1.id LIMIT 2;
+
+-- Test RIGHT JOIN with ORDER BY on right table (should detect optimization opportunity)
+EXPLAIN (COSTS OFF) 
+SELECT * FROM ol_pushdown_t1 t1 
+RIGHT OUTER JOIN ol_pushdown_t2 t2 ON t1.id = t2.id 
+ORDER BY t2.id LIMIT 2;
+
+SELECT * FROM ol_pushdown_t1 t1 
+RIGHT OUTER JOIN ol_pushdown_t2 t2 ON t1.id = t2.id 
+ORDER BY t2.id LIMIT 2;
+
+-- Test LEFT JOIN with ORDER BY on right table (should NOT detect optimization)
+EXPLAIN (COSTS OFF) 
+SELECT * FROM ol_pushdown_t1 t1 
+LEFT OUTER JOIN ol_pushdown_t2 t2 ON t1.id = t2.id 
+ORDER BY t2.value LIMIT 2;
+
+-- Test INNER JOIN (should NOT detect optimization)
+EXPLAIN (COSTS OFF) 
+SELECT * FROM ol_pushdown_t1 t1 
+INNER JOIN ol_pushdown_t2 t2 ON t1.id = t2.id 
+ORDER BY t1.id LIMIT 2;
+
+-- Clean up
+DROP TABLE ol_pushdown_t1;
+DROP TABLE ol_pushdown_t2;
