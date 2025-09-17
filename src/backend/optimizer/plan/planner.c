@@ -133,6 +133,7 @@ static grouping_sets_data *preprocess_grouping_sets(PlannerInfo *root);
 static List *remap_to_groupclause_idx(List *groupClause, List *gsets,
 									  int *tleref_to_colnum_map);
 static void preprocess_rowmarks(PlannerInfo *root);
+static void optimize_outer_join_order_limit_pushdown(PlannerInfo *root);
 static double preprocess_limit(PlannerInfo *root,
 							   double tuple_fraction,
 							   int64 *offset_est, int64 *count_est);
@@ -1082,6 +1083,17 @@ subquery_planner(PlannerGlobal *glob, Query *parse, PlannerInfo *parent_root,
 	 */
 	if (hasResultRTEs || hasOuterJoins)
 		remove_useless_result_rtes(root);
+
+	/*
+	 * Try to push down ORDER BY and LIMIT to outer join sides when beneficial.
+	 * This optimization applies when:
+	 * 1. Query has ORDER BY and optionally LIMIT
+	 * 2. Main join is an outer join (LEFT/RIGHT/FULL)
+	 * 3. ORDER BY references only columns from the preserved side
+	 */
+	if (hasOuterJoins && parse->sortClause && !parse->groupClause &&
+		!parse->havingQual && !parse->setOperations && !parse->distinctClause)
+		optimize_outer_join_order_limit_pushdown(root);
 
 	/*
 	 * Do the main planning.
@@ -2416,6 +2428,178 @@ select_rowmark_type(RangeTblEntry *rte, LockClauseStrength strength)
 		}
 		elog(ERROR, "unrecognized LockClauseStrength %d", (int) strength);
 		return ROW_MARK_EXCLUSIVE;	/* keep compiler quiet */
+	}
+}
+
+/*
+ * optimize_outer_join_order_limit_pushdown
+ * 		Try to push ORDER BY and LIMIT clauses down to the appropriate side
+ * 		of outer joins when this can improve query performance.
+ *
+ * For LEFT OUTER JOIN, if ORDER BY references only left table columns,
+ * we can push ORDER BY (and LIMIT if present) to the left side.
+ * For RIGHT OUTER JOIN, if ORDER BY references only right table columns,
+ * we can push ORDER BY (and LIMIT) to the right side.
+ * This optimization preserves query semantics while potentially reducing
+ * the amount of data that needs to be processed in the join.
+ */
+static void
+optimize_outer_join_order_limit_pushdown(PlannerInfo *root)
+{
+	Query	   *parse = root->parse;
+	Node	   *jtnode;
+	JoinExpr   *j;
+	ListCell   *lc;
+	bool		can_pushdown = false;
+	bool		push_to_left = false;
+	int			left_varno = 0, right_varno = 0;
+
+	/* Only handle simple case: single join in FROM clause */
+	if (list_length(parse->jointree->fromlist) != 1)
+		return;
+
+	jtnode = (Node *) linitial(parse->jointree->fromlist);
+	if (!IsA(jtnode, JoinExpr))
+		return;
+
+	j = (JoinExpr *) jtnode;
+
+	/* Only handle LEFT and RIGHT outer joins */
+	if (j->jointype != JOIN_LEFT && j->jointype != JOIN_RIGHT)
+		return;
+
+	/* Get the base relation varnos for each side */
+	if (IsA(j->larg, RangeTblRef))
+		left_varno = ((RangeTblRef *) j->larg)->rtindex;
+	if (IsA(j->rarg, RangeTblRef))
+		right_varno = ((RangeTblRef *) j->rarg)->rtindex;
+
+	/* Only handle simple case where both sides are base relations */
+	if (left_varno == 0 || right_varno == 0)
+		return;
+
+	/*
+	 * Check if all ORDER BY expressions reference only one side of the join.
+	 * For LEFT JOIN, we can push to left side if ORDER BY uses only left table.
+	 * For RIGHT JOIN, we can push to right side if ORDER BY uses only right table.
+	 */
+	foreach(lc, parse->sortClause)
+	{
+		SortGroupClause *sortcl = lfirst_node(SortGroupClause, lc);
+		TargetEntry *tle = get_sortgroupref_tle(sortcl->tleSortGroupRef,
+												parse->targetList);
+		Relids		varnos = pull_varnos(root, (Node *) tle->expr);
+
+		/* Check if this ORDER BY expression references only one side */
+		if (j->jointype == JOIN_LEFT)
+		{
+			if (bms_is_subset(varnos, bms_make_singleton(left_varno)))
+			{
+				if (!can_pushdown)
+				{
+					can_pushdown = true;
+					push_to_left = true;
+				}
+				else if (!push_to_left)
+				{
+					/* Mixed references - can't optimize */
+					can_pushdown = false;
+					break;
+				}
+			}
+			else
+			{
+				/* References other tables - can't optimize */
+				can_pushdown = false;
+				break;
+			}
+		}
+		else if (j->jointype == JOIN_RIGHT)
+		{
+			if (bms_is_subset(varnos, bms_make_singleton(right_varno)))
+			{
+				if (!can_pushdown)
+				{
+					can_pushdown = true;
+					push_to_left = false;
+				}
+				else if (push_to_left)
+				{
+					/* Mixed references - can't optimize */
+					can_pushdown = false;
+					break;
+				}
+			}
+			else
+			{
+				/* References other tables - can't optimize */
+				can_pushdown = false;
+				break;
+			}
+		}
+	}
+
+	/*
+	 * If we can push down, create a subquery for the appropriate side
+	 * with the ORDER BY and LIMIT clauses moved down.
+	 */
+	if (can_pushdown)
+	{
+		RangeTblEntry *target_rte;
+		Query	   *subquery;
+		RangeTblEntry *new_rte;
+		int			target_varno = push_to_left ? left_varno : right_varno;
+
+		target_rte = rt_fetch(target_varno, parse->rtable);
+
+		/* Only optimize base relations, not already complex subqueries */
+		if (target_rte->rtekind != RTE_RELATION)
+			return;
+
+		/* Create a new subquery */
+		subquery = makeNode(Query);
+		subquery->commandType = CMD_SELECT;
+		subquery->querySource = QSRC_ORIGINAL;
+
+		/* Create target list for the subquery - simple SELECT * equivalent */
+		subquery->targetList = NIL;  /* Will be expanded later by the planner */
+
+		/* Set up range table with just this one relation */
+		subquery->rtable = list_make1(copyObject(target_rte));
+
+		/* Create a simple FROM clause */
+		subquery->jointree = makeFromExpr(list_make1(makeNode(RangeTblRef)), NULL);
+		((RangeTblRef *) linitial(subquery->jointree->fromlist))->rtindex = 1;
+
+		/* Move ORDER BY to subquery, adjusting variable references */
+		subquery->sortClause = copyObject(parse->sortClause);
+
+		/* Move LIMIT to subquery if present */
+		if (parse->limitCount)
+		{
+			subquery->limitCount = copyObject(parse->limitCount);
+			subquery->limitOffset = copyObject(parse->limitOffset);
+			subquery->limitOption = parse->limitOption;
+		}
+
+		/* Update the RTE to be a subquery */
+		new_rte = makeNode(RangeTblEntry);
+		new_rte->rtekind = RTE_SUBQUERY;
+		new_rte->subquery = subquery;
+		new_rte->alias = target_rte->alias ? copyObject(target_rte->alias) : makeAlias("optimized_subq", NIL);
+		new_rte->eref = copyObject(target_rte->eref);
+		new_rte->lateral = false;
+		new_rte->inh = false;
+		new_rte->inFromCl = target_rte->inFromCl;
+
+		/* Replace the old RTE */
+		list_nth_cell(parse->rtable, target_varno - 1)->ptr_value = new_rte;
+
+		/* Remove ORDER BY and LIMIT from main query since we pushed them down */
+		parse->sortClause = NIL;
+		parse->limitCount = NULL;
+		parse->limitOffset = NULL;
+		parse->limitOption = LIMIT_OPTION_COUNT;
 	}
 }
 
