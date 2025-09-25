@@ -271,6 +271,8 @@ extern PGDLLIMPORT char *backtrace_functions;
 
 extern PGDLLIMPORT int temp_file_limit;
 
+extern PGDLLIMPORT char *temp_oid_interval;
+
 extern PGDLLIMPORT int num_temp_buffers;
 
 extern PGDLLIMPORT char *cluster_name;

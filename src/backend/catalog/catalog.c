@@ -573,11 +573,20 @@ GetNewRelFileNumber(Oid reltablespace, Relation pg_class, char relpersistence)
 		CHECK_FOR_INTERRUPTS();
 
 		/* Generate the OID */
-		if (pg_class)
+		if (relpersistence == RELPERSISTENCE_TEMP)
+		{
+			/* Use temp OID allocation for temporary tables */
+			rlocator.locator.relNumber = GetNewTempObjectId();
+		}
+		else if (pg_class)
+		{
 			rlocator.locator.relNumber = GetNewOidWithIndex(pg_class, ClassOidIndexId,
 															Anum_pg_class_oid);
+		}
 		else
+		{
 			rlocator.locator.relNumber = GetNewObjectId();
+		}
 
 		/* Check for existing file of same name */
 		rpath = relpath(rlocator, MAIN_FORKNUM);

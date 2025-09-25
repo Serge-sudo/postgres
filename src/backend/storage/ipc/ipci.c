@@ -298,6 +298,7 @@ CreateOrAttachShmemStructs(void)
 	 * Set up xlog, clog, and buffers
 	 */
 	VarsupShmemInit();
+	InitTempOidState();
 	XLOGShmemInit();
 	XLogPrefetchShmemInit();
 	XLogRecoveryShmemInit();

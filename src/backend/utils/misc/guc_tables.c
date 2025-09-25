@@ -101,6 +101,7 @@ extern int	CommitDelay;
 extern int	CommitSiblings;
 extern char *default_tablespace;
 extern char *temp_tablespaces;
+extern char *temp_oid_interval;
 extern bool ignore_checksum_failure;
 extern bool ignore_invalid_pages;
 
@@ -4144,6 +4145,17 @@ struct config_string ConfigureNamesString[] =
 		&temp_tablespaces,
 		"",
 		check_temp_tablespaces, assign_temp_tablespaces, NULL
+	},
+
+	{
+		{"temp_oid_interval", PGC_POSTMASTER, RESOURCES_MEM,
+			gettext_noop("Sets the OID interval(s) to use for temporary table allocation."),
+			gettext_noop("Format: start:end, comma-separated values, or -1:count for automatic allocation."),
+			0
+		},
+		&temp_oid_interval,
+		"",
+		check_temp_oid_interval, assign_temp_oid_interval, NULL
 	},
 
 	{

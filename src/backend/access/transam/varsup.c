@@ -702,4 +702,140 @@ AssertTransactionIdInAllowableRange(TransactionId xid)
 	Assert(TransactionIdFollowsOrEquals(xid, oldest_xid) ||
 		   TransactionIdPrecedesOrEquals(xid, next_xid));
 }
+
+/*
+ * InitTempOidState -- initialize temporary OID allocation state
+ *
+ * This function is called during postmaster startup to initialize the
+ * temporary OID allocation system based on the temp_oid_interval GUC.
+ */
+void
+InitTempOidState(void)
+{
+	extern char *temp_oid_interval;
+	char	   *rawval;
+	char	   *token;
+	char	   *saveptr;
+	int			numRanges = 0;
+	TempOidState *tempState;
+	
+	/* Initialize the shared temp OID state */
+	tempState = &TransamVariables->tempOidState;
+	memset(tempState, 0, sizeof(TempOidState));
+	
+	/* If temp_oid_interval is empty, disable temp OID allocation */
+	if (temp_oid_interval == NULL || *temp_oid_interval == '\0')
+	{
+		tempState->num_ranges = 0;
+		return;
+	}
+	
+	/* Make a modifiable copy */
+	rawval = pstrdup(temp_oid_interval);
+	
+	/* Parse comma-separated ranges */
+	token = strtok_r(rawval, ",", &saveptr);
+	while (token != NULL && numRanges < MAX_TEMP_OID_RANGES)
+	{
+		char *colon_pos = strchr(token, ':');
+		Oid start_oid, end_oid;
+		
+		/* Trim whitespace */
+		while (isspace((unsigned char) *token))
+			token++;
+		
+		if (colon_pos != NULL)
+		{
+			/* Range format: start:end */
+			*colon_pos = '\0';
+			start_oid = (Oid) strtoul(token, NULL, 10);
+			end_oid = (Oid) strtoul(colon_pos + 1, NULL, 10);
+			
+			if (start_oid == (Oid) -1)
+			{
+				/* Automatic allocation: -1:count */
+				Oid count = end_oid;
+				/* Find available OIDs by scanning backwards from max OID */
+				/* In a real implementation, this would check pg_class */
+				/* For now, we'll just allocate from a high range */
+				Oid found_start = 0xFFFF0000 - count;
+				start_oid = found_start;
+				end_oid = found_start + count - 1;
+			}
+		}
+		else
+		{
+			/* Single OID */
+			start_oid = (Oid) strtoul(token, NULL, 10);
+			end_oid = start_oid;
+		}
+		
+		tempState->ranges[numRanges].start_oid = start_oid;
+		tempState->ranges[numRanges].end_oid = end_oid;
+		numRanges++;
+		
+		token = strtok_r(NULL, ",", &saveptr);
+	}
+	
+	tempState->num_ranges = numRanges;
+	tempState->current_range = 0;
+	if (numRanges > 0)
+		tempState->next_oid = tempState->ranges[0].start_oid;
+	
+	pfree(rawval);
+}
+
+/*
+ * GetNewTempObjectId -- allocate a new OID for temporary objects
+ *
+ * This function allocates OIDs from the configured temporary OID ranges
+ * instead of using the main OID counter, helping to reduce contention.
+ */
+Oid
+GetNewTempObjectId(void)
+{
+	Oid			result;
+	TempOidState *tempState;
+	
+	/* Safety check, we should never get this far in a HS standby */
+	if (RecoveryInProgress())
+		elog(ERROR, "cannot assign OIDs during recovery");
+	
+	LWLockAcquire(OidGenLock, LW_EXCLUSIVE);
+	
+	tempState = &TransamVariables->tempOidState;
+	
+	/* If no temp OID ranges configured, fall back to regular allocation */
+	if (tempState->num_ranges == 0)
+	{
+		LWLockRelease(OidGenLock);
+		return GetNewObjectId();
+	}
+	
+	/* Try to allocate from current range */
+	if (tempState->next_oid <= tempState->ranges[tempState->current_range].end_oid)
+	{
+		result = tempState->next_oid;
+		tempState->next_oid++;
+	}
+	else
+	{
+		/* Move to next range */
+		tempState->current_range++;
+		if (tempState->current_range >= tempState->num_ranges)
+		{
+			/* Wrap around to first range */
+			tempState->current_range = 0;
+		}
+		
+		tempState->next_oid = tempState->ranges[tempState->current_range].start_oid;
+		result = tempState->next_oid;
+		tempState->next_oid++;
+	}
+	
+	LWLockRelease(OidGenLock);
+	
+	return result;
+}
+
 #endif

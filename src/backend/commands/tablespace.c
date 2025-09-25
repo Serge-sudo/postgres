@@ -54,6 +54,7 @@
 #include "access/htup_details.h"
 #include "access/reloptions.h"
 #include "access/tableam.h"
+#include "access/transam.h"
 #include "access/xact.h"
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
@@ -82,6 +83,7 @@
 /* GUC variables */
 char	   *default_tablespace = NULL;
 char	   *temp_tablespaces = NULL;
+char	   *temp_oid_interval = NULL;
 bool		allow_in_place_tablespaces = false;
 
 Oid			binary_upgrade_next_pg_tablespace_oid = InvalidOid;
@@ -1318,6 +1320,139 @@ assign_temp_tablespaces(const char *newval, void *extra)
 		SetTempTablespaces(myextra->tblSpcs, myextra->numSpcs);
 	else
 		SetTempTablespaces(NULL, 0);
+}
+
+/*
+ * Routines for handling the GUC variable 'temp_oid_interval'.
+ */
+
+typedef struct temp_oid_interval_extra
+{
+	/* Parsed temp OID ranges */
+	int			numRanges;
+	TempOidRange ranges[MAX_TEMP_OID_RANGES];
+} temp_oid_interval_extra;
+
+/* check_hook: validate new temp_oid_interval */
+bool
+check_temp_oid_interval(char **newval, void **extra, GucSource source)
+{
+	char	   *rawval;
+	char	   *token;
+	char	   *saveptr;
+	temp_oid_interval_extra *myextra;
+	int			numRanges = 0;
+	
+	/* Handle empty string - disable temp OID intervals */
+	if (*newval == NULL || **newval == '\0')
+	{
+		*extra = NULL;
+		return true;
+	}
+	
+	/* Need a modifiable copy of string */
+	rawval = pstrdup(*newval);
+	
+	/* Allocate extra structure */
+	myextra = guc_malloc(LOG, sizeof(temp_oid_interval_extra));
+	if (!myextra)
+	{
+		pfree(rawval);
+		return false;
+	}
+	memset(myextra, 0, sizeof(temp_oid_interval_extra));
+	
+	/* Parse comma-separated ranges */
+	token = strtok_r(rawval, ",", &saveptr);
+	while (token != NULL && numRanges < MAX_TEMP_OID_RANGES)
+	{
+		char *colon_pos = strchr(token, ':');
+		Oid start_oid, end_oid;
+		
+		/* Trim whitespace */
+		while (isspace((unsigned char) *token))
+			token++;
+		
+		if (colon_pos != NULL)
+		{
+			/* Range format: start:end */
+			*colon_pos = '\0';
+			start_oid = (Oid) strtoul(token, NULL, 10);
+			end_oid = (Oid) strtoul(colon_pos + 1, NULL, 10);
+			
+			if (start_oid == (Oid) -1)
+			{
+				/* Automatic allocation: -1:count */
+				if (end_oid == 0 || end_oid > 10000)
+				{
+					GUC_check_errdetail("Invalid automatic allocation count: %u", end_oid);
+					pfree(rawval);
+					return false;
+				}
+				/* We'll determine the actual range during startup */
+				myextra->ranges[numRanges].start_oid = (Oid) -1;
+				myextra->ranges[numRanges].end_oid = end_oid; /* count */
+			}
+			else
+			{
+				/* Manual range */
+				if (start_oid >= end_oid || start_oid < FirstNormalObjectId)
+				{
+					GUC_check_errdetail("Invalid OID range: %u:%u", start_oid, end_oid);
+					pfree(rawval);
+					return false;
+				}
+				myextra->ranges[numRanges].start_oid = start_oid;
+				myextra->ranges[numRanges].end_oid = end_oid;
+			}
+		}
+		else
+		{
+			/* Single OID */
+			start_oid = (Oid) strtoul(token, NULL, 10);
+			if (start_oid < FirstNormalObjectId)
+			{
+				GUC_check_errdetail("Invalid OID: %u", start_oid);
+				pfree(rawval);
+				return false;
+			}
+			myextra->ranges[numRanges].start_oid = start_oid;
+			myextra->ranges[numRanges].end_oid = start_oid;
+		}
+		
+		numRanges++;
+		token = strtok_r(NULL, ",", &saveptr);
+	}
+	
+	if (numRanges == 0)
+	{
+		GUC_check_errdetail("No valid OID ranges specified.");
+		pfree(rawval);
+		return false;
+	}
+	
+	myextra->numRanges = numRanges;
+	*extra = myextra;
+	
+	pfree(rawval);
+	return true;
+}
+
+/* assign_hook: do extra actions as needed */
+void
+assign_temp_oid_interval(const char *newval, void *extra)
+{
+	temp_oid_interval_extra *myextra = (temp_oid_interval_extra *) extra;
+	
+	/*
+	 * The actual initialization of temp OID state happens during startup
+	 * in InitTempOidState().
+	 */
+	if (myextra)
+	{
+		/* Store the parsed ranges for later use during startup */
+		/* This will be handled in InitTempOidState() */
+	}
 }
 
 /*

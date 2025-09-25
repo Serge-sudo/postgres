@@ -197,6 +197,31 @@ FullTransactionIdAdvance(FullTransactionId *dest)
 #define FirstNormalObjectId		16384
 
 /*
+ * Maximum number of OID ranges for temporary tables
+ */
+#define MAX_TEMP_OID_RANGES		64
+
+/*
+ * Structure for managing temporary table OID allocation ranges
+ */
+typedef struct TempOidRange
+{
+	Oid			start_oid;		/* start of OID range */
+	Oid			end_oid;		/* end of OID range */
+} TempOidRange;
+
+/*
+ * Shared state for temporary OID allocation
+ */
+typedef struct TempOidState
+{
+	int			num_ranges;		/* number of configured ranges */
+	int			current_range;	/* currently active range index */
+	Oid			next_oid;		/* next OID to allocate in current range */
+	TempOidRange ranges[MAX_TEMP_OID_RANGES];
+} TempOidState;
+
+/*
  * TransamVariables is a data structure in shared memory that is used to track
  * OID and XID assignment state.  For largely historical reasons, there is
  * just one struct with different fields that are protected by different
@@ -213,6 +238,11 @@ typedef struct TransamVariablesData
 	 */
 	Oid			nextOid;		/* next OID to assign */
 	uint32		oidCount;		/* OIDs available before must do XLOG work */
+	
+	/*
+	 * Temporary table OID allocation state, protected by OidGenLock.
+	 */
+	TempOidState tempOidState;	/* temporary table OID allocation state */
 
 	/*
 	 * These fields are protected by XidGenLock.
@@ -293,6 +323,8 @@ extern void SetTransactionIdLimit(TransactionId oldest_datfrozenxid,
 extern void AdvanceOldestClogXid(TransactionId oldest_datfrozenxid);
 extern bool ForceTransactionIdLimitUpdate(void);
 extern Oid	GetNewObjectId(void);
+extern Oid	GetNewTempObjectId(void);
+extern void InitTempOidState(void);
 extern void StopGeneratingPinnedObjectIds(void);
 
 #ifdef USE_ASSERT_CHECKING
