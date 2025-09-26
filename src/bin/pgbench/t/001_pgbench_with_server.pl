@@ -947,7 +947,7 @@ $node->pgbench(
 	});
 
 # Try to end a pipeline that hasn't started
-$node->pgbench(
+$node->
 	'-t 1 -n -M extended',
 	2,
 	[],
