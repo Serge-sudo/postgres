@@ -50,6 +50,10 @@
  * last_max_csn - Record the max csn till now.
  * last_csn_log_wal - for interval we log the assign csn to wal
  * oldestXmin - first sensible Xmin on the first existed page in the CSN Log
+ * 
+ * HLC fields for Hybrid Logical Clock support:
+ * hlc_physical_time - last physical timestamp used in HLC
+ * hlc_logical_counter - logical counter for current physical time
  */
 typedef struct CSNShared
 {
@@ -57,6 +61,9 @@ typedef struct CSNShared
 	pg_atomic_uint32	oldestXmin;
 	CSN					last_max_csn;
 	CSN					last_csn_log_wal;
+	/* HLC state */
+	pg_atomic_uint64	hlc_physical_time;
+	pg_atomic_uint32	hlc_logical_counter;
 	volatile slock_t	lock;
 } CSNShared;
 
@@ -141,6 +148,9 @@ CSNLogShmemInit(void)
 		pg_atomic_init_u32(&csnShared->oldestXmin, InvalidTransactionId);
 		csnShared->last_max_csn = InvalidCSN;
 		csnShared->last_csn_log_wal = InvalidCSN;
+		/* Initialize HLC fields */
+		pg_atomic_init_u64(&csnShared->hlc_physical_time, 0);
+		pg_atomic_init_u32(&csnShared->hlc_logical_counter, 0);
 		SpinLockInit(&csnShared->lock);
 	}
 }
@@ -689,52 +699,16 @@ csnsyncfiletag(const FileTag *ftag, char *path)
 /*
  * GenerateCSN
  *
- * Generate CSN which is actually a local time. Also we are forcing
- * this time to be always increasing. Since now it is not uncommon to have
- * millions of read transactions per second we are trying to use nanoseconds
- * if such time resolution is available.
+ * Generate CSN using Hybrid Logical Clock algorithm instead of simple timestamps.
+ * This replaces the Clock-SI implementation to avoid Microsoft patent issues.
+ * 
+ * For compatibility, this function now wraps the HLC implementation.
  */
 CSN
 GenerateCSN(bool locked, CSN assign)
 {
-	instr_time	current_time;
-	CSN	csn;
-	CSN log_csn = InvalidCSN;
-
-	Assert(get_csnlog_status() || csn_snapshot_defer_time > 0);
-
-	/* TODO: create some macro that add small random shift to current time. */
-	INSTR_TIME_SET_CURRENT(current_time);
-	csn = (CSN) INSTR_TIME_GET_NANOSEC(current_time) + (int64) (csn_time_shift * 1E9);
-
-	if(assign != InvalidCSN && csn < assign)
-		csn = assign;
-
-	/* TODO: change to atomics? */
-	if (!locked)
-		SpinLockAcquire(&csnShared->lock);
-
-	if (csn <= csnShared->last_max_csn)
-		csn = csnShared->last_max_csn + 1;
-	csnShared->last_max_csn = csn;
-
-	if (enable_csn_wal && csn > csnShared->last_csn_log_wal)
-	{
-		/*
-		 * We log the CSN 5s greater than generated, you can see comments on
-		 * the CSN_ASSIGN_TIME_INTERVAL.
-		 */
-		log_csn = CSNAddByNanosec(csn, CSN_ASSIGN_TIME_INTERVAL);
-		csnShared->last_csn_log_wal = log_csn;
-	}
-
-	if (!locked)
-		SpinLockRelease(&csnShared->lock);
-
-	if (log_csn != InvalidCSN)
-		WriteAssignCSNXlogRec(csn);
-
-	return csn;
+	/* If assign is provided, treat it as a remote HLC to advance beyond */
+	return GenerateHLCTimestamp(locked, assign);
 }
 
 CSN
@@ -765,4 +739,165 @@ GetOldestXmin(void)
 {
 	Assert(get_csnlog_status());
 	return pg_atomic_read_u32(&csnShared->oldestXmin);
+}
+
+/*
+ * ========================
+ * Hybrid Logical Clock Implementation
+ * ========================
+ * 
+ * This implementation replaces the Clock-SI algorithm to avoid Microsoft patent issues.
+ * Based on the HLC algorithm used in CockroachDB for global snapshot isolation.
+ * 
+ * HLC ensures global ordering of events across distributed nodes while maintaining
+ * partial ordering based on causality.
+ */
+
+/*
+ * HLCLess - compare two HLC timestamps
+ * Returns true if hlc1 < hlc2 according to HLC ordering
+ */
+bool
+HLCLess(CSN hlc1, CSN hlc2)
+{
+	uint64 pt1 = CSN_TO_HLC_PHYSICAL(hlc1);
+	uint64 pt2 = CSN_TO_HLC_PHYSICAL(hlc2);
+	uint32 l1 = CSN_TO_HLC_LOGICAL(hlc1);
+	uint32 l2 = CSN_TO_HLC_LOGICAL(hlc2);
+
+	if (pt1 != pt2)
+		return pt1 < pt2;
+	return l1 < l2;
+}
+
+/*
+ * HLCEqual - check if two HLC timestamps are equal
+ */
+bool
+HLCEqual(CSN hlc1, CSN hlc2)
+{
+	return hlc1 == hlc2;
+}
+
+/*
+ * GenerateHLCTimestamp - Generate HLC timestamp for local events
+ * 
+ * This is the main replacement for GenerateCSN using HLC algorithm
+ * locked: whether caller already holds the lock
+ * remote_hlc: if not InvalidCSN, advance to be greater than this remote HLC
+ */
+CSN
+GenerateHLCTimestamp(bool locked, CSN remote_hlc)
+{
+	instr_time	current_time;
+	uint64		now_ns;
+	uint64		pt, remote_pt = 0;
+	uint32		l, remote_l = 0;
+	CSN			new_hlc;
+	CSN			log_csn = InvalidCSN;
+
+	Assert(get_csnlog_status() || csn_snapshot_defer_time > 0);
+
+	/* Get current physical time in nanoseconds */
+	INSTR_TIME_SET_CURRENT(current_time);
+	now_ns = (uint64) INSTR_TIME_GET_NANOSEC(current_time) + (int64) (csn_time_shift * 1E9);
+	
+	/* Apply mask to fit in our bit allocation */
+	now_ns = now_ns & HLC_PHYSICAL_MASK;
+
+	/* Extract remote HLC components if provided */
+	if (remote_hlc != InvalidCSN)
+	{
+		remote_pt = CSN_TO_HLC_PHYSICAL(remote_hlc);
+		remote_l = CSN_TO_HLC_LOGICAL(remote_hlc);
+	}
+
+	if (!locked)
+		SpinLockAcquire(&csnShared->lock);
+
+	/* Get current HLC state */
+	pt = pg_atomic_read_u64(&csnShared->hlc_physical_time);
+	l = pg_atomic_read_u32(&csnShared->hlc_logical_counter);
+
+	/* HLC algorithm for local event advancement */
+	if (remote_hlc != InvalidCSN)
+	{
+		/* Advance based on remote HLC (receiving a message) */
+		pt = now_ns > remote_pt ? now_ns : remote_pt;
+		if (pt == remote_pt)
+		{
+			/* Same physical time as remote, increment logical counter */
+			l = (l > remote_l ? l : remote_l) + 1;
+		}
+		else
+		{
+			/* Different physical time, reset logical counter */
+			l = 0;
+		}
+	}
+	else
+	{
+		/* Local event advancement */
+		if (now_ns > pt)
+		{
+			/* Physical time advanced, reset logical counter */
+			pt = now_ns;
+			l = 0;
+		}
+		else
+		{
+			/* Same or earlier physical time, increment logical counter */
+			l++;
+		}
+	}
+
+	/* Ensure logical counter doesn't overflow */
+	if (l > HLC_LOGICAL_MASK)
+	{
+		/* If logical counter overflows, advance physical time */
+		pt++;
+		l = 0;
+	}
+
+	/* Store new HLC state */
+	pg_atomic_write_u64(&csnShared->hlc_physical_time, pt);
+	pg_atomic_write_u32(&csnShared->hlc_logical_counter, l);
+
+	/* Pack into CSN format */
+	new_hlc = HLC_TO_CSN(((HybridLogicalClock){pt, l}));
+
+	/* Update last_max_csn for compatibility */
+	if (new_hlc > csnShared->last_max_csn)
+		csnShared->last_max_csn = new_hlc;
+
+	/* Handle WAL logging as in original implementation */
+	if (enable_csn_wal && new_hlc > csnShared->last_csn_log_wal)
+	{
+		/*
+		 * We log the CSN 5s greater than generated, you can see comments on
+		 * the CSN_ASSIGN_TIME_INTERVAL.
+		 */
+		log_csn = CSNAddByNanosec(new_hlc, CSN_ASSIGN_TIME_INTERVAL);
+		csnShared->last_csn_log_wal = log_csn;
+	}
+
+	if (!locked)
+		SpinLockRelease(&csnShared->lock);
+
+	if (log_csn != InvalidCSN)
+		WriteAssignCSNXlogRec(new_hlc);
+
+	return new_hlc;
+}
+
+/*
+ * AdvanceHLCOnRemote - Advance HLC when receiving remote timestamp
+ * 
+ * This function is called when we receive a remote HLC timestamp
+ * and need to advance our local HLC to maintain causality
+ */
+CSN
+AdvanceHLCOnRemote(CSN remote_hlc)
+{
+	return GenerateHLCTimestamp(false, remote_hlc);
 }

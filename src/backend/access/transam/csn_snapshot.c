@@ -28,6 +28,10 @@
 #include "utils/snapmgr.h"
 #include "miscadmin.h"
 
+/* Forward declarations for HLC functions */
+extern bool HLCLess(CSN hlc1, CSN hlc2);
+extern bool HLCEqual(CSN hlc1, CSN hlc2);
+
 /* Raise a warning if imported snapshot_csn exceeds ours by this value. */
 #define SNAP_DESYNC_COMPLAIN (1*NSECS_PER_SEC) /* 1 second */
 
@@ -412,40 +416,44 @@ CSNSnapshotAssignCurrent(SnapshotCSN snapshot_csn)
  * which is greater than snapshot_csn on this node. To preserve proper isolation
  * this node needs to wait when such snapshot_csn comes on local clock.
  *
- * This should happend relatively rare if nodes have running NTP/PTP/etc.
+ * Updated to use HLC comparisons instead of simple timestamp comparisons.
+ * This should happen relatively rare if nodes have running NTP/PTP/etc.
  * Complain if wait time is more than SNAP_SYNC_COMPLAIN.
  */
 void
 CSNSnapshotSync(SnapshotCSN remote_csn)
 {
 	SnapshotCSN	local_csn;
-	SnapshotCSN	delta;
+	uint64		remote_pt, local_pt, delta;
 
 	Assert(enable_csn_snapshot);
 
 	for(;;)
 	{
-		if (GetLastGeneratedCSN() > remote_csn)
+		/* Use HLC comparison instead of simple numeric comparison */
+		if (!HLCLess(GetLastGeneratedCSN(), remote_csn))
 			return;
 
-		local_csn = GenerateCSN(true, InvalidCSN);
+		/* Generate local CSN, advancing based on remote if needed */
+		local_csn = GenerateCSN(true, remote_csn);
 
-		if (local_csn >= remote_csn)
-			/*
-			 * Everything is fine too, but last_max_csn wasn't updated for
-			 * some time.
-			 */
+		/* Check if we've advanced beyond remote HLC */
+		if (!HLCLess(local_csn, remote_csn))
 			return;
 
-		/* Okay we need to sleep now */
-		delta = remote_csn - local_csn;
+		/* Calculate physical time delta for sleep */
+		remote_pt = CSN_TO_HLC_PHYSICAL(remote_csn);
+		local_pt = CSN_TO_HLC_PHYSICAL(local_csn);
+		delta = remote_pt > local_pt ? remote_pt - local_pt : 0;
+		
 		if (delta > SNAP_DESYNC_COMPLAIN)
 			ereport(WARNING,
 				(errmsg("remote global snapshot exceeds ours by more than a second"),
 				 errhint("Consider running NTPd on servers participating in global transaction")));
 
-		/* TODO: report this sleeptime somewhere? */
-		pg_usleep((long) (delta/NSECS_PER_USEC));
+		/* Sleep based on physical time difference */
+		if (delta > 0)
+			pg_usleep((long) (delta/NSECS_PER_USEC));
 
 		/*
 		 * Loop that checks to ensure that we actually slept for specified
@@ -453,7 +461,7 @@ CSNSnapshotSync(SnapshotCSN remote_csn)
 		 */
 	}
 
-	Assert(false); /* Should not happend */
+	Assert(false); /* Should not happen */
 	return;
 }
 
@@ -543,7 +551,10 @@ XidInCSNSnapshot(TransactionId xid, Snapshot snapshot)
 	csn = TransactionIdGetCSN(xid);
 
 	if (CSNIsNormal(csn))
-		return (csn >= snapshot->snapshot_csn);
+	{
+		/* Use HLC comparison instead of simple numeric comparison */
+		return !HLCLess(csn, snapshot->snapshot_csn) && !HLCEqual(csn, snapshot->snapshot_csn);
+	}
 	else if (CSNIsFrozen(csn))
 	{
 		/* It is bootstrap or frozen transaction */

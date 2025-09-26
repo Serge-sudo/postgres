@@ -126,6 +126,34 @@ typedef uint64 CSN;
 typedef uint64 SnapshotCSN;
 
 /*
+ * Hybrid Logical Clock (HLC) structure
+ * Used to replace Clock-SI for global snapshot isolation
+ * Based on CockroachDB's implementation to avoid Microsoft patent issues
+ */
+typedef struct HybridLogicalClock
+{
+	uint64	physical_time;	/* Physical timestamp in nanoseconds */
+	uint32	logical_counter; /* Logical counter for same physical time */
+} HybridLogicalClock;
+
+/* HLC macros for easier manipulation */
+#define HLC_PHYSICAL_BITS		40	/* bits for physical time (about 34 years) */
+#define HLC_LOGICAL_BITS		24	/* bits for logical counter */
+#define HLC_PHYSICAL_MASK		((1ULL << HLC_PHYSICAL_BITS) - 1)
+#define HLC_LOGICAL_MASK		((1ULL << HLC_LOGICAL_BITS) - 1)
+
+/* Pack HLC into a 64-bit CSN for compatibility */
+#define HLC_TO_CSN(hlc) \
+	(((uint64)(hlc).physical_time << HLC_LOGICAL_BITS) | (hlc).logical_counter)
+
+/* Unpack CSN into HLC components */
+#define CSN_TO_HLC_PHYSICAL(csn) \
+	((csn) >> HLC_LOGICAL_BITS)
+
+#define CSN_TO_HLC_LOGICAL(csn) \
+	((csn) & HLC_LOGICAL_MASK)
+
+/*
  * Struct representing all kind of possible snapshots.
  *
  * There are several different kinds of snapshots:
