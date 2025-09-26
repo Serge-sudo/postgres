@@ -889,15 +889,3 @@ GenerateHLCTimestamp(bool locked, CSN remote_hlc)
 
 	return new_hlc;
 }
-
-/*
- * AdvanceHLCOnRemote - Advance HLC when receiving remote timestamp
- * 
- * This function is called when we receive a remote HLC timestamp
- * and need to advance our local HLC to maintain causality
- */
-CSN
-AdvanceHLCOnRemote(CSN remote_hlc)
-{
-	return GenerateHLCTimestamp(false, remote_hlc);
-}

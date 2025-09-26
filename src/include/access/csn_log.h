@@ -96,7 +96,6 @@ extern CSN GetLastGeneratedCSN(void);
 
 /* Hybrid Logical Clock functions */
 extern CSN GenerateHLCTimestamp(bool locked, CSN remote_hlc);
-extern CSN AdvanceHLCOnRemote(CSN remote_hlc);
 extern bool HLCLess(CSN hlc1, CSN hlc2);
 extern bool HLCEqual(CSN hlc1, CSN hlc2);
 
