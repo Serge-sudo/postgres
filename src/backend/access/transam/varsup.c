@@ -41,7 +41,7 @@
 TransamVariablesData *TransamVariables = NULL;
 
 /* Forward declaration */
-static bool IsOidInTempRanges(Oid oid);
+static uint32 IsOidInTempRanges(Oid oid);
 
 
 /*
@@ -619,17 +619,53 @@ GetNewObjectId(void)
 	 * to avoid conflicts between main OID allocation and temp table allocation.
 	 */
 	do {
-		result = TransamVariables->nextOid;
-		(TransamVariables->nextOid)++;
-		(TransamVariables->oidCount)--;
+		uint32 temp_range_remaining;
 		
-		/* If we run out of pre-allocated OIDs, allocate more */
-		if (TransamVariables->oidCount == 0)
+		result = TransamVariables->nextOid;
+		temp_range_remaining = IsOidInTempRanges(result);
+		
+		if (temp_range_remaining > 0)
 		{
-			XLogPutNextOid(TransamVariables->nextOid + VAR_OID_PREFETCH);
-			TransamVariables->oidCount = VAR_OID_PREFETCH;
+			/* 
+			 * OID is in a temp range. Skip the entire range, but don't skip
+			 * more than VAR_OID_PREFETCH at once since we need to XLOG.
+			 */
+			uint32 skip_count = (temp_range_remaining > VAR_OID_PREFETCH) ? 
+								 VAR_OID_PREFETCH : temp_range_remaining;
+			
+			TransamVariables->nextOid += skip_count;
+			
+			/* Adjust oidCount - if we skip more than available, we need to allocate more */
+			if (skip_count >= TransamVariables->oidCount)
+			{
+				/* We're skipping beyond our pre-allocated range */
+				XLogPutNextOid(TransamVariables->nextOid + VAR_OID_PREFETCH);
+				TransamVariables->oidCount = VAR_OID_PREFETCH;
+			}
+			else
+			{
+				TransamVariables->oidCount -= skip_count;
+			}
+			
+			/* Continue the loop to check the new OID */
+			continue;
 		}
-	} while (IsOidInTempRanges(result));
+		else
+		{
+			/* OID is not in temp range, we can use it */
+			(TransamVariables->nextOid)++;
+			(TransamVariables->oidCount)--;
+			
+			/* If we run out of pre-allocated OIDs, allocate more */
+			if (TransamVariables->oidCount == 0)
+			{
+				XLogPutNextOid(TransamVariables->nextOid + VAR_OID_PREFETCH);
+				TransamVariables->oidCount = VAR_OID_PREFETCH;
+			}
+			
+			break; /* Found a usable OID */
+		}
+	} while (true);
 
 	LWLockRelease(OidGenLock);
 
@@ -730,12 +766,15 @@ AssertTransactionIdInAllowableRange(TransactionId xid)
  * IsOidInTempRanges -- check if an OID falls within any temporary table ranges
  *
  * This function checks if the given OID falls within any of the configured
- * temporary table OID ranges. It's used by GetNewObjectId to avoid allocating
- * OIDs that are reserved for temporary tables.
+ * temporary table OID ranges. If it does, returns the number of OIDs remaining
+ * in that range (including the current OID). If not, returns 0.
+ *
+ * This allows GetNewObjectId to skip entire temp ranges efficiently instead
+ * of checking OIDs one by one.
  *
  * Note: This function assumes OidGenLock is already held by the caller.
  */
-static bool
+static uint32
 IsOidInTempRanges(Oid oid)
 {
 	TempOidState *tempState = &TransamVariables->tempOidState;
@@ -743,7 +782,7 @@ IsOidInTempRanges(Oid oid)
 	
 	/* If no temp ranges configured, OID is not in any temp range */
 	if (tempState->num_ranges == 0)
-		return false;
+		return 0;
 	
 	/* Check if OID falls within any configured range */
 	for (i = 0; i < tempState->num_ranges; i++)
@@ -751,11 +790,12 @@ IsOidInTempRanges(Oid oid)
 		if (oid >= tempState->ranges[i].start_oid &&
 			oid <= tempState->ranges[i].end_oid)
 		{
-			return true;
+			/* Return number of OIDs remaining in this range (including current OID) */
+			return tempState->ranges[i].end_oid - oid + 1;
 		}
 	}
 	
-	return false;
+	return 0;
 }
 
 /*
