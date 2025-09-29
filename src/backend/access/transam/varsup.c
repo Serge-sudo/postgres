@@ -798,60 +798,27 @@ IsOidInTempRanges(Oid oid)
 	return 0;
 }
 
+
 /*
- * IsOidInUse -- check if an OID is already used in pg_class
+ * FindAvailableOidRangeOptimized -- find a range of available OIDs using efficient backward scan
  *
- * This function checks if the given OID is already used in pg_class.
- * It's used during temp OID range validation and automatic allocation.
+ * This function performs a single backward scan on pg_class using the OID index
+ * to find a contiguous range of 'count' available OIDs. Returns the start OID
+ * of the range, or InvalidOid if no suitable range is found.
+ *
+ * This is much more efficient than checking individual OIDs.
  */
-static bool
-IsOidInUse(Oid oid)
+static Oid
+FindAvailableOidRangeOptimized(int count)
 {
 	Relation	rel;
 	SysScanDesc scan;
 	ScanKeyData key;
-	bool		found = false;
-	
-	/* Can't check during bootstrap */
-	if (IsBootstrapProcessingMode() || !IsNormalProcessingMode())
-		return false;
-	
-	/* Check if we can safely access catalogs */
-	if (!IsTransactionState())
-		return false;
-	
-	rel = table_open(RelationRelationId, AccessShareLock);
-	
-	ScanKeyInit(&key,
-				Anum_pg_class_oid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(oid));
-	
-	scan = systable_beginscan(rel, ClassOidIndexId, true,
-							  SnapshotAny, 1, &key);
-	
-	found = HeapTupleIsValid(systable_getnext(scan));
-	
-	systable_endscan(scan);
-	table_close(rel, AccessShareLock);
-	
-	return found;
-}
-
-/*
- * FindAvailableOidRange -- find a range of available OIDs
- *
- * This function scans pg_class backward from high OID values to find
- * a contiguous range of 'count' available OIDs. Returns the start OID
- * of the range, or InvalidOid if no suitable range is found.
- */
-static Oid
-FindAvailableOidRange(int count)
-{
+	HeapTuple	tuple;
 	Oid			start_search = 0xFFFFF000; /* Start near max OID */
-	Oid			current_oid;
-	int			consecutive_free = 0;
+	Oid			current_oid = start_search;
 	Oid			range_start = InvalidOid;
+	bool		first_tuple = true;
 	
 	/* Can't search during bootstrap */
 	if (IsBootstrapProcessingMode() || !IsNormalProcessingMode())
@@ -867,41 +834,92 @@ FindAvailableOidRange(int count)
 		return 0xFFFF0000 - count;
 	}
 	
-	/* Search backward for available OIDs */
-	for (current_oid = start_search; current_oid > FirstNormalObjectId && consecutive_free < count; current_oid--)
+	rel = table_open(RelationRelationId, AccessShareLock);
+	
+	/* Set up scan key for OIDs <= start_search */
+	ScanKeyInit(&key,
+				Anum_pg_class_oid,
+				BTLessEqualStrategyNumber, F_OIDLE,
+				ObjectIdGetDatum(start_search));
+	
+	/* Scan backward through the index */
+	scan = systable_beginscan(rel, ClassOidIndexId, true,
+							  SnapshotAny, 1, &key);
+	
+	/* Process tuples in descending OID order */
+	while ((tuple = systable_getnext(scan)) != NULL)
 	{
-		if (!IsOidInUse(current_oid))
+		Oid tuple_oid = ((Form_pg_class) GETSTRUCT(tuple))->oid;
+		
+		if (first_tuple)
 		{
-			consecutive_free++;
-			if (consecutive_free == 1)
-				range_start = current_oid; /* End of range (we're going backward) */
+			/* Initialize with the highest found OID */
+			current_oid = start_search;
+			first_tuple = false;
 		}
-		else
+		
+		/* Check for gap between current_oid and this tuple's OID */
+		if (current_oid > tuple_oid + 1)
 		{
-			consecutive_free = 0;
-			range_start = InvalidOid;
+			/* Found a gap, count consecutive free OIDs */
+			Oid gap_size = current_oid - tuple_oid - 1;
+			
+			if (gap_size >= count)
+			{
+				/* Found a suitable range */
+				range_start = current_oid - count + 1;
+				break;
+			}
+		}
+		
+		/* Move to the next OID to check */
+		current_oid = tuple_oid - 1;
+		
+		/* Stop if we've gone too low */
+		if (current_oid < FirstNormalObjectId)
+			break;
+	}
+	
+	/* Check if there's a gap at the beginning of our search range */
+	if (range_start == InvalidOid && first_tuple)
+	{
+		/* No tuples found in our range, entire range is available */
+		if (start_search - FirstNormalObjectId + 1 >= count)
+		{
+			range_start = start_search - count + 1;
+		}
+	}
+	else if (range_start == InvalidOid && current_oid >= FirstNormalObjectId)
+	{
+		/* Check gap before the lowest found OID */
+		Oid gap_size = current_oid - FirstNormalObjectId + 1;
+		if (gap_size >= count)
+		{
+			range_start = current_oid - count + 1;
 		}
 	}
 	
-	if (consecutive_free >= count)
-	{
-		/* Found a suitable range, return the start (lowest OID) */
-		return range_start - count + 1;
-	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
 	
-	return InvalidOid;
+	return range_start;
 }
 
 /*
- * ValidateOidRange -- validate that a specified OID range is available
+ * ValidateOidRangeOptimized -- validate that a specified OID range is available
  *
- * This function checks that all OIDs in the specified range are not
- * already used in pg_class. Returns true if the range is valid.
+ * This function efficiently checks that all OIDs in the specified range are not
+ * already used in pg_class using a single scan with range-based scan keys.
+ * Returns true if the range is valid.
  */
 static bool
-ValidateOidRange(Oid start_oid, Oid end_oid)
+ValidateOidRangeOptimized(Oid start_oid, Oid end_oid)
 {
-	Oid current_oid;
+	Relation	rel;
+	SysScanDesc scan;
+	ScanKeyData keys[2];
+	HeapTuple	tuple;
+	bool		range_valid = true;
 	
 	/* Can't validate during bootstrap */
 	if (IsBootstrapProcessingMode() || !IsNormalProcessingMode())
@@ -911,19 +929,38 @@ ValidateOidRange(Oid start_oid, Oid end_oid)
 	if (!IsTransactionState())
 		return true;
 	
-	/* Check each OID in the range */
-	for (current_oid = start_oid; current_oid <= end_oid; current_oid++)
+	rel = table_open(RelationRelationId, AccessShareLock);
+	
+	/* Set up scan keys for OIDs in the range [start_oid, end_oid] */
+	ScanKeyInit(&keys[0],
+				Anum_pg_class_oid,
+				BTGreaterEqualStrategyNumber, F_OIDGE,
+				ObjectIdGetDatum(start_oid));
+	
+	ScanKeyInit(&keys[1],
+				Anum_pg_class_oid,
+				BTLessEqualStrategyNumber, F_OIDLE,
+				ObjectIdGetDatum(end_oid));
+	
+	/* Scan for any OIDs in our target range */
+	scan = systable_beginscan(rel, ClassOidIndexId, true,
+							  SnapshotAny, 2, keys);
+	
+	/* If we find any tuple, the range is not available */
+	if ((tuple = systable_getnext(scan)) != NULL)
 	{
-		if (IsOidInUse(current_oid))
-		{
-			ereport(WARNING,
-					(errmsg("temp OID range validation failed: OID %u is already in use", current_oid),
-					 errhint("Choose a different OID range for temp_oid_interval.")));
-			return false;
-		}
+		Oid conflicting_oid = ((Form_pg_class) GETSTRUCT(tuple))->oid;
+		
+		ereport(WARNING,
+				(errmsg("temp OID range validation failed: OID %u is already in use", conflicting_oid),
+				 errhint("Choose a different OID range for temp_oid_interval.")));
+		range_valid = false;
 	}
 	
-	return true;
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	
+	return range_valid;
 }
 
 /*
@@ -1053,7 +1090,7 @@ EnsureTempOidStateInitialized(void)
 		{
 			/* Automatic allocation: find available range */
 			Oid count = tempState->ranges[i].end_oid;
-			Oid found_start = FindAvailableOidRange(count);
+			Oid found_start = FindAvailableOidRangeOptimized(count);
 			
 			if (found_start == InvalidOid)
 			{
@@ -1072,7 +1109,7 @@ EnsureTempOidStateInitialized(void)
 		else
 		{
 			/* Manual range - validate that OIDs are not already in use */
-			if (!ValidateOidRange(tempState->ranges[i].start_oid, tempState->ranges[i].end_oid))
+			if (!ValidateOidRangeOptimized(tempState->ranges[i].start_oid, tempState->ranges[i].end_oid))
 			{
 				ereport(ERROR,
 						(errmsg("temp OID range %u:%u contains OIDs that are already in use",
