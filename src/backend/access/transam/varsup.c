@@ -15,15 +15,22 @@
 
 #include "access/clog.h"
 #include "access/commit_ts.h"
+#include "access/genam.h"
+#include "access/htup_details.h"
 #include "access/subtrans.h"
+#include "access/table.h"
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlogutils.h"
+#include "catalog/indexing.h"
+#include "catalog/pg_class.h"
 #include "commands/dbcommands.h"
 #include "miscadmin.h"
 #include "postmaster/autovacuum.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
+#include "utils/fmgroids.h"
+#include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
 
@@ -752,6 +759,134 @@ IsOidInTempRanges(Oid oid)
 }
 
 /*
+ * IsOidInUse -- check if an OID is already used in pg_class
+ *
+ * This function checks if the given OID is already used in pg_class.
+ * It's used during temp OID range validation and automatic allocation.
+ */
+static bool
+IsOidInUse(Oid oid)
+{
+	Relation	rel;
+	SysScanDesc scan;
+	ScanKeyData key;
+	bool		found = false;
+	
+	/* Can't check during bootstrap */
+	if (IsBootstrapProcessingMode() || !IsNormalProcessingMode())
+		return false;
+	
+	/* Check if we can safely access catalogs */
+	if (!IsTransactionState())
+		return false;
+	
+	rel = table_open(RelationRelationId, AccessShareLock);
+	
+	ScanKeyInit(&key,
+				Anum_pg_class_oid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(oid));
+	
+	scan = systable_beginscan(rel, ClassOidIndexId, true,
+							  SnapshotAny, 1, &key);
+	
+	found = HeapTupleIsValid(systable_getnext(scan));
+	
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	
+	return found;
+}
+
+/*
+ * FindAvailableOidRange -- find a range of available OIDs
+ *
+ * This function scans pg_class backward from high OID values to find
+ * a contiguous range of 'count' available OIDs. Returns the start OID
+ * of the range, or InvalidOid if no suitable range is found.
+ */
+static Oid
+FindAvailableOidRange(int count)
+{
+	Oid			start_search = 0xFFFFF000; /* Start near max OID */
+	Oid			current_oid;
+	int			consecutive_free = 0;
+	Oid			range_start = InvalidOid;
+	
+	/* Can't search during bootstrap */
+	if (IsBootstrapProcessingMode() || !IsNormalProcessingMode())
+	{
+		/* Use a high range during bootstrap */
+		return 0xFFFF0000 - count;
+	}
+	
+	/* Check if we can safely access catalogs */
+	if (!IsTransactionState())
+	{
+		/* Use a high range if we can't access catalogs yet */
+		return 0xFFFF0000 - count;
+	}
+	
+	/* Search backward for available OIDs */
+	for (current_oid = start_search; current_oid > FirstNormalObjectId && consecutive_free < count; current_oid--)
+	{
+		if (!IsOidInUse(current_oid))
+		{
+			consecutive_free++;
+			if (consecutive_free == 1)
+				range_start = current_oid; /* End of range (we're going backward) */
+		}
+		else
+		{
+			consecutive_free = 0;
+			range_start = InvalidOid;
+		}
+	}
+	
+	if (consecutive_free >= count)
+	{
+		/* Found a suitable range, return the start (lowest OID) */
+		return range_start - count + 1;
+	}
+	
+	return InvalidOid;
+}
+
+/*
+ * ValidateOidRange -- validate that a specified OID range is available
+ *
+ * This function checks that all OIDs in the specified range are not
+ * already used in pg_class. Returns true if the range is valid.
+ */
+static bool
+ValidateOidRange(Oid start_oid, Oid end_oid)
+{
+	Oid current_oid;
+	
+	/* Can't validate during bootstrap */
+	if (IsBootstrapProcessingMode() || !IsNormalProcessingMode())
+		return true;
+	
+	/* Check if we can safely access catalogs */
+	if (!IsTransactionState())
+		return true;
+	
+	/* Check each OID in the range */
+	for (current_oid = start_oid; current_oid <= end_oid; current_oid++)
+	{
+		if (IsOidInUse(current_oid))
+		{
+			ereport(WARNING,
+					(errmsg("temp OID range validation failed: OID %u is already in use", current_oid),
+					 errhint("Choose a different OID range for temp_oid_interval.")));
+			return false;
+		}
+	}
+	
+	return true;
+}
+
+/*
  * InitTempOidState -- initialize temporary OID allocation state
  *
  * This function is called during postmaster startup to initialize the
@@ -801,21 +936,32 @@ InitTempOidState(void)
 			
 			if (start_oid == (Oid) -1)
 			{
-				/* Automatic allocation: -1:count */
-				Oid count = end_oid;
-				/* Find available OIDs by scanning backwards from max OID */
-				/* In a real implementation, this would check pg_class */
-				/* For now, we'll just allocate from a high range */
-				Oid found_start = 0xFFFF0000 - count;
-				start_oid = found_start;
-				end_oid = found_start + count - 1;
+				/* Automatic allocation: -1:count - will be resolved later */
+				/* Store the count in end_oid, and mark as unresolved */
+				/* The actual range will be found during lazy initialization */
+				start_oid = (Oid) -1;  /* Mark as needing automatic allocation */
+				/* end_oid already contains the count */
+				
+				ereport(LOG,
+						(errmsg("configured automatic temp OID allocation for %u OIDs (range will be determined later)",
+								end_oid)));
+			}
+			else
+			{
+				/* Manual range - validation will be done during lazy initialization */
+				ereport(LOG,
+						(errmsg("configured manual temp OID range %u:%u (validation will be done later)",
+								start_oid, end_oid)));
 			}
 		}
 		else
 		{
-			/* Single OID */
+			/* Single OID - validation will be done during lazy initialization */
 			start_oid = (Oid) strtoul(token, NULL, 10);
 			end_oid = start_oid;
+			
+			ereport(LOG,
+					(errmsg("configured single temp OID %u (validation will be done later)", start_oid)));
 		}
 		
 		tempState->ranges[numRanges].start_oid = start_oid;
@@ -827,10 +973,84 @@ InitTempOidState(void)
 	
 	tempState->num_ranges = numRanges;
 	tempState->current_range = 0;
+	tempState->initialized = false;  /* Lazy initialization - validation will be done later */
 	if (numRanges > 0)
-		tempState->next_oid = tempState->ranges[0].start_oid;
+	{
+		/* For automatic allocation ranges, we can't set next_oid yet */
+		if (tempState->ranges[0].start_oid != (Oid) -1)
+			tempState->next_oid = tempState->ranges[0].start_oid;
+		else
+			tempState->next_oid = InvalidOid;  /* Will be set during lazy init */
+	}
 	
 	pfree(rawval);
+}
+
+/*
+ * EnsureTempOidStateInitialized -- perform lazy initialization of temp OID ranges
+ *
+ * This function is called when temp OIDs are first requested to validate
+ * manual ranges and perform automatic allocation for -1:count ranges.
+ */
+static void
+EnsureTempOidStateInitialized(void)
+{
+	TempOidState *tempState = &TransamVariables->tempOidState;
+	int			i;
+	
+	/* Already initialized or no ranges configured */
+	if (tempState->initialized || tempState->num_ranges == 0)
+		return;
+	
+	/* Can't initialize if catalogs aren't available */
+	if (IsBootstrapProcessingMode() || !IsNormalProcessingMode() || !IsTransactionState())
+		return;
+	
+	/* Process each range */
+	for (i = 0; i < tempState->num_ranges; i++)
+	{
+		if (tempState->ranges[i].start_oid == (Oid) -1)
+		{
+			/* Automatic allocation: find available range */
+			Oid count = tempState->ranges[i].end_oid;
+			Oid found_start = FindAvailableOidRange(count);
+			
+			if (found_start == InvalidOid)
+			{
+				ereport(ERROR,
+						(errmsg("could not find %u available OIDs for automatic temp table allocation", count),
+						 errhint("Try reducing the count or use manual OID ranges.")));
+			}
+			
+			tempState->ranges[i].start_oid = found_start;
+			tempState->ranges[i].end_oid = found_start + count - 1;
+			
+			ereport(LOG,
+					(errmsg("automatically allocated temp OID range %u:%u for %u OIDs",
+							found_start, found_start + count - 1, count)));
+		}
+		else
+		{
+			/* Manual range - validate that OIDs are not already in use */
+			if (!ValidateOidRange(tempState->ranges[i].start_oid, tempState->ranges[i].end_oid))
+			{
+				ereport(ERROR,
+						(errmsg("temp OID range %u:%u contains OIDs that are already in use",
+								tempState->ranges[i].start_oid, tempState->ranges[i].end_oid),
+						 errhint("Choose a different OID range or use automatic allocation with -1:count.")));
+			}
+			
+			ereport(LOG,
+					(errmsg("validated temp OID range %u:%u",
+							tempState->ranges[i].start_oid, tempState->ranges[i].end_oid)));
+		}
+	}
+	
+	/* Set the initial next_oid */
+	if (tempState->num_ranges > 0)
+		tempState->next_oid = tempState->ranges[0].start_oid;
+	
+	tempState->initialized = true;
 }
 
 /*
@@ -859,6 +1079,9 @@ GetNewTempObjectId(void)
 		LWLockRelease(OidGenLock);
 		return GetNewObjectId();
 	}
+	
+	/* Ensure temp OID state is fully initialized (lazy initialization) */
+	EnsureTempOidStateInitialized();
 	
 	/* Try to allocate from current range */
 	if (tempState->next_oid <= tempState->ranges[tempState->current_range].end_oid)

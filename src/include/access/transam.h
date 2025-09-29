@@ -218,6 +218,7 @@ typedef struct TempOidState
 	int			num_ranges;		/* number of configured ranges */
 	int			current_range;	/* currently active range index */
 	Oid			next_oid;		/* next OID to allocate in current range */
+	bool		initialized;	/* true if ranges have been validated/allocated */
 	TempOidRange ranges[MAX_TEMP_OID_RANGES];
 } TempOidState;
 
