@@ -33,6 +33,9 @@
 /* pointer to variables struct in shared memory */
 TransamVariablesData *TransamVariables = NULL;
 
+/* Forward declaration */
+static bool IsOidInTempRanges(Oid oid);
+
 
 /*
  * Initialization of shared memory for TransamVariables.
@@ -603,10 +606,23 @@ GetNewObjectId(void)
 		TransamVariables->oidCount = VAR_OID_PREFETCH;
 	}
 
-	result = TransamVariables->nextOid;
-
-	(TransamVariables->nextOid)++;
-	(TransamVariables->oidCount)--;
+	/*
+	 * Find an OID that doesn't conflict with temporary table ranges.
+	 * Skip any OIDs that fall within configured temporary table ranges
+	 * to avoid conflicts between main OID allocation and temp table allocation.
+	 */
+	do {
+		result = TransamVariables->nextOid;
+		(TransamVariables->nextOid)++;
+		(TransamVariables->oidCount)--;
+		
+		/* If we run out of pre-allocated OIDs, allocate more */
+		if (TransamVariables->oidCount == 0)
+		{
+			XLogPutNextOid(TransamVariables->nextOid + VAR_OID_PREFETCH);
+			TransamVariables->oidCount = VAR_OID_PREFETCH;
+		}
+	} while (IsOidInTempRanges(result));
 
 	LWLockRelease(OidGenLock);
 
@@ -701,6 +717,38 @@ AssertTransactionIdInAllowableRange(TransactionId xid)
 
 	Assert(TransactionIdFollowsOrEquals(xid, oldest_xid) ||
 		   TransactionIdPrecedesOrEquals(xid, next_xid));
+}
+
+/*
+ * IsOidInTempRanges -- check if an OID falls within any temporary table ranges
+ *
+ * This function checks if the given OID falls within any of the configured
+ * temporary table OID ranges. It's used by GetNewObjectId to avoid allocating
+ * OIDs that are reserved for temporary tables.
+ *
+ * Note: This function assumes OidGenLock is already held by the caller.
+ */
+static bool
+IsOidInTempRanges(Oid oid)
+{
+	TempOidState *tempState = &TransamVariables->tempOidState;
+	int			i;
+	
+	/* If no temp ranges configured, OID is not in any temp range */
+	if (tempState->num_ranges == 0)
+		return false;
+	
+	/* Check if OID falls within any configured range */
+	for (i = 0; i < tempState->num_ranges; i++)
+	{
+		if (oid >= tempState->ranges[i].start_oid &&
+			oid <= tempState->ranges[i].end_oid)
+		{
+			return true;
+		}
+	}
+	
+	return false;
 }
 
 /*
