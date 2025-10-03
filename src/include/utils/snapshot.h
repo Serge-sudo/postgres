@@ -137,18 +137,18 @@ typedef struct HybridLogicalClock
 } HybridLogicalClock;
 
 /* HLC macros for easier manipulation */
-#define HLC_PHYSICAL_BITS		40	/* bits for physical time (about 34 years) */
-#define HLC_LOGICAL_BITS		24	/* bits for logical counter */
-#define HLC_PHYSICAL_MASK		((1ULL << HLC_PHYSICAL_BITS) - 1)
-#define HLC_LOGICAL_MASK		((1ULL << HLC_LOGICAL_BITS) - 1)
+#define HLC_PHYSICAL_BITS		40	/* bits for physical time */
+#define HLC_LOGICAL_BITS		23	/* bits for logical counter */
+#define HLC_LOGICAL_MASK		((uint64_t)(1ULL << HLC_LOGICAL_BITS) - 1)
+#define HLC_PHYSICAL_MASK		(~(uint64_t)HLC_LOGICAL_MASK) & ((1ULL << 63) - 1)
 
 /* Pack HLC into a 64-bit CSN for compatibility */
 #define HLC_TO_CSN(hlc) \
-	(((uint64)(hlc).physical_time << HLC_LOGICAL_BITS) | (hlc).logical_counter)
+	((((uint64)(hlc).physical_time) & HLC_PHYSICAL_MASK) | ((hlc).logical_counter & HLC_LOGICAL_MASK))
 
 /* Unpack CSN into HLC components */
 #define CSN_TO_HLC_PHYSICAL(csn) \
-	((csn) >> HLC_LOGICAL_BITS)
+	((csn) & HLC_PHYSICAL_MASK)
 
 #define CSN_TO_HLC_LOGICAL(csn) \
 	((csn) & HLC_LOGICAL_MASK)

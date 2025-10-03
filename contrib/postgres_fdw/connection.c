@@ -815,7 +815,7 @@ begin_remote_xact(ConnCacheEntry *entry)
 				fdwTransState->csn = ExportCSNSnapshot();
 
 			snprintf(import_sql, sizeof(import_sql),
-				"SELECT pg_csn_snapshot_import("UINT64_FORMAT")",
+				"SELECT pg_csn_snapshot_import("UINT64_FORMAT"::bigint)",
 				fdwTransState->csn);
 
 			do_sql_command(entry->conn, import_sql);

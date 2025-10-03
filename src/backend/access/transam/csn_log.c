@@ -801,7 +801,7 @@ GenerateHLCTimestamp(bool locked, CSN remote_hlc)
 	/* Get current physical time in nanoseconds */
 	INSTR_TIME_SET_CURRENT(current_time);
 	now_ns = (uint64) INSTR_TIME_GET_NANOSEC(current_time) + (int64) (csn_time_shift * 1E9);
-	
+
 	/* Apply mask to fit in our bit allocation */
 	now_ns = now_ns & HLC_PHYSICAL_MASK;
 

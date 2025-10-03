@@ -216,7 +216,7 @@ CSNSnapshotMapXmin(SnapshotCSN snapshot_csn)
 	/*
 	 * Round up snapshot_csn to the next second -- pessimistically and safely.
 	 */
-	csn_seconds = (snapshot_csn / NSECS_PER_SEC + 1);
+	csn_seconds = (CSN_TO_HLC_PHYSICAL(snapshot_csn) / NSECS_PER_SEC + 1);
 
 	/*
 	 * Fast-path check. Avoid taking exclusive CSNSnapshotXidMapLock lock
@@ -321,7 +321,7 @@ CSNSnapshotToXmin(SnapshotCSN snapshot_csn)
 	Assert(csnXidMap != NULL);
 
 	/* Round down to get conservative estimates */
-	csn_seconds = (snapshot_csn / NSECS_PER_SEC);
+	csn_seconds = (CSN_TO_HLC_PHYSICAL(snapshot_csn) / NSECS_PER_SEC);
 
 	LWLockAcquire(CSNSnapshotXidMapLock, LW_SHARED);
 	last_csn_seconds = pg_atomic_read_u64(&csnXidMap->last_csn_seconds);
