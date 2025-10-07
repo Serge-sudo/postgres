@@ -14,11 +14,41 @@
 #ifndef PROCARRAY_H
 #define PROCARRAY_H
 
+#include "storage/adaptive_lwlock.h"
 #include "storage/lock.h"
 #include "storage/standby.h"
 #include "utils/relcache.h"
 #include "utils/snapshot.h"
 
+/* External reference to the adaptive ProcArray lock */
+extern AdaptiveLWLock *GetAdaptiveProcArrayLock(void);
+extern bool AdaptiveProcArrayLockOn(void);
+
+/* Macro wrappers to use adaptive lock in place of ProcArrayLock */
+#define ProcArrayLockAcquire(mode) \
+	AdaptiveProcArrayLockOn() ? \
+		AdaptiveLWLockAcquire(GetAdaptiveProcArrayLock(), (mode)) : \
+		LWLockAcquire(ProcArrayLock, (mode))
+
+#define ProcArrayLockConditionalAcquire(mode) \
+	AdaptiveProcArrayLockOn() ? \
+		AdaptiveLWLockConditionalAcquire(GetAdaptiveProcArrayLock(), (mode)) : \
+		LWLockConditionalAcquire(ProcArrayLock, (mode))
+
+#define ProcArrayLockRelease() \
+	AdaptiveProcArrayLockOn() ? \
+		AdaptiveLWLockRelease(GetAdaptiveProcArrayLock()) : \
+		LWLockRelease(ProcArrayLock)
+
+#define ProcArrayLockHeldByMe() \
+	(AdaptiveProcArrayLockOn() ? \
+		AdaptiveLWLockHeldByMe(GetAdaptiveProcArrayLock()) : \
+		LWLockHeldByMe(ProcArrayLock))
+
+#define ProcArrayLockHeldByMeInMode(mode) \
+	(AdaptiveProcArrayLockOn() ? \
+		AdaptiveLWLockHeldByMeInMode(GetAdaptiveProcArrayLock(), (mode)) : \
+		LWLockHeldByMeInMode(ProcArrayLock, (mode)))
 
 extern Size ProcArrayShmemSize(void);
 extern void CreateSharedProcArray(void);

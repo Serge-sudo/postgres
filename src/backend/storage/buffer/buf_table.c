@@ -22,6 +22,7 @@
 #include "postgres.h"
 
 #include "storage/buf_internals.h"
+#include "utils/guc.h"
 
 /* entry for buffer lookup hashtable */
 typedef struct
@@ -31,6 +32,7 @@ typedef struct
 } BufferLookupEnt;
 
 static HTAB *SharedBufHash;
+static AdaptiveLWLock *AdaptiveBufferMappingLocks = NULL;
 
 
 /*
@@ -40,7 +42,7 @@ static HTAB *SharedBufHash;
 Size
 BufTableShmemSize(int size)
 {
-	return hash_estimate_size(size, sizeof(BufferLookupEnt));
+	return hash_estimate_size(size, sizeof(BufferLookupEnt)) + MAXALIGN(sizeof(AdaptiveLWLock) * NUM_BUFFER_PARTITIONS);
 }
 
 /*
@@ -51,6 +53,7 @@ void
 InitBufTable(int size)
 {
 	HASHCTL		info;
+	bool		found;
 
 	/* assume no locking is needed yet */
 
@@ -63,6 +66,34 @@ InitBufTable(int size)
 								  size, size,
 								  &info,
 								  HASH_ELEM | HASH_BLOBS | HASH_PARTITION);
+				
+	if (enable_adaptive_buffer_mapping_lock)
+	{				  
+		/* Create or attach to the Adaptive ProcArray Lock */
+		AdaptiveBufferMappingLocks = (AdaptiveLWLock *)
+			ShmemInitStruct("Adaptive Buffer Mapping Locks",
+							MAXALIGN(sizeof(AdaptiveLWLock) * NUM_BUFFER_PARTITIONS),
+							&found);
+
+		if (!found)
+		{	
+			/* Initialize the adaptive lock */
+			for (int i = 0; i < NUM_BUFFER_PARTITIONS; i++)
+				AdaptiveLWLockInitialize(AdaptiveBufferMappingLocks + i, LWTRANCHE_BUFFER_MAPPING, -1, true);
+		}
+	}
+}
+
+AdaptiveLWLock *
+GetAdaptiveBufferMappingLock(void)
+{
+	return AdaptiveBufferMappingLocks;
+}
+
+bool 
+AdaptiveBufferMappingLockOn(void)
+{
+	return enable_adaptive_buffer_mapping_lock;
 }
 
 /*

@@ -27,6 +27,7 @@
 #include "storage/spin.h"
 #include "utils/relcache.h"
 #include "utils/resowner.h"
+#include "storage/adaptive_lwlock.h"
 
 /*
  * Buffer state is a single 32-bit variable where following data is combined.
@@ -169,6 +170,8 @@ BufTagMatchesRelFileLocator(const BufferTag *tag,
 		(BufTagGetRelNumber(tag) == rlocator->relNumber);
 }
 
+extern AdaptiveLWLock *GetAdaptiveBufferMappingLock(void);
+extern bool AdaptiveBufferMappingLockOn(void);
 
 /*
  * The shared buffer mapping table is partitioned to reduce contention.
@@ -185,15 +188,22 @@ BufTableHashPartition(uint32 hashcode)
 static inline LWLock *
 BufMappingPartitionLock(uint32 hashcode)
 {
+	if (AdaptiveBufferMappingLockOn())
+		return (LWLock *) (GetAdaptiveBufferMappingLock() + BufTableHashPartition(hashcode));
+
 	return &MainLWLockArray[BUFFER_MAPPING_LWLOCK_OFFSET +
 							BufTableHashPartition(hashcode)].lock;
 }
 
-static inline LWLock *
-BufMappingPartitionLockByIndex(uint32 index)
-{
-	return &MainLWLockArray[BUFFER_MAPPING_LWLOCK_OFFSET + index].lock;
-}
+#define BufferMappingLockAcquire(lock, mode) \
+	AdaptiveBufferMappingLockOn() \
+		? AdaptiveLWLockAcquire((AdaptiveLWLock *)(lock), mode) \
+		: LWLockAcquire((LWLock *)(lock), mode)
+
+#define BufferMappingLockRelease(lock) \
+	AdaptiveBufferMappingLockOn() \
+		? AdaptiveLWLockRelease((AdaptiveLWLock *)(lock)) \
+		: LWLockRelease((LWLock *)(lock))
 
 /*
  *	BufferDesc -- shared descriptor/state data for a single shared buffer.

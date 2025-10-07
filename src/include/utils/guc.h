@@ -271,6 +271,9 @@ extern PGDLLIMPORT char *backtrace_functions;
 
 extern PGDLLIMPORT int temp_file_limit;
 
+extern PGDLLIMPORT bool enable_adaptive_procarraylock;
+extern PGDLLIMPORT bool enable_adaptive_buffer_mapping_lock;
+
 extern PGDLLIMPORT int num_temp_buffers;
 
 extern PGDLLIMPORT char *cluster_name;

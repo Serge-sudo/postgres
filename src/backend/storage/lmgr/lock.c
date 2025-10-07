@@ -3841,7 +3841,7 @@ GetBlockerStatusData(int blocked_pid)
 	 * does have the advantage that we're guaranteed to return a
 	 * self-consistent instantaneous state.
 	 */
-	LWLockAcquire(ProcArrayLock, LW_SHARED);
+	ProcArrayLockAcquire(LW_SHARED);
 
 	proc = BackendPidGetProcWithLock(blocked_pid);
 
@@ -3883,7 +3883,7 @@ GetBlockerStatusData(int blocked_pid)
 		Assert(data->nprocs <= data->maxprocs);
 	}
 
-	LWLockRelease(ProcArrayLock);
+	ProcArrayLockRelease();
 
 	return data;
 }

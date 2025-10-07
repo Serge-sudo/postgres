@@ -140,6 +140,8 @@ extern Size LWLockShmemSize(void);
 extern void CreateLWLocks(void);
 extern void InitLWLockAccess(void);
 
+const char *GetLWTrancheName(uint16 trancheId);
+
 extern const char *GetLWLockIdentifier(uint32 classId, uint16 eventId);
 
 /*
@@ -215,6 +217,7 @@ typedef enum BuiltinTrancheIds
 	LWTRANCHE_SUBTRANS_SLRU,
 	LWTRANCHE_XACT_SLRU,
 	LWTRANCHE_PARALLEL_VACUUM_DSA,
+	LWTRANCHE_PROCARRAY_ADAPTIVE,
 	LWTRANCHE_FIRST_USER_DEFINED,
 }			BuiltinTrancheIds;
 

@@ -1,6 +1,7 @@
 # Copyright (c) 2022-2024, PostgreSQL Global Development Group
 
 backend_sources += files(
+  'adaptive_lwlock.c',
   'condition_variable.c',
   'deadlock.c',
   'lmgr.c',
