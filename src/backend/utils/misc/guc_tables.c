@@ -531,6 +531,7 @@ int			log_temp_files = -1;
 double		log_statement_sample_rate = 1.0;
 double		log_xact_sample_rate = 0;
 char	   *backtrace_functions;
+int			log2_num_xlog_insert_locks;
 
 int			temp_file_limit = -1;
 
@@ -2055,6 +2056,16 @@ struct config_int ConfigureNamesInt[] =
 		},
 		&PostAuthDelay,
 		0, 0, INT_MAX / 1000000,
+		NULL, NULL, NULL
+	},
+	{
+		{
+			"log2_num_xlog_insert_locks", PGC_POSTMASTER, UNGROUPED,
+			gettext_noop("Number of xlog insertion locks."),
+			NULL
+		},
+		&log2_num_xlog_insert_locks,
+		3, 0, 16,
 		NULL, NULL, NULL
 	},
 	{
