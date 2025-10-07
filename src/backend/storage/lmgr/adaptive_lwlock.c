@@ -506,19 +506,35 @@ AdaptiveLWLockAcquire(AdaptiveLWLock *lock, LWLockMode mode)
 
 		AdaptiveLWLockQueueSelf(lock, mode);
 
-		/* Loop until we acquire the lock */
-		for (;;)
+		/*
+		 * Try to acquire again after queueing. This is critical to avoid a
+		 * race condition where the lock is released after our first attempt
+		 * but before we queue ourselves. If we get the lock now, we need to
+		 * dequeue ourselves.
+		 */
+		mustwait = AdaptiveLWLockAttemptLock(lock, mode, &slot_index);
+
+		if (!mustwait)
 		{
-			PGSemaphoreLock(MyProc->sem);
-
-			/* Try to acquire again after waking up */
-			if (!AdaptiveLWLockAttemptLock(lock, mode, &slot_index))
+			/* Got the lock on second try, undo queueing */
+			AdaptiveLWLockDequeueSelf(lock);
+		}
+		else
+		{
+			/* Loop until we acquire the lock */
+			for (;;)
 			{
-				AdaptiveLWLockDequeueSelf(lock);
-				break;
-			}
+				PGSemaphoreLock(MyProc->sem);
 
-			extraWaits++;
+				/* Try to acquire again after waking up */
+				if (!AdaptiveLWLockAttemptLock(lock, mode, &slot_index))
+				{
+					AdaptiveLWLockDequeueSelf(lock);
+					break;
+				}
+
+				extraWaits++;
+			}
 		}
 
 		/* Update contention stats */
