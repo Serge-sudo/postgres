@@ -316,15 +316,20 @@ AdaptiveLWLockDequeueSelf(AdaptiveLWLock *lock)
 
 	AdaptiveLWLockWaitListLock(lock);
 
+	/*
+	 * Remove ourselves from the waitlist, unless we've already been removed.
+	 * The removal happens with the wait list lock held, so there's no race in
+	 * this check.
+	 */
 	on_waitlist = MyProc->lwWaiting == LW_WS_WAITING;
-
 	if (on_waitlist)
-	{
 		proclist_delete(&lock->waiters, MyProcNumber, lwWaitLink);
-		MyProc->lwWaiting = LW_WS_NOT_WAITING;
-	}
 
 	AdaptiveLWLockWaitListUnlock(lock);
+
+	/* Clear waiting state after releasing lock, nice for debugging */
+	if (on_waitlist)
+		MyProc->lwWaiting = LW_WS_NOT_WAITING;
 
 #ifdef LOCK_DEBUG
 	if (on_waitlist)
