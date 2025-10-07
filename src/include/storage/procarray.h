@@ -14,10 +14,27 @@
 #ifndef PROCARRAY_H
 #define PROCARRAY_H
 
+#include "storage/adaptive_lwlock.h"
 #include "storage/lock.h"
 #include "storage/standby.h"
 #include "utils/relcache.h"
 #include "utils/snapshot.h"
+
+/* External reference to the adaptive ProcArray lock */
+extern AdaptiveLWLock *GetAdaptiveProcArrayLock(void);
+
+/* Macro wrappers to use adaptive lock in place of ProcArrayLock */
+#define ProcArrayLockAcquire(mode) \
+	AdaptiveLWLockAcquire(GetAdaptiveProcArrayLock(), (mode))
+
+#define ProcArrayLockConditionalAcquire(mode) \
+	AdaptiveLWLockConditionalAcquire(GetAdaptiveProcArrayLock(), (mode))
+
+#define ProcArrayLockRelease() \
+	AdaptiveLWLockRelease(GetAdaptiveProcArrayLock())
+
+#define ProcArrayLockHeldByMe() \
+	AdaptiveLWLockHeldByMe(GetAdaptiveProcArrayLock())
 
 
 extern Size ProcArrayShmemSize(void);
