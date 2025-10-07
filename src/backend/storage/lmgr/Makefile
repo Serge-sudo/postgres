@@ -13,6 +13,7 @@ top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 
 OBJS = \
+	adaptive_lwlock.o \
 	condition_variable.o \
 	deadlock.o \
 	lmgr.o \
