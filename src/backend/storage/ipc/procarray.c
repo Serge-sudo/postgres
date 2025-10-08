@@ -275,7 +275,6 @@ static PGPROC *allProcs;
  * Adaptive LWLock for ProcArray to reduce cache line contention
  */
 static AdaptiveLWLock *AdaptiveProcArrayLock = NULL;
-static AdaptiveLWLockStats *AdaptiveProcArrayLockStats = NULL;
 
 /*
  * GetAdaptiveProcArrayLock - return pointer to the adaptive ProcArray lock
@@ -427,7 +426,6 @@ ProcArrayShmemSize(void)
 
 	/* Add space for the adaptive ProcArray lock */
 	size = add_size(size, sizeof(AdaptiveLWLock));
-	size = add_size(size, sizeof(AdaptiveLWLockStats));
 
 	return size;
 }
@@ -473,21 +471,10 @@ CreateSharedProcArray(void)
 						sizeof(AdaptiveLWLock),
 						&found);
 
-	AdaptiveProcArrayLockStats = (AdaptiveLWLockStats *)
-		ShmemInitStruct("Adaptive ProcArray Lock Stats",
-						sizeof(AdaptiveLWLockStats),
-						&found);
-
 	if (!found)
 	{
 		/* Initialize the adaptive lock */
 		AdaptiveLWLockInitialize(AdaptiveProcArrayLock, LWTRANCHE_PROCARRAY_ADAPTIVE);
-		AdaptiveProcArrayLock->stats = AdaptiveProcArrayLockStats;
-
-		/* Initialize stats */
-		pg_atomic_init_u32(&AdaptiveProcArrayLockStats->exclusive_acquisitions, 0);
-		pg_atomic_init_u32(&AdaptiveProcArrayLockStats->shared_acquisitions, 0);
-		pg_atomic_init_u32(&AdaptiveProcArrayLockStats->contentions, 0);
 	}
 
 	/* Create or attach to the KnownAssignedXids arrays too, if needed */

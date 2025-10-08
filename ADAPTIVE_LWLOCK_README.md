@@ -10,21 +10,21 @@ This implementation adds an Adaptive LWLock to PostgreSQL that reduces cache lin
 Standard LWLocks have a significant performance issue: every shared lock acquisition causes cache line invalidation because the shared lock counter must be atomically incremented. This leads to excessive cache bouncing in read-heavy workloads.
 
 ### Solution
-The Adaptive LWLock uses an array of cache-line-padded standard LWLocks:
+The Adaptive LWLock uses an array of cache-line-padded atomic counters:
 
-- **Shared Lock Acquisition**: Randomly selects one of N LWLocks and acquires it in shared mode
-- **Exclusive Lock Acquisition**: Must acquire ALL N LWLocks in exclusive mode
-- **Adaptive Switching**: Based on workload statistics, exclusive lock holders can adjust the number of active LWLocks
+- **Shared Lock Acquisition**: Randomly selects one of N atomic counters to increment
+- **Exclusive Lock Acquisition**: Must acquire ALL N counters 
+- **Adaptive Switching**: Based on workload statistics, exclusive lock holders can adjust the number of active counters
 
 ### Key Features
 
-1. **Cache Line Isolation**: Each LWLock is padded to its own cache line (128 bytes) to prevent false sharing
-2. **Distributed Shared Locks**: Shared locks are distributed across multiple LWLocks, reducing contention
-3. **Ordered Exclusive Acquisition**: All exclusive acquirers use the same lock order to prevent deadlock
+1. **Cache Line Padding**: Each counter sits in its own cache line (128 bytes) to prevent false sharing
+2. **Memory Barriers**: Proper read/write barriers ensure consistency
+3. **Retry Logic**: Validates that active counter count hasn't changed during acquisition
 4. **Statistics**: Tracks acquisitions and contentions to guide adaptive behavior
 5. **Workload Adaptation**:
-   - High exclusive lock rate (>10%) + low contention (<1%) → reduce LWLocks (faster exclusive)
-   - High contention (>5%) → increase LWLocks (less cache bouncing)
+   - High exclusive lock rate (>10%) + low contention (<1%) → reduce counters (faster exclusive)
+   - High contention (>5%) → increase counters (less cache bouncing)
 
 ## Files
 
@@ -39,8 +39,9 @@ The Adaptive LWLock uses an array of cache-line-padded standard LWLocks:
 typedef struct AdaptiveLWLock
 {
     uint16 tranche;                     // tranche ID
-    pg_atomic_uint32 active_locks;      // number of active LWLock slots
-    LWLockPadded locks[8];              // array of padded LWLocks
+    pg_atomic_uint32 active_counters;   // number of active slots
+    proclist_head waiters;              // wait queue
+    AdaptiveLWLockCounter counters[8];  // cache-line-padded atomics
     AdaptiveLWLockStats *stats;         // statistics pointer
 } AdaptiveLWLock;
 ```
@@ -58,13 +59,13 @@ ProcArrayLockRelease();                // release
 
 ### Read-Heavy Workloads
 - **Benefit**: Significant reduction in cache line contention
-- **Mechanism**: Multiple LWLocks spread load across cache lines
-- **Trade-off**: No additional complexity over standard LWLocks
+- **Mechanism**: Multiple counters spread load across cache lines
+- **Trade-off**: Slightly more complex acquisition logic
 
 ### Write-Heavy Workloads  
-- **Benefit**: Adaptive reduction to single LWLock
+- **Benefit**: Adaptive reduction to single counter
 - **Mechanism**: Statistics-driven adjustment by exclusive lock holders
-- **Trade-off**: Must acquire multiple locks for exclusive access
+- **Trade-off**: May not provide benefits over standard LWLock
 
 ### Mixed Workloads
 - **Benefit**: Automatic adaptation to workload characteristics
@@ -74,21 +75,24 @@ ProcArrayLockRelease();                // release
 ## Implementation Details
 
 ### Shared Lock Acquisition
-1. Read current active_locks value
-2. Randomly select one LWLock slot
-3. Acquire that LWLock in shared mode using standard LWLockAcquire
+1. Read current active_counters value (snapshot)
+2. Randomly select counter slot based on process ID
+3. Atomically increment selected counter
+4. Verify active_counters hasn't changed (with read barrier)
+5. If changed, decrement and retry
 
 ### Exclusive Lock Acquisition
-1. Read current active_locks value
-2. For each active LWLock (in order):
-   - Acquire it in exclusive mode using standard LWLockAcquire
-3. After success, optionally adjust active_locks based on stats
+1. Read current active_counters value
+2. For each active counter:
+   - Try to CAS from 0 to EXCLUSIVE_FLAG
+   - If any fails, rollback and retry
+3. After success, optionally adjust active_counters based on stats
 
 ### Adaptive Adjustment
-Performed by exclusive lock holders after acquiring all locks:
+Performed by exclusive lock holders after acquiring lock:
 - Sample: Requires 1000+ total acquisitions
-- Reduce locks if: exclusive_rate > 10% AND contention < 1%
-- Increase locks if: contention > 5%
+- Reduce counters if: exclusive_rate > 10% AND contention < 1%
+- Increase counters if: contention > 5%
 - Reset stats after adjustment to prevent oscillation
 
 ## Future Enhancements
