@@ -48,6 +48,7 @@
 #include "commands/schemacmds.h"
 #include "commands/seclabel.h"
 #include "commands/sequence.h"
+#include "commands/shardgroupcmds.h"
 #include "commands/subscriptioncmds.h"
 #include "commands/tablecmds.h"
 #include "commands/tablespace.h"
@@ -132,6 +133,7 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_AlterCollationStmt:
 		case T_AlterDatabaseRefreshCollStmt:
 		case T_AlterDatabaseSetStmt:
+		case T_AlterDatabaseSetShardGroupStmt:
 		case T_AlterDatabaseStmt:
 		case T_AlterDefaultPrivilegesStmt:
 		case T_AlterDomainStmt:
@@ -147,6 +149,7 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_AlterOpFamilyStmt:
 		case T_AlterOperatorStmt:
 		case T_AlterOwnerStmt:
+		case T_AlterShardGroupStmt:
 		case T_AlterPolicyStmt:
 		case T_AlterPublicationStmt:
 		case T_AlterRoleSetStmt:
@@ -183,6 +186,7 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_CreateRoleStmt:
 		case T_CreateSchemaStmt:
 		case T_CreateSeqStmt:
+		case T_CreateShardGroupStmt:
 		case T_CreateStatsStmt:
 		case T_CreateStmt:
 		case T_CreateSubscriptionStmt:
@@ -1593,6 +1597,20 @@ ProcessUtilitySlow(ParseState *pstate,
 
 			case T_CreateForeignServerStmt:
 				address = CreateForeignServer((CreateForeignServerStmt *) parsetree);
+				break;
+
+			case T_CreateShardGroupStmt:
+				address = CreateShardGroup((CreateShardGroupStmt *) parsetree);
+				break;
+
+			case T_AlterShardGroupStmt:
+				address = AlterShardGroup((AlterShardGroupStmt *) parsetree);
+				break;
+
+			case T_AlterDatabaseSetShardGroupStmt:
+				AlterDatabaseSetShardGroup((AlterDatabaseSetShardGroupStmt *) parsetree);
+				/* no commands stashed for this */
+				commandCollected = true;
 				break;
 
 			case T_AlterForeignServerStmt:
