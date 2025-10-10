@@ -1022,6 +1022,7 @@ stmt:
 			| AlterSeqStmt
 			| AlterSystemStmt
 			| AlterTableStmt
+			| AlterTableSetShardGroupStmt
 			| AlterTblSpcStmt
 			| AlterCompositeTypeStmt
 			| AlterPublicationStmt
@@ -11490,6 +11491,21 @@ AlterDatabaseSetShardGroupStmt:
 
 					n->dbname = $3;
 					n->sgname = $8;
+					$$ = (Node *) n;
+				}
+		;
+
+/* ----------------------
+ *		ALTER TABLE SET SHARD GROUP Statement
+ * ----------------------
+ */
+AlterTableSetShardGroupStmt:
+			ALTER TABLE relation_expr SET SHARD GROUP_P name
+				{
+					AlterTableSetShardGroupStmt *n = makeNode(AlterTableSetShardGroupStmt);
+
+					n->relation = $3;
+					n->sgname = $7;
 					$$ = (Node *) n;
 				}
 		;
