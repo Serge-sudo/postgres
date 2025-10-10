@@ -2532,8 +2532,16 @@ CreateCommandTag(Node *parsetree)
 			tag = CMDTAG_CREATE_SERVER;
 			break;
 
+		case T_CreateShardGroupStmt:
+			tag = CMDTAG_CREATE_SHARD_GROUP;
+			break;
+
 		case T_AlterForeignServerStmt:
 			tag = CMDTAG_ALTER_SERVER;
+			break;
+
+		case T_AlterShardGroupStmt:
+			tag = CMDTAG_ALTER_SHARD_GROUP;
 			break;
 
 		case T_CreateUserMappingStmt:
@@ -2716,6 +2724,10 @@ CreateCommandTag(Node *parsetree)
 			tag = AlterObjectTypeCommandTag(((AlterTableStmt *) parsetree)->objtype);
 			break;
 
+		case T_AlterTableSetShardGroupStmt:
+			tag = CMDTAG_ALTER_TABLE;
+			break;
+
 		case T_AlterDomainStmt:
 			tag = CMDTAG_ALTER_DOMAIN;
 			break;
@@ -2846,6 +2858,7 @@ CreateCommandTag(Node *parsetree)
 		case T_AlterDatabaseStmt:
 		case T_AlterDatabaseRefreshCollStmt:
 		case T_AlterDatabaseSetStmt:
+		case T_AlterDatabaseSetShardGroupStmt:
 			tag = CMDTAG_ALTER_DATABASE;
 			break;
 
