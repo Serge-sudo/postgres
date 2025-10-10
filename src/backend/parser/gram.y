@@ -608,7 +608,6 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <list>	constraints_set_list
 %type <boolean> constraints_set_mode
 %type <str>		OptTableSpace OptConsTableSpace OptShardGroup
-%type <list>	OptDistributedBy
 %type <rolespec> OptTableSpaceOwner
 %type <ival>	opt_check_option
 
@@ -642,7 +641,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <boolean> opt_if_not_exists
 %type <boolean> opt_unique_null_treatment
 %type <ival>	generated_when override_kind
-%type <partspec>	PartitionSpec OptPartitionSpec
+%type <partspec>	PartitionSpec OptPartitionSpec DistributeSpec OptDistributeSpec
 %type <partelem>	part_elem
 %type <list>		part_params
 %type <partboundspec> PartitionBoundSpec
@@ -3571,7 +3570,7 @@ copy_generic_opt_arg_list_item:
 
 CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 			OptInherit OptPartitionSpec table_access_method_clause OptWith
-			OnCommitOption OptTableSpace OptDistributedBy OptShardGroup
+			OnCommitOption OptTableSpace OptDistributeSpec OptShardGroup
 				{
 					CreateStmt *n = makeNode(CreateStmt);
 
@@ -3587,14 +3586,14 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $12;
 					n->tablespacename = $13;
 					n->if_not_exists = false;
-					n->distributeby = $14;
+					n->distributespec = $14;
 					n->is_worldwide = false;
 					n->shardgroup = $15;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE IF_P NOT EXISTS qualified_name '('
 			OptTableElementList ')' OptInherit OptPartitionSpec table_access_method_clause
-			OptWith OnCommitOption OptTableSpace OptDistributedBy OptShardGroup
+			OptWith OnCommitOption OptTableSpace OptDistributeSpec OptShardGroup
 				{
 					CreateStmt *n = makeNode(CreateStmt);
 
@@ -3610,7 +3609,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $15;
 					n->tablespacename = $16;
 					n->if_not_exists = true;
-					n->distributeby = $17;
+					n->distributespec = $17;
 					n->is_worldwide = false;
 					n->shardgroup = $18;
 					$$ = (Node *) n;
@@ -3634,7 +3633,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $11;
 					n->tablespacename = $12;
 					n->if_not_exists = false;
-					n->distributeby = NIL;
+					n->distributespec = NULL;
 					n->is_worldwide = false;
 					n->shardgroup = NULL;
 					$$ = (Node *) n;
@@ -3658,7 +3657,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $14;
 					n->tablespacename = $15;
 					n->if_not_exists = true;
-					n->distributeby = NIL;
+					n->distributespec = NULL;
 					n->is_worldwide = false;
 					n->shardgroup = NULL;
 					$$ = (Node *) n;
@@ -3682,7 +3681,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $13;
 					n->tablespacename = $14;
 					n->if_not_exists = false;
-					n->distributeby = NIL;
+					n->distributespec = NULL;
 					n->is_worldwide = false;
 					n->shardgroup = NULL;
 					$$ = (Node *) n;
@@ -3706,7 +3705,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $16;
 					n->tablespacename = $17;
 					n->if_not_exists = true;
-					n->distributeby = NIL;
+					n->distributespec = NULL;
 					n->is_worldwide = false;
 					n->shardgroup = NULL;
 					$$ = (Node *) n;
@@ -3728,7 +3727,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $12;
 					n->tablespacename = $13;
 					n->if_not_exists = false;
-					n->distributeby = NIL;
+					n->distributespec = NULL;
 					n->is_worldwide = true;
 					n->shardgroup = $14;
 					$$ = (Node *) n;
@@ -3751,7 +3750,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $15;
 					n->tablespacename = $16;
 					n->if_not_exists = true;
-					n->distributeby = NIL;
+					n->distributespec = NULL;
 					n->is_worldwide = true;
 					n->shardgroup = $17;
 					$$ = (Node *) n;
@@ -4634,8 +4633,21 @@ OptTableSpace:   TABLESPACE name					{ $$ = $2; }
 			| /*EMPTY*/								{ $$ = NULL; }
 		;
 
-OptDistributedBy: DISTRIBUTED BY '(' name_list ')'	{ $$ = $4; }
-			| /*EMPTY*/								{ $$ = NIL; }
+/* Optional distribution specification */
+OptDistributeSpec: DistributeSpec	{ $$ = $1; }
+			| /*EMPTY*/				{ $$ = NULL; }
+		;
+
+DistributeSpec: DISTRIBUTED BY ColId '(' part_params ')'
+				{
+					PartitionSpec *n = makeNode(PartitionSpec);
+
+					n->strategy = parsePartitionStrategy($3);
+					n->partParams = $5;
+					n->location = @1;
+
+					$$ = n;
+				}
 		;
 
 OptShardGroup: SHARD GROUP_P name					{ $$ = $3; }

@@ -2663,7 +2663,7 @@ typedef struct CreateStmt
 	char	   *accessMethod;	/* table access method */
 	bool		if_not_exists;	/* just do nothing if it already exists? */
 	/* sharding-related fields */
-	List	   *distributeby;	/* DISTRIBUTED BY column list */
+	PartitionSpec *distributespec;	/* DISTRIBUTED BY clause (similar to partspec) */
 	bool		is_worldwide;	/* true for WORLDWIDE TABLE */
 	char	   *shardgroup;		/* SHARD GROUP name, or NULL for default */
 } CreateStmt;
