@@ -28,7 +28,6 @@
 #include "catalog/pg_shdepend.h"
 #include "catalog/pg_shardgroups.h"
 #include "catalog/pg_shardmembers.h"
-#include "catalog/pg_db_shardgroup.h"
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "commands/shardgroupcmds.h"
@@ -324,82 +323,6 @@ AlterShardGroup(AlterShardGroupStmt *stmt)
 }
 
 /*
- * ALTER DATABASE SET DEFAULT SHARD GROUP
- */
-void
-AlterDatabaseSetShardGroup(AlterDatabaseSetShardGroupStmt *stmt)
-{
-	Oid			dbid;
-	Oid			sgoid;
-	Relation	rel;
-	HeapTuple	tuple;
-	ObjectAddress dbAddr, sgAddr, defaultAddr;
-	
-	/* Check permissions */
-	if (!superuser())
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("permission denied to set default shard group"),
-				 errhint("Must be superuser to set default shard group for a database.")));
-	
-	/* Get database OID */
-	dbid = get_database_oid(stmt->dbname, false);
-	
-	/* Check we're not trying to set it for the current database during a transaction */
-	if (dbid == MyDatabaseId && IsTransactionState())
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot set default shard group for current database within a transaction")));
-	
-	/* Get shard group OID */
-	sgoid = get_shardgroup_oid(stmt->sgname, false);
-	
-	/* Open the catalog */
-	rel = table_open(DbShardGroupRelationId, RowExclusiveLock);
-	
-	/* Check if there's already a default for this database */
-	tuple = SearchSysCacheCopy1(DBSHARDGROUPDBID, ObjectIdGetDatum(dbid));
-	
-	if (HeapTupleIsValid(tuple))
-	{
-		/* Update existing entry */
-		Form_pg_db_shardgroup form = (Form_pg_db_shardgroup) GETSTRUCT(tuple);
-		form->sgid = sgoid;
-		
-		CatalogTupleUpdate(rel, &tuple->t_self, tuple);
-		heap_freetuple(tuple);
-	}
-	else
-	{
-		/* Insert new entry */
-		Datum		values[Natts_pg_db_shardgroup];
-		bool		nulls[Natts_pg_db_shardgroup];
-		
-		memset(values, 0, sizeof(values));
-		memset(nulls, false, sizeof(nulls));
-		
-		values[Anum_pg_db_shardgroup_dbid - 1] = ObjectIdGetDatum(dbid);
-		values[Anum_pg_db_shardgroup_sgid - 1] = ObjectIdGetDatum(sgoid);
-		
-		tuple = heap_form_tuple(RelationGetDescr(rel), values, nulls);
-		CatalogTupleInsert(rel, tuple);
-		
-		heap_freetuple(tuple);
-		
-		/* Record dependencies */
-		ObjectAddressSet(dbAddr, DatabaseRelationId, dbid);
-		ObjectAddressSet(sgAddr, ShardGroupRelationId, sgoid);
-		ObjectAddressSubSet(defaultAddr, DbShardGroupRelationId, dbid, 0);
-		
-		recordDependencyOn(&defaultAddr, &sgAddr, DEPENDENCY_NORMAL);
-		/* PIN the database mapping so it doesn't get dropped */
-		recordSharedDependencyOn(&defaultAddr, &dbAddr, SHARED_DEPENDENCY_INVALID);
-	}
-	
-	table_close(rel, RowExclusiveLock);
-}
-
-/*
  * ALTER TABLE SET SHARD GROUP
  *
  * This handles the ALTER TABLE ... SET SHARD GROUP command.
@@ -479,11 +402,12 @@ get_database_default_shardgroup(Oid dbid)
 	Oid			sgid = InvalidOid;
 	HeapTuple	tuple;
 	
-	tuple = SearchSysCache1(DBSHARDGROUPDBID, ObjectIdGetDatum(dbid));
+	tuple = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(dbid));
 	
 	if (HeapTupleIsValid(tuple))
 	{
-		sgid = ((Form_pg_db_shardgroup) GETSTRUCT(tuple))->sgid;
+		Form_pg_database dbform = (Form_pg_database) GETSTRUCT(tuple);
+		sgid = dbform->datshardgroup;
 		ReleaseSysCache(tuple);
 	}
 	

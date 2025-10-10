@@ -282,7 +282,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 %type <node>	stmt toplevel_stmt schema_stmt routine_body_stmt
 		AlterEventTrigStmt AlterCollationStmt
-		AlterDatabaseStmt AlterDatabaseSetStmt AlterDatabaseSetShardGroupStmt AlterDomainStmt AlterEnumStmt
+		AlterDatabaseStmt AlterDatabaseSetStmt AlterDomainStmt AlterEnumStmt
 		AlterFdwStmt AlterForeignServerStmt AlterGroupStmt
 		AlterObjectDependsStmt AlterObjectSchemaStmt AlterOwnerStmt
 		AlterOperatorStmt AlterShardGroupStmt AlterTypeStmt AlterSeqStmt AlterSystemStmt AlterTableStmt
@@ -1003,7 +1003,6 @@ stmt:
 			| AlterCollationStmt
 			| AlterDatabaseStmt
 			| AlterDatabaseSetStmt
-			| AlterDatabaseSetShardGroupStmt
 			| AlterDefaultPrivilegesStmt
 			| AlterDomainStmt
 			| AlterEnumStmt
@@ -11447,6 +11446,15 @@ AlterDatabaseStmt:
 														(Node *) makeString($6), @6));
 					$$ = (Node *) n;
 				 }
+			| ALTER DATABASE name SET DEFAULT SHARD GROUP_P name
+				 {
+					AlterDatabaseStmt *n = makeNode(AlterDatabaseStmt);
+
+					n->dbname = $3;
+					n->options = list_make1(makeDefElem("shardgroup",
+														(Node *) makeString($8), @8));
+					$$ = (Node *) n;
+				 }
 			| ALTER DATABASE name REFRESH COLLATION VERSION_P
 				 {
 					AlterDatabaseRefreshCollStmt *n = makeNode(AlterDatabaseRefreshCollStmt);
@@ -11535,21 +11543,6 @@ AlterShardGroupStmt:
 		;
 
 /*****************************************************************************
- *		ALTER DATABASE SET DEFAULT SHARD GROUP
- *****************************************************************************/
-
-AlterDatabaseSetShardGroupStmt:
-			ALTER DATABASE name SET DEFAULT SHARD GROUP_P name
-				{
-					AlterDatabaseSetShardGroupStmt *n = makeNode(AlterDatabaseSetShardGroupStmt);
-
-					n->dbname = $3;
-					n->sgname = $8;
-					$$ = (Node *) n;
-				}
-		;
-
-/* ----------------------
  *		ALTER TABLE SET SHARD GROUP Statement
  * ----------------------
  */
