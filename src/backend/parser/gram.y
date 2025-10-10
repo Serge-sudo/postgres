@@ -1002,6 +1002,7 @@ stmt:
 			| AlterCollationStmt
 			| AlterDatabaseStmt
 			| AlterDatabaseSetStmt
+			| AlterDatabaseSetShardGroupStmt
 			| AlterDefaultPrivilegesStmt
 			| AlterDomainStmt
 			| AlterEnumStmt
@@ -1015,6 +1016,7 @@ stmt:
 			| AlterObjectSchemaStmt
 			| AlterOwnerStmt
 			| AlterOperatorStmt
+			| AlterShardGroupStmt
 			| AlterTypeStmt
 			| AlterPolicyStmt
 			| AlterSeqStmt
@@ -1059,6 +1061,7 @@ stmt:
 			| CreatePLangStmt
 			| CreateSchemaStmt
 			| CreateSeqStmt
+			| CreateShardGroupStmt
 			| CreateStmt
 			| CreateSubscriptionStmt
 			| CreateStatsStmt
@@ -3583,6 +3586,9 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $12;
 					n->tablespacename = $13;
 					n->if_not_exists = false;
+					n->distributeby = NIL;
+					n->is_worldwide = false;
+					n->shardgroup = NULL;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE IF_P NOT EXISTS qualified_name '('
@@ -3603,6 +3609,9 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $15;
 					n->tablespacename = $16;
 					n->if_not_exists = true;
+					n->distributeby = NIL;
+					n->is_worldwide = false;
+					n->shardgroup = NULL;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE qualified_name OF any_name
@@ -3624,6 +3633,9 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $11;
 					n->tablespacename = $12;
 					n->if_not_exists = false;
+					n->distributeby = NIL;
+					n->is_worldwide = false;
+					n->shardgroup = NULL;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE IF_P NOT EXISTS qualified_name OF any_name
@@ -3645,6 +3657,9 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $14;
 					n->tablespacename = $15;
 					n->if_not_exists = true;
+					n->distributeby = NIL;
+					n->is_worldwide = false;
+					n->shardgroup = NULL;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE qualified_name PARTITION OF qualified_name
@@ -3666,6 +3681,9 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $13;
 					n->tablespacename = $14;
 					n->if_not_exists = false;
+					n->distributeby = NIL;
+					n->is_worldwide = false;
+					n->shardgroup = NULL;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE IF_P NOT EXISTS qualified_name PARTITION OF
@@ -3687,6 +3705,9 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $16;
 					n->tablespacename = $17;
 					n->if_not_exists = true;
+					n->distributeby = NIL;
+					n->is_worldwide = false;
+					n->shardgroup = NULL;
 					$$ = (Node *) n;
 				}
 		;
@@ -11387,6 +11408,88 @@ AlterDatabaseSetStmt:
 
 					n->dbname = $3;
 					n->setstmt = $4;
+					$$ = (Node *) n;
+				}
+		;
+
+
+/*****************************************************************************
+ *
+ *		Sharding DDL statements
+ *
+ *****************************************************************************/
+
+/*****************************************************************************
+ *		CREATE SHARD GROUP
+ *****************************************************************************/
+
+CreateShardGroupStmt:
+			CREATE SHARD GROUP_P name
+				{
+					CreateShardGroupStmt *n = makeNode(CreateShardGroupStmt);
+
+					n->sgname = $4;
+					n->options = NIL;
+					$$ = (Node *) n;
+				}
+			| CREATE SHARD GROUP_P name WITH '(' generic_option_list ')'
+				{
+					CreateShardGroupStmt *n = makeNode(CreateShardGroupStmt);
+
+					n->sgname = $4;
+					n->options = $7;
+					$$ = (Node *) n;
+				}
+		;
+
+/*****************************************************************************
+ *		ALTER SHARD GROUP
+ *****************************************************************************/
+
+AlterShardGroupStmt:
+			ALTER SHARD GROUP_P name ADD_P MEMBER name
+				{
+					AlterShardGroupStmt *n = makeNode(AlterShardGroupStmt);
+
+					n->sgname = $4;
+					n->action = "ADD";
+					n->servername = $7;
+					n->options = NIL;
+					$$ = (Node *) n;
+				}
+			| ALTER SHARD GROUP_P name ADD_P MEMBER name WITH '(' generic_option_list ')'
+				{
+					AlterShardGroupStmt *n = makeNode(AlterShardGroupStmt);
+
+					n->sgname = $4;
+					n->action = "ADD";
+					n->servername = $7;
+					n->options = $10;
+					$$ = (Node *) n;
+				}
+			| ALTER SHARD GROUP_P name DROP MEMBER name
+				{
+					AlterShardGroupStmt *n = makeNode(AlterShardGroupStmt);
+
+					n->sgname = $4;
+					n->action = "DROP";
+					n->servername = $7;
+					n->options = NIL;
+					$$ = (Node *) n;
+				}
+		;
+
+/*****************************************************************************
+ *		ALTER DATABASE SET DEFAULT SHARD GROUP
+ *****************************************************************************/
+
+AlterDatabaseSetShardGroupStmt:
+			ALTER DATABASE name SET DEFAULT SHARD GROUP_P name
+				{
+					AlterDatabaseSetShardGroupStmt *n = makeNode(AlterDatabaseSetShardGroupStmt);
+
+					n->dbname = $3;
+					n->sgname = $8;
 					$$ = (Node *) n;
 				}
 		;
