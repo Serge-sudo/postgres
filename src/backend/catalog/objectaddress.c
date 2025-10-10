@@ -70,6 +70,7 @@
 #include "commands/extension.h"
 #include "commands/policy.h"
 #include "commands/proclang.h"
+#include "commands/shardgroupcmds.h"
 #include "commands/tablespace.h"
 #include "commands/trigger.h"
 #include "foreign/foreign.h"
@@ -1312,6 +1313,11 @@ get_object_address_unqualified(ObjectType objtype,
 			address.objectId = get_publication_oid(name, missing_ok);
 			address.objectSubId = 0;
 			break;
+		case OBJECT_SHARD_GROUP:
+			address.classId = ShardGroupRelationId;
+			address.objectId = get_shardgroup_oid(name, missing_ok);
+			address.objectSubId = 0;
+			break;
 		case OBJECT_SUBSCRIPTION:
 			address.classId = SubscriptionRelationId;
 			address.objectId = get_subscription_oid(name, missing_ok);
@@ -2302,6 +2308,7 @@ pg_get_object_address(PG_FUNCTION_ARGS)
 		case OBJECT_PUBLICATION:
 		case OBJECT_ROLE:
 		case OBJECT_SCHEMA:
+		case OBJECT_SHARD_GROUP:
 		case OBJECT_SUBSCRIPTION:
 		case OBJECT_TABLESPACE:
 			if (list_length(name) != 1)
@@ -2447,6 +2454,7 @@ check_object_ownership(Oid roleid, ObjectType objtype, ObjectAddress address,
 		case OBJECT_LANGUAGE:
 		case OBJECT_PUBLICATION:
 		case OBJECT_SCHEMA:
+		case OBJECT_SHARD_GROUP:
 		case OBJECT_SUBSCRIPTION:
 		case OBJECT_TABLESPACE:
 			if (!object_ownercheck(address.classId, address.objectId, roleid))

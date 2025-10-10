@@ -476,6 +476,10 @@ does_not_exist_skipping(ObjectType objtype, Node *object)
 			msg = gettext_noop("publication \"%s\" does not exist, skipping");
 			name = strVal(object);
 			break;
+		case OBJECT_SHARD_GROUP:
+			msg = gettext_noop("shard group \"%s\" does not exist, skipping");
+			name = strVal(object);
+			break;
 
 		case OBJECT_COLUMN:
 		case OBJECT_DATABASE:

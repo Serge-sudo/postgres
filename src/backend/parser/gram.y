@@ -7061,6 +7061,7 @@ drop_type_name:
 			| PUBLICATION							{ $$ = OBJECT_PUBLICATION; }
 			| SCHEMA								{ $$ = OBJECT_SCHEMA; }
 			| SERVER								{ $$ = OBJECT_FOREIGN_SERVER; }
+			| SHARD GROUP_P							{ $$ = OBJECT_SHARD_GROUP; }
 		;
 
 /* object types attached to a table */
