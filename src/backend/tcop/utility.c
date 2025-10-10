@@ -2662,6 +2662,9 @@ CreateCommandTag(Node *parsetree)
 				case OBJECT_PUBLICATION:
 					tag = CMDTAG_DROP_PUBLICATION;
 					break;
+				case OBJECT_SHARD_GROUP:
+					tag = CMDTAG_DROP_SHARD_GROUP;
+					break;
 				case OBJECT_STATISTIC_EXT:
 					tag = CMDTAG_DROP_STATISTICS;
 					break;

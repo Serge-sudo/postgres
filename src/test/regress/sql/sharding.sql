@@ -49,4 +49,12 @@ CREATE WORLDWIDE TABLE test_t_worldwide (a int, b int) SHARD GROUP sg_test_2;
 CREATE TABLE test_t_distribute (a int, b int) DISTRIBUTED BY (a) SHARD GROUP sg_test_2;
 SELECT * FROM pg_class WHERE relname like 'test_t_%';
 
+SELECT * FROM pg_shardgroups;
+SELECT * FROM pg_shardmembers;
+DROP SHARD GROUP sg_test_2;
+SELECT * FROM pg_shardgroups;
+SELECT * FROM pg_shardmembers;
+DROP SHARD GROUP sg_test;
+SELECT * FROM pg_shardgroups;
+SELECT * FROM pg_shardmembers;
 

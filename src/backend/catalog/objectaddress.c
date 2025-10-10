@@ -70,6 +70,7 @@
 #include "commands/extension.h"
 #include "commands/policy.h"
 #include "commands/proclang.h"
+#include "commands/shardgroupcmds.h"
 #include "commands/tablespace.h"
 #include "commands/trigger.h"
 #include "foreign/foreign.h"
@@ -642,14 +643,14 @@ static const ObjectPropertyType ObjectProperty[] =
 		"shard group",
 		ShardGroupRelationId,
 		ShardGroupOidIndexId,
-		-1,
-		-1,
+		SHARDGROUPOID,
+		SHARDGROUPNAME,
 		Anum_pg_shardgroups_oid,
 		Anum_pg_shardgroups_sgname,
 		InvalidAttrNumber,
 		Anum_pg_shardgroups_sgowner,
 		Anum_pg_shardgroups_sgoptions,
-		OBJECT_TYPE,
+		OBJECT_SHARD_GROUP,
 		true
 	},
 	{
@@ -1033,6 +1034,7 @@ get_object_address(ObjectType objtype, Node *object,
 			case OBJECT_PARAMETER_ACL:
 			case OBJECT_ACCESS_METHOD:
 			case OBJECT_PUBLICATION:
+			case OBJECT_SHARD_GROUP:
 			case OBJECT_SUBSCRIPTION:
 				address = get_object_address_unqualified(objtype,
 														 castNode(String, object), missing_ok);
@@ -1338,6 +1340,11 @@ get_object_address_unqualified(ObjectType objtype,
 		case OBJECT_PUBLICATION:
 			address.classId = PublicationRelationId;
 			address.objectId = get_publication_oid(name, missing_ok);
+			address.objectSubId = 0;
+			break;
+		case OBJECT_SHARD_GROUP:
+			address.classId = ShardGroupRelationId;
+			address.objectId = get_shardgroup_oid(name, missing_ok);
 			address.objectSubId = 0;
 			break;
 		case OBJECT_SUBSCRIPTION:
@@ -2330,6 +2337,7 @@ pg_get_object_address(PG_FUNCTION_ARGS)
 		case OBJECT_PUBLICATION:
 		case OBJECT_ROLE:
 		case OBJECT_SCHEMA:
+		case OBJECT_SHARD_GROUP:
 		case OBJECT_SUBSCRIPTION:
 		case OBJECT_TABLESPACE:
 			if (list_length(name) != 1)
@@ -2475,6 +2483,7 @@ check_object_ownership(Oid roleid, ObjectType objtype, ObjectAddress address,
 		case OBJECT_LANGUAGE:
 		case OBJECT_PUBLICATION:
 		case OBJECT_SCHEMA:
+		case OBJECT_SHARD_GROUP:
 		case OBJECT_SUBSCRIPTION:
 		case OBJECT_TABLESPACE:
 			if (!object_ownercheck(address.classId, address.objectId, roleid))
