@@ -56,9 +56,11 @@
 #include "catalog/toasting.h"
 #include "commands/cluster.h"
 #include "commands/comment.h"
+#include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
 #include "commands/sequence.h"
+#include "commands/shardgroupcmds.h"
 #include "commands/tablecmds.h"
 #include "commands/tablespace.h"
 #include "commands/trigger.h"
@@ -1268,6 +1270,66 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	if (stmt->constraints)
 		AddRelationNewConstraints(rel, NIL, stmt->constraints,
 								  true, true, false, queryString);
+
+	/*
+	 * Handle sharding-related features: distributed tables, worldwide tables,
+	 * and shard group assignment.
+	 */
+	if (stmt->distributeby || stmt->is_worldwide || stmt->shardgroup)
+	{
+		Oid			sgid = InvalidOid;
+		
+		/* Validate that distributed/worldwide flags are mutually exclusive */
+		if (stmt->distributeby && stmt->is_worldwide)
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("table cannot be both DISTRIBUTED and WORLDWIDE")));
+		
+		/* Determine the shard group OID */
+		if (stmt->shardgroup)
+		{
+			/* Explicit shard group specified */
+			sgid = get_shardgroup_oid(stmt->shardgroup, false);
+		}
+		else
+		{
+			/* Use database default shard group */
+			sgid = get_database_default_shardgroup(MyDatabaseId);
+			if (!OidIsValid(sgid))
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_OBJECT),
+						 errmsg("no default shard group set for database \"%s\"",
+								get_database_name(MyDatabaseId)),
+						 errhint("Use ALTER DATABASE SET DEFAULT SHARD GROUP or specify SHARD GROUP explicitly.")));
+		}
+		
+		/* Handle distributed tables */
+		if (stmt->distributeby)
+		{
+			/* TODO: Validate distribution columns exist */
+			/* TODO: Set relkind to RELKIND_DISTRIBUTED_TABLE */
+			/* TODO: Store distribution key metadata */
+			ereport(NOTICE,
+					(errmsg("DISTRIBUTED BY clause not yet fully implemented"),
+					 errdetail("Table will be created as ordinary table for now.")));
+		}
+		
+		/* Handle worldwide tables */
+		if (stmt->is_worldwide)
+		{
+			/* TODO: Set relkind to RELKIND_WORLDWIDE_TABLE */
+			/* TODO: Validate table is suitable for worldwide replication */
+			ereport(NOTICE,
+					(errmsg("WORLDWIDE table not yet fully implemented"),
+					 errdetail("Table will be created as ordinary table for now.")));
+		}
+		
+		/* Set the shard group for the relation */
+		if (OidIsValid(sgid))
+		{
+			SetRelationShardGroup(relationId, sgid);
+		}
+	}
 
 	ObjectAddressSet(address, RelationRelationId, relationId);
 

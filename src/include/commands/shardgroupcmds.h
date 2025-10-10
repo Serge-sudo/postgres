@@ -22,4 +22,9 @@ extern ObjectAddress AlterShardGroup(AlterShardGroupStmt *stmt);
 extern void AlterDatabaseSetShardGroup(AlterDatabaseSetShardGroupStmt *stmt);
 extern void AlterTableSetShardGroup(AlterTableSetShardGroupStmt *stmt);
 
+/* Helper functions for shard group management */
+extern Oid get_shardgroup_oid(const char *sgname, bool missing_ok);
+extern Oid get_database_default_shardgroup(Oid dbid);
+extern void SetRelationShardGroup(Oid relid, Oid sgid);
+
 #endif							/* SHARDGROUPCMDS_H */

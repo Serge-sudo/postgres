@@ -25,7 +25,7 @@
  *		typedef struct FormData_pg_db_shardgroup
  * ----------------
  */
-CATALOG(pg_db_shardgroup,6112,DbShardGroupRelationId) BKI_ROWTYPE_OID(6113,DbShardGroupRelation_Rowtype_Id)
+CATALOG(pg_db_shardgroup,8801,DbShardGroupRelationId) BKI_ROWTYPE_OID(8802,DbShardGroupRelation_Rowtype_Id)
 {
 	Oid			dbid BKI_LOOKUP(pg_database);	/* references pg_database.oid */
 	Oid			sgid;			/* references pg_shardgroups.oid */
@@ -38,7 +38,7 @@ CATALOG(pg_db_shardgroup,6112,DbShardGroupRelationId) BKI_ROWTYPE_OID(6113,DbSha
  */
 typedef FormData_pg_db_shardgroup *Form_pg_db_shardgroup;
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_db_shardgroup_dbid_index, 6114, DbShardGroupDbidIndexId, pg_db_shardgroup, btree(dbid oid_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_db_shardgroup_dbid_index, 8803, DbShardGroupDbidIndexId, pg_db_shardgroup, btree(dbid oid_ops));
 
 MAKE_SYSCACHE(DBSHARDGROUPDBID, pg_db_shardgroup_dbid_index, 4);
 

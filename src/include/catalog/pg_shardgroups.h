@@ -25,7 +25,7 @@
  *		typedef struct FormData_pg_shardgroups
  * ----------------
  */
-CATALOG(pg_shardgroups,6100,ShardGroupRelationId) BKI_ROWTYPE_OID(6101,ShardGroupRelation_Rowtype_Id)
+CATALOG(pg_shardgroups,8789,ShardGroupRelationId) BKI_ROWTYPE_OID(8790,ShardGroupRelation_Rowtype_Id)
 {
 	Oid			oid;			/* oid */
 	NameData	sgname;			/* shard group name */
@@ -43,10 +43,10 @@ CATALOG(pg_shardgroups,6100,ShardGroupRelationId) BKI_ROWTYPE_OID(6101,ShardGrou
  */
 typedef FormData_pg_shardgroups *Form_pg_shardgroups;
 
-DECLARE_TOAST(pg_shardgroups, 6102, 6103);
+DECLARE_TOAST(pg_shardgroups, 8791, 8792);
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_shardgroups_oid_index, 6104, ShardGroupOidIndexId, pg_shardgroups, btree(oid oid_ops));
-DECLARE_UNIQUE_INDEX(pg_shardgroups_name_index, 6105, ShardGroupNameIndexId, pg_shardgroups, btree(sgname name_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_shardgroups_oid_index, 8793, ShardGroupOidIndexId, pg_shardgroups, btree(oid oid_ops));
+DECLARE_UNIQUE_INDEX(pg_shardgroups_name_index, 8794, ShardGroupNameIndexId, pg_shardgroups, btree(sgname name_ops));
 
 MAKE_SYSCACHE(SHARDGROUPOID, pg_shardgroups_oid_index, 4);
 MAKE_SYSCACHE(SHARDGROUPNAME, pg_shardgroups_name_index, 4);
