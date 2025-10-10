@@ -5,11 +5,38 @@
 -- Full implementation is TODO.
 --
 
--- CREATE SHARD GROUP (should error with "not yet implemented")
-CREATE SHARD GROUP sg_test;
+CREATE EXTENSION IF NOT EXISTS postgres_fdw;
 
--- CREATE SHARD GROUP with options (should error with "not yet implemented")
-CREATE SHARD GROUP sg_test2 WITH (routing_strategy='hash');
+SELECT * FROM pg_shardgroups;
+SELECT * FROM pg_db_shardgroup;
+SELECT * FROM pg_shardmembers;
 
--- Test error message
+\d+ pg_shardgroups
+\d+ pg_db_shardgroup
+\d+ pg_shardmembers
+
+-- CREATE SHARD GROUP 
 CREATE SHARD GROUP sg_test;
+SELECT * FROM pg_shardgroups;
+-- -- Test error message
+CREATE SHARD GROUP sg_test;
+SELECT * FROM pg_shardgroups;
+
+
+-- ALTER DATABASE ... SET SHARD GROUP
+CREATE SERVER server1
+    FOREIGN DATA WRAPPER postgres_fdw
+    OPTIONS (host 'localhost', dbname 'postgres', port '5432');
+ALTER SHARD GROUP sg_test ADD MEMBER server1;
+SELECT * FROM pg_shardmembers;
+DROP SERVER server1;
+ALTER SHARD GROUP sg_test DROP MEMBER server1;
+SELECT * FROM pg_shardmembers;
+
+
+
+CREATE WORLDWIDE TABLE test_t_worldwide (a int, b int) SHARD GROUP sg_test;
+CREATE TABLE test_t_distribute (a int, b int) DISTRIBUTED BY (a) SHARD GROUP sg_test;
+SELECT * FROM pg_class WHERE relname like 'test_t_%';
+
+
