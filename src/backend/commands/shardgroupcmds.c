@@ -295,9 +295,6 @@ AlterShardGroup(AlterShardGroupStmt *stmt)
 			
 			memberoid = ((Form_pg_shardmembers) GETSTRUCT(tuple))->oid;
 			
-			/* Delete the tuple */
-			CatalogTupleDelete(rel, &tuple->t_self);
-			
 			systable_endscan(scan);
 		}
 		
