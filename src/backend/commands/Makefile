@@ -50,6 +50,7 @@ OBJS = \
 	schemacmds.o \
 	seclabel.o \
 	sequence.o \
+	shardgroupcmds.o \
 	statscmds.o \
 	subscriptioncmds.o \
 	tablecmds.o \
