@@ -607,7 +607,8 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 %type <list>	constraints_set_list
 %type <boolean> constraints_set_mode
-%type <str>		OptTableSpace OptConsTableSpace
+%type <str>		OptTableSpace OptConsTableSpace OptShardGroup
+%type <list>	OptDistributedBy
 %type <rolespec> OptTableSpaceOwner
 %type <ival>	opt_check_option
 
@@ -3571,7 +3572,7 @@ copy_generic_opt_arg_list_item:
 
 CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 			OptInherit OptPartitionSpec table_access_method_clause OptWith
-			OnCommitOption OptTableSpace
+			OnCommitOption OptTableSpace OptDistributedBy OptShardGroup
 				{
 					CreateStmt *n = makeNode(CreateStmt);
 
@@ -3587,14 +3588,14 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $12;
 					n->tablespacename = $13;
 					n->if_not_exists = false;
-					n->distributeby = NIL;
+					n->distributeby = $14;
 					n->is_worldwide = false;
-					n->shardgroup = NULL;
+					n->shardgroup = $15;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE IF_P NOT EXISTS qualified_name '('
 			OptTableElementList ')' OptInherit OptPartitionSpec table_access_method_clause
-			OptWith OnCommitOption OptTableSpace
+			OptWith OnCommitOption OptTableSpace OptDistributedBy OptShardGroup
 				{
 					CreateStmt *n = makeNode(CreateStmt);
 
@@ -3610,9 +3611,9 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $15;
 					n->tablespacename = $16;
 					n->if_not_exists = true;
-					n->distributeby = NIL;
+					n->distributeby = $17;
 					n->is_worldwide = false;
-					n->shardgroup = NULL;
+					n->shardgroup = $18;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE qualified_name OF any_name
@@ -3709,6 +3710,51 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->distributeby = NIL;
 					n->is_worldwide = false;
 					n->shardgroup = NULL;
+					$$ = (Node *) n;
+				}
+		| CREATE OptTemp WORLDWIDE TABLE qualified_name '(' OptTableElementList ')'
+			OptInherit table_access_method_clause OptWith OnCommitOption OptTableSpace OptShardGroup
+				{
+					CreateStmt *n = makeNode(CreateStmt);
+
+					$5->relpersistence = $2;
+					n->relation = $5;
+					n->tableElts = $7;
+					n->inhRelations = $9;
+					n->partspec = NULL;
+					n->ofTypename = NULL;
+					n->constraints = NIL;
+					n->accessMethod = $10;
+					n->options = $11;
+					n->oncommit = $12;
+					n->tablespacename = $13;
+					n->if_not_exists = false;
+					n->distributeby = NIL;
+					n->is_worldwide = true;
+					n->shardgroup = $14;
+					$$ = (Node *) n;
+				}
+		| CREATE OptTemp WORLDWIDE TABLE IF_P NOT EXISTS qualified_name '('
+			OptTableElementList ')' OptInherit table_access_method_clause OptWith
+			OnCommitOption OptTableSpace OptShardGroup
+				{
+					CreateStmt *n = makeNode(CreateStmt);
+
+					$8->relpersistence = $2;
+					n->relation = $8;
+					n->tableElts = $10;
+					n->inhRelations = $12;
+					n->partspec = NULL;
+					n->ofTypename = NULL;
+					n->constraints = NIL;
+					n->accessMethod = $13;
+					n->options = $14;
+					n->oncommit = $15;
+					n->tablespacename = $16;
+					n->if_not_exists = true;
+					n->distributeby = NIL;
+					n->is_worldwide = true;
+					n->shardgroup = $17;
 					$$ = (Node *) n;
 				}
 		;
@@ -4586,6 +4632,14 @@ OnCommitOption:  ON COMMIT DROP				{ $$ = ONCOMMIT_DROP; }
 		;
 
 OptTableSpace:   TABLESPACE name					{ $$ = $2; }
+			| /*EMPTY*/								{ $$ = NULL; }
+		;
+
+OptDistributedBy: DISTRIBUTED BY '(' name_list ')'	{ $$ = $4; }
+			| /*EMPTY*/								{ $$ = NIL; }
+		;
+
+OptShardGroup: SHARD GROUP_P name					{ $$ = $3; }
 			| /*EMPTY*/								{ $$ = NULL; }
 		;
 
