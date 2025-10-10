@@ -19,7 +19,6 @@
 
 extern ObjectAddress CreateShardGroup(CreateShardGroupStmt *stmt);
 extern ObjectAddress AlterShardGroup(AlterShardGroupStmt *stmt);
-extern void AlterDatabaseSetShardGroup(AlterDatabaseSetShardGroupStmt *stmt);
 extern void AlterTableSetShardGroup(AlterTableSetShardGroupStmt *stmt);
 
 /* Helper functions for shard group management */

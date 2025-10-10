@@ -4259,17 +4259,6 @@ typedef struct AlterShardGroupStmt
 } AlterShardGroupStmt;
 
 /* ----------------------
- *		ALTER DATABASE SET DEFAULT SHARD GROUP Statement
- * ----------------------
- */
-typedef struct AlterDatabaseSetShardGroupStmt
-{
-	NodeTag		type;
-	char	   *dbname;			/* database name */
-	char	   *sgname;			/* shard group name */
-} AlterDatabaseSetShardGroupStmt;
-
-/* ----------------------
  *		ALTER TABLE SET SHARD GROUP Statement
  * ----------------------
  */

@@ -133,7 +133,6 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_AlterCollationStmt:
 		case T_AlterDatabaseRefreshCollStmt:
 		case T_AlterDatabaseSetStmt:
-		case T_AlterDatabaseSetShardGroupStmt:
 		case T_AlterDatabaseStmt:
 		case T_AlterDefaultPrivilegesStmt:
 		case T_AlterDomainStmt:
@@ -1607,12 +1606,6 @@ ProcessUtilitySlow(ParseState *pstate,
 				address = AlterShardGroup((AlterShardGroupStmt *) parsetree);
 				break;
 
-			case T_AlterDatabaseSetShardGroupStmt:
-				AlterDatabaseSetShardGroup((AlterDatabaseSetShardGroupStmt *) parsetree);
-				/* no commands stashed for this */
-				commandCollected = true;
-				break;
-
 			case T_AlterForeignServerStmt:
 				address = AlterForeignServer((AlterForeignServerStmt *) parsetree);
 				break;
@@ -2858,7 +2851,6 @@ CreateCommandTag(Node *parsetree)
 		case T_AlterDatabaseStmt:
 		case T_AlterDatabaseRefreshCollStmt:
 		case T_AlterDatabaseSetStmt:
-		case T_AlterDatabaseSetShardGroupStmt:
 			tag = CMDTAG_ALTER_DATABASE;
 			break;
 

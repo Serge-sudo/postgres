@@ -67,6 +67,9 @@ CATALOG(pg_database,1262,DatabaseRelationId) BKI_SHARED_RELATION BKI_ROWTYPE_OID
 	/* default table space for this DB */
 	Oid			dattablespace BKI_LOOKUP(pg_tablespace);
 
+	/* default shard group for this DB */
+	Oid			datshardgroup BKI_DEFAULT(0);
+
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	/* LC_COLLATE setting */
 	text		datcollate BKI_FORCE_NOT_NULL;
