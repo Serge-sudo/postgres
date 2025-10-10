@@ -25,7 +25,7 @@
  *		typedef struct FormData_pg_shardmembers
  * ----------------
  */
-CATALOG(pg_shardmembers,6106,ShardMemberRelationId) BKI_ROWTYPE_OID(6107,ShardMemberRelation_Rowtype_Id)
+CATALOG(pg_shardmembers,8795,ShardMemberRelationId) BKI_ROWTYPE_OID(8796,ShardMemberRelation_Rowtype_Id)
 {
 	Oid			oid;			/* oid */
 	Oid			sgid;			/* references pg_shardgroups.oid */
@@ -45,10 +45,10 @@ CATALOG(pg_shardmembers,6106,ShardMemberRelationId) BKI_ROWTYPE_OID(6107,ShardMe
  */
 typedef FormData_pg_shardmembers *Form_pg_shardmembers;
 
-DECLARE_TOAST(pg_shardmembers, 6108, 6109);
+DECLARE_TOAST(pg_shardmembers, 8797, 8798);
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_shardmembers_oid_index, 6110, ShardMemberOidIndexId, pg_shardmembers, btree(oid oid_ops));
-DECLARE_UNIQUE_INDEX(pg_shardmembers_sgid_srvid_index, 6111, ShardMemberSgidSrvidIndexId, pg_shardmembers, btree(sgid oid_ops, srvid oid_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_shardmembers_oid_index, 8799, ShardMemberOidIndexId, pg_shardmembers, btree(oid oid_ops));
+DECLARE_UNIQUE_INDEX(pg_shardmembers_sgid_srvid_index, 8800, ShardMemberSgidSrvidIndexId, pg_shardmembers, btree(sgid oid_ops, srvid oid_ops));
 
 MAKE_SYSCACHE(SHARDMEMBEROID, pg_shardmembers_oid_index, 4);
 
