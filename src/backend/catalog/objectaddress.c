@@ -51,6 +51,8 @@
 #include "catalog/pg_publication_namespace.h"
 #include "catalog/pg_publication_rel.h"
 #include "catalog/pg_rewrite.h"
+#include "catalog/pg_shardgroups.h"
+#include "catalog/pg_shardmembers.h"
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_subscription.h"
 #include "catalog/pg_tablespace.h"
@@ -4053,6 +4055,67 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
+		case ShardGroupRelationId:
+			{
+				HeapTuple	sgTup;
+				Form_pg_shardgroups sgForm;
+
+				sgTup = SearchSysCache1(SHARDGROUPOID,
+										ObjectIdGetDatum(object->objectId));
+				if (!HeapTupleIsValid(sgTup))
+				{
+					if (!missing_ok)
+						elog(ERROR, "cache lookup failed for shard group %u",
+							 object->objectId);
+					break;
+				}
+
+				sgForm = (Form_pg_shardgroups) GETSTRUCT(sgTup);
+				appendStringInfo(&buffer, _("shard group %s"),
+								 NameStr(sgForm->sgname));
+
+				ReleaseSysCache(sgTup);
+				break;
+			}
+
+		case ShardMemberRelationId:
+			{
+				HeapTuple	smTup;
+				Form_pg_shardmembers smForm;
+				HeapTuple	sgTup;
+				ForeignServer *srv;
+
+				smTup = SearchSysCache1(SHARDMEMBEROID,
+										ObjectIdGetDatum(object->objectId));
+				if (!HeapTupleIsValid(smTup))
+				{
+					if (!missing_ok)
+						elog(ERROR, "cache lookup failed for shard member %u",
+							 object->objectId);
+					break;
+				}
+
+				smForm = (Form_pg_shardmembers) GETSTRUCT(smTup);
+
+				sgTup = SearchSysCache1(SHARDGROUPOID,
+										ObjectIdGetDatum(smForm->sgid));
+				srv = GetForeignServerExtended(smForm->srvid, missing_ok);
+
+				if (HeapTupleIsValid(sgTup) && srv)
+				{
+					Form_pg_shardgroups sgForm = (Form_pg_shardgroups) GETSTRUCT(sgTup);
+
+					appendStringInfo(&buffer, _("shard group member %s in %s"),
+									 srv->servername,
+									 NameStr(sgForm->sgname));
+				}
+
+				if (HeapTupleIsValid(sgTup))
+					ReleaseSysCache(sgTup);
+				ReleaseSysCache(smTup);
+				break;
+			}
+
 		default:
 			elog(ERROR, "unsupported object class: %u", object->classId);
 	}
@@ -4584,6 +4647,14 @@ getObjectTypeDescription(const ObjectAddress *object, bool missing_ok)
 
 		case TransformRelationId:
 			appendStringInfoString(&buffer, "transform");
+			break;
+
+		case ShardGroupRelationId:
+			appendStringInfoString(&buffer, "shard group");
+			break;
+
+		case ShardMemberRelationId:
+			appendStringInfoString(&buffer, "shard group member");
 			break;
 
 		default:
@@ -5931,6 +6002,74 @@ getObjectIdentityParts(const ObjectAddress *object,
 				table_close(transformDesc, AccessShareLock);
 			}
 			break;
+
+		case ShardGroupRelationId:
+			{
+				HeapTuple	sgTup;
+				Form_pg_shardgroups sgForm;
+
+				sgTup = SearchSysCache1(SHARDGROUPOID,
+										ObjectIdGetDatum(object->objectId));
+				if (!HeapTupleIsValid(sgTup))
+				{
+					if (!missing_ok)
+						elog(ERROR, "cache lookup failed for shard group %u",
+							 object->objectId);
+					break;
+				}
+
+				sgForm = (Form_pg_shardgroups) GETSTRUCT(sgTup);
+				appendStringInfoString(&buffer,
+									   quote_identifier(NameStr(sgForm->sgname)));
+				if (objname)
+					*objname = list_make1(pstrdup(NameStr(sgForm->sgname)));
+
+				ReleaseSysCache(sgTup);
+				break;
+			}
+
+		case ShardMemberRelationId:
+			{
+				HeapTuple	smTup;
+				Form_pg_shardmembers smForm;
+				HeapTuple	sgTup;
+				ForeignServer *srv;
+
+				smTup = SearchSysCache1(SHARDMEMBEROID,
+										ObjectIdGetDatum(object->objectId));
+				if (!HeapTupleIsValid(smTup))
+				{
+					if (!missing_ok)
+						elog(ERROR, "cache lookup failed for shard member %u",
+							 object->objectId);
+					break;
+				}
+
+				smForm = (Form_pg_shardmembers) GETSTRUCT(smTup);
+
+				sgTup = SearchSysCache1(SHARDGROUPOID,
+										ObjectIdGetDatum(smForm->sgid));
+				srv = GetForeignServerExtended(smForm->srvid, missing_ok);
+
+				if (HeapTupleIsValid(sgTup) && srv)
+				{
+					Form_pg_shardgroups sgForm = (Form_pg_shardgroups) GETSTRUCT(sgTup);
+
+					appendStringInfo(&buffer, "%s in shard group %s",
+									 quote_identifier(srv->servername),
+									 quote_identifier(NameStr(sgForm->sgname)));
+
+					if (objname)
+						*objname = list_make1(pstrdup(srv->servername));
+					if (objargs)
+						*objargs = list_make1(pstrdup(NameStr(sgForm->sgname)));
+				}
+
+				if (HeapTupleIsValid(sgTup))
+					ReleaseSysCache(sgTup);
+				ReleaseSysCache(smTup);
+				break;
+			}
 
 		default:
 			elog(ERROR, "unsupported object class: %u", object->classId);
