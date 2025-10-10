@@ -2661,6 +2661,10 @@ typedef struct CreateStmt
 	char	   *tablespacename; /* table space to use, or NULL */
 	char	   *accessMethod;	/* table access method */
 	bool		if_not_exists;	/* just do nothing if it already exists? */
+	/* sharding-related fields */
+	List	   *distributeby;	/* DISTRIBUTED BY column list */
+	bool		is_worldwide;	/* true for WORLDWIDE TABLE */
+	char	   *shardgroup;		/* SHARD GROUP name, or NULL for default */
 } CreateStmt;
 
 /* ----------
@@ -4229,5 +4233,51 @@ typedef struct DropSubscriptionStmt
 	bool		missing_ok;		/* Skip error if missing? */
 	DropBehavior behavior;		/* RESTRICT or CASCADE behavior */
 } DropSubscriptionStmt;
+
+/* ----------------------
+ *		CREATE SHARD GROUP Statement
+ * ----------------------
+ */
+typedef struct CreateShardGroupStmt
+{
+	NodeTag		type;
+	char	   *sgname;			/* shard group name */
+	List	   *options;		/* list of DefElem nodes */
+} CreateShardGroupStmt;
+
+/* ----------------------
+ *		ALTER SHARD GROUP Statement
+ * ----------------------
+ */
+typedef struct AlterShardGroupStmt
+{
+	NodeTag		type;
+	char	   *sgname;			/* shard group name */
+	char	   *action;			/* "ADD" or "DROP" */
+	char	   *servername;		/* member server name */
+	List	   *options;		/* list of DefElem nodes (for ADD) */
+} AlterShardGroupStmt;
+
+/* ----------------------
+ *		ALTER DATABASE SET DEFAULT SHARD GROUP Statement
+ * ----------------------
+ */
+typedef struct AlterDatabaseSetShardGroupStmt
+{
+	NodeTag		type;
+	char	   *dbname;			/* database name */
+	char	   *sgname;			/* shard group name */
+} AlterDatabaseSetShardGroupStmt;
+
+/* ----------------------
+ *		ALTER TABLE SET SHARD GROUP Statement
+ * ----------------------
+ */
+typedef struct AlterTableSetShardGroupStmt
+{
+	NodeTag		type;
+	RangeVar   *relation;		/* table name */
+	char	   *sgname;			/* shard group name */
+} AlterTableSetShardGroupStmt;
 
 #endif							/* PARSENODES_H */

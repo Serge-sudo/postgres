@@ -122,6 +122,9 @@ CATALOG(pg_class,1259,RelationRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(83,Relat
 	/* link to original rel during table rewrite; otherwise 0 */
 	Oid			relrewrite BKI_DEFAULT(0) BKI_LOOKUP_OPT(pg_class);
 
+	/* shard group id; 0 if not in a shard group */
+	Oid			relsgid BKI_DEFAULT(0);
+
 	/* all Xids < this are frozen in this rel */
 	TransactionId relfrozenxid BKI_DEFAULT(3);	/* FirstNormalTransactionId */
 
@@ -171,6 +174,8 @@ MAKE_SYSCACHE(RELNAMENSP, pg_class_relname_nsp_index, 128);
 #define		  RELKIND_FOREIGN_TABLE   'f'	/* foreign table */
 #define		  RELKIND_PARTITIONED_TABLE 'p' /* partitioned table */
 #define		  RELKIND_PARTITIONED_INDEX 'I' /* partitioned index */
+#define		  RELKIND_DISTRIBUTED_TABLE 'D' /* distributed table */
+#define		  RELKIND_WORLDWIDE_TABLE 'W'	/* worldwide (replicated) table */
 
 #define		  RELPERSISTENCE_PERMANENT	'p' /* regular table */
 #define		  RELPERSISTENCE_UNLOGGED	'u' /* unlogged permanent table */
