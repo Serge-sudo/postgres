@@ -612,6 +612,20 @@ static const ObjectPropertyType ObjectProperty[] =
 		true
 	},
 	{
+		"shard group",
+		ShardGroupRelationId,
+		ShardGroupOidIndexId,
+		SHARDGROUPOID,
+		SHARDGROUPNAME,
+		Anum_pg_shardgroups_oid,
+		Anum_pg_shardgroups_sgname,
+		InvalidAttrNumber,
+		Anum_pg_shardgroups_sgowner,
+		InvalidAttrNumber,
+		OBJECT_SHARD_GROUP,
+		true
+	},
+	{
 		"extended statistics",
 		StatisticExtRelationId,
 		StatisticExtOidIndexId,
@@ -1006,6 +1020,7 @@ get_object_address(ObjectType objtype, Node *object,
 			case OBJECT_PARAMETER_ACL:
 			case OBJECT_ACCESS_METHOD:
 			case OBJECT_PUBLICATION:
+			case OBJECT_SHARD_GROUP:
 			case OBJECT_SUBSCRIPTION:
 				address = get_object_address_unqualified(objtype,
 														 castNode(String, object), missing_ok);

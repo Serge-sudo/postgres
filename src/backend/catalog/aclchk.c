@@ -62,6 +62,7 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_parameter_acl.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_shardgroups.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
 #include "commands/dbcommands.h"
@@ -271,6 +272,9 @@ restrict_and_check_grant(bool is_grant, AclMode avail_goptions, bool all_privs,
 			break;
 		case OBJECT_SCHEMA:
 			whole_mask = ACL_ALL_RIGHTS_SCHEMA;
+			break;
+		case OBJECT_SHARD_GROUP:
+			whole_mask = ACL_ALL_RIGHTS_SCHEMA;  /* Use schema rights as template */
 			break;
 		case OBJECT_TABLESPACE:
 			whole_mask = ACL_ALL_RIGHTS_TABLESPACE;
@@ -3072,6 +3076,8 @@ pg_aclmask(ObjectType objtype, Oid object_oid, AttrNumber attnum, Oid roleid,
 			elog(ERROR, "grantable rights not supported for event triggers");
 			/* not reached, but keep compiler quiet */
 			return ACL_NO_RIGHTS;
+		case OBJECT_SHARD_GROUP:
+			return object_aclmask(ShardGroupRelationId, object_oid, roleid, mask, how);
 		case OBJECT_TYPE:
 			return object_aclmask(TypeRelationId, object_oid, roleid, mask, how);
 		default:
