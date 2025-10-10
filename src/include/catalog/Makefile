@@ -83,8 +83,7 @@ CATALOG_HEADERS := \
 	pg_subscription.h \
 	pg_subscription_rel.h \
 	pg_shardgroups.h \
-	pg_shardmembers.h \
-	pg_db_shardgroup.h
+	pg_shardmembers.h
 
 GENERATED_HEADERS := $(CATALOG_HEADERS:%.h=%_d.h)
 
