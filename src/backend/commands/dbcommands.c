@@ -2412,6 +2412,9 @@ AlterDatabase(ParseState *pstate, AlterDatabaseStmt *stmt, bool isTopLevel)
 
 	if (dshardgroup)
 	{
+		Oid			sgoid;
+		Oid			db_oid;
+
 		/*
 		 * While the SET DEFAULT SHARD GROUP syntax doesn't allow any other options,
 		 * somebody could write "WITH SHARD GROUP ...".  Forbid any other
@@ -2425,8 +2428,8 @@ AlterDatabase(ParseState *pstate, AlterDatabaseStmt *stmt, bool isTopLevel)
 					 parser_errposition(pstate, dshardgroup->location)));
 		
 		/* Get shard group OID */
-		Oid sgoid = get_shardgroup_oid(defGetString(dshardgroup), false);
-		Oid dboid = get_database_oid(stmt->dbname, false);
+		sgoid = get_shardgroup_oid(defGetString(dshardgroup), false);
+		db_oid = get_database_oid(stmt->dbname, false);
 		
 		/* Check permissions */
 		if (!superuser())
@@ -2458,12 +2461,12 @@ AlterDatabase(ParseState *pstate, AlterDatabaseStmt *stmt, bool isTopLevel)
 		CatalogTupleUpdate(rel, &tuple->t_self, newtuple);
 		UnlockTuple(rel, &tuple->t_self, InplaceUpdateTupleLock);
 		
-		InvokeObjectPostAlterHook(DatabaseRelationId, dboid, 0);
+		InvokeObjectPostAlterHook(DatabaseRelationId, db_oid, 0);
 		
 		systable_endscan(scan);
 		table_close(rel, NoLock);
 		
-		return dboid;
+		return db_oid;
 	}
 
 	if (distemplate && distemplate->arg)
