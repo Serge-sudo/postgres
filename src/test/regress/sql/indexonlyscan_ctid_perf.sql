@@ -7,13 +7,24 @@ CREATE TABLE perf_test_table (
     data TEXT
 );
 
--- Insert test data
+-- Insert test data (more data for better performance measurement)
 INSERT INTO perf_test_table 
 SELECT i, 'data_' || i 
-FROM generate_series(1, 10000) i;
+FROM generate_series(1, 100000) i;
 
 -- Make sure table is fully visible for index-only scans
 VACUUM perf_test_table;
+
+-- Verify the feature is working correctly
+SET enable_seqscan = off;
+
+-- With feature enabled - should use Index Only Scan
+SET enable_indexonlyscan_ctid = on;
+EXPLAIN (COSTS OFF) DELETE FROM perf_test_table WHERE id = 50000;
+
+-- With feature disabled - should use Index Scan  
+SET enable_indexonlyscan_ctid = off;
+EXPLAIN (COSTS OFF) DELETE FROM perf_test_table WHERE id = 50001;
 
 -- Create a table to store timing results
 CREATE TABLE perf_results (
@@ -36,8 +47,8 @@ BEGIN
     
     start_time := clock_timestamp();
     
-    -- Perform random deletes
-    FOR i IN 1..100 LOOP
+    -- Perform random deletes (more iterations for better measurement)
+    FOR i IN 1..1000 LOOP
         DELETE FROM perf_test_table WHERE id = 1000 + i;
     END LOOP;
     
@@ -51,7 +62,7 @@ END $$;
 -- Restore deleted data
 INSERT INTO perf_test_table 
 SELECT i, 'data_' || i 
-FROM generate_series(1001, 1100) i;
+FROM generate_series(1001, 2000) i;
 
 VACUUM perf_test_table;
 
@@ -67,9 +78,9 @@ BEGIN
     
     start_time := clock_timestamp();
     
-    -- Perform same random deletes
-    FOR i IN 1..100 LOOP
-        DELETE FROM perf_test_table WHERE id = 2000 + i;
+    -- Perform same random deletes (more iterations for better measurement)
+    FOR i IN 1..1000 LOOP
+        DELETE FROM perf_test_table WHERE id = 10000 + i;
     END LOOP;
     
     end_time := clock_timestamp();
