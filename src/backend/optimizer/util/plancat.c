@@ -286,7 +286,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			info->reltablespace =
 				RelationGetForm(indexRelation)->reltablespace;
 			info->rel = rel;
-			info->ncolumns = ncolumns = index->indnatts;
+			info->ncolumns = ncolumns = index->indnatts + 1;
 			info->nkeycolumns = nkeycolumns = index->indnkeyatts;
 
 			info->indexkeys = (int *) palloc(sizeof(int) * ncolumns);
@@ -295,11 +295,15 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			info->opcintype = (Oid *) palloc(sizeof(Oid) * nkeycolumns);
 			info->canreturn = (bool *) palloc(sizeof(bool) * ncolumns);
 
-			for (i = 0; i < ncolumns; i++)
+			for (i = 0; i < ncolumns - 1; i++)
 			{
 				info->indexkeys[i] = index->indkey.values[i];
 				info->canreturn[i] = index_can_return(indexRelation, i + 1);
 			}
+
+			/* last entry is for ctid column */
+			info->indexkeys[ncolumns - 1] = SelfItemPointerAttributeNumber;
+			info->canreturn[ncolumns - 1] = true;
 
 			for (i = 0; i < nkeycolumns; i++)
 			{

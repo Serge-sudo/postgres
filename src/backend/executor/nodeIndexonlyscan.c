@@ -48,7 +48,7 @@
 
 static TupleTableSlot *IndexOnlyNext(IndexOnlyScanState *node);
 static void StoreIndexTuple(IndexOnlyScanState *node, TupleTableSlot *slot,
-							IndexTuple itup, TupleDesc itupdesc);
+							IndexTuple itup, TupleDesc itupdesc, ItemPointer tid);
 
 
 /* ----------------------------------------------------------------
@@ -203,11 +203,13 @@ IndexOnlyNext(IndexOnlyScanState *node)
 			 * check on the number of fields.
 			 */
 			Assert(slot->tts_tupleDescriptor->natts ==
-				   scandesc->xs_hitupdesc->natts);
+				   scandesc->xs_hitupdesc->natts ||
+				   slot->tts_tupleDescriptor->natts ==
+				   scandesc->xs_hitupdesc->natts + 1);
 			ExecForceStoreHeapTuple(scandesc->xs_hitup, slot, false);
 		}
 		else if (scandesc->xs_itup)
-			StoreIndexTuple(node, slot, scandesc->xs_itup, scandesc->xs_itupdesc);
+			StoreIndexTuple(node, slot, scandesc->xs_itup, scandesc->xs_itupdesc, tid);
 		else
 			elog(ERROR, "no data returned for index-only scan");
 
@@ -266,7 +268,7 @@ IndexOnlyNext(IndexOnlyScanState *node)
  */
 static void
 StoreIndexTuple(IndexOnlyScanState *node, TupleTableSlot *slot,
-				IndexTuple itup, TupleDesc itupdesc)
+				IndexTuple itup, TupleDesc itupdesc, ItemPointer tid)
 {
 	/*
 	 * Note: we must use the tupdesc supplied by the AM in index_deform_tuple,
@@ -275,7 +277,9 @@ StoreIndexTuple(IndexOnlyScanState *node, TupleTableSlot *slot,
 	 * the same number of columns though, as well as being datatype-compatible
 	 * which is something we can't so easily check.
 	 */
-	Assert(slot->tts_tupleDescriptor->natts == itupdesc->natts);
+
+	Assert(slot->tts_tupleDescriptor->natts == itupdesc->natts || 
+		   slot->tts_tupleDescriptor->natts == itupdesc->natts + 1);
 
 	ExecClearTuple(slot);
 	index_deform_tuple(itup, itupdesc, slot->tts_values, slot->tts_isnull);
@@ -308,6 +312,26 @@ StoreIndexTuple(IndexOnlyScanState *node, TupleTableSlot *slot,
 			namestrcpy(name, DatumGetCString(slot->tts_values[attnum]));
 			slot->tts_values[attnum] = NameGetDatum(name);
 		}
+	}
+
+	/*
+	 * Store the TID in the slot. Index-only scans can provide the TID since
+	 * it's inherently available from the index entry.
+	 */
+	slot->tts_tid = *tid;
+
+
+	/*
+	 * If ctid was added to the indextlist (making the slot have one more
+	 * attribute than the index tuple), we need to store it as the last
+	 * attribute value.
+	 */
+	if (slot->tts_tupleDescriptor->natts == itupdesc->natts + 1)
+	{
+		int			ctid_attno = slot->tts_tupleDescriptor->natts - 1;
+
+		slot->tts_values[ctid_attno] = PointerGetDatum(tid);
+		slot->tts_isnull[ctid_attno] = false;
 	}
 
 	ExecStoreVirtualTuple(slot);
