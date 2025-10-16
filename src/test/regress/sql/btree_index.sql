@@ -282,3 +282,30 @@ CREATE TABLE btree_part (id int4) PARTITION BY RANGE (id);
 CREATE INDEX btree_part_idx ON btree_part(id);
 ALTER INDEX btree_part_idx ALTER COLUMN id SET (n_distinct=100);
 DROP TABLE btree_part;
+
+--
+-- Test that DELETE and UPDATE can use index-only scans when only ctid is needed
+--
+CREATE TABLE index_only_delete_test (id int PRIMARY KEY, data text);
+INSERT INTO index_only_delete_test SELECT i, 'data_' || i FROM generate_series(1, 100) i;
+VACUUM (ANALYZE) index_only_delete_test;
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+
+-- DELETE should use Index Only Scan
+EXPLAIN (COSTS OFF) DELETE FROM index_only_delete_test WHERE id = 50;
+DELETE FROM index_only_delete_test WHERE id = 50;
+
+-- UPDATE should use Index Only Scan
+EXPLAIN (COSTS OFF) UPDATE index_only_delete_test SET data = 'updated' WHERE id = 51;
+UPDATE index_only_delete_test SET data = 'updated' WHERE id = 51;
+
+-- Verify the operations worked
+SELECT COUNT(*) FROM index_only_delete_test WHERE id = 50; -- should be 0
+SELECT data FROM index_only_delete_test WHERE id = 51; -- should be 'updated'
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+
+DROP TABLE index_only_delete_test;

@@ -801,6 +801,16 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"enable_indexonlyscan_ctid", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enables returning ctid from index-only scans for DELETE/UPDATE."),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&enable_indexonlyscan_ctid,
+		true,
+		NULL, NULL, NULL
+	},
+	{
 		{"enable_bitmapscan", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables the planner's use of bitmap-scan plans."),
 			NULL,

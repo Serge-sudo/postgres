@@ -1790,6 +1790,16 @@ check_index_only(RelOptInfo *rel, IndexOptInfo *index)
 							   attno - FirstLowInvalidHeapAttributeNumber);
 	}
 
+	/*
+	 * Indexes can also return the TID (ctid) of tuples, as this information
+	 * is inherently available in index entries. Add it to the set of
+	 * returnable attributes if the feature is enabled.
+	 */
+	if (enable_indexonlyscan_ctid)
+		index_canreturn_attrs =
+			bms_add_member(index_canreturn_attrs,
+						   SelfItemPointerAttributeNumber - FirstLowInvalidHeapAttributeNumber);
+
 	/* Do we have all the necessary attributes? */
 	result = bms_is_subset(attrs_used, index_canreturn_attrs);
 
