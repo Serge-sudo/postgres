@@ -286,7 +286,9 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			info->reltablespace =
 				RelationGetForm(indexRelation)->reltablespace;
 			info->rel = rel;
-			info->ncolumns = ncolumns = index->indnatts + 1;
+			
+			/* Add ctid to index columns if feature is enabled */
+			info->ncolumns = ncolumns = index->indnatts + (enable_indexonlyscan_ctid ? 1 : 0);
 			info->nkeycolumns = nkeycolumns = index->indnkeyatts;
 
 			info->indexkeys = (int *) palloc(sizeof(int) * ncolumns);
@@ -295,15 +297,18 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			info->opcintype = (Oid *) palloc(sizeof(Oid) * nkeycolumns);
 			info->canreturn = (bool *) palloc(sizeof(bool) * ncolumns);
 
-			for (i = 0; i < ncolumns - 1; i++)
+			for (i = 0; i < (enable_indexonlyscan_ctid ? ncolumns - 1 : ncolumns); i++)
 			{
 				info->indexkeys[i] = index->indkey.values[i];
 				info->canreturn[i] = index_can_return(indexRelation, i + 1);
 			}
 
-			/* last entry is for ctid column */
-			info->indexkeys[ncolumns - 1] = SelfItemPointerAttributeNumber;
-			info->canreturn[ncolumns - 1] = true;
+			/* last entry is for ctid column if feature is enabled */
+			if (enable_indexonlyscan_ctid)
+			{
+				info->indexkeys[ncolumns - 1] = SelfItemPointerAttributeNumber;
+				info->canreturn[ncolumns - 1] = true;
+			}
 
 			for (i = 0; i < nkeycolumns; i++)
 			{
