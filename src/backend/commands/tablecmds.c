@@ -1306,31 +1306,21 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 		/* Handle distributed tables */
 		if (stmt->distributespec)
 		{
-			char		relkind;
-			
-			/* Distributed tables use relkind 'D' */
-			relkind = RELKIND_DISTRIBUTED_TABLE;
-			
 			/* TODO: Validate distribution columns exist */
 			/* TODO: Store distribution key metadata */
 			/* TODO: Create distribution key similar to partition key */
 			ereport(NOTICE,
 					(errmsg("DISTRIBUTED BY clause not yet fully implemented"),
-					 errdetail("Table will be created as distributed table with relkind 'D'.")));
+					 errdetail("Table will be created as distributed table.")));
 		}
 		
 		/* Handle worldwide tables */
 		if (stmt->is_worldwide)
 		{
-			char		relkind;
-			
-			/* Worldwide tables use relkind 'W' */
-			relkind = RELKIND_WORLDWIDE_TABLE;
-			
 			/* TODO: Validate table is suitable for worldwide replication */
 			ereport(NOTICE,
 					(errmsg("WORLDWIDE table not yet fully implemented"),
-					 errdetail("Table will be created as worldwide table with relkind 'W'.")));
+					 errdetail("Table will be created as worldwide table.")));
 		}
 		
 		/* Set the shard group for the relation */
