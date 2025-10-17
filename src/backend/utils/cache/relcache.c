@@ -1209,12 +1209,11 @@ retry:
 	else if (RELKIND_HAS_TABLE_AM(relation->rd_rel->relkind) ||
 			 relation->rd_rel->relkind == RELKIND_SEQUENCE)
 		RelationInitTableAccessMethod(relation);
-	else if (relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
-			 relation->rd_rel->relkind == RELKIND_DISTRIBUTED_TABLE)
+	else if (relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
 	{
 		/*
 		 * Do nothing: access methods are a setting that partitions can
-		 * inherit. This applies to both partitioned and distributed tables.
+		 * inherit.
 		 */
 	}
 	else

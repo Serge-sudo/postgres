@@ -204,13 +204,11 @@ MAKE_SYSCACHE(RELNAMENSP, pg_class_relname_nsp_index, 128);
 	 (relkind) == RELKIND_INDEX || \
 	 (relkind) == RELKIND_SEQUENCE || \
 	 (relkind) == RELKIND_TOASTVALUE || \
-	 (relkind) == RELKIND_MATVIEW || \
-	 (relkind) == RELKIND_WORLDWIDE_TABLE)
+	 (relkind) == RELKIND_MATVIEW)
 
 #define RELKIND_HAS_PARTITIONS(relkind) \
 	((relkind) == RELKIND_PARTITIONED_TABLE || \
-	 (relkind) == RELKIND_PARTITIONED_INDEX || \
-	 (relkind) == RELKIND_DISTRIBUTED_TABLE)
+	 (relkind) == RELKIND_PARTITIONED_INDEX)
 
 /*
  * Relation kinds that support tablespaces: All relation kinds with storage
@@ -233,8 +231,7 @@ MAKE_SYSCACHE(RELNAMENSP, pg_class_relname_nsp_index, 128);
 #define RELKIND_HAS_TABLE_AM(relkind) \
 	((relkind) == RELKIND_RELATION || \
 	 (relkind) == RELKIND_TOASTVALUE || \
-	 (relkind) == RELKIND_MATVIEW || \
-	 (relkind) == RELKIND_WORLDWIDE_TABLE)
+	 (relkind) == RELKIND_MATVIEW)
 
 extern int	errdetail_relkind_not_supported(char relkind);
 
