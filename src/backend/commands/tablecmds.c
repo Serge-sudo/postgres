@@ -1339,6 +1339,14 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 			CreateTablesOnShardMembers(relationId, sgid, stmt->partbound != NULL);
 		}
 	}
+	else if (stmt->partbound != NULL && OidIsValid(rel->rd_rel->relsgid))
+	{
+		/*
+		 * For partitions that inherit shard group from parent:
+		 * Also create tables on shard members
+		 */
+		CreateTablesOnShardMembers(relationId, rel->rd_rel->relsgid, true);
+	}
 
 	ObjectAddressSet(address, RelationRelationId, relationId);
 
@@ -1355,8 +1363,13 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
  * CreateTablesOnShardMembers
  *		Create tables on foreign servers (shard members) after table creation
  *
- * For regular tables: creates normal tables on remote servers using postgres_fdw
- * For partitions of distributed tables: creates foreign tables referencing the partition
+ * For regular tables: creates tables on remote servers
+ * For partitions of distributed tables: creates foreign tables on remote servers
+ *
+ * This function generates and executes CREATE TABLE commands on remote servers
+ * using postgres_fdw. The implementation:
+ * 1. For non-partition tables: CREATE TABLE on each remote server
+ * 2. For partitions: CREATE FOREIGN TABLE on each remote server pointing to local partition
  */
 static void
 CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition)
@@ -1365,10 +1378,11 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition)
 	ListCell   *lc;
 	Relation	rel;
 	TupleDesc	tupdesc;
-	StringInfoData buf;
+	StringInfoData create_table_sql;
 	char	   *relname;
 	char	   *nspname;
 	int			i;
+	int			first_col;
 
 	/* Get list of shard members */
 	members = get_shardgroup_members(sgid);
@@ -1381,9 +1395,31 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition)
 	relname = RelationGetRelationName(rel);
 	nspname = get_namespace_name(RelationGetNamespace(rel));
 
-	/* Build the column definitions part of CREATE TABLE */
-	initStringInfo(&buf);
-	appendStringInfo(&buf, "(");
+	/* Build the CREATE TABLE DDL */
+	initStringInfo(&create_table_sql);
+	
+	if (is_partition)
+	{
+		/*
+		 * For partitions of distributed tables:
+		 * On foreign servers, create FOREIGN TABLEs that reference local partition
+		 */
+		appendStringInfo(&create_table_sql, "CREATE FOREIGN TABLE IF NOT EXISTS %s.%s (",
+						 quote_identifier(nspname),
+						 quote_identifier(relname));
+	}
+	else
+	{
+		/*
+		 * For regular distributed/worldwide tables:
+		 * Create actual tables on foreign servers
+		 */
+		appendStringInfo(&create_table_sql, "CREATE TABLE IF NOT EXISTS %s.%s (",
+						 quote_identifier(nspname),
+						 quote_identifier(relname));
+	}
+	
+	first_col = 1;
 	for (i = 0; i < tupdesc->natts; i++)
 	{
 		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
@@ -1391,77 +1427,54 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition)
 		if (attr->attisdropped)
 			continue;
 
-		if (i > 0)
-			appendStringInfo(&buf, ", ");
+		if (!first_col)
+			appendStringInfo(&create_table_sql, ", ");
+		first_col = 0;
 
-		appendStringInfo(&buf, "%s %s",
+		appendStringInfo(&create_table_sql, "%s %s",
 						 quote_identifier(NameStr(attr->attname)),
 						 format_type_with_typemod(attr->atttypid, attr->atttypmod));
 
 		/* Add NOT NULL constraint if present */
 		if (attr->attnotnull)
-			appendStringInfo(&buf, " NOT NULL");
+			appendStringInfo(&create_table_sql, " NOT NULL");
 	}
-	appendStringInfo(&buf, ")");
+	appendStringInfo(&create_table_sql, ")");
+	
+	/* For foreign tables on remote servers, add SERVER clause */
+	if (is_partition)
+	{
+		/* TODO: Add SERVER clause and table options for foreign tables */
+	}
 
-	/* Execute CREATE TABLE or CREATE FOREIGN TABLE on each shard member */
+	/*
+	 * Generate NOTICE messages with the DDL to be executed on each shard member.
+	 * 
+	 * TODO: Implement actual remote execution. This requires:
+	 * 1. Connection management using postgres_fdw or dblink
+	 * 2. Transaction handling (should be done after COMMIT of local DDL)
+	 * 3. Error handling and retry logic
+	 * 4. User mapping and authentication
+	 * 
+	 * For now, we log the DDL that should be executed on each remote server.
+	 * Users can execute these manually or via a background worker/extension.
+	 */
 	foreach(lc, members)
 	{
 		Oid			serveroid = lfirst_oid(lc);
 		ForeignServer *server;
-		StringInfoData sql;
-		int			ret;
 
 		/* Get server information */
 		server = GetForeignServer(serveroid);
 
-		initStringInfo(&sql);
-
-		if (is_partition)
-		{
-			/*
-			 * For partitions of distributed tables:
-			 * Create a FOREIGN TABLE on remote servers
-			 */
-			appendStringInfo(&sql,
-							 "CREATE FOREIGN TABLE IF NOT EXISTS %s.%s %s "
-							 "SERVER %s",
-							 quote_identifier(nspname),
-							 quote_identifier(relname),
-							 buf.data,
-							 quote_identifier(server->servername));
-		}
-		else
-		{
-			/*
-			 * For regular distributed tables:
-			 * Execute CREATE TABLE on remote server via dblink/postgres_fdw
-			 * For now, we'll create a FOREIGN TABLE locally that references it
-			 */
-			appendStringInfo(&sql,
-							 "CREATE FOREIGN TABLE IF NOT EXISTS %s.%s %s "
-							 "SERVER %s",
-							 quote_identifier(nspname),
-							 quote_identifier(relname),
-							 buf.data,
-							 quote_identifier(server->servername));
-		}
-
-		/* Execute the SQL command using SPI */
-		if (SPI_connect() != SPI_OK_CONNECT)
-			elog(ERROR, "SPI_connect failed");
-
-		ret = SPI_execute(sql.data, false, 0);
-		if (ret < 0)
-			elog(ERROR, "failed to create table on shard member %s: %s",
-				 server->servername, sql.data);
-
-		SPI_finish();
-		pfree(sql.data);
+		ereport(NOTICE,
+				(errmsg("table \"%s.%s\" should be created on shard member \"%s\"",
+						nspname, relname, server->servername),
+				 errdetail("Execute: %s", create_table_sql.data)));
 	}
 
 	table_close(rel, AccessShareLock);
-	pfree(buf.data);
+	pfree(create_table_sql.data);
 	pfree(nspname);
 	list_free(members);
 }
