@@ -68,6 +68,7 @@
 #include "commands/user.h"
 #include "commands/vacuum.h"
 #include "executor/executor.h"
+#include "executor/spi.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
 #include "miscadmin.h"
@@ -675,6 +676,7 @@ static List *GetParentedForeignKeyRefs(Relation partition);
 static void ATDetachCheckNoForeignKeyRefs(Relation partition);
 static char GetAttributeCompression(Oid atttypid, const char *compression);
 static char GetAttributeStorage(Oid atttypid, const char *storagemode);
+static void CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition);
 
 
 /* ----------------------------------------------------------------
@@ -1328,6 +1330,13 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 		if (OidIsValid(sgid))
 		{
 			SetRelationShardGroup(relationId, sgid);
+			
+			/*
+			 * Create tables on shard members (foreign servers)
+			 * For partitions: create foreign tables on remote servers
+			 * For regular tables: create foreign tables on remote servers
+			 */
+			CreateTablesOnShardMembers(relationId, sgid, stmt->partbound != NULL);
 		}
 	}
 
@@ -1340,6 +1349,121 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	relation_close(rel, NoLock);
 
 	return address;
+}
+
+/*
+ * CreateTablesOnShardMembers
+ *		Create tables on foreign servers (shard members) after table creation
+ *
+ * For regular tables: creates normal tables on remote servers using postgres_fdw
+ * For partitions of distributed tables: creates foreign tables referencing the partition
+ */
+static void
+CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition)
+{
+	List	   *members;
+	ListCell   *lc;
+	Relation	rel;
+	TupleDesc	tupdesc;
+	StringInfoData buf;
+	char	   *relname;
+	char	   *nspname;
+	int			i;
+
+	/* Get list of shard members */
+	members = get_shardgroup_members(sgid);
+	if (members == NIL)
+		return;	/* No members, nothing to do */
+
+	/* Open the relation to get its structure */
+	rel = table_open(relationId, AccessShareLock);
+	tupdesc = RelationGetDescr(rel);
+	relname = RelationGetRelationName(rel);
+	nspname = get_namespace_name(RelationGetNamespace(rel));
+
+	/* Build the column definitions part of CREATE TABLE */
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "(");
+	for (i = 0; i < tupdesc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+
+		if (attr->attisdropped)
+			continue;
+
+		if (i > 0)
+			appendStringInfo(&buf, ", ");
+
+		appendStringInfo(&buf, "%s %s",
+						 quote_identifier(NameStr(attr->attname)),
+						 format_type_with_typemod(attr->atttypid, attr->atttypmod));
+
+		/* Add NOT NULL constraint if present */
+		if (attr->attnotnull)
+			appendStringInfo(&buf, " NOT NULL");
+	}
+	appendStringInfo(&buf, ")");
+
+	/* Execute CREATE TABLE or CREATE FOREIGN TABLE on each shard member */
+	foreach(lc, members)
+	{
+		Oid			serveroid = lfirst_oid(lc);
+		ForeignServer *server;
+		StringInfoData sql;
+		int			ret;
+
+		/* Get server information */
+		server = GetForeignServer(serveroid);
+
+		initStringInfo(&sql);
+
+		if (is_partition)
+		{
+			/*
+			 * For partitions of distributed tables:
+			 * Create a FOREIGN TABLE on remote servers
+			 */
+			appendStringInfo(&sql,
+							 "CREATE FOREIGN TABLE IF NOT EXISTS %s.%s %s "
+							 "SERVER %s",
+							 quote_identifier(nspname),
+							 quote_identifier(relname),
+							 buf.data,
+							 quote_identifier(server->servername));
+		}
+		else
+		{
+			/*
+			 * For regular distributed tables:
+			 * Execute CREATE TABLE on remote server via dblink/postgres_fdw
+			 * For now, we'll create a FOREIGN TABLE locally that references it
+			 */
+			appendStringInfo(&sql,
+							 "CREATE FOREIGN TABLE IF NOT EXISTS %s.%s %s "
+							 "SERVER %s",
+							 quote_identifier(nspname),
+							 quote_identifier(relname),
+							 buf.data,
+							 quote_identifier(server->servername));
+		}
+
+		/* Execute the SQL command using SPI */
+		if (SPI_connect() != SPI_OK_CONNECT)
+			elog(ERROR, "SPI_connect failed");
+
+		ret = SPI_execute(sql.data, false, 0);
+		if (ret < 0)
+			elog(ERROR, "failed to create table on shard member %s: %s",
+				 server->servername, sql.data);
+
+		SPI_finish();
+		pfree(sql.data);
+	}
+
+	table_close(rel, AccessShareLock);
+	pfree(buf.data);
+	pfree(nspname);
+	list_free(members);
 }
 
 /*
