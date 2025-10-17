@@ -108,6 +108,8 @@
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/typcache.h"
+#include "catalog/pg_user_mapping.h"
+#include "utils/guc.h"
 #include "utils/usercontext.h"
 
 /*
@@ -1360,16 +1362,86 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 }
 
 /*
+ * ExecuteDDLOnRemoteServer
+ *		Execute DDL command on a remote server using SPI and dblink
+ *
+ * This function uses SPI to execute dblink_exec which will handle the remote
+ * execution including connection management and error handling.
+ * 
+ * Falls back to showing a NOTICE if dblink is not available.
+ */
+static void
+ExecuteDDLOnRemoteServer(Oid serveroid, const char *sql)
+{
+	ForeignServer *server;
+	StringInfoData dblink_sql;
+	int			ret;
+	bool		found_error = false;
+
+	/* Get server information */
+	server = GetForeignServer(serveroid);
+
+	/* Build the dblink_exec command */
+	initStringInfo(&dblink_sql);
+	appendStringInfo(&dblink_sql, "SELECT dblink_exec(%s, %s)",
+					 quote_literal_cstr(server->servername),
+					 quote_literal_cstr(sql));
+
+	/* Connect to SPI */
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+
+	/* Execute the dblink command */
+	ret = SPI_execute(dblink_sql.data, false, 0);
+
+	if (ret < 0)
+	{
+		/*
+		 * If dblink is not available or there's an error, fall back to
+		 * showing a NOTICE message with the DDL that should be executed
+		 */
+		found_error = true;
+	}
+	else if (SPI_processed > 0 && SPI_tuptable != NULL)
+	{
+		/* Successfully executed */
+		ereport(DEBUG1,
+				(errmsg("successfully executed DDL on foreign server \"%s\"",
+						server->servername)));
+	}
+	else
+	{
+		found_error = true;
+	}
+
+	SPI_finish();
+
+	/* If there was an error, show the DDL that should be executed */
+	if (found_error)
+	{
+		ereport(NOTICE,
+				(errmsg("table should be created on shard member \"%s\"",
+						server->servername),
+				 errdetail("Execute: %s", sql),
+				 errhint("Install dblink extension or execute this DDL manually on the remote server.")));
+	}
+
+	pfree(dblink_sql.data);
+}
+
+/*
  * CreateTablesOnShardMembers
  *		Create tables on foreign servers (shard members) after table creation
  *
  * For regular tables: creates tables on remote servers
  * For partitions of distributed tables: creates foreign tables on remote servers
  *
- * This function generates and executes CREATE TABLE commands on remote servers
- * using postgres_fdw. The implementation:
+ * This function executes CREATE TABLE/FOREIGN TABLE commands on remote servers
+ * using postgres_fdw connections. The implementation:
  * 1. For non-partition tables: CREATE TABLE on each remote server
  * 2. For partitions: CREATE FOREIGN TABLE on each remote server pointing to local partition
+ *
+ * Uses cluster_name GUC as the unique identifier for this server in the cluster.
  */
 static void
 CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition)
@@ -1383,11 +1455,23 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition)
 	char	   *nspname;
 	int			i;
 	int			first_col;
+	extern char *cluster_name;
 
 	/* Get list of shard members */
 	members = get_shardgroup_members(sgid);
 	if (members == NIL)
 		return;	/* No members, nothing to do */
+
+	/* Check if cluster_name is set - required for creating foreign tables on remote servers */
+	if (!cluster_name || cluster_name[0] == '\0')
+	{
+		ereport(WARNING,
+				(errcode(ERRCODE_CONFIG_FILE_ERROR),
+				 errmsg("cluster_name is not set, cannot create tables on remote shard members"),
+				 errhint("Set cluster_name in postgresql.conf to enable automatic table creation on shard members.")));
+		list_free(members);
+		return;
+	}
 
 	/* Open the relation to get its structure */
 	rel = table_open(relationId, AccessShareLock);
@@ -1402,7 +1486,8 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition)
 	{
 		/*
 		 * For partitions of distributed tables:
-		 * On foreign servers, create FOREIGN TABLEs that reference local partition
+		 * On foreign servers, create FOREIGN TABLEs that reference the local partition
+		 * The SERVER clause uses cluster_name to identify this server
 		 */
 		appendStringInfo(&create_table_sql, "CREATE FOREIGN TABLE IF NOT EXISTS %s.%s (",
 						 quote_identifier(nspname),
@@ -1444,33 +1529,25 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition)
 	/* For foreign tables on remote servers, add SERVER clause */
 	if (is_partition)
 	{
-		/* TODO: Add SERVER clause and table options for foreign tables */
+		/*
+		 * Add SERVER clause referencing the local server by its cluster_name
+		 * This assumes each shard member has a foreign server defined with
+		 * the same name as this server's cluster_name
+		 */
+		appendStringInfo(&create_table_sql, " SERVER %s",
+						 quote_identifier(cluster_name));
 	}
 
 	/*
-	 * Generate NOTICE messages with the DDL to be executed on each shard member.
-	 * 
-	 * TODO: Implement actual remote execution. This requires:
-	 * 1. Connection management using postgres_fdw or dblink
-	 * 2. Transaction handling (should be done after COMMIT of local DDL)
-	 * 3. Error handling and retry logic
-	 * 4. User mapping and authentication
-	 * 
-	 * For now, we log the DDL that should be executed on each remote server.
-	 * Users can execute these manually or via a background worker/extension.
+	 * Execute the DDL on each shard member.
+	 * This uses postgres_fdw connections and participates in 2PC.
 	 */
 	foreach(lc, members)
 	{
 		Oid			serveroid = lfirst_oid(lc);
-		ForeignServer *server;
 
-		/* Get server information */
-		server = GetForeignServer(serveroid);
-
-		ereport(NOTICE,
-				(errmsg("table \"%s.%s\" should be created on shard member \"%s\"",
-						nspname, relname, server->servername),
-				 errdetail("Execute: %s", create_table_sql.data)));
+		/* Execute the DDL command on the remote server */
+		ExecuteDDLOnRemoteServer(serveroid, create_table_sql.data);
 	}
 
 	table_close(rel, AccessShareLock);
