@@ -1,0 +1,119 @@
+diff -U3 /home/runner/work/postgres/postgres/src/test/regress/expected/sharding.out /home/runner/work/postgres/postgres/src/test/regress/results/sharding.out
+--- /home/runner/work/postgres/postgres/src/test/regress/expected/sharding.out	2025-10-17 13:48:46.004271239 +0000
++++ /home/runner/work/postgres/postgres/src/test/regress/results/sharding.out	2025-10-17 13:48:55.421304375 +0000
+@@ -46,7 +46,7 @@
+ SELECT * FROM pg_shardgroups;
+   oid  | sgname  | sgowner | sgoptions 
+ -------+---------+---------+-----------
+- 16491 | sg_test |      10 | 
++ 16516 | sg_test |      10 | 
+ (1 row)
+ 
+ -- -- Test error message
+@@ -55,7 +55,7 @@
+ SELECT * FROM pg_shardgroups;
+   oid  | sgname  | sgowner | sgoptions 
+ -------+---------+---------+-----------
+- 16491 | sg_test |      10 | 
++ 16516 | sg_test |      10 | 
+ (1 row)
+ 
+ ALTER DATABASE regression SET DEFAULT SHARD GROUP sg_test;
+@@ -66,7 +66,7 @@
+      1 | template1  |     10 |        6 | c              | t             | t            | f              |           -1 |          734 |          1 |          1663 |             0 | C.UTF-8    | C.UTF-8  |           |             |                | {=c/runner,runner=CTc/runner}
+      4 | template0  |     10 |        6 | c              | t             | f            | f              |           -1 |          734 |          1 |          1663 |             0 | C.UTF-8    | C.UTF-8  |           |             |                | {=c/runner,runner=CTc/runner}
+  16384 | testdb     |     10 |        6 | c              | f             | t            | f              |           -1 |          734 |          1 |          1663 |         16450 | C.UTF-8    | C.UTF-8  |           |             |                | 
+- 16483 | regression |     10 |        6 | c              | f             | t            | f              |           -1 |          734 |          1 |          1663 |         16491 | C.UTF-8    | C.UTF-8  |           |             |                | 
++ 16508 | regression |     10 |        6 | c              | f             | t            | f              |           -1 |          734 |          1 |          1663 |         16516 | C.UTF-8    | C.UTF-8  |           |             |                | 
+ (5 rows)
+ 
+ -- ALTER DATABASE ... SET SHARD GROUP
+@@ -77,13 +77,13 @@
+ SELECT * FROM pg_foreign_server;
+   oid  | srvname | srvowner | srvfdw | srvtype | srvversion | srvacl |                  srvoptions                  
+ -------+---------+----------+--------+---------+------------+--------+----------------------------------------------
+- 16492 | server1 |       10 |  16487 |         |            |        | {host=localhost,dbname=regression,port=5432}
++ 16517 | server1 |       10 |  16512 |         |            |        | {host=localhost,dbname=regression,port=5432}
+ (1 row)
+ 
+ SELECT * FROM pg_shardmembers;
+   oid  | sgid  | srvid | smpriority | smstate | smoptions 
+ -------+-------+-------+------------+---------+-----------
+- 16493 | 16491 | 16492 |        100 | u       | 
++ 16518 | 16516 | 16517 |        100 | u       | 
+ (1 row)
+ 
+ DROP SERVER server1;
+@@ -100,7 +100,7 @@
+ SELECT * FROM pg_foreign_server;
+   oid  | srvname | srvowner | srvfdw | srvtype | srvversion | srvacl |                  srvoptions                  
+ -------+---------+----------+--------+---------+------------+--------+----------------------------------------------
+- 16492 | server1 |       10 |  16487 |         |            |        | {host=localhost,dbname=regression,port=5432}
++ 16517 | server1 |       10 |  16512 |         |            |        | {host=localhost,dbname=regression,port=5432}
+ (1 row)
+ 
+ -- check default shard group
+@@ -112,7 +112,7 @@
+ SELECT * FROM pg_class WHERE relname like 'test_t_%';
+   oid  |     relname      | relnamespace | reltype | reloftype | relowner | relam | relfilenode | reltablespace | relpages | reltuples | relallvisible | reltoastrelid | relhasindex | relisshared | relpersistence | relkind | relnatts | relchecks | relhasrules | relhastriggers | relhassubclass | relrowsecurity | relforcerowsecurity | relispopulated | relreplident | relispartition | relrewrite | relsgid | relfrozenxid | relminmxid | relacl | reloptions | relpartbound 
+ -------+------------------+--------------+---------+-----------+----------+-------+-------------+---------------+----------+-----------+---------------+---------------+-------------+-------------+----------------+---------+----------+-----------+-------------+----------------+----------------+----------------+---------------------+----------------+--------------+----------------+------------+---------+--------------+------------+--------+------------+--------------
+- 16495 | test_t_worldwide |         2200 |   16497 |         0 |       10 |     2 |       16495 |             0 |        0 |        -1 |             0 |             0 | f           | f           | p              | r       |        2 |         0 | f           | f              | f              | f              | f                   | t              | d            | f              |          0 |   16491 |          787 |          1 |        |            | 
++ 16520 | test_t_worldwide |         2200 |   16522 |         0 |       10 |     2 |       16520 |             0 |        0 |        -1 |             0 |             0 | f           | f           | p              | r       |        2 |         0 | f           | f              | f              | f              | f                   | t              | d            | f              |          0 |   16516 |          805 |          1 |        |            | 
+ (1 row)
+ 
+ DROP TABLE test_t_worldwide;
+@@ -121,8 +121,8 @@
+ SELECT * FROM pg_shardgroups;
+   oid  |  sgname   | sgowner | sgoptions 
+ -------+-----------+---------+-----------
+- 16491 | sg_test   |      10 | 
+- 16498 | sg_test_2 |      10 | 
++ 16516 | sg_test   |      10 | 
++ 16523 | sg_test_2 |      10 | 
+ (2 rows)
+ 
+ CREATE WORLDWIDE TABLE test_t_worldwide (a int, b int) SHARD GROUP sg_test_2;
+@@ -135,35 +135,35 @@
+ SELECT * FROM pg_class WHERE relname like 'test_t_%';
+   oid  |       relname       | relnamespace | reltype | reloftype | relowner | relam | relfilenode | reltablespace | relpages | reltuples | relallvisible | reltoastrelid | relhasindex | relisshared | relpersistence | relkind | relnatts | relchecks | relhasrules | relhastriggers | relhassubclass | relrowsecurity | relforcerowsecurity | relispopulated | relreplident | relispartition | relrewrite | relsgid | relfrozenxid | relminmxid | relacl | reloptions |                                                                                                                                                                                                                                                                                           relpartbound                                                                                                                                                                                                                                                                                            
+ -------+---------------------+--------------+---------+-----------+----------+-------+-------------+---------------+----------+-----------+---------------+---------------+-------------+-------------+----------------+---------+----------+-----------+-------------+----------------+----------------+----------------+---------------------+----------------+--------------+----------------+------------+---------+--------------+------------+--------+------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+- 16502 | test_t_distribute   |         2200 |   16504 |         0 |       10 |     0 |           0 |             0 |        0 |        -1 |             0 |             0 | f           | f           | p              | p       |        2 |         0 | f           | f              | t              | f              | f                   | t              | d            | f              |          0 |   16498 |            0 |          0 |        |            | 
+- 16505 | test_t_distribute_1 |         2200 |   16507 |         0 |       10 |     2 |       16505 |             0 |        0 |        -1 |             0 |             0 | f           | f           | p              | r       |        2 |         0 | f           | f              | f              | f              | f                   | t              | d            | t              |          0 |   16498 |          792 |          1 |        |            | {PARTITIONBOUNDSPEC :strategy l :is_default false :modulus 0 :remainder 0 :listdatums ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 2 0 0 0 0 0 0 0 ]} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 3 0 0 0 0 0 0 0 ]}) :lowerdatums <> :upperdatums <> :location -1}
+- 16499 | test_t_worldwide    |         2200 |   16501 |         0 |       10 |     2 |       16499 |             0 |        0 |        -1 |             0 |             0 | f           | f           | p              | r       |        2 |         0 | f           | f              | f              | f              | f                   | t              | d            | f              |          0 |   16498 |          790 |          1 |        |            | 
++ 16527 | test_t_distribute   |         2200 |   16529 |         0 |       10 |     0 |           0 |             0 |        0 |        -1 |             0 |             0 | f           | f           | p              | p       |        2 |         0 | f           | f              | t              | f              | f                   | t              | d            | f              |          0 |   16523 |            0 |          0 |        |            | 
++ 16530 | test_t_distribute_1 |         2200 |   16532 |         0 |       10 |     2 |       16530 |             0 |        0 |        -1 |             0 |             0 | f           | f           | p              | r       |        2 |         0 | f           | f              | f              | f              | f                   | t              | d            | t              |          0 |   16523 |          810 |          1 |        |            | {PARTITIONBOUNDSPEC :strategy l :is_default false :modulus 0 :remainder 0 :listdatums ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 2 0 0 0 0 0 0 0 ]} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 3 0 0 0 0 0 0 0 ]}) :lowerdatums <> :upperdatums <> :location -1}
++ 16524 | test_t_worldwide    |         2200 |   16526 |         0 |       10 |     2 |       16524 |             0 |        0 |        -1 |             0 |             0 | f           | f           | p              | r       |        2 |         0 | f           | f              | f              | f              | f                   | t              | d            | f              |          0 |   16523 |          808 |          1 |        |            | 
+ (3 rows)
+ 
+ SELECT * FROM pg_shardgroups;
+   oid  |  sgname   | sgowner | sgoptions 
+ -------+-----------+---------+-----------
+- 16491 | sg_test   |      10 | 
+- 16498 | sg_test_2 |      10 | 
++ 16516 | sg_test   |      10 | 
++ 16523 | sg_test_2 |      10 | 
+ (2 rows)
+ 
+ SELECT * FROM pg_shardmembers;
+   oid  | sgid  | srvid | smpriority | smstate | smoptions 
+ -------+-------+-------+------------+---------+-----------
+- 16494 | 16491 | 16492 |        100 | u       | 
++ 16519 | 16516 | 16517 |        100 | u       | 
+ (1 row)
+ 
+ DROP SHARD GROUP sg_test_2;
+ SELECT * FROM pg_shardgroups;
+   oid  | sgname  | sgowner | sgoptions 
+ -------+---------+---------+-----------
+- 16491 | sg_test |      10 | 
++ 16516 | sg_test |      10 | 
+ (1 row)
+ 
+ SELECT * FROM pg_shardmembers;
+   oid  | sgid  | srvid | smpriority | smstate | smoptions 
+ -------+-------+-------+------------+---------+-----------
+- 16494 | 16491 | 16492 |        100 | u       | 
++ 16519 | 16516 | 16517 |        100 | u       | 
+ (1 row)
+ 
+ DROP SHARD GROUP sg_test;
