@@ -2391,7 +2391,7 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 
 		/* Advance LogwrtResult.Write to end of current buffer page */
 		LogwrtResult.Write = EndPtr;
-		ispartialpage = WriteRqst.Write < LogwrtResult.Write;
+		ispartialpage = reservedUpTo < LogwrtResult.Write;
 
 		if (!XLByteInPrevSeg(LogwrtResult.Write, openLogSegNo,
 							 wal_segment_size))
@@ -2438,7 +2438,7 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 		 * contiguous in memory), or if we are at the end of the logfile
 		 * segment.
 		 */
-		last_iteration = WriteRqst.Write <= LogwrtResult.Write;
+		last_iteration = reservedUpTo <= LogwrtResult.Write;
 
 		finishing_seg = !ispartialpage &&
 			(startoffset + npages * XLOG_BLCKSZ) >= wal_segment_size;
@@ -2578,7 +2578,7 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 		if (ispartialpage)
 		{
 			/* Only asked to write a partial page */
-			LogwrtResult.Write = WriteRqst.Write;
+			LogwrtResult.Write = reservedUpTo;
 			break;
 		}
 		curridx = NextBufIdx(curridx);
