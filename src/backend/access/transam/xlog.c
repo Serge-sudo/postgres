@@ -308,8 +308,9 @@ static bool doPageWrites;
  * contents of the buffer being replaced haven't been written yet, the mapping
  * lock is released while the write is done, and reacquired afterwards.
  *
- * WALWriteLock: must be held to write WAL buffers to disk (XLogWrite or
- * XLogFlush).
+ * WALWriteLock: No longer used for WAL writing. WAL writes now use atomic
+ * operations (WALWriteReserveUpTo, WALWriteSyncReserveUpTo, WALWriteSyncDoneUpTo)
+ * to allow multiple processes to write concurrently.
  *
  * ControlFileLock: must be held to read/update control file or create
  * new log file.
@@ -464,7 +465,7 @@ typedef struct XLogCtlData
 	/* Fake LSN counter, for unlogged relations. */
 	pg_atomic_uint64 unloggedLSN;
 
-	/* Time and LSN of last xlog segment switch. Protected by WALWriteLock. */
+	/* Time and LSN of last xlog segment switch. Protected by info_lck. */
 	pg_time_t	lastSegSwitchTime;
 	XLogRecPtr	lastSegSwitchLSN;
 
@@ -474,14 +475,21 @@ typedef struct XLogCtlData
 	pg_atomic_uint64 logFlushResult;	/* last byte + 1 flushed */
 
 	/*
+	 * Atomics for parallel WAL writing. Multiple processes can write to WAL
+	 * concurrently using these atomics instead of WALWriteLock.
+	 */
+	pg_atomic_uint64 WALWriteReserveUpTo;		/* reserved position for writing */
+	pg_atomic_uint64 WALWriteSyncReserveUpTo;	/* reserved position for fsync */
+	pg_atomic_uint64 WALWriteSyncDoneUpTo;		/* fsynced position */
+
+	/*
 	 * Latest initialized page in the cache (last byte position + 1).
 	 *
 	 * To change the identity of a buffer (and InitializedUpTo), you need to
 	 * hold WALBufMappingLock.  To change the identity of a buffer that's
-	 * still dirty, the old page needs to be written out first, and for that
-	 * you need WALWriteLock, and you need to ensure that there are no
-	 * in-progress insertions to the page by calling
-	 * WaitXLogInsertionsToFinish().
+	 * still dirty, the old page needs to be written out first using atomic
+	 * operations, and you need to ensure that there are no in-progress
+	 * insertions to the page by calling WaitXLogInsertionsToFinish().
 	 */
 	XLogRecPtr	InitializedUpTo;
 
@@ -1496,10 +1504,10 @@ WALInsertLockUpdateInsertingAt(XLogRecPtr insertingAt)
  * than 'upto' to finish, the return value is always >= 'upto'.
  *
  * Note: When you are about to write out WAL, you must call this function
- * *before* acquiring WALWriteLock, to avoid deadlocks. This function might
- * need to wait for an insertion to finish (or at least advance to next
- * uninitialized page), and the inserter might need to evict an old WAL buffer
- * to make room for a new one, which in turn requires WALWriteLock.
+ * before writing, to avoid issues. This function might need to wait for an
+ * insertion to finish (or at least advance to next uninitialized page), and
+ * the inserter might need to evict an old WAL buffer to make room for a new
+ * one, which in turn requires writing using atomic operations.
  */
 static XLogRecPtr
 WaitXLogInsertionsToFinish(XLogRecPtr upto)
@@ -2033,7 +2041,7 @@ AdvanceXLInsertBuffer(XLogRecPtr upto, TimeLineID tli, bool opportunistic)
 			if (LogwrtResult.Write < OldPageRqstPtr)
 			{
 				/*
-				 * Must acquire write lock. Release WALBufMappingLock first,
+				 * Must write out the old page. Release WALBufMappingLock first,
 				 * to make sure that all insertions that we need to wait for
 				 * can finish (up to this same position). Otherwise we risk
 				 * deadlock.
@@ -2042,22 +2050,14 @@ AdvanceXLInsertBuffer(XLogRecPtr upto, TimeLineID tli, bool opportunistic)
 
 				WaitXLogInsertionsToFinish(OldPageRqstPtr);
 
-				LWLockAcquire(WALWriteLock, LW_EXCLUSIVE);
-
 				RefreshXLogWriteResult(LogwrtResult);
-				if (LogwrtResult.Write >= OldPageRqstPtr)
+				if (LogwrtResult.Write < OldPageRqstPtr)
 				{
-					/* OK, someone wrote it already */
-					LWLockRelease(WALWriteLock);
-				}
-				else
-				{
-					/* Have to write it ourselves */
+					/* Have to write it ourselves using atomic operations */
 					TRACE_POSTGRESQL_WAL_BUFFER_WRITE_DIRTY_START();
 					WriteRqst.Write = OldPageRqstPtr;
 					WriteRqst.Flush = 0;
 					XLogWrite(WriteRqst, tli, false);
-					LWLockRelease(WALWriteLock);
 					PendingWalStats.wal_buffers_full++;
 					TRACE_POSTGRESQL_WAL_BUFFER_WRITE_DIRTY_DONE();
 				}
@@ -2307,9 +2307,10 @@ XLogCheckpointNeeded(XLogSegNo new_segno)
  * This option allows us to avoid uselessly issuing multiple writes when a
  * single one would do.
  *
- * Must be called with WALWriteLock held. WaitXLogInsertionsToFinish(WriteRqst)
- * must be called before grabbing the lock, to make sure the data is ready to
- * write.
+ * Uses atomic operations for parallel WAL writing. Multiple processes can
+ * write to WAL concurrently using CAS operations instead of WALWriteLock.
+ * WaitXLogInsertionsToFinish(WriteRqst) must be called before calling this,
+ * to make sure the data is ready to write.
  */
 static void
 XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
@@ -2321,6 +2322,8 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 	int			npages;
 	int			startidx;
 	uint32		startoffset;
+	XLogRecPtr	reservedUpTo;
+	XLogRecPtr	expectedReserved;
 
 	/* We should always be inside a critical section here */
 	Assert(CritSectionCount > 0);
@@ -2329,6 +2332,28 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 	 * Update local LogwrtResult (caller probably did this already, but...)
 	 */
 	RefreshXLogWriteResult(LogwrtResult);
+
+	/*
+	 * Reserve our write position using CAS on WALWriteReserveUpTo.
+	 * This allows multiple processes to write concurrently.
+	 */
+	do
+	{
+		expectedReserved = pg_atomic_read_u64(&XLogCtl->WALWriteReserveUpTo);
+		
+		/* If someone already reserved past our write position, we're done */
+		if (expectedReserved >= WriteRqst.Write)
+		{
+			LogwrtResult.Write = WriteRqst.Write;
+			return;
+		}
+		
+		reservedUpTo = WriteRqst.Write;
+	} while (!pg_atomic_compare_exchange_u64(&XLogCtl->WALWriteReserveUpTo,
+											  &expectedReserved, reservedUpTo));
+
+	/* We've reserved from expectedReserved to reservedUpTo */
+	LogwrtResult.Write = expectedReserved;
 
 	/*
 	 * Since successive pages in the xlog cache are consecutively allocated,
@@ -2350,7 +2375,7 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 	 */
 	curridx = XLogRecPtrToBufIdx(LogwrtResult.Write);
 
-	while (LogwrtResult.Write < WriteRqst.Write)
+	while (LogwrtResult.Write < reservedUpTo)
 	{
 		/*
 		 * Make sure we're not ahead of the insert process.  This could happen
@@ -2486,10 +2511,9 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 
 			/*
 			 * If we just wrote the whole last page of a logfile segment,
-			 * fsync the segment immediately.  This avoids having to go back
-			 * and re-open prior segments when an fsync request comes along
-			 * later. Doing it here ensures that one and only one backend will
-			 * perform this fsync.
+			 * we need to coordinate fsync using atomic operations. Multiple
+			 * processes writing concurrently use CAS to determine who performs
+			 * the fsync.
 			 *
 			 * This is also the right place to notify the Archiver that the
 			 * segment is ready to copy to archival storage, and to update the
@@ -2499,31 +2523,54 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 			 */
 			if (finishing_seg)
 			{
-				issue_xlog_fsync(openLogFile, openLogSegNo, tli);
-
-				/* signal that we need to wakeup walsenders later */
-				WalSndWakeupRequest();
-
-				LogwrtResult.Flush = LogwrtResult.Write;	/* end of page */
-
-				if (XLogArchivingActive())
-					XLogArchiveNotifySeg(openLogSegNo, tli);
-
-				XLogCtl->lastSegSwitchTime = (pg_time_t) time(NULL);
-				XLogCtl->lastSegSwitchLSN = LogwrtResult.Flush;
-
-				/*
-				 * Request a checkpoint if we've consumed too much xlog since
-				 * the last one.  For speed, we first check using the local
-				 * copy of RedoRecPtr, which might be out of date; if it looks
-				 * like a checkpoint is needed, forcibly update RedoRecPtr and
-				 * recheck.
-				 */
-				if (IsUnderPostmaster && XLogCheckpointNeeded(openLogSegNo))
+				XLogRecPtr	syncReserved;
+				XLogRecPtr	expectedSyncReserved;
+				
+				/* Reserve fsync position using CAS */
+				do
 				{
-					(void) GetRedoRecPtr();
-					if (XLogCheckpointNeeded(openLogSegNo))
-						RequestCheckpoint(CHECKPOINT_CAUSE_XLOG);
+					expectedSyncReserved = pg_atomic_read_u64(&XLogCtl->WALWriteSyncReserveUpTo);
+					syncReserved = LogwrtResult.Write;
+				} while (!pg_atomic_compare_exchange_u64(&XLogCtl->WALWriteSyncReserveUpTo,
+														  &expectedSyncReserved, syncReserved));
+				
+				/*
+				 * If we're the one who reserved this position (i.e., we crossed
+				 * the segment boundary), perform the fsync.
+				 */
+				if (expectedSyncReserved < LogwrtResult.Write)
+				{
+					issue_xlog_fsync(openLogFile, openLogSegNo, tli);
+
+					/* signal that we need to wakeup walsenders later */
+					WalSndWakeupRequest();
+
+					LogwrtResult.Flush = LogwrtResult.Write;	/* end of page */
+					
+					/* Update the sync done position */
+					pg_atomic_write_u64(&XLogCtl->WALWriteSyncDoneUpTo, LogwrtResult.Flush);
+
+					if (XLogArchivingActive())
+						XLogArchiveNotifySeg(openLogSegNo, tli);
+
+					SpinLockAcquire(&XLogCtl->info_lck);
+					XLogCtl->lastSegSwitchTime = (pg_time_t) time(NULL);
+					XLogCtl->lastSegSwitchLSN = LogwrtResult.Flush;
+					SpinLockRelease(&XLogCtl->info_lck);
+
+					/*
+					 * Request a checkpoint if we've consumed too much xlog since
+					 * the last one.  For speed, we first check using the local
+					 * copy of RedoRecPtr, which might be out of date; if it looks
+					 * like a checkpoint is needed, forcibly update RedoRecPtr and
+					 * recheck.
+					 */
+					if (IsUnderPostmaster && XLogCheckpointNeeded(openLogSegNo))
+					{
+						(void) GetRedoRecPtr();
+						if (XLogCheckpointNeeded(openLogSegNo))
+							RequestCheckpoint(CHECKPOINT_CAUSE_XLOG);
+					}
 				}
 			}
 		}
@@ -2544,11 +2591,14 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 	Assert(npages == 0);
 
 	/*
-	 * If asked to flush, do so
+	 * If asked to flush, do so using atomic coordination
 	 */
 	if (LogwrtResult.Flush < WriteRqst.Flush &&
 		LogwrtResult.Flush < LogwrtResult.Write)
 	{
+		XLogRecPtr	syncReserved;
+		XLogRecPtr	expectedSyncReserved;
+		
 		/*
 		 * Could get here without iterating above loop, in which case we might
 		 * have no open file or the wrong one.  However, we do not need to
@@ -2570,7 +2620,26 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 				ReserveExternalFD();
 			}
 
-			issue_xlog_fsync(openLogFile, openLogSegNo, tli);
+			/* Reserve fsync position using CAS */
+			do
+			{
+				expectedSyncReserved = pg_atomic_read_u64(&XLogCtl->WALWriteSyncReserveUpTo);
+				syncReserved = LogwrtResult.Write;
+			} while (!pg_atomic_compare_exchange_u64(&XLogCtl->WALWriteSyncReserveUpTo,
+													  &expectedSyncReserved, syncReserved));
+
+			/*
+			 * If we reserved this position (or if we're the last writer who needs
+			 * to fsync), perform the fsync.
+			 */
+			if (expectedSyncReserved < LogwrtResult.Write || 
+				syncReserved >= reservedUpTo)
+			{
+				issue_xlog_fsync(openLogFile, openLogSegNo, tli);
+				
+				/* Update the sync done position */
+				pg_atomic_write_u64(&XLogCtl->WALWriteSyncDoneUpTo, LogwrtResult.Write);
+			}
 		}
 
 		/* signal that we need to wakeup walsenders later */
@@ -2790,8 +2859,8 @@ UpdateMinRecoveryPoint(XLogRecPtr lsn, bool force)
 /*
  * Ensure that all XLOG data through the given position is flushed to disk.
  *
- * NOTE: this differs from XLogWrite mainly in that the WALWriteLock is not
- * already held, and we try to avoid acquiring it if possible.
+ * NOTE: this now uses atomic operations for parallel WAL writing instead of
+ * WALWriteLock.
  */
 void
 XLogFlush(XLogRecPtr record)
@@ -2839,8 +2908,8 @@ XLogFlush(XLogRecPtr record)
 	WriteRqstPtr = record;
 
 	/*
-	 * Now wait until we get the write lock, or someone else does the flush
-	 * for us.
+	 * Now perform the write and flush. With atomic operations, we don't need
+	 * WALWriteLock anymore - multiple processes can write concurrently.
 	 */
 	for (;;)
 	{
@@ -2862,29 +2931,12 @@ XLogFlush(XLogRecPtr record)
 		insertpos = WaitXLogInsertionsToFinish(WriteRqstPtr);
 
 		/*
-		 * Try to get the write lock. If we can't get it immediately, wait
-		 * until it's released, and recheck if we still need to do the flush
-		 * or if the backend that held the lock did it for us already. This
-		 * helps to maintain a good rate of group committing when the system
-		 * is bottlenecked by the speed of fsyncing.
+		 * Check if someone else already flushed the record.
+		 * With atomic operations, we can proceed without a lock.
 		 */
-		if (!LWLockAcquireOrWait(WALWriteLock, LW_EXCLUSIVE))
-		{
-			/*
-			 * The lock is now free, but we didn't acquire it yet. Before we
-			 * do, loop back to check if someone else flushed the record for
-			 * us already.
-			 */
-			continue;
-		}
-
-		/* Got the lock; recheck whether request is satisfied */
 		RefreshXLogWriteResult(LogwrtResult);
 		if (record <= LogwrtResult.Flush)
-		{
-			LWLockRelease(WALWriteLock);
 			break;
-		}
 
 		/*
 		 * Sleep before flush! By adding a delay here, we may give further
@@ -2901,14 +2953,9 @@ XLogFlush(XLogRecPtr record)
 			pg_usleep(CommitDelay);
 
 			/*
-			 * Re-check how far we can now flush the WAL. It's generally not
-			 * safe to call WaitXLogInsertionsToFinish while holding
-			 * WALWriteLock, because an in-progress insertion might need to
-			 * also grab WALWriteLock to make progress. But we know that all
-			 * the insertions up to insertpos have already finished, because
-			 * that's what the earlier WaitXLogInsertionsToFinish() returned.
-			 * We're only calling it again to allow insertpos to be moved
-			 * further forward, not to actually wait for anyone.
+			 * Re-check how far we can now flush the WAL. With atomic operations,
+			 * we can safely call WaitXLogInsertionsToFinish to allow insertpos
+			 * to be moved further forward.
 			 */
 			insertpos = WaitXLogInsertionsToFinish(insertpos);
 		}
@@ -2919,7 +2966,6 @@ XLogFlush(XLogRecPtr record)
 
 		XLogWrite(WriteRqst, insertTLI, false);
 
-		LWLockRelease(WALWriteLock);
 		/* done */
 		break;
 	}
@@ -3088,16 +3134,14 @@ XLogBackgroundFlush(void)
 
 	START_CRIT_SECTION();
 
-	/* now wait for any in-progress insertions to finish and get write lock */
+	/* now wait for any in-progress insertions to finish */
 	WaitXLogInsertionsToFinish(WriteRqst.Write);
-	LWLockAcquire(WALWriteLock, LW_EXCLUSIVE);
 	RefreshXLogWriteResult(LogwrtResult);
 	if (WriteRqst.Write > LogwrtResult.Write ||
 		WriteRqst.Flush > LogwrtResult.Flush)
 	{
 		XLogWrite(WriteRqst, insertTLI, flexible);
 	}
-	LWLockRelease(WALWriteLock);
 
 	END_CRIT_SECTION();
 
@@ -4996,6 +5040,9 @@ XLOGShmemInit(void)
 	pg_atomic_init_u64(&XLogCtl->logWriteResult, InvalidXLogRecPtr);
 	pg_atomic_init_u64(&XLogCtl->logFlushResult, InvalidXLogRecPtr);
 	pg_atomic_init_u64(&XLogCtl->unloggedLSN, InvalidXLogRecPtr);
+	pg_atomic_init_u64(&XLogCtl->WALWriteReserveUpTo, InvalidXLogRecPtr);
+	pg_atomic_init_u64(&XLogCtl->WALWriteSyncReserveUpTo, InvalidXLogRecPtr);
+	pg_atomic_init_u64(&XLogCtl->WALWriteSyncDoneUpTo, InvalidXLogRecPtr);
 }
 
 /*
@@ -6035,6 +6082,9 @@ StartupXLOG(void)
 	pg_atomic_write_u64(&XLogCtl->logInsertResult, EndOfLog);
 	pg_atomic_write_u64(&XLogCtl->logWriteResult, EndOfLog);
 	pg_atomic_write_u64(&XLogCtl->logFlushResult, EndOfLog);
+	pg_atomic_write_u64(&XLogCtl->WALWriteReserveUpTo, EndOfLog);
+	pg_atomic_write_u64(&XLogCtl->WALWriteSyncReserveUpTo, EndOfLog);
+	pg_atomic_write_u64(&XLogCtl->WALWriteSyncDoneUpTo, EndOfLog);
 	XLogCtl->LogwrtRqst.Write = EndOfLog;
 	XLogCtl->LogwrtRqst.Flush = EndOfLog;
 
@@ -6073,8 +6123,10 @@ StartupXLOG(void)
 	InRecovery = false;
 
 	/* start the archive_timeout timer and LSN running */
+	SpinLockAcquire(&XLogCtl->info_lck);
 	XLogCtl->lastSegSwitchTime = (pg_time_t) time(NULL);
 	XLogCtl->lastSegSwitchLSN = EndOfLog;
+	SpinLockRelease(&XLogCtl->info_lck);
 
 	/* also initialize latestCompletedXid, to nextXid - 1 */
 	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
@@ -6583,11 +6635,11 @@ GetLastSegSwitchData(XLogRecPtr *lastSwitchLSN)
 {
 	pg_time_t	result;
 
-	/* Need WALWriteLock, but shared lock is sufficient */
-	LWLockAcquire(WALWriteLock, LW_SHARED);
+	/* Need to use spinlock to read these values safely */
+	SpinLockAcquire(&XLogCtl->info_lck);
 	result = XLogCtl->lastSegSwitchTime;
 	*lastSwitchLSN = XLogCtl->lastSegSwitchLSN;
-	LWLockRelease(WALWriteLock);
+	SpinLockRelease(&XLogCtl->info_lck);
 
 	return result;
 }
