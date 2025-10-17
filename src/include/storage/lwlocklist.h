@@ -40,7 +40,7 @@ PG_LWLOCK(6, SInvalWrite)
 PG_LWLOCK(7, WALBufMapping)
 PG_LWLOCK(8, WALWrite)
 PG_LWLOCK(9, ControlFile)
-/* 10 was CheckpointLock */
+PG_LWLOCK(10, WALFlush)
 /* 11 was XactSLRULock */
 /* 12 was SubtransSLRULock */
 PG_LWLOCK(13, MultiXactGen)

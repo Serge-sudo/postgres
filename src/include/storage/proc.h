@@ -52,6 +52,17 @@ struct XidCache
 };
 
 /*
+ * List to link PGPROC structures for the cases when they
+ * can't be linked via SHM_QUEUE like when we want to operate
+ * the list using atomic operations.  Currently this is used
+ * to link PGPROC's for WAL write operations.
+ */
+typedef struct PGPROC_LIST
+{
+	struct PGPROC_LIST *next;
+} PGPROC_LIST;
+
+/*
  * Flags for PGPROC->statusFlags and PROC_HDR->statusFlags[]
  */
 #define		PROC_IS_AUTOVACUUM	0x01	/* is it an autovac worker? */
@@ -266,6 +277,11 @@ struct PGPROC
 									 * ProcGlobal->subxidStates[i] */
 	struct XidCache subxids;	/* cache for subtransaction XIDs */
 
+	/* Support for group WAL write. */
+	bool		writeWAL;		/* true if waiting for WAL write */
+	XLogRecPtr	writePos;		/* LSN up to which WAL needs to be written */
+	PGPROC_LIST pendingWriteWALLinks;	/* list link for pending WAL writes */
+
 	/* Support for group XID clearing. */
 	/* true, if member of ProcArray group waiting for XID clear */
 	bool		procArrayGroupMember;
@@ -397,6 +413,8 @@ typedef struct PROC_HDR
 	dlist_head	bgworkerFreeProcs;
 	/* Head of list of walsender free PGPROC structures */
 	dlist_head	walsenderFreeProcs;
+	/* List of PGPROC structures that need to have their WAL written */
+	PGPROC_LIST *pendingWriteWALList;
 	/* First pgproc waiting for group XID clear */
 	pg_atomic_uint32 procArrayGroupFirst;
 	/* First pgproc waiting for group transaction status update */
