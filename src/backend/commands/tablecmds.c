@@ -1363,70 +1363,42 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 
 /*
  * ExecuteDDLOnRemoteServer
- *		Execute DDL command on a remote server using SPI and dblink
+ *		Execute DDL command on a remote server
  *
- * This function uses SPI to execute dblink_exec which will handle the remote
- * execution including connection management and error handling.
- * 
- * Falls back to showing a NOTICE if dblink is not available.
+ * This function shows a NOTICE message with the DDL that should be executed
+ * on the remote server. Actual execution should be done via a post-commit
+ * hook, background worker, or manual execution to avoid transaction issues.
+ *
+ * TODO: Implement automatic execution via background worker or event trigger
+ * that runs after transaction commit to avoid snapshot/transaction issues.
  */
 static void
 ExecuteDDLOnRemoteServer(Oid serveroid, const char *sql)
 {
 	ForeignServer *server;
-	StringInfoData dblink_sql;
-	int			ret;
-	bool		found_error = false;
 
 	/* Get server information */
 	server = GetForeignServer(serveroid);
 
-	/* Build the dblink_exec command */
-	initStringInfo(&dblink_sql);
-	appendStringInfo(&dblink_sql, "SELECT dblink_exec(%s, %s)",
-					 quote_literal_cstr(server->servername),
-					 quote_literal_cstr(sql));
-
-	/* Connect to SPI */
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "SPI_connect failed");
-
-	/* Execute the dblink command */
-	ret = SPI_execute(dblink_sql.data, false, 0);
-
-	if (ret < 0)
-	{
-		/*
-		 * If dblink is not available or there's an error, fall back to
-		 * showing a NOTICE message with the DDL that should be executed
-		 */
-		found_error = true;
-	}
-	else if (SPI_processed > 0 && SPI_tuptable != NULL)
-	{
-		/* Successfully executed */
-		ereport(DEBUG1,
-				(errmsg("successfully executed DDL on foreign server \"%s\"",
-						server->servername)));
-	}
-	else
-	{
-		found_error = true;
-	}
-
-	SPI_finish();
-
-	/* If there was an error, show the DDL that should be executed */
-	if (found_error)
-	{
-		ereport(NOTICE,
-				(errmsg("table should be created on shard member \"%s\"",
-						server->servername),
-				 errdetail("Execute: %s", sql),
-				 errhint("Install dblink extension or execute this DDL manually on the remote server.")));
-	}
-
-	pfree(dblink_sql.data);
+	/*
+	 * Show NOTICE with the DDL that should be executed.
+	 * 
+	 * We cannot safely execute DDL on remote servers within the same
+	 * transaction as local DDL due to:
+	 * 1. Snapshot management conflicts with SPI
+	 * 2. Potential deadlocks when connecting back to same server
+	 * 3. Transaction coordination complexity
+	 * 
+	 * The proper implementation would use:
+	 * - Event triggers for post-commit DDL replication
+	 * - Background workers for asynchronous execution
+	 * - FDW API extension for DDL operations (like TRUNCATE)
+	 */
+	ereport(NOTICE,
+			(errmsg("table should be created on shard member \"%s\"",
+					server->servername),
+			 errdetail("Execute: %s", sql),
+			 errhint("Use dblink_exec, postgres_fdw, or execute manually on the remote server.")));
 }
 
 /*
