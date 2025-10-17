@@ -1402,8 +1402,17 @@ WALInsertLockAcquire(void)
 		if (insertPos >= writePos)
 		{
 			int		shift;
+			int		max_shift;
 
 			distance = insertPos - writePos;
+
+			/*
+			 * Calculate the maximum shift based on NUM_XLOGINSERT_LOCKS.
+			 * max_shift = log2(NUM_XLOGINSERT_LOCKS) ensures we don't shift
+			 * beyond the number of locks available. This makes the code
+			 * independent of the actual lock count.
+			 */
+			max_shift = pg_leftmost_one_pos32(NUM_XLOGINSERT_LOCKS);
 
 			/*
 			 * Determine the maximum lock index based on distance using bit
@@ -1413,12 +1422,12 @@ WALInsertLockAcquire(void)
 			 * The shift represents the reduction level:
 			 * - shift 0 (distance >= walBufferSize/2): use all locks
 			 * - shift 1 (distance >= walBufferSize/4): use half locks
-			 * - shift 2 (distance >= walBufferSize/8): use quarter locks  
-			 * - shift 3+: use minimum locks
+			 * - shift 2 (distance >= walBufferSize/8): use quarter locks
+			 * - shift max_shift: use minimum locks
 			 *
 			 * We compute shift by finding the bit position difference between
 			 * (walBufferSize/2) and distance, which gives us log2(walBufferSize/(2*distance)).
-			 * Clamp the result to [0, 3] range.
+			 * Clamp the result to [0, max_shift] range.
 			 */
 			if (distance > 0)
 			{
@@ -1437,13 +1446,13 @@ WALInsertLockAcquire(void)
 					int		thresh_msb = pg_leftmost_one_pos64(threshold);
 					
 					shift = thresh_msb - dist_msb;
-					if (shift > 3)
-						shift = 3;
+					if (shift > max_shift)
+						shift = max_shift;
 				}
 			}
 			else
 			{
-				shift = 3;	/* Use minimum locks when no distance */
+				shift = max_shift;	/* Use minimum locks when no distance */
 			}
 
 			/* Calculate maxLockNo by right-shifting NUM_XLOGINSERT_LOCKS */
