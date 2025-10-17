@@ -1407,7 +1407,9 @@ WALInsertLockAcquire(void)
 			 * - If distance > walBufferSize/2: use all locks (maxLockNo = NUM_XLOGINSERT_LOCKS - 1)
 			 * - If distance > walBufferSize/4: use half locks (maxLockNo = NUM_XLOGINSERT_LOCKS/2 - 1)
 			 * - If distance > walBufferSize/8: use quarter locks (maxLockNo = NUM_XLOGINSERT_LOCKS/4 - 1)
-			 * - Otherwise: use minimum locks (maxLockNo = 0 or 1)
+			 * - Otherwise: use minimum locks (maxLockNo = Max((NUM_XLOGINSERT_LOCKS/8) - 1, 0))
+			 *
+			 * This assumes NUM_XLOGINSERT_LOCKS is a power of 2 for even distribution.
 			 */
 			if (distance > walBufferSize / 2)
 				maxLockNo = NUM_XLOGINSERT_LOCKS - 1;
@@ -1416,7 +1418,7 @@ WALInsertLockAcquire(void)
 			else if (distance > walBufferSize / 8)
 				maxLockNo = (NUM_XLOGINSERT_LOCKS / 4) - 1;
 			else
-				maxLockNo = Max(NUM_XLOGINSERT_LOCKS / 8, 1) - 1;
+				maxLockNo = Max((NUM_XLOGINSERT_LOCKS / 8) - 1, 0);
 		}
 		else
 		{
