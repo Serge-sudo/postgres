@@ -1372,6 +1372,50 @@ static void
 WALInsertLockAcquire(void)
 {
 	bool		immed;
+	int			maxLockNo;
+	uint64		insertPos;
+	uint64		writePos;
+	uint64		walBufferSize;
+	uint64		distance;
+	static int	lockToTry = -1;
+
+	/*
+	 * Calculate the distance between insert and write pointers to determine
+	 * how many locks to use. This helps slow down inserts when the insert
+	 * pointer gets too close to the write pointer, preventing wraparound.
+	 */
+	insertPos = pg_atomic_read_u64(&XLogCtl->logInsertResult);
+	writePos = pg_atomic_read_u64(&XLogCtl->logWriteResult);
+	walBufferSize = (uint64) XLOGbuffers * XLOG_BLCKSZ;
+	
+	/*
+	 * Calculate distance. Handle the case where positions haven't been
+	 * initialized yet (both are 0 or InvalidXLogRecPtr).
+	 */
+	if (insertPos >= writePos)
+		distance = insertPos - writePos;
+	else
+		distance = 0;  /* Should not happen in normal operation */
+
+	/*
+	 * Determine the maximum lock index based on distance:
+	 * - If distance > walBufferSize/2: use all locks (maxLockNo = NUM_XLOGINSERT_LOCKS - 1)
+	 * - If distance > walBufferSize/4: use half locks (maxLockNo = NUM_XLOGINSERT_LOCKS/2 - 1)
+	 * - If distance > walBufferSize/8: use quarter locks (maxLockNo = NUM_XLOGINSERT_LOCKS/4 - 1)
+	 * - Otherwise: use minimum locks (maxLockNo = 0 or 1)
+	 */
+	if (distance > walBufferSize / 2)
+		maxLockNo = NUM_XLOGINSERT_LOCKS - 1;
+	else if (distance > walBufferSize / 4)
+		maxLockNo = (NUM_XLOGINSERT_LOCKS / 2) - 1;
+	else if (distance > walBufferSize / 8)
+		maxLockNo = (NUM_XLOGINSERT_LOCKS / 4) - 1;
+	else
+		maxLockNo = Max(NUM_XLOGINSERT_LOCKS / 8 - 1, 0);
+
+	/* Ensure maxLockNo is at least 0 */
+	if (maxLockNo < 0)
+		maxLockNo = 0;
 
 	/*
 	 * It doesn't matter which of the WAL insertion locks we acquire, so try
@@ -1382,12 +1426,11 @@ WALInsertLockAcquire(void)
 	 *
 	 * If this is the first time through in this backend, pick a lock
 	 * (semi-)randomly.  This allows the locks to be used evenly if you have a
-	 * lot of very short connections.
+	 * lot of very short connections. The lock selection is now limited by
+	 * maxLockNo to slow down inserts when buffer is getting full.
 	 */
-	static int	lockToTry = -1;
-
-	if (lockToTry == -1)
-		lockToTry = MyProcNumber % NUM_XLOGINSERT_LOCKS;
+	if (lockToTry == -1 || lockToTry > maxLockNo)
+		lockToTry = MyProcNumber % (maxLockNo + 1);
 	MyLockNo = lockToTry;
 
 	/*
@@ -1403,9 +1446,9 @@ WALInsertLockAcquire(void)
 		 * inserters, this causes all the inserters to eventually migrate to a
 		 * lock that no-one else is using.  On a system with more inserters
 		 * than locks, it still helps to distribute the inserters evenly
-		 * across the locks.
+		 * across the locks. The range is limited to maxLockNo.
 		 */
-		lockToTry = (lockToTry + 1) % NUM_XLOGINSERT_LOCKS;
+		lockToTry = (lockToTry + 1) % (maxLockNo + 1);
 	}
 }
 
