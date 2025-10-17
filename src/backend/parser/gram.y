@@ -3586,7 +3586,8 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $12;
 					n->tablespacename = $13;
 					n->if_not_exists = false;
-					n->distributespec = $14;
+					n->is_distributed = ($14 != NULL);
+					n->partspec = ($14 != NULL) ? $14 : n->partspec;  /* DISTRIBUTED BY overrides PARTITION BY */
 					n->is_worldwide = false;
 					n->shardgroup = $15;
 					$$ = (Node *) n;
@@ -3609,7 +3610,8 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $15;
 					n->tablespacename = $16;
 					n->if_not_exists = true;
-					n->distributespec = $17;
+					n->is_distributed = ($17 != NULL);
+					n->partspec = ($17 != NULL) ? $17 : n->partspec;  /* DISTRIBUTED BY overrides PARTITION BY */
 					n->is_worldwide = false;
 					n->shardgroup = $18;
 					$$ = (Node *) n;
@@ -3633,7 +3635,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $11;
 					n->tablespacename = $12;
 					n->if_not_exists = false;
-					n->distributespec = NULL;
+					n->is_distributed = false;
 					n->is_worldwide = false;
 					n->shardgroup = NULL;
 					$$ = (Node *) n;
@@ -3657,7 +3659,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $14;
 					n->tablespacename = $15;
 					n->if_not_exists = true;
-					n->distributespec = NULL;
+					n->is_distributed = false;
 					n->is_worldwide = false;
 					n->shardgroup = NULL;
 					$$ = (Node *) n;
@@ -3681,7 +3683,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $13;
 					n->tablespacename = $14;
 					n->if_not_exists = false;
-					n->distributespec = NULL;
+					n->is_distributed = false;
 					n->is_worldwide = false;
 					n->shardgroup = NULL;
 					$$ = (Node *) n;
@@ -3705,7 +3707,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $16;
 					n->tablespacename = $17;
 					n->if_not_exists = true;
-					n->distributespec = NULL;
+					n->is_distributed = false;
 					n->is_worldwide = false;
 					n->shardgroup = NULL;
 					$$ = (Node *) n;
@@ -3727,7 +3729,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $12;
 					n->tablespacename = $13;
 					n->if_not_exists = false;
-					n->distributespec = NULL;
+					n->is_distributed = false;
 					n->is_worldwide = true;
 					n->shardgroup = $14;
 					$$ = (Node *) n;
@@ -3750,7 +3752,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $15;
 					n->tablespacename = $16;
 					n->if_not_exists = true;
-					n->distributespec = NULL;
+					n->is_distributed = false;
 					n->is_worldwide = true;
 					n->shardgroup = $17;
 					$$ = (Node *) n;
