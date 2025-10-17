@@ -2907,13 +2907,14 @@ XLogFlush(XLogRecPtr record)
 
 		/*
 		 * Sleep before flush for group commit optimization.
+		 * Note: We don't update writeEnd here even if more data became
+		 * available, as we've already reserved our slot. Other processes
+		 * will handle any additional data.
 		 */
 		if (CommitDelay > 0 && enableFsync &&
 			MinimumActiveBackends(CommitSiblings))
 		{
 			pg_usleep(CommitDelay);
-			insertpos = WaitXLogInsertionsToFinish(insertpos);
-			writeEnd = insertpos;
 		}
 
 		/* Build write request */
@@ -2921,9 +2922,15 @@ XLogFlush(XLogRecPtr record)
 		WriteRqst.Flush = writeEnd;
 
 		/*
-		 * Step 2: Perform the write. We need WALWriteLock for file 
-		 * management (opening/closing files, segment switching), but the
-		 * actual write operations can happen concurrently via pg_pwrite.
+		 * Step 2: Perform the write. We still need WALWriteLock for file 
+		 * management (opening/closing files, segment switching). While this
+		 * serializes the critical section, the atomic reservation above
+		 * reduces lock contention by allowing processes to quickly check
+		 * if their data has already been written by another process.
+		 *
+		 * TODO: Further optimization could split XLogWrite into lock-free
+		 * write operations and minimal file management sections to allow
+		 * truly concurrent writes via pg_pwrite to different offsets.
 		 */
 		LWLockAcquire(WALWriteLock, LW_EXCLUSIVE);
 		XLogWrite(WriteRqst, insertTLI, false);
@@ -2943,7 +2950,11 @@ XLogFlush(XLogRecPtr record)
 		/*
 		 * Step 4: Determine if we need to perform fsync.
 		 * Fsync is needed if we crossed a segment boundary or if we're
-		 * near the last reserved writer.
+		 * near the last reserved writer. The fsync itself happens inside
+		 * XLogWrite when WriteRqst.Flush is set.
+		 *
+		 * We check if we're within one block of the last reserved position
+		 * to ensure timely fsync without excessive fsync calls.
 		 */
 		XLByteToSeg(writeReserve, currentSeg, wal_segment_size);
 		XLByteToSeg(writeEnd, targetSeg, wal_segment_size);
@@ -2956,11 +2967,17 @@ XLogFlush(XLogRecPtr record)
 		needFsync = crossedSegment || nearLastWriter;
 
 		/*
-		 * Step 5: Update completion tracking.
+		 * Step 5: Update completion tracking after fsync is done.
+		 * XLogWrite handles the actual fsync when WriteRqst.Flush > 0.
 		 */
-		if (needFsync)
+		if (needFsync && WriteRqst.Flush > 0)
 		{
-			pg_atomic_monotonic_advance_u64(&XLogCtl->WALWriteSyncDoneUpTo, writeEnd);
+			/* Check that fsync actually completed by verifying LogwrtResult */
+			RefreshXLogWriteResult(LogwrtResult);
+			if (LogwrtResult.Flush >= writeEnd)
+			{
+				pg_atomic_monotonic_advance_u64(&XLogCtl->WALWriteSyncDoneUpTo, writeEnd);
+			}
 		}
 
 		/* done */
