@@ -474,6 +474,16 @@ typedef struct XLogCtlData
 	pg_atomic_uint64 logFlushResult;	/* last byte + 1 flushed */
 
 	/*
+	 * Atomics for lock-free multi-process WAL writing and syncing.
+	 * WALWriteReserveUpTo: Position up to which write slots are reserved
+	 * WALWriteSyncReserveUpTo: Position up to which writes are done, ready for sync
+	 * WALWriteSyncDoneUpTo: Position up to which fsync has been completed
+	 */
+	pg_atomic_uint64 WALWriteReserveUpTo;
+	pg_atomic_uint64 WALWriteSyncReserveUpTo;
+	pg_atomic_uint64 WALWriteSyncDoneUpTo;
+
+	/*
 	 * Latest initialized page in the cache (last byte position + 1).
 	 *
 	 * To change the identity of a buffer (and InitializedUpTo), you need to
@@ -2839,12 +2849,19 @@ XLogFlush(XLogRecPtr record)
 	WriteRqstPtr = record;
 
 	/*
-	 * Now wait until we get the write lock, or someone else does the flush
-	 * for us.
+	 * Lock-free multi-process WAL writing using atomics.
+	 * Use CAS operations instead of WALWriteLock for coordination.
 	 */
 	for (;;)
 	{
 		XLogRecPtr	insertpos;
+		XLogRecPtr	writeStart;
+		XLogRecPtr	writeEnd;
+		XLogRecPtr	syncReserve;
+		XLogSegNo	writeStartSeg;
+		XLogSegNo	writeEndSeg;
+		bool		needFsync = false;
+		bool		crossedSegment = false;
 
 		/* done already? */
 		RefreshXLogWriteResult(LogwrtResult);
@@ -2862,64 +2879,97 @@ XLogFlush(XLogRecPtr record)
 		insertpos = WaitXLogInsertionsToFinish(WriteRqstPtr);
 
 		/*
-		 * Try to get the write lock. If we can't get it immediately, wait
-		 * until it's released, and recheck if we still need to do the flush
-		 * or if the backend that held the lock did it for us already. This
-		 * helps to maintain a good rate of group committing when the system
-		 * is bottlenecked by the speed of fsyncing.
+		 * Step 1: Reserve write slot using CAS on WALWriteReserveUpTo.
+		 * Try to atomically advance WALWriteReserveUpTo to our target position.
 		 */
-		if (!LWLockAcquireOrWait(WALWriteLock, LW_EXCLUSIVE))
+		writeStart = pg_atomic_read_u64(&XLogCtl->WALWriteReserveUpTo);
+		
+		/* Check if someone else already reserved past our target */
+		if (writeStart >= insertpos)
 		{
-			/*
-			 * The lock is now free, but we didn't acquire it yet. Before we
-			 * do, loop back to check if someone else flushed the record for
-			 * us already.
-			 */
+			/* Our position is already reserved, wait for completion */
+			pg_usleep(1000);  /* Short sleep */
 			continue;
 		}
 
-		/* Got the lock; recheck whether request is satisfied */
-		RefreshXLogWriteResult(LogwrtResult);
-		if (record <= LogwrtResult.Flush)
+		writeEnd = insertpos;
+		
+		/* Try to reserve the write slot */
+		if (!pg_atomic_compare_exchange_u64(&XLogCtl->WALWriteReserveUpTo,
+											 &writeStart, writeEnd))
 		{
-			LWLockRelease(WALWriteLock);
-			break;
+			/* CAS failed, someone else reserved a slot, retry */
+			continue;
 		}
+
+		/*
+		 * Successfully reserved write slot from writeStart to writeEnd.
+		 * Now perform the actual write to disk.
+		 */
 
 		/*
 		 * Sleep before flush! By adding a delay here, we may give further
 		 * backends the opportunity to join the backlog of group commit
 		 * followers; this can significantly improve transaction throughput,
 		 * at the risk of increasing transaction latency.
-		 *
-		 * We do not sleep if enableFsync is not turned on, nor if there are
-		 * fewer than CommitSiblings other backends with active transactions.
 		 */
 		if (CommitDelay > 0 && enableFsync &&
 			MinimumActiveBackends(CommitSiblings))
 		{
 			pg_usleep(CommitDelay);
 
-			/*
-			 * Re-check how far we can now flush the WAL. It's generally not
-			 * safe to call WaitXLogInsertionsToFinish while holding
-			 * WALWriteLock, because an in-progress insertion might need to
-			 * also grab WALWriteLock to make progress. But we know that all
-			 * the insertions up to insertpos have already finished, because
-			 * that's what the earlier WaitXLogInsertionsToFinish() returned.
-			 * We're only calling it again to allow insertpos to be moved
-			 * further forward, not to actually wait for anyone.
-			 */
+			/* Allow insertpos to be moved further forward */
 			insertpos = WaitXLogInsertionsToFinish(insertpos);
+			writeEnd = insertpos;
 		}
 
-		/* try to write/flush later additions to XLOG as well */
-		WriteRqst.Write = insertpos;
-		WriteRqst.Flush = insertpos;
+		/* Build write request */
+		WriteRqst.Write = writeEnd;
+		WriteRqst.Flush = writeEnd;
 
+		/*
+		 * Perform the write WITHOUT holding WALWriteLock.
+		 * Multiple processes can write concurrently to different
+		 * parts of the WAL file using pg_pwrite.
+		 */
 		XLogWrite(WriteRqst, insertTLI, false);
 
-		LWLockRelease(WALWriteLock);
+		/*
+		 * Step 2: Mark write completion using CAS on WALWriteSyncReserveUpTo.
+		 * This indicates our write is done and ready for fsync.
+		 */
+		syncReserve = pg_atomic_read_u64(&XLogCtl->WALWriteSyncReserveUpTo);
+		while (syncReserve < writeEnd)
+		{
+			if (pg_atomic_compare_exchange_u64(&XLogCtl->WALWriteSyncReserveUpTo,
+												&syncReserve, writeEnd))
+				break;
+		}
+
+		/*
+		 * Step 3: Determine if we need to perform fsync.
+		 * Fsync is needed if we crossed a segment boundary or if we're the
+		 * last process with a reserved write slot.
+		 */
+		XLByteToSeg(writeStart, writeStartSeg, wal_segment_size);
+		XLByteToSeg(writeEnd, writeEndSeg, wal_segment_size);
+		crossedSegment = (writeStartSeg != writeEndSeg);
+
+		/* Check if we're the last reserved writer */
+		XLogRecPtr	currentReserve = pg_atomic_read_u64(&XLogCtl->WALWriteReserveUpTo);
+		bool		isLastWriter = (writeEnd >= currentReserve);
+
+		needFsync = crossedSegment || isLastWriter;
+
+		/*
+		 * Step 4: Perform fsync if needed and update WALWriteSyncDoneUpTo.
+		 */
+		if (needFsync)
+		{
+			/* Update WALWriteSyncDoneUpTo to indicate fsync completion */
+			pg_atomic_monotonic_advance_u64(&XLogCtl->WALWriteSyncDoneUpTo, writeEnd);
+		}
+
 		/* done */
 		break;
 	}
@@ -4996,6 +5046,9 @@ XLOGShmemInit(void)
 	pg_atomic_init_u64(&XLogCtl->logWriteResult, InvalidXLogRecPtr);
 	pg_atomic_init_u64(&XLogCtl->logFlushResult, InvalidXLogRecPtr);
 	pg_atomic_init_u64(&XLogCtl->unloggedLSN, InvalidXLogRecPtr);
+	pg_atomic_init_u64(&XLogCtl->WALWriteReserveUpTo, InvalidXLogRecPtr);
+	pg_atomic_init_u64(&XLogCtl->WALWriteSyncReserveUpTo, InvalidXLogRecPtr);
+	pg_atomic_init_u64(&XLogCtl->WALWriteSyncDoneUpTo, InvalidXLogRecPtr);
 }
 
 /*
