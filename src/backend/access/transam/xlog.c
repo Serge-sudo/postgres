@@ -1387,11 +1387,7 @@ WALInsertLockAcquire(void)
 	 * If XLOGbuffers hasn't been initialized yet (still -1), or if we can't
 	 * determine a valid distance, use all locks.
 	 */
-	if (XLOGbuffers <= 0)
-	{
-		maxLockNo = NUM_XLOGINSERT_LOCKS - 1;
-	}
-	else
+	if (XLOGbuffers > 0)
 	{
 		insertPos = pg_atomic_read_u64(&XLogCtl->logInsertResult);
 		writePos = pg_atomic_read_u64(&XLogCtl->logWriteResult);
@@ -1403,32 +1399,37 @@ WALInsertLockAcquire(void)
 		 * as a safe fallback.
 		 */
 		if (insertPos >= writePos)
+		{
 			distance = insertPos - writePos;
+
+			/*
+			 * Determine the maximum lock index based on distance:
+			 * - If distance > walBufferSize/2: use all locks (maxLockNo = NUM_XLOGINSERT_LOCKS - 1)
+			 * - If distance > walBufferSize/4: use half locks (maxLockNo = NUM_XLOGINSERT_LOCKS/2 - 1)
+			 * - If distance > walBufferSize/8: use quarter locks (maxLockNo = NUM_XLOGINSERT_LOCKS/4 - 1)
+			 * - Otherwise: use minimum locks (maxLockNo = 0 or 1)
+			 */
+			if (distance > walBufferSize / 2)
+				maxLockNo = NUM_XLOGINSERT_LOCKS - 1;
+			else if (distance > walBufferSize / 4)
+				maxLockNo = (NUM_XLOGINSERT_LOCKS / 2) - 1;
+			else if (distance > walBufferSize / 8)
+				maxLockNo = (NUM_XLOGINSERT_LOCKS / 4) - 1;
+			else
+				maxLockNo = Max(NUM_XLOGINSERT_LOCKS / 8, 1) - 1;
+		}
 		else
 		{
 			/* Unexpected condition - use all locks for safety */
 			maxLockNo = NUM_XLOGINSERT_LOCKS - 1;
-			goto lock_acquire;
 		}
-
-		/*
-		 * Determine the maximum lock index based on distance:
-		 * - If distance > walBufferSize/2: use all locks (maxLockNo = NUM_XLOGINSERT_LOCKS - 1)
-		 * - If distance > walBufferSize/4: use half locks (maxLockNo = NUM_XLOGINSERT_LOCKS/2 - 1)
-		 * - If distance > walBufferSize/8: use quarter locks (maxLockNo = NUM_XLOGINSERT_LOCKS/4 - 1)
-		 * - Otherwise: use minimum locks (maxLockNo = 0 or 1)
-		 */
-		if (distance > walBufferSize / 2)
-			maxLockNo = NUM_XLOGINSERT_LOCKS - 1;
-		else if (distance > walBufferSize / 4)
-			maxLockNo = (NUM_XLOGINSERT_LOCKS / 2) - 1;
-		else if (distance > walBufferSize / 8)
-			maxLockNo = (NUM_XLOGINSERT_LOCKS / 4) - 1;
-		else
-			maxLockNo = Max(NUM_XLOGINSERT_LOCKS / 8, 1) - 1;
+	}
+	else
+	{
+		/* XLOGbuffers not initialized yet - use all locks */
+		maxLockNo = NUM_XLOGINSERT_LOCKS - 1;
 	}
 
-lock_acquire:
 	/*
 	 * It doesn't matter which of the WAL insertion locks we acquire, so try
 	 * the one we used last time.  If the system isn't particularly busy, it's
