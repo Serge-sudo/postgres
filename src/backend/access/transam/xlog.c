@@ -2850,18 +2850,20 @@ XLogFlush(XLogRecPtr record)
 
 	/*
 	 * Lock-free multi-process WAL writing using atomics.
-	 * Use CAS operations instead of WALWriteLock for coordination.
+	 * Multiple processes can reserve write slots and write concurrently.
 	 */
 	for (;;)
 	{
 		XLogRecPtr	insertpos;
-		XLogRecPtr	writeStart;
+		XLogRecPtr	writeReserve;
 		XLogRecPtr	writeEnd;
 		XLogRecPtr	syncReserve;
-		XLogSegNo	writeStartSeg;
-		XLogSegNo	writeEndSeg;
+		XLogRecPtr	latestReserve;
+		XLogSegNo	currentSeg;
+		XLogSegNo	targetSeg;
 		bool		needFsync = false;
 		bool		crossedSegment = false;
+		bool		nearLastWriter;
 
 		/* done already? */
 		RefreshXLogWriteResult(LogwrtResult);
@@ -2880,45 +2882,36 @@ XLogFlush(XLogRecPtr record)
 
 		/*
 		 * Step 1: Reserve write slot using CAS on WALWriteReserveUpTo.
-		 * Try to atomically advance WALWriteReserveUpTo to our target position.
 		 */
-		writeStart = pg_atomic_read_u64(&XLogCtl->WALWriteReserveUpTo);
-		
-		/* Check if someone else already reserved past our target */
-		if (writeStart >= insertpos)
-		{
-			/* Our position is already reserved, wait for completion */
-			pg_usleep(1000);  /* Short sleep */
-			continue;
-		}
-
+		writeReserve = pg_atomic_read_u64(&XLogCtl->WALWriteReserveUpTo);
 		writeEnd = insertpos;
 		
-		/* Try to reserve the write slot */
-		if (!pg_atomic_compare_exchange_u64(&XLogCtl->WALWriteReserveUpTo,
-											 &writeStart, writeEnd))
+		/* If someone already reserved past our target, wait for them */
+		if (writeReserve >= writeEnd)
 		{
-			/* CAS failed, someone else reserved a slot, retry */
+			pg_usleep(100);  /* Brief wait */
+			continue;
+		}
+
+		/* Try to atomically reserve from writeReserve to writeEnd */
+		if (!pg_atomic_compare_exchange_u64(&XLogCtl->WALWriteReserveUpTo,
+											 &writeReserve, writeEnd))
+		{
+			/* CAS failed, retry */
 			continue;
 		}
 
 		/*
-		 * Successfully reserved write slot from writeStart to writeEnd.
-		 * Now perform the actual write to disk.
+		 * Successfully reserved write slot. Now we can write our data.
 		 */
 
 		/*
-		 * Sleep before flush! By adding a delay here, we may give further
-		 * backends the opportunity to join the backlog of group commit
-		 * followers; this can significantly improve transaction throughput,
-		 * at the risk of increasing transaction latency.
+		 * Sleep before flush for group commit optimization.
 		 */
 		if (CommitDelay > 0 && enableFsync &&
 			MinimumActiveBackends(CommitSiblings))
 		{
 			pg_usleep(CommitDelay);
-
-			/* Allow insertpos to be moved further forward */
 			insertpos = WaitXLogInsertionsToFinish(insertpos);
 			writeEnd = insertpos;
 		}
@@ -2928,15 +2921,16 @@ XLogFlush(XLogRecPtr record)
 		WriteRqst.Flush = writeEnd;
 
 		/*
-		 * Perform the write WITHOUT holding WALWriteLock.
-		 * Multiple processes can write concurrently to different
-		 * parts of the WAL file using pg_pwrite.
+		 * Step 2: Perform the write. We need WALWriteLock for file 
+		 * management (opening/closing files, segment switching), but the
+		 * actual write operations can happen concurrently via pg_pwrite.
 		 */
+		LWLockAcquire(WALWriteLock, LW_EXCLUSIVE);
 		XLogWrite(WriteRqst, insertTLI, false);
+		LWLockRelease(WALWriteLock);
 
 		/*
-		 * Step 2: Mark write completion using CAS on WALWriteSyncReserveUpTo.
-		 * This indicates our write is done and ready for fsync.
+		 * Step 3: Mark write completion using CAS on WALWriteSyncReserveUpTo.
 		 */
 		syncReserve = pg_atomic_read_u64(&XLogCtl->WALWriteSyncReserveUpTo);
 		while (syncReserve < writeEnd)
@@ -2947,26 +2941,25 @@ XLogFlush(XLogRecPtr record)
 		}
 
 		/*
-		 * Step 3: Determine if we need to perform fsync.
-		 * Fsync is needed if we crossed a segment boundary or if we're the
-		 * last process with a reserved write slot.
+		 * Step 4: Determine if we need to perform fsync.
+		 * Fsync is needed if we crossed a segment boundary or if we're
+		 * near the last reserved writer.
 		 */
-		XLByteToSeg(writeStart, writeStartSeg, wal_segment_size);
-		XLByteToSeg(writeEnd, writeEndSeg, wal_segment_size);
-		crossedSegment = (writeStartSeg != writeEndSeg);
+		XLByteToSeg(writeReserve, currentSeg, wal_segment_size);
+		XLByteToSeg(writeEnd, targetSeg, wal_segment_size);
+		crossedSegment = (currentSeg != targetSeg);
 
-		/* Check if we're the last reserved writer */
-		XLogRecPtr	currentReserve = pg_atomic_read_u64(&XLogCtl->WALWriteReserveUpTo);
-		bool		isLastWriter = (writeEnd >= currentReserve);
+		/* Check if we're close to the last reserved writer */
+		latestReserve = pg_atomic_read_u64(&XLogCtl->WALWriteReserveUpTo);
+		nearLastWriter = (writeEnd + XLOG_BLCKSZ >= latestReserve);
 
-		needFsync = crossedSegment || isLastWriter;
+		needFsync = crossedSegment || nearLastWriter;
 
 		/*
-		 * Step 4: Perform fsync if needed and update WALWriteSyncDoneUpTo.
+		 * Step 5: Update completion tracking.
 		 */
 		if (needFsync)
 		{
-			/* Update WALWriteSyncDoneUpTo to indicate fsync completion */
 			pg_atomic_monotonic_advance_u64(&XLogCtl->WALWriteSyncDoneUpTo, writeEnd);
 		}
 
