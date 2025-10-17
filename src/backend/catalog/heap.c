@@ -3567,6 +3567,19 @@ StorePartitionBound(Relation rel, Relation parent, PartitionBoundSpec *bound)
 	new_val[Anum_pg_class_relpartbound - 1] = CStringGetTextDatum(nodeToString(bound));
 	new_null[Anum_pg_class_relpartbound - 1] = false;
 	new_repl[Anum_pg_class_relpartbound - 1] = true;
+	
+	/*
+	 * Inherit shard group ID from parent if the parent has one.
+	 * This ensures that partitions of distributed tables are also distributed
+	 * to the same shard group.
+	 */
+	if (OidIsValid(parent->rd_rel->relsgid))
+	{
+		new_val[Anum_pg_class_relsgid - 1] = ObjectIdGetDatum(parent->rd_rel->relsgid);
+		new_null[Anum_pg_class_relsgid - 1] = false;
+		new_repl[Anum_pg_class_relsgid - 1] = true;
+	}
+	
 	newtuple = heap_modify_tuple(tuple, RelationGetDescr(classRel),
 								 new_val, new_null, new_repl);
 	/* Also set the flag */
