@@ -341,16 +341,15 @@ AlterTableSetShardGroup(AlterTableSetShardGroupStmt *stmt)
 	/* Open the relation to validate it */
 	rel = table_open(relid, NoLock);
 	
-	/* Validate that the relation is a distributed or worldwide table */
-	if (rel->rd_rel->relkind != RELKIND_DISTRIBUTED_TABLE &&
-		rel->rd_rel->relkind != RELKIND_WORLDWIDE_TABLE)
+	/* Validate that the relation has a shard group (distributed or worldwide table) */
+	if (!OidIsValid(rel->rd_rel->relsgid))
 	{
 		table_close(rel, AccessExclusiveLock);
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("relation \"%s\" is not a distributed or worldwide table",
 						RelationGetRelationName(rel)),
-				 errhint("Only distributed ('D') and worldwide ('W') tables can be assigned to shard groups.")));
+				 errhint("Only tables with a shard group can use ALTER TABLE SET SHARD GROUP.")));
 	}
 	
 	/* Get the shard group OID */
