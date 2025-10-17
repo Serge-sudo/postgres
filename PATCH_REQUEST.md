@@ -17,15 +17,21 @@ The domain appears to be completely blocked in this sandboxed environment.
 ## What I Need
 Please provide the patch content through one of these methods:
 
-### Option 1: Direct Paste (Recommended)
-Copy the entire patch content and paste it in a comment or create a file in the repository with the content.
+### Option 1: Add File to Repository (Recommended)
+Download the patch file locally and commit it to the repository:
+```bash
+git add reduce_walwritelock_contention.patch
+git commit -m "Add WAL write lock contention reduction patch"
+git push
+```
 
-### Option 2: Upload to Repository
-Download the patch file locally and add it to the repository in a location I can access, such as:
-- `/home/runner/work/postgres/postgres/reduce_walwritelock_contention.patch`
+### Option 2: Direct Paste in Comment
+Copy the entire patch content and paste it in a comment. I will create the file from the pasted content.
 
 ### Option 3: Alternative URL
-Provide an alternative, publicly accessible URL (not postgresql.org domain) where the patch can be downloaded.
+Provide an alternative, publicly accessible URL (not postgresql.org or github.com/user-attachments domains) where the patch can be downloaded.
+
+**Note:** GitHub attachment URLs (github.com/user-attachments/files/...) are not accessible from my environment due to authentication requirements.
 
 ## Once I Have the Patch
 I will:
