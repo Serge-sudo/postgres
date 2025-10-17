@@ -1363,42 +1363,46 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 
 /*
  * ExecuteDDLOnRemoteServer
- *		Execute DDL command on a remote server
+ *		Execute DDL command on a remote server using FDW callback
  *
- * This function shows a NOTICE message with the DDL that should be executed
- * on the remote server. Actual execution should be done via a post-commit
- * hook, background worker, or manual execution to avoid transaction issues.
- *
- * TODO: Implement automatic execution via background worker or event trigger
- * that runs after transaction commit to avoid snapshot/transaction issues.
+ * This function uses the ExecForeignDDL callback if available in the FDW.
+ * For postgres_fdw, this will use the existing connection infrastructure
+ * and participate in 2PC transactions automatically.
  */
 static void
 ExecuteDDLOnRemoteServer(Oid serveroid, const char *sql)
 {
 	ForeignServer *server;
+	ForeignDataWrapper *fdw;
+	FdwRoutine *fdwroutine;
 
-	/* Get server information */
+	/* Get server and FDW information */
 	server = GetForeignServer(serveroid);
+	fdw = GetForeignDataWrapper(server->fdwid);
 
-	/*
-	 * Show NOTICE with the DDL that should be executed.
-	 * 
-	 * We cannot safely execute DDL on remote servers within the same
-	 * transaction as local DDL due to:
-	 * 1. Snapshot management conflicts with SPI
-	 * 2. Potential deadlocks when connecting back to same server
-	 * 3. Transaction coordination complexity
-	 * 
-	 * The proper implementation would use:
-	 * - Event triggers for post-commit DDL replication
-	 * - Background workers for asynchronous execution
-	 * - FDW API extension for DDL operations (like TRUNCATE)
-	 */
-	ereport(NOTICE,
-			(errmsg("table should be created on shard member \"%s\"",
-					server->servername),
-			 errdetail("Execute: %s", sql),
-			 errhint("Use dblink_exec, postgres_fdw, or execute manually on the remote server.")));
+	/* Get the FDW routine */
+	fdwroutine = GetFdwRoutine(fdw->fdwhandler);
+
+	/* Check if FDW supports DDL execution */
+	if (fdwroutine->ExecForeignDDL != NULL)
+	{
+		/* Execute DDL using FDW callback - this participates in 2PC */
+		fdwroutine->ExecForeignDDL(serveroid, sql);
+		
+		ereport(DEBUG1,
+				(errmsg("executed DDL on foreign server \"%s\" using FDW callback",
+						server->servername)));
+	}
+	else
+	{
+		/* FDW doesn't support DDL execution, show NOTICE */
+		ereport(NOTICE,
+				(errmsg("table should be created on shard member \"%s\"",
+						server->servername),
+				 errdetail("Execute: %s", sql),
+				 errhint("The FDW for this server does not support automatic DDL execution. "
+						 "Execute this DDL manually on the remote server.")));
+	}
 }
 
 /*

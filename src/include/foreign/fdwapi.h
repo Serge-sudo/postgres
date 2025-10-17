@@ -164,6 +164,9 @@ typedef void (*ExecForeignTruncate_function) (List *rels,
 											  DropBehavior behavior,
 											  bool restart_seqs);
 
+typedef void (*ExecForeignDDL_function) (Oid serverid,
+										 const char *sql);
+
 typedef Size (*EstimateDSMForeignScan_function) (ForeignScanState *node,
 												 ParallelContext *pcxt);
 typedef void (*InitializeDSMForeignScan_function) (ForeignScanState *node,
@@ -261,6 +264,9 @@ typedef struct FdwRoutine
 
 	/* Support functions for TRUNCATE */
 	ExecForeignTruncate_function ExecForeignTruncate;
+
+	/* Support functions for DDL execution */
+	ExecForeignDDL_function ExecForeignDDL;
 
 	/* Support functions for parallelism under Gather node */
 	IsForeignScanParallelSafe_function IsForeignScanParallelSafe;
