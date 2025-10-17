@@ -535,6 +535,7 @@ char	   *backtrace_functions;
 int			log2_num_xlog_insert_locks;
 bool 		wal_reserve_lock_free;
 bool 		enable_wal_locking_reduction;
+bool 		enable_adaptive_xlog_insert_locks;
 
 int			temp_file_limit = -1;
 
@@ -1036,6 +1037,21 @@ struct config_bool ConfigureNamesBool[] =
 			0
 		},
 		&wal_reserve_lock_free,
+		false,
+		NULL,
+		NULL,
+		NULL
+	},
+	{
+		{
+			"enable_adaptive_xlog_insert_locks",
+			PGC_SIGHUP,
+			UNGROUPED,
+			gettext_noop("Enables adaptive insert locks for XLOG insertion."),
+			NULL,
+			0
+		},
+		&enable_adaptive_xlog_insert_locks,
 		false,
 		NULL,
 		NULL,

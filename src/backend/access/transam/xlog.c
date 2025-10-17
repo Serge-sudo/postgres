@@ -51,6 +51,7 @@
 #include "access/heaptoast.h"
 #include "access/multixact.h"
 #include "access/rewriteheap.h"
+#include "port/pg_bitutils.h"
 #include "access/subtrans.h"
 #include "access/timeline.h"
 #include "access/transam.h"
@@ -1925,6 +1926,91 @@ CopyXLogRecordToWAL(int write_len, bool isLogSwitch, XLogRecData *rdata,
 				errmsg_internal("space reserved for WAL record does not match what was written"));
 }
 
+static int
+WALInsertLockComputeMaxAmount(void)
+{
+	uint64		insertPos;
+	uint64		writePos;
+	uint64		walBufferSize;
+	uint64		distance;
+	int			shift;
+	int 		max_shift;
+	uint64		threshold;
+	
+	
+	/* if adaptive locks are disabled, use all locks */
+	if (!enable_adaptive_xlog_insert_locks)
+		return NUM_XLOGINSERT_LOCKS;
+
+	/*
+	 * Calculate the distance between insert and write pointers to determine
+	 * how many locks to use. This helps slow down inserts when the insert
+	 * pointer gets too close to the write pointer, preventing wraparound.
+	 *
+	 * If XLOGbuffers hasn't been initialized yet (still -1), or if we can't
+	 * determine a valid distance, use all locks.
+	 */
+	if (XLOGbuffers <= 0)
+		return NUM_XLOGINSERT_LOCKS;	
+
+	max_shift = log2_num_xlog_insert_locks;
+	insertPos = pg_atomic_read_u64(&XLogCtl->logInsertResult);
+	writePos = pg_atomic_read_u64(&XLogCtl->logWriteResult);
+	walBufferSize = (uint64) XLOGbuffers * XLOG_BLCKSZ;
+
+	/*
+	 * Calculate distance. If positions are invalid or insert is behind
+	 * write (which shouldn't happen in normal operation), use all locks
+	 * as a safe fallback.
+	 */
+	if (insertPos <= writePos)
+	{
+		/* Unexpected condition - use all locks for safety */
+		return NUM_XLOGINSERT_LOCKS;
+	}
+
+	distance = insertPos - writePos;
+
+	/*
+	 * Determine the maximum lock index based on distance using bit
+	 * operations for exponential distribution. We calculate how many
+	 * times we need to halve the available locks based on buffer pressure.
+	 *
+	 * The shift represents the reduction level:
+	 * - shift 0 (distance >= walBufferSize/2): use all locks
+	 * - shift 1 (distance >= walBufferSize/4): use half locks
+	 * - shift 2 (distance >= walBufferSize/8): use quarter locks
+	 * - ...
+	 *
+	 * We compute shift by finding the bit position difference between
+	 * (walBufferSize/2) and distance, which gives us log2(walBufferSize/(2*distance)).
+	 * Clamp the result to [0, max_shift] range.
+	 */
+	threshold = walBufferSize / 2;
+
+	/* Use bit position to calculate shift level */
+	if (distance >= threshold)
+		shift = 0;
+	else
+	{
+		/*
+			* Calculate shift = floor(log2(threshold/distance)).
+			* We find MSB positions and compute the difference.
+			*/
+		int		dist_msb = pg_leftmost_one_pos64(distance);
+		int		thresh_msb = pg_leftmost_one_pos64(threshold);
+
+		shift = Min(thresh_msb - dist_msb, max_shift);
+	}
+
+	
+	/* sanity check */
+	Assert(shift >= 0);
+
+	/* Calculate maxLockNo by right-shifting NUM_XLOGINSERT_LOCKS */	
+	return Max((NUM_XLOGINSERT_LOCKS >> shift), 1);
+}
+
 /*
  * Acquire a WAL insertion lock, for inserting to WAL.
  */
@@ -1932,6 +2018,7 @@ static void
 WALInsertLockAcquire(void)
 {
 	bool		immed;
+	int			MaxAvailLockNo = WALInsertLockComputeMaxAmount();
 
 	/*
 	 * It doesn't matter which of the WAL insertion locks we acquire, so try
@@ -1940,14 +2027,15 @@ WALInsertLockAcquire(void)
 	 * affinity to a particular lock so that you don't unnecessarily bounce
 	 * cache lines between processes when there's no contention.
 	 *
-	 * If this is the first time through in this backend, pick a lock
-	 * (semi-)randomly.  This allows the locks to be used evenly if you have a
-	 * lot of very short connections.
+	 * If this is the first time through in this backend, or if the previously
+	 * selected lock is now out of range, pick a lock (semi-)randomly. The
+	 * lock selection is now limited by maxLockNo to slow down inserts when
+	 * buffer is getting full.
 	 */
 	static int	lockToTry = -1;
 
-	if (lockToTry == -1)
-		lockToTry = MyProcNumber % NUM_XLOGINSERT_LOCKS;
+	if (lockToTry == -1 || lockToTry > MaxAvailLockNo - 1)
+		lockToTry = MyProcNumber % MaxAvailLockNo;
 	MyLockNo = lockToTry;
 
 	/*
@@ -1965,7 +2053,7 @@ WALInsertLockAcquire(void)
 		 * than locks, it still helps to distribute the inserters evenly
 		 * across the locks.
 		 */
-		lockToTry = (lockToTry + 1) % NUM_XLOGINSERT_LOCKS;
+		lockToTry = (lockToTry + 1) % MaxAvailLockNo;
 	}
 }
 
