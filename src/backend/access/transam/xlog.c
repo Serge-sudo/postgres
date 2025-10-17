@@ -2629,11 +2629,9 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 													  &expectedSyncReserved, syncReserved));
 
 			/*
-			 * If we reserved this position (or if we're the last writer who needs
-			 * to fsync), perform the fsync.
+			 * If we advanced the sync reserve position, perform the fsync.
 			 */
-			if (expectedSyncReserved < LogwrtResult.Write || 
-				syncReserved >= reservedUpTo)
+			if (expectedSyncReserved < LogwrtResult.Write)
 			{
 				issue_xlog_fsync(openLogFile, openLogSegNo, tli);
 				
