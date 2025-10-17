@@ -1275,12 +1275,12 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	 * Handle sharding-related features: distributed tables, worldwide tables,
 	 * and shard group assignment.
 	 */
-	if (stmt->distributespec || stmt->is_worldwide || stmt->shardgroup)
+	if (stmt->is_distributed || stmt->is_worldwide || stmt->shardgroup)
 	{
 		Oid			sgid = InvalidOid;
 		
 		/* Validate that distributed/worldwide flags are mutually exclusive */
-		if (stmt->distributespec && stmt->is_worldwide)
+		if (stmt->is_distributed && stmt->is_worldwide)
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
 					 errmsg("table cannot be both DISTRIBUTED and WORLDWIDE")));
@@ -1304,8 +1304,9 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 		}
 		
 		/* Handle distributed tables */
-		if (stmt->distributespec)
+		if (stmt->is_distributed)
 		{
+			/* Distributed tables are created as partitioned tables */
 			/* TODO: Validate distribution columns exist */
 			/* TODO: Store distribution key metadata */
 			/* TODO: Create distribution key similar to partition key */
