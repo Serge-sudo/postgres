@@ -73,6 +73,7 @@
 #include "pg_trace.h"
 #include "pgstat.h"
 #include "port/atomics.h"
+#include "port/pg_bitutils.h"
 #include "port/pg_iovec.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/startup.h"
@@ -1400,25 +1401,53 @@ WALInsertLockAcquire(void)
 		 */
 		if (insertPos >= writePos)
 		{
+			int		shift;
+
 			distance = insertPos - writePos;
 
 			/*
-			 * Determine the maximum lock index based on distance:
-			 * - If distance > walBufferSize/2: use all locks (maxLockNo = NUM_XLOGINSERT_LOCKS - 1)
-			 * - If distance > walBufferSize/4: use half locks (maxLockNo = NUM_XLOGINSERT_LOCKS/2 - 1)
-			 * - If distance > walBufferSize/8: use quarter locks (maxLockNo = NUM_XLOGINSERT_LOCKS/4 - 1)
-			 * - Otherwise: use minimum locks (maxLockNo = Max((NUM_XLOGINSERT_LOCKS/8) - 1, 0))
+			 * Determine the maximum lock index based on distance using bit
+			 * operations for exponential distribution. We calculate how many
+			 * times we need to halve the available locks based on buffer pressure.
 			 *
-			 * This assumes NUM_XLOGINSERT_LOCKS is a power of 2 for even distribution.
+			 * The shift represents the reduction level:
+			 * - shift 0 (distance >= walBufferSize/2): use all locks
+			 * - shift 1 (distance >= walBufferSize/4): use half locks
+			 * - shift 2 (distance >= walBufferSize/8): use quarter locks  
+			 * - shift 3+: use minimum locks
+			 *
+			 * We compute shift by finding the bit position difference between
+			 * (walBufferSize/2) and distance, which gives us log2(walBufferSize/(2*distance)).
+			 * Clamp the result to [0, 3] range.
 			 */
-			if (distance > walBufferSize / 2)
-				maxLockNo = NUM_XLOGINSERT_LOCKS - 1;
-			else if (distance > walBufferSize / 4)
-				maxLockNo = (NUM_XLOGINSERT_LOCKS / 2) - 1;
-			else if (distance > walBufferSize / 8)
-				maxLockNo = (NUM_XLOGINSERT_LOCKS / 4) - 1;
+			if (distance > 0)
+			{
+				uint64	threshold = walBufferSize / 2;
+				
+				/* Use bit position to calculate shift level */
+				if (distance >= threshold)
+					shift = 0;
+				else
+				{
+					/*
+					 * Calculate shift = floor(log2(threshold/distance)).
+					 * We find MSB positions and compute the difference.
+					 */
+					int		dist_msb = pg_leftmost_one_pos64(distance);
+					int		thresh_msb = pg_leftmost_one_pos64(threshold);
+					
+					shift = thresh_msb - dist_msb;
+					if (shift > 3)
+						shift = 3;
+				}
+			}
 			else
-				maxLockNo = Max((NUM_XLOGINSERT_LOCKS / 8) - 1, 0);
+			{
+				shift = 3;	/* Use minimum locks when no distance */
+			}
+
+			/* Calculate maxLockNo by right-shifting NUM_XLOGINSERT_LOCKS */
+			maxLockNo = Max((NUM_XLOGINSERT_LOCKS >> shift) - 1, 0);
 		}
 		else
 		{
