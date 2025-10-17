@@ -747,6 +747,30 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 		partitioned = false;
 
 	/*
+	 * Handle distributed tables: they behave like partitioned tables
+	 * but use relkind 'D' instead of 'p'.
+	 */
+	if (stmt->distributespec != NULL)
+	{
+		if (relkind != RELKIND_RELATION)
+			elog(ERROR, "unexpected relkind: %d", (int) relkind);
+
+		relkind = RELKIND_DISTRIBUTED_TABLE;
+		partitioned = true;
+	}
+
+	/*
+	 * Worldwide tables use relkind 'W' but are otherwise like regular tables.
+	 */
+	if (stmt->is_worldwide)
+	{
+		if (relkind != RELKIND_RELATION)
+			elog(ERROR, "unexpected relkind: %d", (int) relkind);
+
+		relkind = RELKIND_WORLDWIDE_TABLE;
+	}
+
+	/*
 	 * Look up the namespace in which we are supposed to create the relation,
 	 * check we have permission to create there, lock it against concurrent
 	 * drop, and mark stmt->relation as RELPERSISTENCE_TEMP if a temporary
@@ -1306,11 +1330,6 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 		/* Handle distributed tables */
 		if (stmt->distributespec)
 		{
-			char		relkind;
-			
-			/* Distributed tables use relkind 'D' */
-			relkind = RELKIND_DISTRIBUTED_TABLE;
-			
 			/* TODO: Validate distribution columns exist */
 			/* TODO: Store distribution key metadata */
 			/* TODO: Create distribution key similar to partition key */
@@ -1322,11 +1341,6 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 		/* Handle worldwide tables */
 		if (stmt->is_worldwide)
 		{
-			char		relkind;
-			
-			/* Worldwide tables use relkind 'W' */
-			relkind = RELKIND_WORLDWIDE_TABLE;
-			
 			/* TODO: Validate table is suitable for worldwide replication */
 			ereport(NOTICE,
 					(errmsg("WORLDWIDE table not yet fully implemented"),
