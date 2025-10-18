@@ -270,6 +270,8 @@ InitProcGlobal(void)
 		dlist_init(&procs[i].lockGroupMembers);
 	}
 
+	ProcGlobal->pendingWriteWALList = NULL;
+
 	/*
 	 * Save pointers to the blocks of PGPROC structures reserved for auxiliary
 	 * processes and prepared transactions.
@@ -408,6 +410,11 @@ InitProcess(void)
 
 	/* Initialize wait event information. */
 	MyProc->wait_event_info = 0;
+
+	/* Initialize fields for writting WAL */
+	MyProc->writeWAL = false;
+	MyProc->writePos = 0;
+	MyProc->pendingWriteWALLinks.next = NULL;
 
 	/*
 	 * Acquire ownership of the PGPROC's latch, so that we can use WaitLatch
