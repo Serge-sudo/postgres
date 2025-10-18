@@ -2639,7 +2639,7 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible, PGPROC_LIST *wak
 	/*
 	 * Update shared memory status to indicate write
 	 * progress as we are releasing WALWriteLock. Also,
-	 * update local copy og LogwrtResult since we got a chance.
+	 * update local copy of LogwrtResult since we got a chance.
 	 */
 	{
 		uint64 old = pg_atomic_read_u64(&XLogCtl->logWriteResult);
