@@ -2616,7 +2616,7 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible, PGPROC_LIST *wak
 				LWLockAcquire(WALWriteLock, LW_EXCLUSIVE);
 				RefreshXLogWriteResultWriteOnly(LogwrtResult);
 
-				/* Next cache block may have been writtent already. */
+				/* Next cache block may have been written already. */
 				moveToNextBuf = false;
 			}
 		}
