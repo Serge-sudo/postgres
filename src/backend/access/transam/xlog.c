@@ -2696,23 +2696,45 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible, PGPROC_LIST *wak
 	LWLockRelease(WALWriteLock);
 
 	/*
-	 * Now wake up all the procs waiting for their writes to be
-	 * completed.
+	 * Now wake up all the procs waiting for their writes to be completed.
+	 *
+	 * To optimize fsync operations, we reverse the list before waking
+	 * processes. This way, processes with higher writePos (needing flush
+	 * to further positions) are woken first and have a better chance of
+	 * acquiring WALFlushLock first. When a process with a large writePos
+	 * flushes, it covers the flush needs of processes with smaller writePos,
+	 * so they won't need to fsync again. This reduces the total number of
+	 * fsync calls.
 	 */
-	while (wake_pendingWriteWALElem)
 	{
-		proc_to_clear = (PGPROC *) (((char *) wake_pendingWriteWALElem) -
-									offsetof(PGPROC, pendingWriteWALLinks));
+		PGPROC_LIST *reversed_list = NULL;
+		PGPROC_LIST *curr;
 
-		wake_pendingWriteWALElem = wake_pendingWriteWALElem->next;
+		/* Reverse the list */
+		while (wake_pendingWriteWALElem)
+		{
+			curr = wake_pendingWriteWALElem;
+			wake_pendingWriteWALElem = wake_pendingWriteWALElem->next;
+			curr->next = reversed_list;
+			reversed_list = curr;
+		}
 
-		/* Mark that Xid has cleared for this proc */
-		proc_to_clear->writeWAL = false;
+		/* Now wake processes in reversed order */
+		while (reversed_list)
+		{
+			proc_to_clear = (PGPROC *) (((char *) reversed_list) -
+										offsetof(PGPROC, pendingWriteWALLinks));
 
-		pg_write_barrier();
+			reversed_list = reversed_list->next;
 
-		if (proc_to_clear != MyProc)
-			PGSemaphoreUnlock(proc_to_clear->sem);
+			/* Mark that Xid has cleared for this proc */
+			proc_to_clear->writeWAL = false;
+
+			pg_write_barrier();
+
+			if (proc_to_clear != MyProc)
+				PGSemaphoreUnlock(proc_to_clear->sem);
+		}
 	}
 
 	/*
@@ -3192,19 +3214,40 @@ XLogFlush(XLogRecPtr record)
 	if (largestWALWritePos <= LogwrtResult.Flush)
 	{
 		LWLockRelease(WALWriteLock);
-		while (wake_pendingWriteWALElem)
+		
+		/*
+		 * All data is already flushed. Wake processes in reverse order
+		 * to optimize any remaining operations (same reasoning as main
+		 * wake-up point).
+		 */
 		{
-			proc_to_clear = (PGPROC *) (((char *) wake_pendingWriteWALElem) -
-							offsetof(PGPROC, pendingWriteWALLinks));
+			PGPROC_LIST *reversed_list = NULL;
+			PGPROC_LIST *curr;
 
-			wake_pendingWriteWALElem = wake_pendingWriteWALElem->next;
+			/* Reverse the list */
+			while (wake_pendingWriteWALElem)
+			{
+				curr = wake_pendingWriteWALElem;
+				wake_pendingWriteWALElem = wake_pendingWriteWALElem->next;
+				curr->next = reversed_list;
+				reversed_list = curr;
+			}
 
-			/* Mark that Xid has cleared for this proc */
-			proc_to_clear->writeWAL = false;
+			/* Now wake processes in reversed order */
+			while (reversed_list)
+			{
+				proc_to_clear = (PGPROC *) (((char *) reversed_list) -
+											offsetof(PGPROC, pendingWriteWALLinks));
 
-			pg_write_barrier();
-			if (proc_to_clear != MyProc)
-				PGSemaphoreUnlock(proc_to_clear->sem);
+				reversed_list = reversed_list->next;
+
+				/* Mark that Xid has cleared for this proc */
+				proc_to_clear->writeWAL = false;
+
+				pg_write_barrier();
+				if (proc_to_clear != MyProc)
+					PGSemaphoreUnlock(proc_to_clear->sem);
+			}
 		}
 	}
 	else
