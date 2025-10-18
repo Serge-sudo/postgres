@@ -2064,7 +2064,6 @@ AdvanceXLInsertBuffer(XLogRecPtr upto, TimeLineID tli, bool opportunistic)
 					WriteRqst.Write = OldPageRqstPtr;
 					WriteRqst.Flush = 0;
 					XLogWrite(WriteRqst, tli, false, NULL);
-					LWLockRelease(WALWriteLock);
 					PendingWalStats.wal_buffers_full++;
 					TRACE_POSTGRESQL_WAL_BUFFER_WRITE_DIRTY_DONE();
 				}
