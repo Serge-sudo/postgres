@@ -2542,21 +2542,59 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible, PGPROC_LIST *wak
 				LWLockRelease(WALWriteLock);
 
 				/*
-				 * We do NOT wake up waiting processes here, even though we've
-				 * written and are about to fsync this segment. The reason is
-				 * that XLogWrite may need to continue writing more data beyond
-				 * this segment boundary (the write loop continues after fsync).
-				 * If we woke processes here, those whose writePos is beyond the
-				 * current segment would fail the Assert(record <= LogwrtResult.Write)
-				 * in the waiting code, as their data hasn't been fully written yet.
+				 * Selectively wake up processes whose WAL has been fully written.
+				 * Since XLogWrite may continue writing more data beyond this
+				 * segment boundary, we can only wake processes whose writePos
+				 * is <= LogwrtResult.Write (the end of the segment we just wrote).
+				 * This is an optimization to reduce waiting time during the
+				 * potentially long fsync operation.
 				 *
-				 * All processes will be properly woken at the end of XLogWrite
-				 * when their data has actually been written.
-				 *
-				 * Optimization potential: We could selectively wake processes whose
-				 * writePos <= LogwrtResult.Write, but this adds complexity for
-				 * likely minimal benefit, as most group writes complete quickly.
+				 * We iterate through the list, wake eligible processes, and
+				 * rebuild the list with only those processes that still need
+				 * more data written.
 				 */
+				{
+					PGPROC_LIST *prev_elem = NULL;
+					PGPROC_LIST *curr_elem = wake_pendingWriteWALElem;
+					PGPROC_LIST *next_elem;
+					XLogRecPtr segment_end = LogwrtResult.Write;
+
+					while (curr_elem)
+					{
+						proc_to_clear = (PGPROC *) (((char *) curr_elem) -
+													offsetof(PGPROC, pendingWriteWALLinks));
+						next_elem = curr_elem->next;
+
+						/*
+						 * If this process's data has been fully written
+						 * (writePos <= current write position), wake it up now.
+						 */
+						if (proc_to_clear->writePos <= segment_end)
+						{
+							/* Remove from the list */
+							if (prev_elem)
+								prev_elem->next = next_elem;
+							else
+								wake_pendingWriteWALElem = next_elem;
+
+							/* Mark that write has completed for this proc */
+							proc_to_clear->writeWAL = false;
+
+							pg_write_barrier();
+
+							/* Wake up the process */
+							if (proc_to_clear != MyProc)
+								PGSemaphoreUnlock(proc_to_clear->sem);
+						}
+						else
+						{
+							/* Keep this process in the list */
+							prev_elem = curr_elem;
+						}
+
+						curr_elem = next_elem;
+					}
+				}
 
 				LWLockAcquire(WALFlushLock, LW_EXCLUSIVE);
 

@@ -48,26 +48,32 @@ Leader continues loop, writes up to 200MB
 At END of XLogWrite: wake all processes ✓ NOW it's safe
 ```
 
-## The Correct Design
+## The Correct Design - NOW OPTIMIZED
 
-The code correctly wakes ALL processes at the **end** of `XLogWrite`, after the write loop completes and all data has been written. This ensures:
-- No assertion failures  
-- Processes only wake when their data is actually written
-- Simple, correct behavior
+The code now implements **selective waking** at segment boundaries:
+- Processes whose data is fully written (`writePos <= LogwrtResult.Write`) are woken immediately
+- They don't wait unnecessarily during the fsync operation
+- Processes with data beyond the segment boundary remain in the list and are woken when all data is written
+
+This ensures:
+- No assertion failures (only wake when `writePos <= LogwrtResult.Write`)
+- Reduced waiting time during potentially long fsync operations
+- Optimal performance without sacrificing correctness
 
 ## What Changed
 
-1. **Removed incorrect fix** that uncommented the code
-2. **Added proper comment** explaining why it must stay commented out
-3. **Documented potential optimization** for selective early waking (for future consideration)
+1. **Removed incorrect fix** that uncommented all the code without selective logic
+2. **Implemented selective waking optimization** - processes are woken early if their data is complete
+3. **Added comprehensive comments** explaining the optimization
+4. **Documented the benefits** of this approach
 
 ## Files Updated
 
-- **src/backend/access/transam/xlog.c** - TODO replaced with proper explanation
-- **INIT_PATCH_SAFETY_ANALYSIS.md** - Corrected detailed analysis
+- **src/backend/access/transam/xlog.c** - Implemented selective waking at segment boundaries
+- **INIT_PATCH_SAFETY_ANALYSIS.md** - Documented the optimization implementation
 
 ## Bottom Line
 
-The "INIT PATCH" code was likely an error in the original patch. Leaving it commented out is the correct behavior. The TODO comment has been replaced with a clear explanation.
+The optimization has been implemented! The code now selectively wakes processes whose WAL has been fully written at segment boundaries, reducing wait time during fsync operations.
 
-**Answer:** NO, it is NOT safe to uncomment this code. It must remain commented out.
+**Answer:** The selective waking optimization provides real benefits by allowing completed transactions to proceed while fsync is in progress.

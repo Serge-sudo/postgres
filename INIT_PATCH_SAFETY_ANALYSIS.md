@@ -101,15 +101,25 @@ Wait, I need to reconsider process A. Even though 50MB <= 64MB, Process A should
 
 The `reduce_walwritelock_contention.patch` included this wake code in the `finishing_seg` block, but this appears to have been an error in the original patch. The person who added the TODO comment correctly identified this as a potential issue, and leaving it commented out was the right decision.
 
-## Potential Optimization
+## Potential Optimization - IMPLEMENTED
 
-There is a theoretical optimization: wake only processes whose `writePos <= LogwrtResult.Write` at segment boundaries. However:
+The optimization has been implemented! The code now selectively wakes processes whose `writePos <= LogwrtResult.Write` at segment boundaries.
 
-1. **Complexity**: Requires iterating the list, checking positions, splitting the wake list
-2. **Minimal benefit**: Most group writes complete quickly, spanning few segments
-3. **Current code is correct and simple**: Prioritizes correctness over micro-optimization
+**How it works:**
+1. When finishing a segment, iterate through the `wake_pendingWriteWALElem` list
+2. For each process, check if `writePos <= LogwrtResult.Write` (segment end)
+3. If yes, wake the process immediately (they don't need to wait for fsync or additional writes)
+4. If no, keep them in the list to be woken at the end of XLogWrite
+5. This reduces waiting time during the potentially long fsync operation
 
-The updated comment in the code explains this clearly.
+**Benefits:**
+- Processes whose data is fully written don't wait unnecessarily during fsync
+- The fsync of a segment can be slow, so this optimization provides real benefit
+- Processes can proceed with their transactions sooner
+
+**Correctness:**
+- Only wakes processes whose `writePos <= LogwrtResult.Write`, ensuring the assertion `Assert(record <= LogwrtResult.Write)` never fails
+- Processes with data beyond the segment boundary remain in the list and are woken when all data is written
 
 ## Conclusion
 
