@@ -2541,23 +2541,28 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible, PGPROC_LIST *wak
 
 				LWLockRelease(WALWriteLock);
 
-				// TODO: WHY IN INIT PATCH was DONE , is it safe??
-				// while (wake_pendingWriteWALElem)
-				// {
-				// 	proc_to_clear = (PGPROC *) (((char *) wake_pendingWriteWALElem) -
-				// 								offsetof(PGPROC, pendingWriteWALLinks));
+				/*
+				 * Wake up all waiting processes now that their WAL is written.
+				 * This must be done AFTER releasing WALWriteLock and BEFORE
+				 * acquiring WALFlushLock to avoid deadlock. These processes
+				 * were waiting for their WAL to be written, and since we've
+				 * released the lock, they need to be notified.
+				 */
+				while (wake_pendingWriteWALElem)
+				{
+					proc_to_clear = (PGPROC *) (((char *) wake_pendingWriteWALElem) -
+												offsetof(PGPROC, pendingWriteWALLinks));
 
-				// 	wake_pendingWriteWALElem = wake_pendingWriteWALElem->next;
+					wake_pendingWriteWALElem = wake_pendingWriteWALElem->next;
 
-				// 	/* Mark that Xid has cleared for this proc */
-				// 	proc_to_clear->writeWAL = false;
+					/* Mark that Xid has cleared for this proc */
+					proc_to_clear->writeWAL = false;
 
-				// 	pg_write_barrier();
+					pg_write_barrier();
 
-				// 	if (proc_to_clear != MyProc)
-				// 		PGSemaphoreUnlock(proc_to_clear->sem);
-				// }
-
+					if (proc_to_clear != MyProc)
+						PGSemaphoreUnlock(proc_to_clear->sem);
+				}
 
 				LWLockAcquire(WALFlushLock, LW_EXCLUSIVE);
 
