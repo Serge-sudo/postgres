@@ -279,6 +279,8 @@ InitProcGlobal(void)
 		pg_atomic_init_u64(&(proc->waitStart), 0);
 	}
 
+	ProcGlobal->pendingWriteWALList = NULL;
+
 	/*
 	 * Save pointers to the blocks of PGPROC structures reserved for auxiliary
 	 * processes and prepared transactions.
@@ -432,6 +434,11 @@ InitProcess(void)
 
 	/* Initialize wait event information. */
 	MyProc->wait_event_info = 0;
+
+	/* Initialize fields for writting WAL */
+	MyProc->writeWAL = false;
+	MyProc->writePos = 0;
+	MyProc->pendingWriteWALLinks.next = NULL;
 
 	/* Initialize fields for group transaction status update. */
 	MyProc->clogGroupMember = false;
