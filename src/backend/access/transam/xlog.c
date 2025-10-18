@@ -631,6 +631,10 @@ static XLogwrtResult LogwrtResult = {0, 0};
 		_target.Write = pg_atomic_read_u64(&XLogCtl->logWriteResult); \
 	} while (0)
 
+#define RefreshXLogWriteResultFlushOnly(_target) \
+	do { \
+		_target.Flush = pg_atomic_read_u64(&XLogCtl->logFlushResult); \
+	} while (0)
 /*
  * openLogFile is -1 or a kernel FD for an open log file segment.
  * openLogSegNo identifies the segment, and openLogTLI the corresponding TLI.
@@ -2327,7 +2331,6 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible, PGPROC_LIST *wak
 	int			npages;
 	int			startidx;
 	uint32		startoffset;
-	long long	start;
 	bool		moveToNextBuf;
 	PGPROC      *proc_to_clear;
 
@@ -2538,21 +2541,22 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible, PGPROC_LIST *wak
 
 				LWLockRelease(WALWriteLock);
 
-				while (wake_pendingWriteWALElem)
-				{
-					proc_to_clear = (PGPROC *) (((char *) wake_pendingWriteWALElem) -
-												offsetof(PGPROC, pendingWriteWALLinks));
+				// TODO: WHY IN INIT PATCH was DONE , is it safe??
+				// while (wake_pendingWriteWALElem)
+				// {
+				// 	proc_to_clear = (PGPROC *) (((char *) wake_pendingWriteWALElem) -
+				// 								offsetof(PGPROC, pendingWriteWALLinks));
 
-					wake_pendingWriteWALElem = wake_pendingWriteWALElem->next;
+				// 	wake_pendingWriteWALElem = wake_pendingWriteWALElem->next;
 
-					/* Mark that Xid has cleared for this proc */
-					proc_to_clear->writeWAL = false;
+				// 	/* Mark that Xid has cleared for this proc */
+				// 	proc_to_clear->writeWAL = false;
 
-					pg_write_barrier();
+				// 	pg_write_barrier();
 
-					if (proc_to_clear != MyProc)
-						PGSemaphoreUnlock(proc_to_clear->sem);
-				}
+				// 	if (proc_to_clear != MyProc)
+				// 		PGSemaphoreUnlock(proc_to_clear->sem);
+				// }
 
 
 				LWLockAcquire(WALFlushLock, LW_EXCLUSIVE);
@@ -2591,12 +2595,16 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible, PGPROC_LIST *wak
 				 * Update shared memory status to indicate flush
 				 * progress as we are releasing WALFlushLock.
 				 */
+				{
+					uint64 old = pg_atomic_read_u64(&XLogCtl->logFlushResult);
+					while (old < LogwrtResult.Flush &&
+						   !pg_atomic_compare_exchange_u64(&XLogCtl->logFlushResult, &old, LogwrtResult.Flush));
+				}
 				SpinLockAcquire(&XLogCtl->info_lck);
 				if (XLogCtl->LogwrtRqst.Flush < LogwrtResult.Flush)
 					XLogCtl->LogwrtRqst.Flush = LogwrtResult.Flush;
 				SpinLockRelease(&XLogCtl->info_lck);
-				pg_atomic_write_u64(&XLogCtl->logFlushResult, LogwrtResult.Flush);
-				RefreshXLogWriteResult(LogwrtResult);
+				RefreshXLogWriteResultFlushOnly(LogwrtResult);
 
 				LWLockRelease(WALFlushLock);
 
@@ -2606,7 +2614,7 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible, PGPROC_LIST *wak
 				 * only while holding WALWriteLock.
 				 */
 				LWLockAcquire(WALWriteLock, LW_EXCLUSIVE);
-				LogwrtResult.Write = pg_atomic_read_u64(&XLogCtl->logWriteResult);
+				RefreshXLogWriteResultWriteOnly(LogwrtResult);
 
 				/* Next cache block may have been writtent already. */
 				moveToNextBuf = false;
@@ -2633,7 +2641,14 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible, PGPROC_LIST *wak
 	 * progress as we are releasing WALWriteLock. Also,
 	 * update local copy og LogwrtResult since we got a chance.
 	 */
-	pg_atomic_write_u64(&XLogCtl->logWriteResult, LogwrtResult.Write);
+	{
+		uint64 old = pg_atomic_read_u64(&XLogCtl->logWriteResult);
+		while (old < LogwrtResult.Write &&
+			   !pg_atomic_compare_exchange_u64(&XLogCtl->logWriteResult, &old, LogwrtResult.Write))
+		{
+			/* retry until we succeed or find a value >= LogwrtResult.Write */
+		}
+	}
 	SpinLockAcquire(&XLogCtl->info_lck);
 	if (XLogCtl->LogwrtRqst.Write < LogwrtResult.Write)
 		XLogCtl->LogwrtRqst.Write = LogwrtResult.Write;
@@ -2698,7 +2713,7 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible, PGPROC_LIST *wak
 					//pg_usleep(1);
 				}
 				/* Got the lock; recheck whether request is satisfied */
-				LogwrtResult.Flush = pg_atomic_read_u64(&XLogCtl->logFlushResult);
+				RefreshXLogWriteResultFlushOnly(LogwrtResult);
 
 				if (WriteRqst.Flush <= LogwrtResult.Flush ||
 					LogwrtResult.Write <= LogwrtResult.Flush)
@@ -2739,36 +2754,28 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible, PGPROC_LIST *wak
 				break;
 			}
 		}
-
-		/*
-		* We write Write first, bar, then Flush.  When reading, the opposite must
-		* be done (with a matching barrier in between), so that we always see a
-		* Flush value that trails behind the Write value seen.
-		*/
-		pg_atomic_write_u64(&XLogCtl->logWriteResult, LogwrtResult.Write);
-		pg_write_barrier();
-		pg_atomic_write_u64(&XLogCtl->logFlushResult, LogwrtResult.Flush);
+	}
 
 #ifdef USE_ASSERT_CHECKING
-		{
-			XLogRecPtr	Flush;
-			XLogRecPtr	Write;
-			XLogRecPtr	Insert;
+	{
+		XLogRecPtr	Flush;
+		XLogRecPtr	Write;
+		XLogRecPtr	Insert;
 
-			Flush = pg_atomic_read_u64(&XLogCtl->logFlushResult);
-			pg_read_barrier();
-			Write = pg_atomic_read_u64(&XLogCtl->logWriteResult);
-			pg_read_barrier();
-			Insert = pg_atomic_read_u64(&XLogCtl->logInsertResult);
+		Flush = pg_atomic_read_u64(&XLogCtl->logFlushResult);
+		pg_read_barrier();
+		Write = pg_atomic_read_u64(&XLogCtl->logWriteResult);
+		pg_read_barrier();
+		Insert = pg_atomic_read_u64(&XLogCtl->logInsertResult);
 
-			/* WAL written to disk is always ahead of WAL flushed */
-			Assert(Write >= Flush);
+		/* WAL written to disk is always ahead of WAL flushed */
+		Assert(Write >= Flush);
 
-			/* WAL inserted to buffers is always ahead of WAL written */
-			Assert(Insert >= Write);
-		}
-#endif
+		/* WAL inserted to buffers is always ahead of WAL written */
+		Assert(Insert >= Write);
 	}
+#endif
+
 }
 
 /*
@@ -3075,6 +3082,8 @@ XLogFlush(XLogRecPtr record)
 				 * this function.
 				 */
 				RefreshXLogWriteResult(LogwrtResult);
+
+				Assert(record <= LogwrtResult.Write);
 
 				if (record <= LogwrtResult.Flush)
 					goto wal_is_written;
@@ -9754,7 +9763,6 @@ SetWalWriterSleeping(bool sleeping)
 static void
 XLogFsync(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 {
-	pg_atomic_write_u64(&XLogCtl->logWriteResult, LogwrtResult.Write);
 	SpinLockAcquire(&XLogCtl->info_lck);
 	if (XLogCtl->LogwrtRqst.Write < LogwrtResult.Write)
 		XLogCtl->LogwrtRqst.Write = LogwrtResult.Write;
