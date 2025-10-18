@@ -2542,27 +2542,21 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible, PGPROC_LIST *wak
 				LWLockRelease(WALWriteLock);
 
 				/*
-				 * Wake up all waiting processes now that their WAL is written.
-				 * This must be done AFTER releasing WALWriteLock and BEFORE
-				 * acquiring WALFlushLock to avoid deadlock. These processes
-				 * were waiting for their WAL to be written, and since we've
-				 * released the lock, they need to be notified.
+				 * We do NOT wake up waiting processes here, even though we've
+				 * written and are about to fsync this segment. The reason is
+				 * that XLogWrite may need to continue writing more data beyond
+				 * this segment boundary (the write loop continues after fsync).
+				 * If we woke processes here, those whose writePos is beyond the
+				 * current segment would fail the Assert(record <= LogwrtResult.Write)
+				 * in the waiting code, as their data hasn't been fully written yet.
+				 *
+				 * All processes will be properly woken at the end of XLogWrite
+				 * when their data has actually been written.
+				 *
+				 * Optimization potential: We could selectively wake processes whose
+				 * writePos <= LogwrtResult.Write, but this adds complexity for
+				 * likely minimal benefit, as most group writes complete quickly.
 				 */
-				while (wake_pendingWriteWALElem)
-				{
-					proc_to_clear = (PGPROC *) (((char *) wake_pendingWriteWALElem) -
-												offsetof(PGPROC, pendingWriteWALLinks));
-
-					wake_pendingWriteWALElem = wake_pendingWriteWALElem->next;
-
-					/* Mark that Xid has cleared for this proc */
-					proc_to_clear->writeWAL = false;
-
-					pg_write_barrier();
-
-					if (proc_to_clear != MyProc)
-						PGSemaphoreUnlock(proc_to_clear->sem);
-				}
 
 				LWLockAcquire(WALFlushLock, LW_EXCLUSIVE);
 

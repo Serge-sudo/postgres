@@ -1,4 +1,4 @@
-# Direct Answer to Your Question
+# Direct Answer to Your Question - CORRECTED
 
 ## The Question
 You asked about this TODO comment in the code:
@@ -6,39 +6,68 @@ You asked about this TODO comment in the code:
 // TODO: WHY IN INIT PATCH was DONE , is it safe??
 ```
 
-## The Answer
+## The Answer (CORRECTED)
 
-### Is it safe?
-**NO, it is NOT SAFE** to leave that code commented out.
+### Is it safe to leave commented out?
+**YES, it IS SAFE** and in fact **NECESSARY** to leave that code commented out.
 
-### What I found
-The commented-out code is part of a patch called "reduce_walwritelock_contention.patch" (which you have in your repository). This patch implements a group WAL writing mechanism to improve PostgreSQL's performance.
+### Initial Analysis Was Wrong
+The initial analysis incorrectly concluded that the code should be uncommented. After careful review and feedback from @Serge-sudo, it's clear that:
 
-### What the code does
-When PostgreSQL finishes writing a WAL (Write-Ahead Log) segment, it:
-1. Releases the WALWriteLock (to allow other operations during the slow fsync)
-2. **MUST wake up all processes waiting for their WAL to be written** ← This was commented out!
-3. Then acquires WALFlushLock to do the fsync
+1. **The code MUST stay commented out**
+2. **Uncommenting it would cause bugs** (assertion failures)
+3. **The current behavior is correct**
 
-### Why it's critical
-If the wake-up code is commented out:
-- Processes waiting for their WAL to be written will **hang forever** (deadlock)
-- They're waiting to be notified that their data was written
-- But the notification never comes because the code is commented out
+## Why It Must Stay Commented Out
 
-### How to change it
-**I've already fixed it!** The code has been:
-- ✅ Uncommented
-- ✅ Properly documented with comments explaining why it's needed
-- ✅ Committed to your repository
+### The Problem with Waking Processes Early
 
-### The fix
-The code now properly wakes up waiting processes between releasing WALWriteLock and acquiring WALFlushLock. This is the same pattern used in other parts of the code (see lines 2663 and 3156 in the same file).
+The `XLogWrite` function writes WAL data in a **loop**. When it finishes writing a segment, it:
+1. Releases the write lock
+2. Fsyncs that segment  
+3. Reacquires the write lock
+4. **Continues the loop** to write more data if needed
+
+If we wake up processes in the middle (when finishing a segment), **some processes may have data beyond that segment** that hasn't been written yet. These processes would:
+- Wake up thinking their data is written
+- Check: `Assert(record <= LogwrtResult.Write)`
+- **FAIL** because their data position is beyond the segment we just finished
+
+### Example
+
+```
+Process A needs WAL at position 50MB
+Process B needs WAL at position 200MB
+Leader finishes segment at 64MB (finishing_seg = true)
+
+If we wake processes here:
+  Process A: Checks 50MB <= 64MB ✓ BUT we haven't finished the full write yet!
+  Process B: Checks 200MB <= 64MB ✗ ASSERTION FAILS!
+
+Leader continues loop, writes up to 200MB
+At END of XLogWrite: wake all processes ✓ NOW it's safe
+```
+
+## The Correct Design
+
+The code correctly wakes ALL processes at the **end** of `XLogWrite`, after the write loop completes and all data has been written. This ensures:
+- No assertion failures  
+- Processes only wake when their data is actually written
+- Simple, correct behavior
+
+## What Changed
+
+1. **Removed incorrect fix** that uncommented the code
+2. **Added proper comment** explaining why it must stay commented out
+3. **Documented potential optimization** for selective early waking (for future consideration)
 
 ## Files Updated
-1. **src/backend/access/transam/xlog.c** - The actual fix
-2. **INIT_PATCH_SAFETY_ANALYSIS.md** - Detailed technical analysis
-3. **SAFETY_ANALYSIS_SUMMARY.md** - Summary with code examples
+
+- **src/backend/access/transam/xlog.c** - TODO replaced with proper explanation
+- **INIT_PATCH_SAFETY_ANALYSIS.md** - Corrected detailed analysis
 
 ## Bottom Line
-The "INIT PATCH" (reduce_walwritelock_contention.patch) code **must** be active. It was incorrectly commented out, creating a potential deadlock. The fix restores it with proper documentation.
+
+The "INIT PATCH" code was likely an error in the original patch. Leaving it commented out is the correct behavior. The TODO comment has been replaced with a clear explanation.
+
+**Answer:** NO, it is NOT safe to uncomment this code. It must remain commented out.
