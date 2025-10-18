@@ -127,6 +127,17 @@ typedef enum
 	PROC_WAIT_STATUS_ERROR,
 } ProcWaitStatus;
 
+ /*
+ * List to link PGPROC structures for the cases when they
+ * can't be linked via SHM_QUEUE like when we want to operate
+ * the list using atomic operations.  Currently this is used
+ * to link PGPROC's for clearing their XID information.
+ */
+typedef struct PGPROC_LIST
+{
+	struct PGPROC_LIST *next;
+} PGPROC_LIST;
+
 /*
  * Each backend has a PGPROC struct in shared memory.  There is also a list of
  * currently-unused PGPROC structs that will be reallocated to new backends.
