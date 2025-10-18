@@ -435,7 +435,7 @@ InitProcess(void)
 	/* Initialize wait event information. */
 	MyProc->wait_event_info = 0;
 
-	/* Initialize fields for writting WAL */
+	/* Initialize fields for writing WAL */
 	MyProc->writeWAL = false;
 	MyProc->writePos = 0;
 	MyProc->pendingWriteWALLinks.next = NULL;
