@@ -127,6 +127,17 @@ typedef enum
 	PROC_WAIT_STATUS_ERROR,
 } ProcWaitStatus;
 
+ /*
+ * List to link PGPROC structures for the cases when they
+ * can't be linked via SHM_QUEUE like when we want to operate
+ * the list using atomic operations.  Currently this is used
+ * to link PGPROC's for clearing their XID information.
+ */
+typedef struct PGPROC_LIST
+{
+	struct PGPROC_LIST *next;
+} PGPROC_LIST;
+
 /*
  * Each backend has a PGPROC struct in shared memory.  There is also a list of
  * currently-unused PGPROC structs that will be reallocated to new backends.
@@ -265,6 +276,9 @@ struct PGPROC
 	XidCacheStatus subxidStatus;	/* mirrored with
 									 * ProcGlobal->subxidStates[i] */
 	struct XidCache subxids;	/* cache for subtransaction XIDs */
+	bool            writeWAL;
+	XLogRecPtr      writePos;
+	PGPROC_LIST     pendingWriteWALLinks;
 
 	/* Support for group XID clearing. */
 	/* true, if member of ProcArray group waiting for XID clear */
@@ -397,6 +411,8 @@ typedef struct PROC_HDR
 	dlist_head	bgworkerFreeProcs;
 	/* Head of list of walsender free PGPROC structures */
 	dlist_head	walsenderFreeProcs;
+	/* list of PGPROC structures that need to have their WAL written */
+	PGPROC_LIST *pendingWriteWALList;
 	/* First pgproc waiting for group XID clear */
 	pg_atomic_uint32 procArrayGroupFirst;
 	/* First pgproc waiting for group transaction status update */
