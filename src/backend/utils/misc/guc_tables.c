@@ -532,6 +532,11 @@ double		log_statement_sample_rate = 1.0;
 double		log_xact_sample_rate = 0;
 char	   *backtrace_functions;
 
+int			log2_num_xlog_insert_locks;
+bool 		wal_reserve_lock_free;
+bool 		enable_wal_locking_reduction;
+bool 		enable_adaptive_xlog_insert_locks;
+
 int			temp_file_limit = -1;
 
 int			num_temp_buffers = 1024;
@@ -1021,6 +1026,51 @@ struct config_bool ConfigureNamesBool[] =
 		&current_role_is_superuser,
 		false,
 		NULL, NULL, NULL
+	},
+	{
+		{
+			"wal_reserve_lock_free",
+			PGC_POSTMASTER,
+			UNGROUPED,
+			gettext_noop("Enables the use of a lock-free algorithm for reserving WAL space."),
+			NULL,
+			0
+		},
+		&wal_reserve_lock_free,
+		false,
+		NULL,
+		NULL,
+		NULL
+	},
+	{
+		{
+			"enable_adaptive_xlog_insert_locks",
+			PGC_SIGHUP,
+			UNGROUPED,
+			gettext_noop("Enables adaptive insert locks for XLOG insertion."),
+			NULL,
+			0
+		},
+		&enable_adaptive_xlog_insert_locks,
+		false,
+		NULL,
+		NULL,
+		NULL
+	},
+	{
+		{
+			"enable_wal_locking_reduction",
+			PGC_POSTMASTER,
+			UNGROUPED,
+			gettext_noop("Enables reduced locking in WAL during new buffer allocation."),
+			NULL,
+			0
+		},
+		&enable_wal_locking_reduction,
+		false,
+		NULL,
+		NULL,
+		NULL
 	},
 	{
 		/*
@@ -2055,6 +2105,16 @@ struct config_int ConfigureNamesInt[] =
 		},
 		&PostAuthDelay,
 		0, 0, INT_MAX / 1000000,
+		NULL, NULL, NULL
+	},
+	{
+		{
+			"log2_num_xlog_insert_locks", PGC_POSTMASTER, UNGROUPED,
+			gettext_noop("Number of xlog insertion locks."),
+			NULL
+		},
+		&log2_num_xlog_insert_locks,
+		3, 0, 16,
 		NULL, NULL, NULL
 	},
 	{

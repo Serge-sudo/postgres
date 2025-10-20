@@ -107,6 +107,18 @@ proc_exit(int code)
 	if (MyProcPid != (int) getpid())
 		elog(PANIC, "proc_exit() called in child process");
 
+	/* 
+	 * One of critical sections essential invariats is not to allow
+	 * any other process to observe half-way made changes.
+	 * This inludes requrement of holding locks to modified buffer
+	 * until xlog records describing changes are properly created.
+	 * PostgreSQL already disallows to process any signal cancellation
+	 * inside CRIT section, guaratees process does not release lock
+	 * on its buffers too early. 
+	 */
+	if (CritSectionCount != 0)
+		_exit(2);
+
 	/* Clean up everything that must be cleaned up */
 	proc_exit_prepare(code);
 
