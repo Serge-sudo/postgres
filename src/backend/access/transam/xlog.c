@@ -156,6 +156,13 @@ int			wal_segment_size = DEFAULT_XLOG_SEG_SIZE;
 #define NUM_XLOGINSERT_LOCKS  (1 << log2_num_xlog_insert_locks)
 
 /*
+ * Number of WAL write locks to use. Similar to WAL insertion locks, a higher
+ * value allows more concurrent writes to disk, reducing contention on the
+ * single WALWriteLock.
+ */
+#define NUM_XLOG_WRITE_LOCKS  (1 << log2_num_xlog_write_locks)
+
+/*
  * Max distance from last checkpoint, before triggering a new xlog-based
  * checkpoint.
  */
@@ -390,6 +397,27 @@ typedef union WALInsertLockPadded
 	WALInsertLock l;
 	char		pad[PG_CACHE_LINE_SIZE];
 } WALInsertLockPadded;
+
+/*
+ * WAL write locks for concurrent disk writes. Each lock tracks the position
+ * being written (writingAt) to coordinate chain-reaction updates of the
+ * shared write pointer.
+ */
+typedef struct
+{
+	LWLock		lock;
+	pg_atomic_uint64 writingAt;
+} WALWriteLock;
+
+/*
+ * All the WAL write locks are allocated as an array in shared memory,
+ * similar to WAL insertion locks.
+ */
+typedef union WALWriteLockPadded
+{
+	WALWriteLock l;
+	char		pad[PG_CACHE_LINE_SIZE];
+} WALWriteLockPadded;
 
 #ifndef WAL_LINK_64
 #ifdef PG_HAVE_ATOMIC_U64_SIMULATION
@@ -729,6 +757,18 @@ typedef struct XLogCtlData
 	XLogRecPtr	lastFpwDisableRecPtr;
 
 	slock_t		info_lck;		/* locks shared variables shown above */
+	
+	/*
+	 * WAL write locks for parallel disk writes. These locks coordinate
+	 * multiple processes writing to disk concurrently.
+	 */
+	WALWriteLockPadded *WALWriteLocks;
+	
+	/*
+	 * Shared atomic write pointer for coordinating chain-reaction updates
+	 * after each process completes its write.
+	 */
+	pg_atomic_uint64 SharedWritePtr;
 } XLogCtlData;
 
 /*
@@ -748,6 +788,9 @@ static WALInsertLockPadded *WALInsertLocks = NULL;
 
 /* same for XLogCtl->Insert.PrevLinksHash */
 static WALPrevPosLink *PrevLinksHash = NULL;
+
+/* a private copy of XLogCtl->WALWriteLocks, for convenience */
+static WALWriteLockPadded *WALWriteLocks = NULL;
 
 /*
  * We maintain an image of pg_control in shared memory.
@@ -919,6 +962,9 @@ static void WALInsertLockAcquire(void);
 static void WALInsertLockAcquireExclusive(void);
 static void WALInsertLockRelease(void);
 static void WALInsertLockUpdateInsertingAt(XLogRecPtr insertingAt);
+
+static void WALWriteLockAcquire(int *lockno);
+static void WALWriteLockRelease(int lockno);
 
 /*
  * Insert an XLOG record represented by an already-constructed chain of data
@@ -2154,6 +2200,44 @@ WALInsertLockUpdateInsertingAt(XLogRecPtr insertingAt)
 		LWLockUpdateVar(&WALInsertLocks[MyLockNo].l.lock,
 						&WALInsertLocks[MyLockNo].l.insertingAt,
 						insertingAt);
+}
+
+/*
+ * Acquire one of the WAL write locks for parallel disk writes.
+ * Similar to WALInsertLockAcquire, but for write operations.
+ */
+static void
+WALWriteLockAcquire(int *lockno)
+{
+	bool		immed;
+	static int	lockToTry = -1;
+
+	/*
+	 * Try to acquire a write lock, preferring the one used last time
+	 * for cache affinity.
+	 */
+	if (lockToTry == -1)
+		lockToTry = MyProcNumber % NUM_XLOG_WRITE_LOCKS;
+	*lockno = lockToTry;
+
+	immed = LWLockAcquire(&WALWriteLocks[*lockno].l.lock, LW_EXCLUSIVE);
+	if (!immed)
+	{
+		/*
+		 * If we couldn't get the lock immediately, try another lock next
+		 * time to distribute load evenly.
+		 */
+		lockToTry = (lockToTry + 1) % NUM_XLOG_WRITE_LOCKS;
+	}
+}
+
+/*
+ * Release a WAL write lock.
+ */
+static void
+WALWriteLockRelease(int lockno)
+{
+	LWLockRelease(&WALWriteLocks[lockno].l.lock);
 }
 
 /*
@@ -6024,6 +6108,9 @@ XLOGShmemSize(void)
 	/* WAL insertion locks, plus alignment */
 	size = add_size(size, mul_size(sizeof(WALInsertLockPadded), NUM_XLOGINSERT_LOCKS + 1));
 	
+	/* WAL write locks, plus alignment */
+	size = add_size(size, mul_size(sizeof(WALWriteLockPadded), NUM_XLOG_WRITE_LOCKS + 1));
+	
 	if (wal_reserve_lock_free)
 	{
 		/* prevlinkshash, abuses alignment of WAL insertion locks. */
@@ -6086,6 +6173,7 @@ XLOGShmemInit(void)
 		/* Initialize local copy of WALInsertLocks and PrevLinksHash */
 		WALInsertLocks = XLogCtl->Insert.WALInsertLocks;
 		PrevLinksHash = XLogCtl->Insert.PrevLinksHash;
+		WALWriteLocks = XLogCtl->WALWriteLocks;
 
 		if (localControlFile)
 			pfree(localControlFile);
@@ -6138,6 +6226,19 @@ XLOGShmemInit(void)
 		allocptr += sizeof(WALPrevPosLink) * PREV_LINKS_HASH_CAPA;
 	}
 
+	/* WAL write locks. Ensure they're aligned to the full padded size */
+	allocptr += sizeof(WALWriteLockPadded) -
+		((uintptr_t) allocptr) % sizeof(WALWriteLockPadded);
+	WALWriteLocks = XLogCtl->WALWriteLocks =
+		(WALWriteLockPadded *) allocptr;
+	allocptr += sizeof(WALWriteLockPadded) * NUM_XLOG_WRITE_LOCKS;
+
+	for (i = 0; i < NUM_XLOG_WRITE_LOCKS; i++)
+	{
+		LWLockInitialize(&WALWriteLocks[i].l.lock, LWTRANCHE_WAL_WRITE);
+		pg_atomic_init_u64(&WALWriteLocks[i].l.writingAt, InvalidXLogRecPtr);
+	}
+
 	/*
 	 * Align the start of the page buffers to a full xlog block size boundary.
 	 * This simplifies some calculations in XLOG insertion. It is also
@@ -6162,6 +6263,7 @@ XLOGShmemInit(void)
 	pg_atomic_init_u64(&XLogCtl->logWriteResult, InvalidXLogRecPtr);
 	pg_atomic_init_u64(&XLogCtl->logFlushResult, InvalidXLogRecPtr);
 	pg_atomic_init_u64(&XLogCtl->unloggedLSN, InvalidXLogRecPtr);
+	pg_atomic_init_u64(&XLogCtl->SharedWritePtr, InvalidXLogRecPtr);
 	
 	if (enable_wal_locking_reduction)
 	{
