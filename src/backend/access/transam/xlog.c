@@ -3497,7 +3497,9 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 			 * too many logfile segments have been used since the last
 			 * checkpoint.
 			 */
-			if (finishing_seg)
+			if (finishing_seg &&
+				(wal_sync_method != WAL_SYNC_METHOD_OPEN &&
+				wal_sync_method != WAL_SYNC_METHOD_OPEN_DSYNC))
 			{
 				/*
 				 * Update shared memory status to indicate write
@@ -3956,13 +3958,6 @@ XLogFlush(XLogRecPtr record)
 		goto wal_is_written;
 
 	/*
-	 * Before actually performing the write, wait for all in-flight
-	 * insertions to the pages we're about to write to finish.
-	 */
-
-	insertpos = WaitXLogInsertionsToFinish(WriteRqstPtr);
-
-	/*
 	 * New approach: Check if our record is already reserved for writing
 	 * by checking WALWriteReservedUpTo. If it is, wait on the condition
 	 * variable until it's flushed. Otherwise, try to acquire WALWriteLock
@@ -4002,6 +3997,12 @@ XLogFlush(XLogRecPtr record)
 		}
 		else
 		{
+			/*
+			 * Before actually performing the write, wait for all in-flight
+	 		 * insertions to the pages we're about to write to finish.
+	 		 */
+			insertpos = WaitXLogInsertionsToFinish(WriteRqstPtr);
+
 			/* Our write is not yet reserved, try to acquire the lock, we are leader */
 			ConditionVariableCancelSleep();
 			while (true)
@@ -4027,6 +4028,18 @@ XLogFlush(XLogRecPtr record)
 			}
 		}
 	}
+
+	/*
+	 * Re-check how far we can now flush the WAL. It's generally not
+	 * safe to call WaitXLogInsertionsToFinish while holding
+	 * WALWriteLock, because an in-progress insertion might need to
+	 * also grab WALWriteLock to make progress. But we know that all
+	 * the insertions up to insertpos have already finished, because
+	 * that's what the earlier WaitXLogInsertionsToFinish() returned.
+	 * We're only calling it again to allow insertpos to be moved
+	 * further forward, not to actually wait for anyone.
+	 */
+	insertpos = WaitXLogInsertionsToFinish(insertpos);
 
 	/*
 	 * We now hold WALWriteLock. Update WALWriteReservedUpTo to indicate
