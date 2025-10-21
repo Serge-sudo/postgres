@@ -533,6 +533,7 @@ double		log_xact_sample_rate = 0;
 char	   *backtrace_functions;
 
 int			log2_num_xlog_insert_locks;
+int			log2_num_xlog_write_locks;
 bool 		wal_reserve_lock_free;
 bool 		enable_wal_locking_reduction;
 bool 		enable_adaptive_xlog_insert_locks;
@@ -2114,6 +2115,16 @@ struct config_int ConfigureNamesInt[] =
 			NULL
 		},
 		&log2_num_xlog_insert_locks,
+		3, 0, 16,
+		NULL, NULL, NULL
+	},
+	{
+		{
+			"log2_num_xlog_write_locks", PGC_POSTMASTER, UNGROUPED,
+			gettext_noop("Number of xlog write locks (log2)."),
+			gettext_noop("Controls the number of concurrent WAL write locks for parallel disk writes.")
+		},
+		&log2_num_xlog_write_locks,
 		3, 0, 16,
 		NULL, NULL, NULL
 	},

@@ -156,6 +156,13 @@ int			wal_segment_size = DEFAULT_XLOG_SEG_SIZE;
 #define NUM_XLOGINSERT_LOCKS  (1 << log2_num_xlog_insert_locks)
 
 /*
+ * Number of WAL write locks to use. Similar to WAL insertion locks, a higher
+ * value allows more concurrent writes to disk, reducing contention on the
+ * single WALWriteLock.
+ */
+#define NUM_XLOG_WRITE_LOCKS  (1 << log2_num_xlog_write_locks)
+
+/*
  * Max distance from last checkpoint, before triggering a new xlog-based
  * checkpoint.
  */
@@ -390,6 +397,27 @@ typedef union WALInsertLockPadded
 	WALInsertLock l;
 	char		pad[PG_CACHE_LINE_SIZE];
 } WALInsertLockPadded;
+
+/*
+ * WAL write locks for concurrent disk writes. Each lock tracks the position
+ * being written (writingAt) to coordinate chain-reaction updates of the
+ * shared write pointer.
+ */
+typedef struct
+{
+	LWLock		lock;
+	pg_atomic_uint64 writingAt;
+} WALWriteLockSlot;
+
+/*
+ * All the WAL write locks are allocated as an array in shared memory,
+ * similar to WAL insertion locks.
+ */
+typedef union WALWriteLockPadded
+{
+	WALWriteLockSlot l;
+	char		pad[PG_CACHE_LINE_SIZE];
+} WALWriteLockPadded;
 
 #ifndef WAL_LINK_64
 #ifdef PG_HAVE_ATOMIC_U64_SIMULATION
@@ -729,6 +757,18 @@ typedef struct XLogCtlData
 	XLogRecPtr	lastFpwDisableRecPtr;
 
 	slock_t		info_lck;		/* locks shared variables shown above */
+	
+	/*
+	 * WAL write locks for parallel disk writes. These locks coordinate
+	 * multiple processes writing to disk concurrently.
+	 */
+	WALWriteLockPadded *WALWriteLocks;
+	
+	/*
+	 * Shared atomic write pointer for coordinating chain-reaction updates
+	 * after each process completes its write.
+	 */
+	pg_atomic_uint64 SharedWritePtr;
 } XLogCtlData;
 
 /*
@@ -748,6 +788,9 @@ static WALInsertLockPadded *WALInsertLocks = NULL;
 
 /* same for XLogCtl->Insert.PrevLinksHash */
 static WALPrevPosLink *PrevLinksHash = NULL;
+
+/* a private copy of XLogCtl->WALWriteLocks, for convenience */
+static WALWriteLockPadded *WALWriteLocks = NULL;
 
 /*
  * We maintain an image of pg_control in shared memory.
@@ -919,6 +962,36 @@ static void WALInsertLockAcquire(void);
 static void WALInsertLockAcquireExclusive(void);
 static void WALInsertLockRelease(void);
 static void WALInsertLockUpdateInsertingAt(XLogRecPtr insertingAt);
+
+static void WALWriteLockAcquire(int *lockno);
+static void WALWriteLockRelease(int lockno);
+static void UpdateSharedWritePtr(XLogRecPtr writeStart, XLogRecPtr writeEnd, int lockno);
+
+/*
+ * NOTE: Multiple WAL write locks infrastructure
+ * 
+ * The following functions implement a system of multiple WAL write locks
+ * similar to WAL insertion locks. This allows multiple backends to write
+ * to disk concurrently, reducing contention.
+ * 
+ * The chain reaction mechanism works as follows:
+ * 1. Each backend acquires one of NUM_XLOG_WRITE_LOCKS write locks
+ * 2. After writing its portion to disk, it calls UpdateSharedWritePtr
+ * 3. UpdateSharedWritePtr waits until SharedWritePtr equals the backend's
+ *    write start position (ensuring previous writers have finished)
+ * 4. It then atomically updates SharedWritePtr to its write end position
+ * 5. This creates a chain where each backend enables the next one
+ * 
+ * To fully integrate this, XLogWrite would need to be refactored to:
+ * - Use WALWriteLockAcquire instead of LWLockAcquire(WALWriteLock)
+ * - Track the write range for each backend
+ * - Call UpdateSharedWritePtr after completing the write
+ * - Release the write lock with WALWriteLockRelease
+ * 
+ * This is a complex change requiring careful synchronization with flush
+ * operations and recovery logic. The infrastructure is now in place for
+ * incremental integration.
+ */
 
 /*
  * Insert an XLOG record represented by an already-constructed chain of data
@@ -2154,6 +2227,108 @@ WALInsertLockUpdateInsertingAt(XLogRecPtr insertingAt)
 		LWLockUpdateVar(&WALInsertLocks[MyLockNo].l.lock,
 						&WALInsertLocks[MyLockNo].l.insertingAt,
 						insertingAt);
+}
+
+/*
+ * Acquire one of the WAL write locks for parallel disk writes.
+ * Similar to WALInsertLockAcquire, but for write operations.
+ */
+static void
+WALWriteLockAcquire(int *lockno)
+{
+	bool		immed;
+	static int	lockToTry = -1;
+
+	/*
+	 * Try to acquire a write lock, preferring the one used last time
+	 * for cache affinity.
+	 */
+	if (lockToTry == -1)
+		lockToTry = MyProcNumber % NUM_XLOG_WRITE_LOCKS;
+	*lockno = lockToTry;
+
+	immed = LWLockAcquire(&WALWriteLocks[*lockno].l.lock, LW_EXCLUSIVE);
+	if (!immed)
+	{
+		/*
+		 * If we couldn't get the lock immediately, try another lock next
+		 * time to distribute load evenly.
+		 */
+		lockToTry = (lockToTry + 1) % NUM_XLOG_WRITE_LOCKS;
+	}
+}
+
+/*
+ * Release a WAL write lock.
+ */
+static void
+WALWriteLockRelease(int lockno)
+{
+	LWLockRelease(&WALWriteLocks[lockno].l.lock);
+}
+
+/*
+ * Update the shared write pointer after completing a write.
+ * This implements the chain reaction mechanism: each process waits for
+ * the previous writer to update the pointer, then updates it itself.
+ * 
+ * writeStart: Position where this backend started writing
+ * writeEnd: Position where this backend finished writing
+ * lockno: The write lock number this backend is holding
+ */
+static void
+UpdateSharedWritePtr(XLogRecPtr writeStart, XLogRecPtr writeEnd, int lockno)
+{
+	XLogRecPtr	currentPtr;
+	XLogRecPtr	expectedPtr;
+	
+	/* Mark what we're writing in our lock slot */
+	pg_atomic_write_u64(&WALWriteLocks[lockno].l.writingAt, writeEnd);
+	pg_write_barrier();
+	
+	/*
+	 * Wait for our turn in the chain. We can only update SharedWritePtr
+	 * if it currently points to our writeStart position (meaning all
+	 * previous writes have completed and updated it).
+	 */
+	for (;;)
+	{
+		currentPtr = pg_atomic_read_u64(&XLogCtl->SharedWritePtr);
+		
+		if (currentPtr >= writeEnd)
+		{
+			/* Someone else already advanced past our position */
+			break;
+		}
+		
+		if (currentPtr < writeStart)
+		{
+			/*
+			 * SharedWritePtr hasn't reached our write start yet.
+			 * Previous writers are still working. Wait a bit.
+			 */
+			pg_usleep(1L);
+			continue;
+		}
+		
+		/*
+		 * currentPtr is in [writeStart, writeEnd), which means it's our
+		 * turn. Try to advance it to writeEnd using CAS.
+		 */
+		expectedPtr = writeStart;
+		if (pg_atomic_compare_exchange_u64(&XLogCtl->SharedWritePtr,
+										   &expectedPtr,
+										   writeEnd))
+		{
+			/* Successfully updated, we're done */
+			break;
+		}
+		
+		/* CAS failed, retry the loop to recheck conditions */
+	}
+	
+	/* Clear our writingAt marker */
+	pg_atomic_write_u64(&WALWriteLocks[lockno].l.writingAt, InvalidXLogRecPtr);
 }
 
 /*
@@ -6024,6 +6199,9 @@ XLOGShmemSize(void)
 	/* WAL insertion locks, plus alignment */
 	size = add_size(size, mul_size(sizeof(WALInsertLockPadded), NUM_XLOGINSERT_LOCKS + 1));
 	
+	/* WAL write locks, plus alignment */
+	size = add_size(size, mul_size(sizeof(WALWriteLockPadded), NUM_XLOG_WRITE_LOCKS + 1));
+	
 	if (wal_reserve_lock_free)
 	{
 		/* prevlinkshash, abuses alignment of WAL insertion locks. */
@@ -6086,6 +6264,7 @@ XLOGShmemInit(void)
 		/* Initialize local copy of WALInsertLocks and PrevLinksHash */
 		WALInsertLocks = XLogCtl->Insert.WALInsertLocks;
 		PrevLinksHash = XLogCtl->Insert.PrevLinksHash;
+		WALWriteLocks = XLogCtl->WALWriteLocks;
 
 		if (localControlFile)
 			pfree(localControlFile);
@@ -6138,6 +6317,19 @@ XLOGShmemInit(void)
 		allocptr += sizeof(WALPrevPosLink) * PREV_LINKS_HASH_CAPA;
 	}
 
+	/* WAL write locks. Ensure they're aligned to the full padded size */
+	allocptr += sizeof(WALWriteLockPadded) -
+		((uintptr_t) allocptr) % sizeof(WALWriteLockPadded);
+	WALWriteLocks = XLogCtl->WALWriteLocks =
+		(WALWriteLockPadded *) allocptr;
+	allocptr += sizeof(WALWriteLockPadded) * NUM_XLOG_WRITE_LOCKS;
+
+	for (i = 0; i < NUM_XLOG_WRITE_LOCKS; i++)
+	{
+		LWLockInitialize(&WALWriteLocks[i].l.lock, LWTRANCHE_WAL_WRITE);
+		pg_atomic_init_u64(&WALWriteLocks[i].l.writingAt, InvalidXLogRecPtr);
+	}
+
 	/*
 	 * Align the start of the page buffers to a full xlog block size boundary.
 	 * This simplifies some calculations in XLOG insertion. It is also
@@ -6162,6 +6354,7 @@ XLOGShmemInit(void)
 	pg_atomic_init_u64(&XLogCtl->logWriteResult, InvalidXLogRecPtr);
 	pg_atomic_init_u64(&XLogCtl->logFlushResult, InvalidXLogRecPtr);
 	pg_atomic_init_u64(&XLogCtl->unloggedLSN, InvalidXLogRecPtr);
+	pg_atomic_init_u64(&XLogCtl->SharedWritePtr, InvalidXLogRecPtr);
 	
 	if (enable_wal_locking_reduction)
 	{
