@@ -1,0 +1,110 @@
+Testing LWLock Crash Recovery
+=============================
+
+This document describes how to manually test the lwlock crash recovery
+behavior described in src/backend/storage/lmgr/README.lwlock-crash-recovery.
+
+WARNING: These tests will crash your PostgreSQL instance and require a restart.
+Do NOT run these tests on production systems.
+
+Test Setup
+----------
+
+1. Build PostgreSQL with debug symbols and assertions enabled:
+   ./configure --enable-debug --enable-cassert
+   make && make install
+
+2. Initialize and start a test cluster:
+   initdb -D /tmp/test_pgdata
+   pg_ctl -D /tmp/test_pgdata -l /tmp/postgres.log start
+
+Manual Test: Backend Holding LWLock is Killed
+---------------------------------------------
+
+This test demonstrates that killing a backend while it holds an lwlock
+does not cause the system to hang permanently.
+
+Test Procedure:
+
+1. Start PostgreSQL and connect with psql:
+   psql -d postgres
+
+2. In one terminal, start a long-running query that will hold locks:
+   SELECT pg_sleep(300);
+
+3. In another terminal, identify the backend PID:
+   psql -d postgres -c "SELECT pid, backend_type, state FROM pg_stat_activity WHERE state = 'active';"
+
+4. Kill the backend with SIGKILL (most severe form of kill):
+   kill -9 <backend_pid>
+
+5. Monitor the PostgreSQL log file. You should see:
+   - "server process ... was terminated by signal 9: Killed"
+   - "terminating any other active server processes"
+   - "all server processes terminated; reinitializing"
+   - Database system performing crash recovery
+
+6. After recovery completes, verify the system is working:
+   psql -d postgres -c "SELECT 1;"
+
+Expected Result:
+- The postmaster detects the crash
+- All other backends are terminated
+- Shared memory (including lwlocks) is reinitialized
+- System recovers and is available again
+- No backends are left hanging waiting for the killed process's locks
+
+Alternative Test: Using GDB to Simulate Hanging with Lock
+---------------------------------------------------------
+
+For a more controlled test, you can use GDB to stop a process while it
+holds an lwlock:
+
+1. Attach GDB to a backend:
+   gdb -p <backend_pid>
+
+2. Set a breakpoint in a function that holds an lwlock:
+   break LWLockAcquire
+
+3. Continue execution and wait for the breakpoint:
+   continue
+
+4. When the breakpoint hits, the backend is holding an lwlock. From another
+   terminal, send SIGKILL:
+   kill -9 <backend_pid>
+
+5. Observe the same crash recovery sequence in the logs.
+
+Automated Testing
+-----------------
+
+A full automated test would require:
+1. Extension or test module to deliberately hold lwlocks
+2. Controlled process termination
+3. Verification of crash recovery
+4. Verification that system is operational after recovery
+
+Due to the complexity and risk of such tests, they are typically run
+as part of specialized PostgreSQL testing frameworks rather than regular
+regression tests.
+
+Configuration Notes
+------------------
+
+The restart_after_crash GUC parameter controls this behavior:
+- ON (default): System recovers automatically after crashes
+- OFF: System shuts down instead of recovering
+
+To test with restart_after_crash = OFF:
+1. Set in postgresql.conf: restart_after_crash = off
+2. Restart PostgreSQL
+3. Follow the test procedure above
+4. Observe that the system shuts down instead of recovering
+
+Conclusion
+----------
+
+These tests demonstrate that PostgreSQL's crash recovery mechanism
+ensures that lwlocks held by crashed processes do not cause permanent
+hangs. The system automatically detects crashes, terminates all backends,
+reinitializes shared memory, and recovers to a consistent state.
