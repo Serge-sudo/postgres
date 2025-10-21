@@ -965,6 +965,33 @@ static void WALInsertLockUpdateInsertingAt(XLogRecPtr insertingAt);
 
 static void WALWriteLockAcquire(int *lockno);
 static void WALWriteLockRelease(int lockno);
+static void UpdateSharedWritePtr(XLogRecPtr writeStart, XLogRecPtr writeEnd, int lockno);
+
+/*
+ * NOTE: Multiple WAL write locks infrastructure
+ * 
+ * The following functions implement a system of multiple WAL write locks
+ * similar to WAL insertion locks. This allows multiple backends to write
+ * to disk concurrently, reducing contention.
+ * 
+ * The chain reaction mechanism works as follows:
+ * 1. Each backend acquires one of NUM_XLOG_WRITE_LOCKS write locks
+ * 2. After writing its portion to disk, it calls UpdateSharedWritePtr
+ * 3. UpdateSharedWritePtr waits until SharedWritePtr equals the backend's
+ *    write start position (ensuring previous writers have finished)
+ * 4. It then atomically updates SharedWritePtr to its write end position
+ * 5. This creates a chain where each backend enables the next one
+ * 
+ * To fully integrate this, XLogWrite would need to be refactored to:
+ * - Use WALWriteLockAcquire instead of LWLockAcquire(WALWriteLock)
+ * - Track the write range for each backend
+ * - Call UpdateSharedWritePtr after completing the write
+ * - Release the write lock with WALWriteLockRelease
+ * 
+ * This is a complex change requiring careful synchronization with flush
+ * operations and recovery logic. The infrastructure is now in place for
+ * incremental integration.
+ */
 
 /*
  * Insert an XLOG record represented by an already-constructed chain of data
@@ -2238,6 +2265,70 @@ static void
 WALWriteLockRelease(int lockno)
 {
 	LWLockRelease(&WALWriteLocks[lockno].l.lock);
+}
+
+/*
+ * Update the shared write pointer after completing a write.
+ * This implements the chain reaction mechanism: each process waits for
+ * the previous writer to update the pointer, then updates it itself.
+ * 
+ * writeStart: Position where this backend started writing
+ * writeEnd: Position where this backend finished writing
+ * lockno: The write lock number this backend is holding
+ */
+static void
+UpdateSharedWritePtr(XLogRecPtr writeStart, XLogRecPtr writeEnd, int lockno)
+{
+	XLogRecPtr	currentPtr;
+	XLogRecPtr	expectedPtr;
+	
+	/* Mark what we're writing in our lock slot */
+	pg_atomic_write_u64(&WALWriteLocks[lockno].l.writingAt, writeEnd);
+	pg_write_barrier();
+	
+	/*
+	 * Wait for our turn in the chain. We can only update SharedWritePtr
+	 * if it currently points to our writeStart position (meaning all
+	 * previous writes have completed and updated it).
+	 */
+	for (;;)
+	{
+		currentPtr = pg_atomic_read_u64(&XLogCtl->SharedWritePtr);
+		
+		if (currentPtr >= writeEnd)
+		{
+			/* Someone else already advanced past our position */
+			break;
+		}
+		
+		if (currentPtr < writeStart)
+		{
+			/*
+			 * SharedWritePtr hasn't reached our write start yet.
+			 * Previous writers are still working. Wait a bit.
+			 */
+			pg_usleep(1L);
+			continue;
+		}
+		
+		/*
+		 * currentPtr is in [writeStart, writeEnd), which means it's our
+		 * turn. Try to advance it to writeEnd using CAS.
+		 */
+		expectedPtr = writeStart;
+		if (pg_atomic_compare_exchange_u64(&XLogCtl->SharedWritePtr,
+										   &expectedPtr,
+										   writeEnd))
+		{
+			/* Successfully updated, we're done */
+			break;
+		}
+		
+		/* CAS failed, retry the loop to recheck conditions */
+	}
+	
+	/* Clear our writingAt marker */
+	pg_atomic_write_u64(&WALWriteLocks[lockno].l.writingAt, InvalidXLogRecPtr);
 }
 
 /*
