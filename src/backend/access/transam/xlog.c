@@ -407,7 +407,7 @@ typedef struct
 {
 	LWLock		lock;
 	pg_atomic_uint64 writingAt;
-} WALWriteLock;
+} WALWriteLockSlot;
 
 /*
  * All the WAL write locks are allocated as an array in shared memory,
@@ -415,7 +415,7 @@ typedef struct
  */
 typedef union WALWriteLockPadded
 {
-	WALWriteLock l;
+	WALWriteLockSlot l;
 	char		pad[PG_CACHE_LINE_SIZE];
 } WALWriteLockPadded;
 
