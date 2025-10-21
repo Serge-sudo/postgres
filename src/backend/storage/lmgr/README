@@ -29,6 +29,12 @@ process has to wait for an LWLock, it blocks on a SysV semaphore so as
 to not consume CPU time.  Waiting processes will be granted the lock in
 arrival order.  There is no timeout.
 
+Note: If a backend crashes while holding an LWLock, the postmaster will
+detect the crash and initiate crash recovery, which terminates all other
+backends and reinitializes shared memory (including all LWLocks). This
+ensures the system will not hang indefinitely. See README.lwlock-crash-recovery
+for details.
+
 * Regular locks (a/k/a heavyweight locks).  The regular lock manager
 supports a variety of lock modes with table-driven semantics, and it has
 full deadlock detection and automatic release at transaction end.

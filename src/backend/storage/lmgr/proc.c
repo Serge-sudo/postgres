@@ -834,6 +834,15 @@ RemoveProcFromArray(int code, Datum arg)
 /*
  * ProcKill() -- Destroy the per-proc data structure for
  *		this process. Release any of its held LW locks.
+ *
+ * Note: This function runs during normal backend shutdown and releases
+ * all LWLocks held by the backend via LWLockReleaseAll(). However, if
+ * a backend crashes or is killed abnormally (e.g., SIGKILL), this function
+ * never runs. In that case, the postmaster's crash recovery mechanism will
+ * detect the failure, terminate all backends, and reinitialize shared memory,
+ * which effectively clears any locks held by the crashed process. See
+ * src/backend/postmaster/postmaster.c::HandleChildCrash() and
+ * src/backend/storage/lmgr/README.lwlock-crash-recovery for details.
  */
 static void
 ProcKill(int code, Datum arg)

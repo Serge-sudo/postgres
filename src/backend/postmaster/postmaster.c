@@ -2870,6 +2870,14 @@ CleanupBackend(int pid,
  *
  * The objectives here are to clean up our local state about the child
  * process, and to signal all other remaining children to quickdie.
+ *
+ * When a backend crashes, it may be holding lightweight locks (LWLocks) on
+ * shared memory data structures. Since the crashed process cannot execute
+ * its normal cleanup code (ProcKill() -> LWLockReleaseAll()), these locks
+ * remain held in shared memory. To prevent the system from hanging
+ * indefinitely, we terminate all other backends and later reinitialize
+ * all shared memory (including LWLocks) via CreateSharedMemoryAndSemaphores().
+ * See also: src/backend/storage/lmgr/README.lwlock-crash-recovery
  */
 static void
 HandleChildCrash(int pid, int exitstatus, const char *procname)

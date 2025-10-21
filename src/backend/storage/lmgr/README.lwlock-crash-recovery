@@ -1,0 +1,124 @@
+LWLock Behavior During Backend Crash
+====================================
+
+This document explains what happens when a PostgreSQL backend process holding
+a lightweight lock (LWLock) is killed or crashes abnormally, and why the system
+does not become permanently stuck.
+
+Background
+----------
+
+Lightweight locks (LWLocks) are PostgreSQL's primary mechanism for protecting
+shared memory data structures. They are faster than heavyweight locks but have
+simpler semantics - notably, they don't have built-in deadlock detection and
+don't automatically handle abnormal process termination like some OS-level
+synchronization primitives.
+
+The Question
+-----------
+
+When a backend holding an LWLock is killed (e.g., with SIGKILL) or crashes,
+it cannot execute its normal cleanup code (ProcKill() -> LWLockReleaseAll()).
+This raises the question: Will other backends waiting for that lock be stuck
+forever?
+
+The Answer
+----------
+
+No, the system will NOT be stuck forever. PostgreSQL has a robust crash
+recovery mechanism that handles this scenario.
+
+How Crash Recovery Works
+------------------------
+
+When a backend crashes or is killed abnormally:
+
+1. The postmaster detects the abnormal process exit (via SIGCHLD signal
+   handler or waitpid()).
+
+2. The postmaster enters crash recovery mode by calling HandleChildCrash(),
+   which:
+   a. Logs the crash event
+   b. Sets the FatalError flag
+   c. Sends SIGQUIT to ALL other backend processes, forcing them to exit
+      immediately without attempting to clean up locks or transactions
+
+3. The postmaster waits for all backends to exit (pmState == PM_NO_CHILDREN).
+
+4. Once all backends are terminated, the postmaster:
+   a. Calls shmem_exit(1) to detach from shared memory
+   b. Calls CreateSharedMemoryAndSemaphores() to completely reinitialize
+      the shared memory segment
+   c. Starts the startup process to perform crash recovery from WAL
+
+5. The reinitialization of shared memory includes resetting ALL lwlocks to
+   their initial (unlocked) state. Any locks that were held by crashed
+   processes are effectively cleared.
+
+6. After WAL replay, the system is back online with a clean slate.
+
+Why This Design?
+---------------
+
+This "restart everything" approach might seem drastic, but it's the safest
+option because:
+
+1. Crash Safety: If one backend crashed while holding an lwlock, it might
+   have been in the middle of modifying shared memory data structures. Simply
+   releasing the lock wouldn't be safe - the protected data might be in an
+   inconsistent state.
+
+2. Simplicity: Rather than trying to track which data structures might be
+   corrupted, PostgreSQL uses WAL (Write-Ahead Logging) to ensure all
+   persistent state can be recovered correctly after restarting.
+
+3. Reliability: This design ensures that after a crash, the system is in a
+   known-good state, not a potentially corrupted state with locks artificially
+   released.
+
+Code References
+--------------
+
+Key functions involved in this process:
+
+- src/backend/postmaster/postmaster.c:
+  * HandleChildCrash() - Detects backend crashes and initiates recovery
+  * CreateSharedMemoryAndSemaphores() - Reinitializes shared memory
+
+- src/backend/storage/lmgr/proc.c:
+  * ProcKill() - Normal cleanup that releases lwlocks (only runs on clean exit)
+
+- src/backend/storage/lmgr/lwlock.c:
+  * LWLockReleaseAll() - Releases all locks held by a process
+  * CreateLWLocks() - Initializes lwlocks during shared memory creation
+
+Configuration
+------------
+
+The behavior can be controlled by the restart_after_crash GUC parameter:
+- When ON (default): System automatically recovers after backend crashes
+- When OFF: System shuts down instead of recovering
+
+Alternative Behaviors
+--------------------
+
+Some might wonder why PostgreSQL doesn't use OS-level primitives that
+automatically clean up on process death (like POSIX robust mutexes). The
+reasons include:
+
+1. Portability: Not all platforms support robust mutexes
+2. Performance: LWLocks are highly optimized for the common (non-crash) case
+3. Safety: As explained above, simply releasing a lock after a crash isn't
+   safe - the protected data might be corrupted
+
+Summary
+-------
+
+When a backend holding an lwlock crashes:
+- Other backends are immediately terminated
+- All shared memory (including lwlocks) is reinitialized
+- The system recovers via WAL replay
+- The system is NOT stuck forever
+
+This design prioritizes correctness and crash safety over attempting to
+continue with potentially corrupted shared state.

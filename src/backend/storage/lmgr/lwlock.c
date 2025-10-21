@@ -1873,6 +1873,14 @@ LWLockReleaseClearVar(LWLock *lock, pg_atomic_uint64 *valptr, uint64 val)
  * unchanged by this operation.  This is necessary since InterruptHoldoffCount
  * has been set to an appropriate level earlier in error recovery. We could
  * decrement it below zero if we allow it to drop for each released lock!
+ *
+ * This function is also called by ProcKill() during normal backend termination.
+ * However, if a backend crashes or is killed (e.g., SIGKILL) before it can
+ * call this function, the locks remain held in shared memory. In this case,
+ * the postmaster detects the crash, terminates all other backends, and
+ * reinitializes the entire shared memory segment (including all LWLocks).
+ * This ensures that the system will not hang indefinitely waiting for locks
+ * held by dead processes. See README.lwlock-crash-recovery for details.
  */
 void
 LWLockReleaseAll(void)
