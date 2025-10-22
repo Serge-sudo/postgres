@@ -57,6 +57,7 @@
 #include "commands/dbcommands.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "port/atomics.h"
 #include "port/pg_lfind.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
@@ -98,6 +99,41 @@ typedef struct ProcArrayStruct
 	/* indexes into allProcs[], has PROCARRAY_MAXPROCS entries */
 	int			pgprocnos[FLEXIBLE_ARRAY_MEMBER];
 } ProcArrayStruct;
+
+/*
+ * Shared snapshot cache states for atomic state variable.
+ * The state variable uses atomic operations for lock-free snapshot sharing.
+ */
+#define SNAPSHOT_CACHE_INVALID	0	/* Snapshot is invalid/stale */
+#define SNAPSHOT_CACHE_VALID	1	/* Snapshot is valid and can be copied */
+#define SNAPSHOT_CACHE_LOCKED	2	/* Snapshot is being updated */
+
+/*
+ * Shared snapshot cache - lock-free snapshot sharing across backends.
+ * Uses a single snapshot slot with an atomic state variable.
+ */
+typedef struct SharedSnapshotCache
+{
+	/*
+	 * Atomic state variable indicating snapshot validity:
+	 * - SNAPSHOT_CACHE_INVALID (0): snapshot is invalid/stale
+	 * - SNAPSHOT_CACHE_VALID (1): snapshot is valid and can be copied
+	 * - SNAPSHOT_CACHE_LOCKED (2): snapshot is being updated
+	 */
+	pg_atomic_uint32 state;
+	
+	/* Snapshot data */
+	TransactionId xmin;			/* all XID < xmin are visible */
+	TransactionId xmax;			/* all XID >= xmax are invisible */
+	uint32		xcnt;			/* # of xact ids in xip[] */
+	int32		subxcnt;		/* # of xact ids in subxip[] */
+	bool		suboverflowed;	/* has the subxip array overflowed? */
+	bool		takenDuringRecovery; /* recovery-shaped snapshot? */
+	uint64		snapXactCompletionCount; /* xactCompletionCount when snapshot was taken */
+	
+	/* Variable-length arrays follow */
+	TransactionId xip[FLEXIBLE_ARRAY_MEMBER]; /* running xact IDs, followed by subxip[] */
+} SharedSnapshotCache;
 
 /*
  * State for the GlobalVisTest* family of functions. Those functions can
@@ -271,6 +307,11 @@ static ProcArrayStruct *procArray;
 static PGPROC *allProcs;
 
 /*
+ * Shared snapshot cache for reuse across backends
+ */
+static SharedSnapshotCache *sharedSnapshotCache;
+
+/*
  * Cache to reduce overhead of repeated calls to TransactionIdIsInProgress()
  */
 static TransactionId cachedXidIsNotInProgress = InvalidTransactionId;
@@ -408,6 +449,15 @@ ProcArrayShmemSize(void)
 						mul_size(sizeof(bool), TOTAL_MAX_CACHED_SUBXIDS));
 	}
 
+
+	/*
+	 * Add space for the shared snapshot cache - a single snapshot slot
+	 * with an atomic state variable for lock-free access.
+	 */
+	size = add_size(size, offsetof(SharedSnapshotCache, xip));
+	size = add_size(size,
+					mul_size(sizeof(TransactionId),
+							 PROCARRAY_MAXPROCS + TOTAL_MAX_CACHED_SUBXIDS));
 	return size;
 }
 
@@ -458,6 +508,31 @@ CreateSharedProcArray(void)
 			ShmemInitStruct("KnownAssignedXidsValid",
 							mul_size(sizeof(bool), TOTAL_MAX_CACHED_SUBXIDS),
 							&found);
+	}
+
+	/* Create or attach to the shared snapshot cache structure */
+	sharedSnapshotCache = (SharedSnapshotCache *)
+		ShmemInitStruct("Shared Snapshot Cache",
+						add_size(offsetof(SharedSnapshotCache, xip),
+								 mul_size(sizeof(TransactionId),
+										  PROCARRAY_MAXPROCS + TOTAL_MAX_CACHED_SUBXIDS)),
+						&found);
+
+	if (!found)
+	{
+		/*
+		 * We're the first - initialize the shared snapshot cache.
+		 * Start with invalid state.
+		 */
+		pg_atomic_init_u32(&sharedSnapshotCache->state, SNAPSHOT_CACHE_INVALID);
+
+		sharedSnapshotCache->xmin = InvalidTransactionId;
+		sharedSnapshotCache->xmax = InvalidTransactionId;
+		sharedSnapshotCache->xcnt = 0;
+		sharedSnapshotCache->subxcnt = 0;
+		sharedSnapshotCache->suboverflowed = false;
+		sharedSnapshotCache->takenDuringRecovery = false;
+		sharedSnapshotCache->snapXactCompletionCount = 0;
 	}
 }
 
@@ -683,6 +758,12 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
 		 */
 		if (LWLockConditionalAcquire(ProcArrayLock, LW_EXCLUSIVE))
 		{
+			/*
+			 * Invalidate the shared snapshot cache since a transaction with XID
+			 * is ending. This ensures GetSnapshotData will recompute.
+			 */
+			pg_atomic_write_u32(&sharedSnapshotCache->state, SNAPSHOT_CACHE_INVALID);
+
 			ProcArrayEndTransactionInternal(proc, latestXid);
 			LWLockRelease(ProcArrayLock);
 		}
@@ -845,6 +926,12 @@ ProcArrayGroupClearXid(PGPROC *proc, TransactionId latestXid)
 
 	/* We are the leader.  Acquire the lock on behalf of everyone. */
 	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+
+	/*
+	 * Invalidate the shared snapshot cache since transactions with XIDs
+	 * are ending. This ensures GetSnapshotData will recompute.
+	 */
+	pg_atomic_write_u32(&sharedSnapshotCache->state, SNAPSHOT_CACHE_INVALID);
 
 	/*
 	 * Now that we've got the lock, clear the list of processes waiting for
@@ -2083,48 +2170,96 @@ GetMaxSnapshotSubxidCount(void)
 }
 
 /*
- * Helper function for GetSnapshotData() that checks if the bulk of the
- * visibility information in the snapshot is still valid. If so, it updates
- * the fields that need to change and returns true. Otherwise it returns
- * false.
+ * Helper function for GetSnapshotData() that checks if a snapshot from
+ * shared memory can be reused. This uses a lock-free 3-state atomic variable:
+ * - SNAPSHOT_CACHE_INVALID (0): snapshot is invalid/stale
+ * - SNAPSHOT_CACHE_VALID (1): snapshot is valid and can be copied
+ * - SNAPSHOT_CACHE_LOCKED (2): snapshot is being updated
  *
- * This very likely can be evolved to not need ProcArrayLock held (at very
- * least in the case we already hold a snapshot), but that's for another day.
+ * Returns true if snapshot was successfully reused from shared memory.
  */
 static bool
 GetSnapshotDataReuse(Snapshot snapshot)
 {
 	uint64		curXactCompletionCount;
+	uint32		cache_state;
+	TransactionId *subxip_start;
 
 	Assert(LWLockHeldByMe(ProcArrayLock));
 
+	/*
+	 * First try to reuse the local snapshot if it's still valid.
+	 */
 	if (unlikely(snapshot->snapXactCompletionCount == 0))
-		return false;
+		goto check_shared;
 
 	curXactCompletionCount = TransamVariables->xactCompletionCount;
 	if (curXactCompletionCount != snapshot->snapXactCompletionCount)
+		goto check_shared;
+
+	/*
+	 * Local snapshot is still valid.
+	 */
+	if (!TransactionIdIsValid(MyProc->xmin))
+		MyProc->xmin = TransactionXmin = snapshot->xmin;
+
+	RecentXmin = snapshot->xmin;
+	Assert(TransactionIdPrecedesOrEquals(TransactionXmin, RecentXmin));
+
+	snapshot->curcid = GetCurrentCommandId(false);
+	snapshot->active_count = 0;
+	snapshot->regd_count = 0;
+	snapshot->copied = false;
+	snapshot->lsn = InvalidXLogRecPtr;
+	snapshot->whenTaken = 0;
+
+	return true;
+
+check_shared:
+	/*
+	 * Local snapshot is not valid, check if we can reuse a snapshot from
+	 * shared memory. Read the cache state atomically.
+	 */
+	cache_state = pg_atomic_read_u32(&sharedSnapshotCache->state);
+
+	/* If not valid (0) or locked (2), we can't reuse */
+	if (cache_state != SNAPSHOT_CACHE_VALID)
 		return false;
 
 	/*
-	 * If the current xactCompletionCount is still the same as it was at the
-	 * time the snapshot was built, we can be sure that rebuilding the
-	 * contents of the snapshot the hard way would result in the same snapshot
-	 * contents:
-	 *
-	 * As explained in transam/README, the set of xids considered running by
-	 * GetSnapshotData() cannot change while ProcArrayLock is held. Snapshot
-	 * contents only depend on transactions with xids and xactCompletionCount
-	 * is incremented whenever a transaction with an xid finishes (while
-	 * holding ProcArrayLock exclusively). Thus the xactCompletionCount check
-	 * ensures we would detect if the snapshot would have changed.
-	 *
-	 * As the snapshot contents are the same as it was before, it is safe to
-	 * re-enter the snapshot's xmin into the PGPROC array. None of the rows
-	 * visible under the snapshot could already have been removed (that'd
-	 * require the set of running transactions to change) and it fulfills the
-	 * requirement that concurrent GetSnapshotData() calls yield the same
-	 * xmin.
+	 * Check if the shared snapshot is still valid by comparing
+	 * xactCompletionCount. We read this without a lock, which is safe
+	 * because we're only checking for equality.
 	 */
+	curXactCompletionCount = TransamVariables->xactCompletionCount;
+	if (sharedSnapshotCache->snapXactCompletionCount != curXactCompletionCount)
+		return false;
+
+	/*
+	 * The shared snapshot is valid. Copy it to our local snapshot.
+	 * Since we're only reading and the snapshot won't change (verified by
+	 * xactCompletionCount), we don't need locks.
+	 */
+	snapshot->xmin = sharedSnapshotCache->xmin;
+	snapshot->xmax = sharedSnapshotCache->xmax;
+	snapshot->xcnt = sharedSnapshotCache->xcnt;
+	snapshot->subxcnt = sharedSnapshotCache->subxcnt;
+	snapshot->suboverflowed = sharedSnapshotCache->suboverflowed;
+	snapshot->takenDuringRecovery = sharedSnapshotCache->takenDuringRecovery;
+	snapshot->snapXactCompletionCount = sharedSnapshotCache->snapXactCompletionCount;
+
+	/* Copy xip array */
+	if (snapshot->xcnt > 0)
+		memcpy(snapshot->xip, sharedSnapshotCache->xip,
+			   snapshot->xcnt * sizeof(TransactionId));
+
+	/* Copy subxip array (stored after xip array in shared memory) */
+	subxip_start = &sharedSnapshotCache->xip[GetMaxSnapshotXidCount()];
+	if (snapshot->subxcnt > 0)
+		memcpy(snapshot->subxip, subxip_start,
+			   snapshot->subxcnt * sizeof(TransactionId));
+
+	/* Update MyProc->xmin if needed */
 	if (!TransactionIdIsValid(MyProc->xmin))
 		MyProc->xmin = TransactionXmin = snapshot->xmin;
 
@@ -2232,6 +2367,9 @@ GetSnapshotData(Snapshot snapshot)
 	 */
 	LWLockAcquire(ProcArrayLock, LW_SHARED);
 
+	/*
+	 * Try to reuse the local snapshot if it's still valid.
+	 */
 	if (GetSnapshotDataReuse(snapshot))
 	{
 		LWLockRelease(ProcArrayLock);
@@ -2414,6 +2552,77 @@ GetSnapshotData(Snapshot snapshot)
 
 	if (!TransactionIdIsValid(MyProc->xmin))
 		MyProc->xmin = TransactionXmin = xmin;
+
+	/*
+	 * Try to cache the snapshot in shared memory using CAS-based locking.
+	 * First check if cache is invalid (0), then try to lock it (CAS to 2).
+	 * If successful, copy our snapshot and mark valid (1).
+	 * If CAS fails, another backend is updating - just give up.
+	 */
+	{
+		uint32		cache_state;
+		uint32		expected_state;
+		TransactionId *subxip_dest;
+
+		/* Check if cache is currently invalid */
+		cache_state = pg_atomic_read_u32(&sharedSnapshotCache->state);
+
+		if (cache_state == SNAPSHOT_CACHE_INVALID)
+		{
+			/*
+			 * Try to lock the cache by doing CAS from INVALID (0) to LOCKED (2).
+			 * If this succeeds, we can proceed with copying our snapshot.
+			 */
+			expected_state = SNAPSHOT_CACHE_INVALID;
+			if (pg_atomic_compare_exchange_u32(&sharedSnapshotCache->state,
+											   &expected_state,
+											   SNAPSHOT_CACHE_LOCKED))
+			{
+				/*
+				 * We got the lock. Copy our snapshot to shared memory.
+				 */
+				sharedSnapshotCache->xmin = xmin;
+				sharedSnapshotCache->xmax = xmax;
+				sharedSnapshotCache->xcnt = count;
+				sharedSnapshotCache->subxcnt = subcount;
+				sharedSnapshotCache->suboverflowed = suboverflowed;
+				sharedSnapshotCache->takenDuringRecovery = snapshot->takenDuringRecovery;
+
+				/* Copy xip array to shared memory */
+				if (count > 0)
+					memcpy(sharedSnapshotCache->xip, snapshot->xip,
+						   count * sizeof(TransactionId));
+
+				/* Copy subxip array to shared memory (stored after xip array) */
+				if (subcount > 0)
+				{
+					subxip_dest = &sharedSnapshotCache->xip[GetMaxSnapshotXidCount()];
+					memcpy(subxip_dest, snapshot->subxip,
+						   subcount * sizeof(TransactionId));
+				}
+
+				/*
+				 * Memory barrier to ensure all writes are visible before
+				 * we set the completion count and mark as valid.
+				 */
+				pg_write_barrier();
+
+				/*
+				 * Set the completion count. This acts as a validity check
+				 * for readers.
+				 */
+				sharedSnapshotCache->snapXactCompletionCount = curXactCompletionCount;
+
+				/*
+				 * Mark the cache as valid. Other backends can now read it.
+				 */
+				pg_atomic_write_u32(&sharedSnapshotCache->state, SNAPSHOT_CACHE_VALID);
+			}
+			/* else: CAS failed, another backend is updating - just give up */
+		}
+		/* else: cache is valid or locked - don't try to update */
+	}
+
 
 	LWLockRelease(ProcArrayLock);
 
