@@ -109,6 +109,17 @@ typedef struct ProcArrayStruct
 #define SNAPSHOT_CACHE_LOCKED	2	/* Snapshot is being updated */
 
 /*
+ * Snapshot cache types - we maintain separate caches for different snapshot purposes.
+ * This prevents catalog snapshot reuse for transaction snapshots and vice versa.
+ */
+typedef enum SnapshotCacheType
+{
+	SNAPSHOT_CACHE_XACT = 0,		/* Transaction snapshot (CurrentSnapshot) */
+	SNAPSHOT_CACHE_CATALOG = 1,		/* Catalog snapshot (CatalogSnapshot) */
+	SNAPSHOT_CACHE_NUMTYPES			/* Must be last */
+} SnapshotCacheType;
+
+/*
  * Shared snapshot cache - lock-free snapshot sharing across backends.
  * Uses a single snapshot slot with an atomic state variable.
  */
@@ -121,6 +132,12 @@ typedef struct SharedSnapshotCache
 	 * - SNAPSHOT_CACHE_LOCKED (2): snapshot is being updated
 	 */
 	pg_atomic_uint32 state;
+	
+	/*
+	 * Recovery lock for handling dead processes that held the cache lock.
+	 * Only used in rare cases where a process dies while updating the cache.
+	 */
+	LWLock		recovery_lock;
 	
 	/* Snapshot data */
 	TransactionId xmin;			/* all XID < xmin are visible */
@@ -307,9 +324,10 @@ static ProcArrayStruct *procArray;
 static PGPROC *allProcs;
 
 /*
- * Shared snapshot cache for reuse across backends
+ * Shared snapshot cache for reuse across backends.
+ * We maintain separate caches for transaction and catalog snapshots.
  */
-static SharedSnapshotCache *sharedSnapshotCache;
+static SharedSnapshotCache *sharedSnapshotCaches[SNAPSHOT_CACHE_NUMTYPES];
 
 /*
  * Cache to reduce overhead of repeated calls to TransactionIdIsInProgress()
@@ -451,13 +469,17 @@ ProcArrayShmemSize(void)
 
 
 	/*
-	 * Add space for the shared snapshot cache - a single snapshot slot
-	 * with an atomic state variable for lock-free access.
+	 * Add space for the shared snapshot caches - separate caches for
+	 * transaction and catalog snapshots with atomic state variables for lock-free access.
 	 */
-	size = add_size(size, offsetof(SharedSnapshotCache, xip));
-	size = add_size(size,
-					mul_size(sizeof(TransactionId),
-							 PROCARRAY_MAXPROCS + TOTAL_MAX_CACHED_SUBXIDS));
+	for (int i = 0; i < SNAPSHOT_CACHE_NUMTYPES; i++)
+	{
+		size = add_size(size, offsetof(SharedSnapshotCache, xip));
+		size = add_size(size,
+						mul_size(sizeof(TransactionId),
+								 PROCARRAY_MAXPROCS + TOTAL_MAX_CACHED_SUBXIDS));
+	}
+
 	return size;
 }
 
@@ -510,29 +532,40 @@ CreateSharedProcArray(void)
 							&found);
 	}
 
-	/* Create or attach to the shared snapshot cache structure */
-	sharedSnapshotCache = (SharedSnapshotCache *)
-		ShmemInitStruct("Shared Snapshot Cache",
-						add_size(offsetof(SharedSnapshotCache, xip),
-								 mul_size(sizeof(TransactionId),
-										  PROCARRAY_MAXPROCS + TOTAL_MAX_CACHED_SUBXIDS)),
-						&found);
-
-	if (!found)
+	/* Create or attach to the shared snapshot cache structures */
+	for (int i = 0; i < SNAPSHOT_CACHE_NUMTYPES; i++)
 	{
-		/*
-		 * We're the first - initialize the shared snapshot cache.
-		 * Start with invalid state.
-		 */
-		pg_atomic_init_u32(&sharedSnapshotCache->state, SNAPSHOT_CACHE_INVALID);
+		const char *cache_names[] = {"Shared Snapshot Cache - Xact", "Shared Snapshot Cache - Catalog"};
+		Size		cache_size;
 
-		sharedSnapshotCache->xmin = InvalidTransactionId;
-		sharedSnapshotCache->xmax = InvalidTransactionId;
-		sharedSnapshotCache->xcnt = 0;
-		sharedSnapshotCache->subxcnt = 0;
-		sharedSnapshotCache->suboverflowed = false;
-		sharedSnapshotCache->takenDuringRecovery = false;
-		sharedSnapshotCache->snapXactCompletionCount = 0;
+		/*
+		 * Use the same size calculation as in ProcArrayShmemSize.
+		 * We can't call GetMaxSnapshotXidCount() here as it might not work during bootstrap.
+		 */
+		cache_size = add_size(offsetof(SharedSnapshotCache, xip),
+							  mul_size(sizeof(TransactionId),
+									   PROCARRAY_MAXPROCS + TOTAL_MAX_CACHED_SUBXIDS));
+
+		sharedSnapshotCaches[i] = (SharedSnapshotCache *)
+			ShmemInitStruct(cache_names[i], cache_size, &found);
+
+		if (!found)
+		{
+			/*
+			 * We're the first - initialize the shared snapshot cache.
+			 * Start with invalid state.
+			 */
+			pg_atomic_init_u32(&sharedSnapshotCaches[i]->state, SNAPSHOT_CACHE_INVALID);
+			LWLockInitialize(&sharedSnapshotCaches[i]->recovery_lock, LWTRANCHE_FIRST_USER_DEFINED + i);
+
+			sharedSnapshotCaches[i]->xmin = InvalidTransactionId;
+			sharedSnapshotCaches[i]->xmax = InvalidTransactionId;
+			sharedSnapshotCaches[i]->xcnt = 0;
+			sharedSnapshotCaches[i]->subxcnt = 0;
+			sharedSnapshotCaches[i]->suboverflowed = false;
+			sharedSnapshotCaches[i]->takenDuringRecovery = false;
+			sharedSnapshotCaches[i]->snapXactCompletionCount = 0;
+		}
 	}
 }
 
@@ -759,10 +792,11 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
 		if (LWLockConditionalAcquire(ProcArrayLock, LW_EXCLUSIVE))
 		{
 			/*
-			 * Invalidate the shared snapshot cache since a transaction with XID
+			 * Invalidate all shared snapshot caches since a transaction with XID
 			 * is ending. This ensures GetSnapshotData will recompute.
 			 */
-			pg_atomic_write_u32(&sharedSnapshotCache->state, SNAPSHOT_CACHE_INVALID);
+			for (int i = 0; i < SNAPSHOT_CACHE_NUMTYPES; i++)
+				pg_atomic_write_u32(&sharedSnapshotCaches[i]->state, SNAPSHOT_CACHE_INVALID);
 
 			ProcArrayEndTransactionInternal(proc, latestXid);
 			LWLockRelease(ProcArrayLock);
@@ -928,10 +962,11 @@ ProcArrayGroupClearXid(PGPROC *proc, TransactionId latestXid)
 	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
 
 	/*
-	 * Invalidate the shared snapshot cache since transactions with XIDs
+	 * Invalidate all shared snapshot caches since transactions with XIDs
 	 * are ending. This ensures GetSnapshotData will recompute.
 	 */
-	pg_atomic_write_u32(&sharedSnapshotCache->state, SNAPSHOT_CACHE_INVALID);
+	for (int i = 0; i < SNAPSHOT_CACHE_NUMTYPES; i++)
+		pg_atomic_write_u32(&sharedSnapshotCaches[i]->state, SNAPSHOT_CACHE_INVALID);
 
 	/*
 	 * Now that we've got the lock, clear the list of processes waiting for
@@ -2170,6 +2205,27 @@ GetMaxSnapshotSubxidCount(void)
 }
 
 /*
+ * Determine which snapshot cache type to use for a given snapshot.
+ * We maintain separate caches for transaction and catalog snapshots.
+ */
+static inline SnapshotCacheType
+GetSnapshotCacheType(Snapshot snapshot)
+{
+	/*
+	 * Check if this is the catalog snapshot by comparing addresses.
+	 * CatalogSnapshotData is a global variable defined in snapmgr.c.
+	 */
+	if (snapshot == &CatalogSnapshotData)
+		return SNAPSHOT_CACHE_CATALOG;
+	
+	/*
+	 * All other MVCC snapshots use the transaction cache.
+	 * This includes CurrentSnapshot, FirstXactSnapshot, SecondarySnapshot, etc.
+	 */
+	return SNAPSHOT_CACHE_XACT;
+}
+
+/*
  * Helper function for GetSnapshotData() that checks if a snapshot from
  * shared memory can be reused. This uses a lock-free 3-state atomic variable:
  * - SNAPSHOT_CACHE_INVALID (0): snapshot is invalid/stale
@@ -2184,6 +2240,7 @@ GetSnapshotDataReuse(Snapshot snapshot)
 	uint64		curXactCompletionCount;
 	uint32		cache_state;
 	TransactionId *subxip_start;
+	SharedSnapshotCache *cache;
 
 	Assert(LWLockHeldByMe(ProcArrayLock));
 
@@ -2226,7 +2283,10 @@ check_shared:
 	if (!FullTransactionIdIsValid(GlobalVisSharedRels.definitely_needed))
 		return false;
 
-	cache_state = pg_atomic_read_u32(&sharedSnapshotCache->state);
+	/* Determine which cache to use based on snapshot type */
+	cache = sharedSnapshotCaches[GetSnapshotCacheType(snapshot)];
+
+	cache_state = pg_atomic_read_u32(&cache->state);
 
 	/* If not valid (0) or locked (2), we can't reuse */
 	if (cache_state != SNAPSHOT_CACHE_VALID)
@@ -2238,7 +2298,7 @@ check_shared:
 	 * because we're only checking for equality.
 	 */
 	curXactCompletionCount = TransamVariables->xactCompletionCount;
-	if (sharedSnapshotCache->snapXactCompletionCount != curXactCompletionCount)
+	if (cache->snapXactCompletionCount != curXactCompletionCount)
 		return false;
 
 	/*
@@ -2250,13 +2310,13 @@ check_shared:
 	 */
 	{
 		TransactionId myxid = ProcGlobal->xids[MyProc->pgxactoff];
-		TransactionId shared_xmin = sharedSnapshotCache->xmin;
-		TransactionId shared_xmax = sharedSnapshotCache->xmax;
+		TransactionId shared_xmin = cache->xmin;
+		TransactionId shared_xmax = cache->xmax;
 		
 		snapshot->xmax = shared_xmax;
-		snapshot->suboverflowed = sharedSnapshotCache->suboverflowed;
-		snapshot->takenDuringRecovery = sharedSnapshotCache->takenDuringRecovery;
-		snapshot->snapXactCompletionCount = sharedSnapshotCache->snapXactCompletionCount;
+		snapshot->suboverflowed = cache->suboverflowed;
+		snapshot->takenDuringRecovery = cache->takenDuringRecovery;
+		snapshot->snapXactCompletionCount = cache->snapXactCompletionCount;
 
 		/*
 		 * Adjust xmin to account for our own XID.
@@ -2272,12 +2332,12 @@ check_shared:
 		 * should not see its own XID in the snapshot.
 		 */
 		{
-			uint32		src_xcnt = sharedSnapshotCache->xcnt;
+			uint32		src_xcnt = cache->xcnt;
 			uint32		dest_xcnt = 0;
 
 			for (uint32 i = 0; i < src_xcnt; i++)
 			{
-				TransactionId xid = sharedSnapshotCache->xip[i];
+				TransactionId xid = cache->xip[i];
 
 				/* Skip our own XID */
 				if (TransactionIdIsValid(myxid) && xid == myxid)
@@ -2290,9 +2350,9 @@ check_shared:
 
 		/* Copy subxip array, excluding our own subxids if present */
 		{
-			uint32		src_subxcnt = sharedSnapshotCache->subxcnt;
+			uint32		src_subxcnt = cache->subxcnt;
 			uint32		dest_subxcnt = 0;
-			TransactionId *src_subxip = &sharedSnapshotCache->xip[GetMaxSnapshotXidCount()];
+			TransactionId *src_subxip = &cache->xip[GetMaxSnapshotXidCount()];
 
 			for (uint32 i = 0; i < src_subxcnt; i++)
 			{
@@ -2611,12 +2671,16 @@ GetSnapshotData(Snapshot snapshot)
 	 * If CAS fails, another backend is updating - just give up.
 	 */
 	{
+		SharedSnapshotCache *cache;
 		uint32		cache_state;
 		uint32		expected_state;
 		TransactionId *subxip_dest;
 
+		/* Determine which cache to use based on snapshot type */
+		cache = sharedSnapshotCaches[GetSnapshotCacheType(snapshot)];
+
 		/* Check if cache is currently invalid */
-		cache_state = pg_atomic_read_u32(&sharedSnapshotCache->state);
+		cache_state = pg_atomic_read_u32(&cache->state);
 
 		if (cache_state == SNAPSHOT_CACHE_INVALID)
 		{
@@ -2625,29 +2689,29 @@ GetSnapshotData(Snapshot snapshot)
 			 * If this succeeds, we can proceed with copying our snapshot.
 			 */
 			expected_state = SNAPSHOT_CACHE_INVALID;
-			if (pg_atomic_compare_exchange_u32(&sharedSnapshotCache->state,
+			if (pg_atomic_compare_exchange_u32(&cache->state,
 											   &expected_state,
 											   SNAPSHOT_CACHE_LOCKED))
 			{
 				/*
 				 * We got the lock. Copy our snapshot to shared memory.
 				 */
-				sharedSnapshotCache->xmin = xmin;
-				sharedSnapshotCache->xmax = xmax;
-				sharedSnapshotCache->xcnt = count;
-				sharedSnapshotCache->subxcnt = subcount;
-				sharedSnapshotCache->suboverflowed = suboverflowed;
-				sharedSnapshotCache->takenDuringRecovery = snapshot->takenDuringRecovery;
+				cache->xmin = xmin;
+				cache->xmax = xmax;
+				cache->xcnt = count;
+				cache->subxcnt = subcount;
+				cache->suboverflowed = suboverflowed;
+				cache->takenDuringRecovery = snapshot->takenDuringRecovery;
 
 				/* Copy xip array to shared memory */
 				if (count > 0)
-					memcpy(sharedSnapshotCache->xip, snapshot->xip,
+					memcpy(cache->xip, snapshot->xip,
 						   count * sizeof(TransactionId));
 
 				/* Copy subxip array to shared memory (stored after xip array) */
 				if (subcount > 0)
 				{
-					subxip_dest = &sharedSnapshotCache->xip[GetMaxSnapshotXidCount()];
+					subxip_dest = &cache->xip[GetMaxSnapshotXidCount()];
 					memcpy(subxip_dest, snapshot->subxip,
 						   subcount * sizeof(TransactionId));
 				}
@@ -2662,12 +2726,12 @@ GetSnapshotData(Snapshot snapshot)
 				 * Set the completion count. This acts as a validity check
 				 * for readers.
 				 */
-				sharedSnapshotCache->snapXactCompletionCount = curXactCompletionCount;
+				cache->snapXactCompletionCount = curXactCompletionCount;
 
 				/*
 				 * Mark the cache as valid. Other backends can now read it.
 				 */
-				pg_atomic_write_u32(&sharedSnapshotCache->state, SNAPSHOT_CACHE_VALID);
+				pg_atomic_write_u32(&cache->state, SNAPSHOT_CACHE_VALID);
 			}
 			/* else: CAS failed, another backend is updating - just give up */
 		}
