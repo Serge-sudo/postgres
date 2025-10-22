@@ -70,26 +70,37 @@
 
 /*
  * Snapshot cache tagged pointer support.
- * Bit 0: invalid flag (1 = cache is being invalidated, cannot be used)
- * Bits 1-4: version tag (incremented on cache update)
- * Upper 59 bits: proc number of PGPROC containing cached snapshot
- * Value of 0 means no cached snapshot available
+ * 
+ * The atomic pointer layout is dynamically calculated based on the number of
+ * procs to maximize the version tag bits for better ABA prevention:
+ * 
+ * - Bits 0-1: Flag bits (bit 0 = invalid flag, bit 1 reserved for future use)
+ * - Next N bits: Proc number (N calculated to fit MaxBackends + NUM_AUXILIARY_PROCS + max_prepared_xacts)
+ * - Remaining bits: Version tag (maximized for ABA prevention)
+ * 
+ * Value of 0 means no cached snapshot available.
  */
-#define SNAPSHOT_CACHE_INVALID_BIT	0
-#define SNAPSHOT_CACHE_INVALID_FLAG	(UINT64CONST(1) << SNAPSHOT_CACHE_INVALID_BIT)
-#define SNAPSHOT_CACHE_TAG_BITS		4
-#define SNAPSHOT_CACHE_TAG_SHIFT	1
-#define SNAPSHOT_CACHE_TAG_MASK		(((UINT64CONST(1) << SNAPSHOT_CACHE_TAG_BITS) - 1) << SNAPSHOT_CACHE_TAG_SHIFT)
-#define SNAPSHOT_CACHE_PROCNO_SHIFT	(SNAPSHOT_CACHE_TAG_SHIFT + SNAPSHOT_CACHE_TAG_BITS)
+#define SNAPSHOT_CACHE_FLAG_BITS		2
+#define SNAPSHOT_CACHE_INVALID_BIT		0
+#define SNAPSHOT_CACHE_INVALID_FLAG		(UINT64CONST(1) << SNAPSHOT_CACHE_INVALID_BIT)
+
+/* These are initialized at runtime in CreateSharedProcArray() */
+static int	SnapshotCacheProcNoBits = 0;	/* Number of bits for proc number */
+static int	SnapshotCacheTagBits = 0;		/* Number of bits for version tag */
+static uint64 SnapshotCacheProcNoMask = 0;	/* Mask for extracting proc number */
+static uint64 SnapshotCacheTagMask = 0;		/* Mask for extracting version tag */
+static int	SnapshotCacheProcNoShift = SNAPSHOT_CACHE_FLAG_BITS;
+static int	SnapshotCacheTagShift = 0;		/* Calculated as FLAG_BITS + ProcNoBits */
 
 #define MakeSnapshotCachePtr(procno, tag) \
-	((((uint64)(procno)) << SNAPSHOT_CACHE_PROCNO_SHIFT) | (((tag) << SNAPSHOT_CACHE_TAG_SHIFT) & SNAPSHOT_CACHE_TAG_MASK))
+	((((uint64)(procno)) << SnapshotCacheProcNoShift) | \
+	 (((uint64)(tag)) << SnapshotCacheTagShift))
 
 #define GetSnapshotCacheProcNo(ptr) \
-	((int)((ptr) >> SNAPSHOT_CACHE_PROCNO_SHIFT))
+	((int)(((ptr) >> SnapshotCacheProcNoShift) & ((UINT64CONST(1) << SnapshotCacheProcNoBits) - 1)))
 
 #define GetSnapshotCacheTag(ptr) \
-	((int)(((ptr) & SNAPSHOT_CACHE_TAG_MASK) >> SNAPSHOT_CACHE_TAG_SHIFT))
+	((int)(((ptr) >> SnapshotCacheTagShift) & ((UINT64CONST(1) << SnapshotCacheTagBits) - 1)))
 
 #define IsSnapshotCacheInvalid(ptr) \
 	(((ptr) & SNAPSHOT_CACHE_INVALID_FLAG) != 0)
@@ -151,10 +162,11 @@ typedef struct ProcArrayStruct
 
 	/*
 	 * Cached snapshot support. This atomic uint64 stores a tagged pointer to
-	 * the cached snapshot. Lower 4 bits are used as a version tag, upper 60
-	 * bits store the proc number of the PGPROC containing the cached snapshot.
-	 * The tag is incremented when the cache is invalidated. A value of 0
-	 * indicates no cached snapshot is available.
+	 * the cached snapshot. The bit layout is dynamically calculated at startup:
+	 * - Bits 0-1: Flag bits (bit 0 = invalid flag, bit 1 reserved)
+	 * - Next N bits: Proc number (N calculated based on max possible procs)
+	 * - Remaining bits: Version tag (maximized for ABA prevention)
+	 * A value of 0 indicates no cached snapshot is available.
 	 */
 	pg_atomic_uint64 cachedSnapshotPtr;
 
@@ -489,6 +501,41 @@ CreateSharedProcArray(void)
 								 mul_size(sizeof(int),
 										  PROCARRAY_MAXPROCS)),
 						&found);
+
+	/*
+	 * Calculate the bit layout for the snapshot cache pointer.
+	 * We need enough bits to represent all possible proc numbers, and we want
+	 * to maximize the remaining bits for the version tag to improve ABA
+	 * prevention. This is done once at startup.
+	 */
+	if (SnapshotCacheProcNoBits == 0)
+	{
+		int			totalProcs = MaxBackends + NUM_AUXILIARY_PROCS + max_prepared_xacts;
+		int			bitsNeeded = 0;
+		int			val = totalProcs - 1;
+
+		/* Calculate bits needed to represent totalProcs values (0 to totalProcs-1) */
+		while (val > 0)
+		{
+			bitsNeeded++;
+			val >>= 1;
+		}
+
+		/* Ensure we have at least 1 bit */
+		if (bitsNeeded == 0)
+			bitsNeeded = 1;
+
+		SnapshotCacheProcNoBits = bitsNeeded;
+		SnapshotCacheTagShift = SNAPSHOT_CACHE_FLAG_BITS + SnapshotCacheProcNoBits;
+		SnapshotCacheTagBits = 64 - SnapshotCacheTagShift;
+
+		/* Precompute masks for efficiency */
+		SnapshotCacheProcNoMask = (UINT64CONST(1) << SnapshotCacheProcNoBits) - 1;
+		SnapshotCacheTagMask = (UINT64CONST(1) << SnapshotCacheTagBits) - 1;
+
+		elog(DEBUG1, "Snapshot cache pointer layout: %d flag bits, %d proc# bits, %d tag bits",
+			 SNAPSHOT_CACHE_FLAG_BITS, SnapshotCacheProcNoBits, SnapshotCacheTagBits);
+	}
 
 	if (!found)
 	{
@@ -2645,7 +2692,7 @@ GetSnapshotData(Snapshot snapshot)
 		oldCachePtr = pg_atomic_read_u64(&procArray->cachedSnapshotPtr);
 		tag = GetSnapshotCacheTag(oldCachePtr);
 		/* Increment tag, wrapping around if needed (but never using 0) */
-		tag = (tag + 1) & ((1 << SNAPSHOT_CACHE_TAG_BITS) - 1);
+		tag = (tag + 1) & ((1 << SnapshotCacheTagBits) - 1);
 		if (tag == 0)
 			tag = 1;
 		/* Create new pointer without invalid flag set */
