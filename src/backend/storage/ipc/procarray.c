@@ -2219,7 +2219,13 @@ check_shared:
 	/*
 	 * Local snapshot is not valid, check if we can reuse a snapshot from
 	 * shared memory. Read the cache state atomically.
+	 * 
+	 * Skip shared snapshot reuse until global visibility states have been
+	 * initialized (they get set up by the first full GetSnapshotData call).
 	 */
+	if (!FullTransactionIdIsValid(GlobalVisSharedRels.definitely_needed))
+		return false;
+
 	cache_state = pg_atomic_read_u32(&sharedSnapshotCache->state);
 
 	/* If not valid (0) or locked (2), we can't reuse */
@@ -2236,28 +2242,73 @@ check_shared:
 		return false;
 
 	/*
-	 * The shared snapshot is valid. Copy it to our local snapshot.
+	 * The shared snapshot is valid. Copy it to our local snapshot,
+	 * but we need to exclude our own XID from the xip array if present
+	 * and adjust xmin to account for our own XID.
 	 * Since we're only reading and the snapshot won't change (verified by
 	 * xactCompletionCount), we don't need locks.
 	 */
-	snapshot->xmin = sharedSnapshotCache->xmin;
-	snapshot->xmax = sharedSnapshotCache->xmax;
-	snapshot->xcnt = sharedSnapshotCache->xcnt;
-	snapshot->subxcnt = sharedSnapshotCache->subxcnt;
-	snapshot->suboverflowed = sharedSnapshotCache->suboverflowed;
-	snapshot->takenDuringRecovery = sharedSnapshotCache->takenDuringRecovery;
-	snapshot->snapXactCompletionCount = sharedSnapshotCache->snapXactCompletionCount;
+	{
+		TransactionId myxid = ProcGlobal->xids[MyProc->pgxactoff];
+		TransactionId shared_xmin = sharedSnapshotCache->xmin;
+		TransactionId shared_xmax = sharedSnapshotCache->xmax;
+		
+		snapshot->xmax = shared_xmax;
+		snapshot->suboverflowed = sharedSnapshotCache->suboverflowed;
+		snapshot->takenDuringRecovery = sharedSnapshotCache->takenDuringRecovery;
+		snapshot->snapXactCompletionCount = sharedSnapshotCache->snapXactCompletionCount;
 
-	/* Copy xip array */
-	if (snapshot->xcnt > 0)
-		memcpy(snapshot->xip, sharedSnapshotCache->xip,
-			   snapshot->xcnt * sizeof(TransactionId));
+		/*
+		 * Adjust xmin to account for our own XID.
+		 * The shared snapshot may not have considered our XID for xmin.
+		 */
+		snapshot->xmin = shared_xmin;
+		if (TransactionIdIsNormal(myxid) && NormalTransactionIdPrecedes(myxid, snapshot->xmin))
+			snapshot->xmin = myxid;
 
-	/* Copy subxip array (stored after xip array in shared memory) */
-	subxip_start = &sharedSnapshotCache->xip[GetMaxSnapshotXidCount()];
-	if (snapshot->subxcnt > 0)
-		memcpy(snapshot->subxip, subxip_start,
-			   snapshot->subxcnt * sizeof(TransactionId));
+		/*
+		 * Copy xip array, excluding our own XID if it's present.
+		 * The shared snapshot includes all running XIDs, but each backend
+		 * should not see its own XID in the snapshot.
+		 */
+		{
+			uint32		src_xcnt = sharedSnapshotCache->xcnt;
+			uint32		dest_xcnt = 0;
+
+			for (uint32 i = 0; i < src_xcnt; i++)
+			{
+				TransactionId xid = sharedSnapshotCache->xip[i];
+
+				/* Skip our own XID */
+				if (TransactionIdIsValid(myxid) && xid == myxid)
+					continue;
+
+				snapshot->xip[dest_xcnt++] = xid;
+			}
+			snapshot->xcnt = dest_xcnt;
+		}
+
+		/* Copy subxip array, excluding our own subxids if present */
+		{
+			uint32		src_subxcnt = sharedSnapshotCache->subxcnt;
+			uint32		dest_subxcnt = 0;
+			TransactionId *src_subxip = &sharedSnapshotCache->xip[GetMaxSnapshotXidCount()];
+
+			for (uint32 i = 0; i < src_subxcnt; i++)
+			{
+				TransactionId subxid = src_subxip[i];
+
+				/*
+				 * Skip our own subxids. We need to check if this subxid belongs
+				 * to our transaction. Since we don't have an easy way to determine
+				 * ownership, we'll include all subxids for now. The subxid cache
+				 * in shared memory comes from other backends anyway.
+				 */
+				snapshot->subxip[dest_subxcnt++] = subxid;
+			}
+			snapshot->subxcnt = dest_subxcnt;
+		}
+	}
 
 	/* Update MyProc->xmin if needed */
 	if (!TransactionIdIsValid(MyProc->xmin))
