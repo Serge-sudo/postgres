@@ -482,7 +482,7 @@ CreateSharedProcArray(void)
 		if (!found)
 		{	
 			/* Initialize the adaptive lock */
-			AdaptiveLWLockInitialize(AdaptiveProcArrayLock, LWTRANCHE_PROCARRAY_ADAPTIVE, -1, true);
+			AdaptiveLWLockInitialize(AdaptiveProcArrayLock, LWTRANCHE_PROCARRAY_ADAPTIVE, -1, false);
 		}
 	}
 
