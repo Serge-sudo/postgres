@@ -88,7 +88,10 @@
 	((int)((ptr) & SNAPSHOT_CACHE_TAG_MASK))
 
 #define InvalidateSnapshotCache() \
-	pg_atomic_write_u64(&procArray->cachedSnapshotPtr, 0)
+	do { \
+		if (procArray != NULL) \
+			pg_atomic_write_u64(&procArray->cachedSnapshotPtr, 0); \
+	} while (0)
 
 /* Our shared memory area */
 typedef struct ProcArrayStruct
@@ -2233,8 +2236,8 @@ TryUseCachedSnapshot(Snapshot snapshot)
 	xactCompletionCount = cachedProc->cachedSnapshotXactCompletionCount;
 
 	/* Get pointers to the xip and subxip arrays for this proc */
-	xip = &ProcGlobal->snapshotCacheXipArrays[cachedProcNo * maxProcs];
-	subxip = &ProcGlobal->snapshotCacheSubxipArrays[cachedProcNo * (PGPROC_MAX_CACHED_SUBXIDS + 1) * maxProcs];
+	xip = &ProcGlobal->snapshotCacheXipArrays[cachedProcNo * MaxBackends];
+	subxip = &ProcGlobal->snapshotCacheSubxipArrays[cachedProcNo * (PGPROC_MAX_CACHED_SUBXIDS + 1) * MaxBackends];
 
 	/* Copy xip and subxip arrays */
 	if (xcnt > 0)
@@ -2371,8 +2374,8 @@ GetSnapshotData(Snapshot snapshot)
 		return snapshot;
 	}
 
-	/* Try to use a cached snapshot from another backend */
-	if (TryUseCachedSnapshot(snapshot))
+	/* Try to use a cached snapshot from another backend (skip during bootstrap) */
+	if (!IsBootstrapProcessingMode() && TryUseCachedSnapshot(snapshot))
 	{
 		LWLockRelease(ProcArrayLock);
 		return snapshot;
@@ -2559,11 +2562,13 @@ GetSnapshotData(Snapshot snapshot)
 	 * Cache this snapshot in our private space so other backends can use it.
 	 * We copy the snapshot data to our PGPROC's cached snapshot storage and
 	 * update the atomic pointer to make it available to others.
+	 * Skip this during bootstrap or if the snapshot cache arrays aren't initialized.
 	 */
+	if (!IsBootstrapProcessingMode() && ProcGlobal->snapshotCacheXipArrays != NULL)
 	{
 		int			myProcNo = GetNumberFromPGProc(MyProc);
-		TransactionId *myXip = &ProcGlobal->snapshotCacheXipArrays[myProcNo * procArray->maxProcs];
-		TransactionId *mySubxip = &ProcGlobal->snapshotCacheSubxipArrays[myProcNo * (PGPROC_MAX_CACHED_SUBXIDS + 1) * procArray->maxProcs];
+		TransactionId *myXip = &ProcGlobal->snapshotCacheXipArrays[myProcNo * MaxBackends];
+		TransactionId *mySubxip = &ProcGlobal->snapshotCacheSubxipArrays[myProcNo * (PGPROC_MAX_CACHED_SUBXIDS + 1) * MaxBackends];
 		uint64		oldCachePtr;
 		uint64		newCachePtr;
 		int			tag;

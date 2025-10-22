@@ -113,15 +113,15 @@ ProcGlobalShmemSize(void)
 	size = add_size(size, mul_size(TotalProcs, sizeof(*ProcGlobal->statusFlags)));
 
 	/*
-	 * Snapshot cache arrays: each proc needs space for xip and subxip arrays.
-	 * We use maxProcs from procArray, but we need to compute it here too.
-	 * For safety, allocate based on MaxBackends.
+	 * Snapshot cache arrays: each proc needs space for ONE cached snapshot's
+	 * xip and subxip arrays. The xip array can have at most MaxBackends entries,
+	 * and the subxip array uses TOTAL_MAX_CACHED_SUBXIDS.
 	 */
 	size = add_size(size, mul_size(TotalProcs,
 								   mul_size(MaxBackends, sizeof(TransactionId))));	/* xip arrays */
 	size = add_size(size, mul_size(TotalProcs,
-								   mul_size(PGPROC_MAX_CACHED_SUBXIDS + 1,
-											mul_size(MaxBackends, sizeof(TransactionId)))));	/* subxip arrays */
+								   mul_size((PGPROC_MAX_CACHED_SUBXIDS + 1) * MaxBackends,
+											sizeof(TransactionId))));	/* subxip arrays */
 
 	return size;
 }
@@ -223,9 +223,9 @@ InitProcGlobal(void)
 	MemSet(ProcGlobal->statusFlags, 0, TotalProcs * sizeof(*ProcGlobal->statusFlags));
 
 	/*
-	 * Allocate snapshot cache arrays. Each proc gets space for cached
-	 * snapshot xip and subxip arrays. We use MaxBackends for the array sizes
-	 * as that's what GetMaxSnapshotXidCount() returns.
+	 * Allocate snapshot cache arrays. Each proc gets space for ONE cached
+	 * snapshot's xip and subxip arrays. The xip array size is MaxBackends,
+	 * and the subxip array size is (PGPROC_MAX_CACHED_SUBXIDS + 1) * MaxBackends.
 	 */
 	ProcGlobal->snapshotCacheXipArrays =
 		(TransactionId *) ShmemAlloc(TotalProcs * MaxBackends * sizeof(TransactionId));

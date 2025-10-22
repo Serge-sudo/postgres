@@ -310,8 +310,7 @@ struct PGPROC
 	/*
 	 * Cached snapshot storage. Each PGPROC has private space to store a
 	 * snapshot that can be shared with other processes. The actual snapshot
-	 * data (xip and subxip arrays) follow immediately after this struct
-	 * in the allocated memory.
+	 * data (xip and subxip arrays) are stored in separate arrays in ProcGlobal.
 	 */
 	TransactionId cachedSnapshotXmin;
 	TransactionId cachedSnapshotXmax;
