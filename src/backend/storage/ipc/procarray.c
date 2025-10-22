@@ -2421,6 +2421,7 @@ GetSnapshotData(Snapshot snapshot)
 	int			mypgxactoff;
 	TransactionId myxid;
 	uint64		curXactCompletionCount;
+	bool		usedCachedSnapshot = false;
 
 	TransactionId replication_slot_xmin = InvalidTransactionId;
 	TransactionId replication_slot_catalog_xmin = InvalidTransactionId;
@@ -2464,23 +2465,20 @@ GetSnapshotData(Snapshot snapshot)
 	 * ProcArrayLock. This is the main optimization - we can reuse a snapshot
 	 * built by another backend without any lock contention.
 	 * Skip this during bootstrap when structures aren't fully initialized.
+	 * 
+	 * Note: Even if we get a cached snapshot, we still need to acquire the
+	 * lock briefly to gather information for GlobalVis state updates.
 	 */
 	if (!IsBootstrapProcessingMode() && TryUseCachedSnapshot(snapshot))
-		return snapshot;
+		usedCachedSnapshot = true;
 
 	/*
-	 * Couldn't use cached snapshot. Acquire shared lock on ProcArrayLock
-	 * to build a new snapshot.
+	 * Acquire shared lock on ProcArrayLock to gather info for GlobalVis
+	 * updates (even if we used cached snapshot) or to build a new snapshot.
 	 */
 	LWLockAcquire(ProcArrayLock, LW_SHARED);
 
-	/* First try to reuse the existing snapshot if possible */
-	if (GetSnapshotDataReuse(snapshot))
-	{
-		LWLockRelease(ProcArrayLock);
-		return snapshot;
-	}
-
+	/* Gather info needed for GlobalVis updates regardless of snapshot source */
 	latest_completed = TransamVariables->latestCompletedXid;
 	mypgxactoff = MyProc->pgxactoff;
 	myxid = other_xids[mypgxactoff];
@@ -2488,6 +2486,25 @@ GetSnapshotData(Snapshot snapshot)
 
 	oldestxid = TransamVariables->oldestXid;
 	curXactCompletionCount = TransamVariables->xactCompletionCount;
+
+	/* If using cached snapshot, skip snapshot building but continue for GlobalVis updates */
+	if (usedCachedSnapshot)
+	{
+		/* Already have snapshot data, copy to local variables for GlobalVis computation and final assignment */
+		xmin = snapshot->xmin;
+		xmax = snapshot->xmax;
+		count = snapshot->xcnt;
+		subcount = snapshot->subxcnt;
+		suboverflowed = snapshot->suboverflowed;
+		goto skip_snapshot_build;
+	}
+
+	/* Try to reuse the existing snapshot if possible */
+	if (GetSnapshotDataReuse(snapshot))
+	{
+		LWLockRelease(ProcArrayLock);
+		return snapshot;
+	}
 
 	/* xmax is always latestCompletedXid + 1 */
 	xmax = XidFromFullTransactionId(latest_completed);
@@ -2647,6 +2664,7 @@ GetSnapshotData(Snapshot snapshot)
 	}
 
 
+skip_snapshot_build:
 	/*
 	 * Fetch into local variable while ProcArrayLock is held - the
 	 * LWLockRelease below is a barrier, ensuring this happens inside the
@@ -2662,9 +2680,11 @@ GetSnapshotData(Snapshot snapshot)
 	 * Cache this snapshot in our private space so other backends can use it.
 	 * We copy the snapshot data to our PGPROC's cached snapshot storage and
 	 * update the atomic pointer to make it available to others.
-	 * Skip this during bootstrap or if the snapshot cache arrays aren't initialized.
+	 * Skip this during bootstrap, if the snapshot cache arrays aren't initialized,
+	 * or if we're using a snapshot that was already cached.
 	 */
-	if (!IsBootstrapProcessingMode() && ProcGlobal->snapshotCacheXipArrays != NULL)
+	if (!usedCachedSnapshot && !IsBootstrapProcessingMode() && 
+		ProcGlobal->snapshotCacheXipArrays != NULL)
 	{
 		int			myProcNo = GetNumberFromPGProc(MyProc);
 		TransactionId *myXip = &ProcGlobal->snapshotCacheXipArrays[myProcNo * MaxBackends];
