@@ -57,6 +57,7 @@
 #include "commands/dbcommands.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "port/atomics.h"
 #include "port/pg_lfind.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
@@ -66,6 +67,28 @@
 #include "utils/snapmgr.h"
 
 #define UINT32_ACCESS_ONCE(var)		 ((uint32)(*((volatile uint32 *)&(var))))
+
+/*
+ * Snapshot cache tagged pointer support.
+ * Lower 4 bits: version tag (incremented on invalidation)
+ * Upper 60 bits: proc number of PGPROC containing cached snapshot
+ * Value of 0 means no cached snapshot available
+ */
+#define SNAPSHOT_CACHE_TAG_BITS		4
+#define SNAPSHOT_CACHE_TAG_MASK		((UINT64CONST(1) << SNAPSHOT_CACHE_TAG_BITS) - 1)
+#define SNAPSHOT_CACHE_PROCNO_SHIFT	SNAPSHOT_CACHE_TAG_BITS
+
+#define MakeSnapshotCachePtr(procno, tag) \
+	((((uint64)(procno)) << SNAPSHOT_CACHE_PROCNO_SHIFT) | ((tag) & SNAPSHOT_CACHE_TAG_MASK))
+
+#define GetSnapshotCacheProcNo(ptr) \
+	((int)((ptr) >> SNAPSHOT_CACHE_PROCNO_SHIFT))
+
+#define GetSnapshotCacheTag(ptr) \
+	((int)((ptr) & SNAPSHOT_CACHE_TAG_MASK))
+
+#define InvalidateSnapshotCache() \
+	pg_atomic_write_u64(&procArray->cachedSnapshotPtr, 0)
 
 /* Our shared memory area */
 typedef struct ProcArrayStruct
@@ -94,6 +117,15 @@ typedef struct ProcArrayStruct
 	TransactionId replication_slot_xmin;
 	/* oldest catalog xmin of any replication slot */
 	TransactionId replication_slot_catalog_xmin;
+
+	/*
+	 * Cached snapshot support. This atomic uint64 stores a tagged pointer to
+	 * the cached snapshot. Lower 4 bits are used as a version tag, upper 60
+	 * bits store the proc number of the PGPROC containing the cached snapshot.
+	 * The tag is incremented when the cache is invalidated. A value of 0
+	 * indicates no cached snapshot is available.
+	 */
+	pg_atomic_uint64 cachedSnapshotPtr;
 
 	/* indexes into allProcs[], has PROCARRAY_MAXPROCS entries */
 	int			pgprocnos[FLEXIBLE_ARRAY_MEMBER];
@@ -442,6 +474,9 @@ CreateSharedProcArray(void)
 		procArray->replication_slot_xmin = InvalidTransactionId;
 		procArray->replication_slot_catalog_xmin = InvalidTransactionId;
 		TransamVariables->xactCompletionCount = 1;
+
+		/* Initialize cached snapshot pointer (0 means no cached snapshot) */
+		pg_atomic_init_u64(&procArray->cachedSnapshotPtr, 0);
 	}
 
 	allProcs = ProcGlobal->allProcs;
@@ -739,6 +774,12 @@ ProcArrayEndTransactionInternal(PGPROC *proc, TransactionId latestXid)
 	Assert(LWLockHeldByMeInMode(ProcArrayLock, LW_EXCLUSIVE));
 	Assert(TransactionIdIsValid(ProcGlobal->xids[pgxactoff]));
 	Assert(ProcGlobal->xids[pgxactoff] == proc->xid);
+
+	/*
+	 * Invalidate the cached snapshot since we're modifying the transaction
+	 * state. This is done by setting the cached snapshot pointer to 0.
+	 */
+	InvalidateSnapshotCache();
 
 	ProcGlobal->xids[pgxactoff] = InvalidTransactionId;
 	proc->xid = InvalidTransactionId;
@@ -2142,6 +2183,97 @@ GetSnapshotDataReuse(Snapshot snapshot)
 }
 
 /*
+ * TryUseCachedSnapshot -- try to use a cached snapshot from shared memory
+ *
+ * This function attempts to copy a snapshot that was previously cached by
+ * another backend. It reads the cached snapshot pointer atomically, copies
+ * the snapshot data, and then rechecks the pointer to ensure the snapshot
+ * is still valid. Returns true if a valid cached snapshot was used.
+ *
+ * Must be called with ProcArrayLock held in shared mode.
+ */
+static bool
+TryUseCachedSnapshot(Snapshot snapshot)
+{
+	uint64		cachePtr;
+	uint64		cachePtr2;
+	int			cachedProcNo;
+	PGPROC	   *cachedProc;
+	TransactionId xmin;
+	TransactionId xmax;
+	uint32		xcnt;
+	int32		subxcnt;
+	bool		suboverflowed;
+	bool		takenDuringRecovery;
+	uint64		xactCompletionCount;
+	TransactionId *xip;
+	TransactionId *subxip;
+	int			maxProcs = procArray->maxProcs;
+
+	Assert(LWLockHeldByMe(ProcArrayLock));
+
+	/* Read the cached snapshot pointer */
+	cachePtr = pg_atomic_read_u64(&procArray->cachedSnapshotPtr);
+
+	/* If no cached snapshot available, return false */
+	if (cachePtr == 0)
+		return false;
+
+	/* Extract proc number from the tagged pointer */
+	cachedProcNo = GetSnapshotCacheProcNo(cachePtr);
+	cachedProc = GetPGProcByNumber(cachedProcNo);
+
+	/* Copy snapshot metadata from the cached PGPROC */
+	xmin = cachedProc->cachedSnapshotXmin;
+	xmax = cachedProc->cachedSnapshotXmax;
+	xcnt = cachedProc->cachedSnapshotXcnt;
+	subxcnt = cachedProc->cachedSnapshotSubxcnt;
+	suboverflowed = cachedProc->cachedSnapshotSuboverflowed;
+	takenDuringRecovery = cachedProc->cachedSnapshotTakenDuringRecovery;
+	xactCompletionCount = cachedProc->cachedSnapshotXactCompletionCount;
+
+	/* Get pointers to the xip and subxip arrays for this proc */
+	xip = &ProcGlobal->snapshotCacheXipArrays[cachedProcNo * maxProcs];
+	subxip = &ProcGlobal->snapshotCacheSubxipArrays[cachedProcNo * (PGPROC_MAX_CACHED_SUBXIDS + 1) * maxProcs];
+
+	/* Copy xip and subxip arrays */
+	if (xcnt > 0)
+		memcpy(snapshot->xip, xip, xcnt * sizeof(TransactionId));
+	if (subxcnt > 0)
+		memcpy(snapshot->subxip, subxip, subxcnt * sizeof(TransactionId));
+
+	/* Recheck the cached snapshot pointer to ensure it hasn't changed */
+	cachePtr2 = pg_atomic_read_u64(&procArray->cachedSnapshotPtr);
+	if (cachePtr != cachePtr2)
+		return false;		/* Cache was invalidated, can't use it */
+
+	/* Apply the cached snapshot data */
+	snapshot->xmin = xmin;
+	snapshot->xmax = xmax;
+	snapshot->xcnt = xcnt;
+	snapshot->subxcnt = subxcnt;
+	snapshot->suboverflowed = suboverflowed;
+	snapshot->takenDuringRecovery = takenDuringRecovery;
+	snapshot->snapXactCompletionCount = xactCompletionCount;
+
+	/* Update backend-local state */
+	if (!TransactionIdIsValid(MyProc->xmin))
+		MyProc->xmin = TransactionXmin = snapshot->xmin;
+
+	RecentXmin = snapshot->xmin;
+	Assert(TransactionIdPrecedesOrEquals(TransactionXmin, RecentXmin));
+
+	snapshot->curcid = GetCurrentCommandId(false);
+	snapshot->active_count = 0;
+	snapshot->regd_count = 0;
+	snapshot->copied = false;
+	snapshot->lsn = InvalidXLogRecPtr;
+	snapshot->whenTaken = 0;
+
+	return true;
+}
+
+/*
  * GetSnapshotData -- returns information about running transactions.
  *
  * The returned snapshot includes xmin (lowest still-running xact ID),
@@ -2232,7 +2364,15 @@ GetSnapshotData(Snapshot snapshot)
 	 */
 	LWLockAcquire(ProcArrayLock, LW_SHARED);
 
+	/* First try to reuse the existing snapshot if possible */
 	if (GetSnapshotDataReuse(snapshot))
+	{
+		LWLockRelease(ProcArrayLock);
+		return snapshot;
+	}
+
+	/* Try to use a cached snapshot from another backend */
+	if (TryUseCachedSnapshot(snapshot))
 	{
 		LWLockRelease(ProcArrayLock);
 		return snapshot;
@@ -2414,6 +2554,45 @@ GetSnapshotData(Snapshot snapshot)
 
 	if (!TransactionIdIsValid(MyProc->xmin))
 		MyProc->xmin = TransactionXmin = xmin;
+
+	/*
+	 * Cache this snapshot in our private space so other backends can use it.
+	 * We copy the snapshot data to our PGPROC's cached snapshot storage and
+	 * update the atomic pointer to make it available to others.
+	 */
+	{
+		int			myProcNo = GetNumberFromPGProc(MyProc);
+		TransactionId *myXip = &ProcGlobal->snapshotCacheXipArrays[myProcNo * procArray->maxProcs];
+		TransactionId *mySubxip = &ProcGlobal->snapshotCacheSubxipArrays[myProcNo * (PGPROC_MAX_CACHED_SUBXIDS + 1) * procArray->maxProcs];
+		uint64		oldCachePtr;
+		uint64		newCachePtr;
+		int			tag;
+
+		/* Copy snapshot data to our cached storage */
+		MyProc->cachedSnapshotXmin = xmin;
+		MyProc->cachedSnapshotXmax = xmax;
+		MyProc->cachedSnapshotXcnt = count;
+		MyProc->cachedSnapshotSubxcnt = subcount;
+		MyProc->cachedSnapshotSuboverflowed = suboverflowed;
+		MyProc->cachedSnapshotTakenDuringRecovery = snapshot->takenDuringRecovery;
+		MyProc->cachedSnapshotXactCompletionCount = curXactCompletionCount;
+
+		/* Copy xip and subxip arrays */
+		if (count > 0)
+			memcpy(myXip, snapshot->xip, count * sizeof(TransactionId));
+		if (subcount > 0)
+			memcpy(mySubxip, snapshot->subxip, subcount * sizeof(TransactionId));
+
+		/* Update the atomic pointer to point to our cached snapshot */
+		oldCachePtr = pg_atomic_read_u64(&procArray->cachedSnapshotPtr);
+		tag = GetSnapshotCacheTag(oldCachePtr);
+		/* Increment tag, wrapping around if needed (but never using 0) */
+		tag = (tag + 1) & SNAPSHOT_CACHE_TAG_MASK;
+		if (tag == 0)
+			tag = 1;
+		newCachePtr = MakeSnapshotCachePtr(myProcNo, tag);
+		pg_atomic_write_u64(&procArray->cachedSnapshotPtr, newCachePtr);
+	}
 
 	LWLockRelease(ProcArrayLock);
 

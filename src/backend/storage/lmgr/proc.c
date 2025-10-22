@@ -112,6 +112,17 @@ ProcGlobalShmemSize(void)
 	size = add_size(size, mul_size(TotalProcs, sizeof(*ProcGlobal->subxidStates)));
 	size = add_size(size, mul_size(TotalProcs, sizeof(*ProcGlobal->statusFlags)));
 
+	/*
+	 * Snapshot cache arrays: each proc needs space for xip and subxip arrays.
+	 * We use maxProcs from procArray, but we need to compute it here too.
+	 * For safety, allocate based on MaxBackends.
+	 */
+	size = add_size(size, mul_size(TotalProcs,
+								   mul_size(MaxBackends, sizeof(TransactionId))));	/* xip arrays */
+	size = add_size(size, mul_size(TotalProcs,
+								   mul_size(PGPROC_MAX_CACHED_SUBXIDS + 1,
+											mul_size(MaxBackends, sizeof(TransactionId)))));	/* subxip arrays */
+
 	return size;
 }
 
@@ -211,6 +222,22 @@ InitProcGlobal(void)
 	ProcGlobal->statusFlags = (uint8 *) ShmemAlloc(TotalProcs * sizeof(*ProcGlobal->statusFlags));
 	MemSet(ProcGlobal->statusFlags, 0, TotalProcs * sizeof(*ProcGlobal->statusFlags));
 
+	/*
+	 * Allocate snapshot cache arrays. Each proc gets space for cached
+	 * snapshot xip and subxip arrays. We use MaxBackends for the array sizes
+	 * as that's what GetMaxSnapshotXidCount() returns.
+	 */
+	ProcGlobal->snapshotCacheXipArrays =
+		(TransactionId *) ShmemAlloc(TotalProcs * MaxBackends * sizeof(TransactionId));
+	MemSet(ProcGlobal->snapshotCacheXipArrays, 0,
+		   TotalProcs * MaxBackends * sizeof(TransactionId));
+	ProcGlobal->snapshotCacheSubxipArrays =
+		(TransactionId *) ShmemAlloc(TotalProcs * (PGPROC_MAX_CACHED_SUBXIDS + 1) *
+									 MaxBackends * sizeof(TransactionId));
+	MemSet(ProcGlobal->snapshotCacheSubxipArrays, 0,
+		   TotalProcs * (PGPROC_MAX_CACHED_SUBXIDS + 1) * MaxBackends *
+		   sizeof(TransactionId));
+
 	for (i = 0; i < TotalProcs; i++)
 	{
 		PGPROC	   *proc = &procs[i];
@@ -228,6 +255,15 @@ InitProcGlobal(void)
 			InitSharedLatch(&(proc->procLatch));
 			LWLockInitialize(&(proc->fpInfoLock), LWTRANCHE_LOCK_FASTPATH);
 		}
+
+		/* Initialize cached snapshot fields */
+		proc->cachedSnapshotXmin = InvalidTransactionId;
+		proc->cachedSnapshotXmax = InvalidTransactionId;
+		proc->cachedSnapshotXcnt = 0;
+		proc->cachedSnapshotSubxcnt = 0;
+		proc->cachedSnapshotSuboverflowed = false;
+		proc->cachedSnapshotTakenDuringRecovery = false;
+		proc->cachedSnapshotXactCompletionCount = 0;
 
 		/*
 		 * Newly created PGPROCs for normal backends, autovacuum workers,

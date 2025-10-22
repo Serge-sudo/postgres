@@ -306,6 +306,20 @@ struct PGPROC
 	PGPROC	   *lockGroupLeader;	/* lock group leader, if I'm a member */
 	dlist_head	lockGroupMembers;	/* list of members, if I'm a leader */
 	dlist_node	lockGroupLink;	/* my member link, if I'm a member */
+
+	/*
+	 * Cached snapshot storage. Each PGPROC has private space to store a
+	 * snapshot that can be shared with other processes. The actual snapshot
+	 * data (xip and subxip arrays) follow immediately after this struct
+	 * in the allocated memory.
+	 */
+	TransactionId cachedSnapshotXmin;
+	TransactionId cachedSnapshotXmax;
+	uint32		cachedSnapshotXcnt;
+	int32		cachedSnapshotSubxcnt;
+	bool		cachedSnapshotSuboverflowed;
+	bool		cachedSnapshotTakenDuringRecovery;
+	uint64		cachedSnapshotXactCompletionCount;
 };
 
 /* NOTE: "typedef struct PGPROC PGPROC" appears in storage/lock.h. */
@@ -409,6 +423,13 @@ typedef struct PROC_HDR
 	int			spins_per_delay;
 	/* Buffer id of the buffer that Startup process waits for pin on, or -1 */
 	int			startupBufferPinWaitBufId;
+
+	/*
+	 * Snapshot cache arrays storage. Each PGPROC has space allocated after
+	 * its struct for cached snapshot xip and subxip arrays.
+	 */
+	TransactionId *snapshotCacheXipArrays;	/* array of xip arrays */
+	TransactionId *snapshotCacheSubxipArrays;	/* array of subxip arrays */
 } PROC_HDR;
 
 extern PGDLLIMPORT PROC_HDR *ProcGlobal;
