@@ -70,23 +70,51 @@
 
 /*
  * Snapshot cache tagged pointer support.
- * Lower 4 bits: version tag (incremented on invalidation)
- * Upper 60 bits: proc number of PGPROC containing cached snapshot
+ * Bit 0: invalid flag (1 = cache is being invalidated, cannot be used)
+ * Bits 1-4: version tag (incremented on cache update)
+ * Upper 59 bits: proc number of PGPROC containing cached snapshot
  * Value of 0 means no cached snapshot available
  */
+#define SNAPSHOT_CACHE_INVALID_BIT	0
+#define SNAPSHOT_CACHE_INVALID_FLAG	(UINT64CONST(1) << SNAPSHOT_CACHE_INVALID_BIT)
 #define SNAPSHOT_CACHE_TAG_BITS		4
-#define SNAPSHOT_CACHE_TAG_MASK		((UINT64CONST(1) << SNAPSHOT_CACHE_TAG_BITS) - 1)
-#define SNAPSHOT_CACHE_PROCNO_SHIFT	SNAPSHOT_CACHE_TAG_BITS
+#define SNAPSHOT_CACHE_TAG_SHIFT	1
+#define SNAPSHOT_CACHE_TAG_MASK		(((UINT64CONST(1) << SNAPSHOT_CACHE_TAG_BITS) - 1) << SNAPSHOT_CACHE_TAG_SHIFT)
+#define SNAPSHOT_CACHE_PROCNO_SHIFT	(SNAPSHOT_CACHE_TAG_SHIFT + SNAPSHOT_CACHE_TAG_BITS)
 
 #define MakeSnapshotCachePtr(procno, tag) \
-	((((uint64)(procno)) << SNAPSHOT_CACHE_PROCNO_SHIFT) | ((tag) & SNAPSHOT_CACHE_TAG_MASK))
+	((((uint64)(procno)) << SNAPSHOT_CACHE_PROCNO_SHIFT) | (((tag) << SNAPSHOT_CACHE_TAG_SHIFT) & SNAPSHOT_CACHE_TAG_MASK))
 
 #define GetSnapshotCacheProcNo(ptr) \
 	((int)((ptr) >> SNAPSHOT_CACHE_PROCNO_SHIFT))
 
 #define GetSnapshotCacheTag(ptr) \
-	((int)((ptr) & SNAPSHOT_CACHE_TAG_MASK))
+	((int)(((ptr) & SNAPSHOT_CACHE_TAG_MASK) >> SNAPSHOT_CACHE_TAG_SHIFT))
 
+#define IsSnapshotCacheInvalid(ptr) \
+	(((ptr) & SNAPSHOT_CACHE_INVALID_FLAG) != 0)
+
+/*
+ * Mark snapshot cache as invalid before acquiring exclusive ProcArrayLock.
+ * This prevents other backends from using or updating the cache while we're
+ * modifying transaction state.
+ */
+#define MarkSnapshotCacheInvalid() \
+	do { \
+		if (procArray != NULL) \
+		{ \
+			uint64 oldPtr, newPtr; \
+			do { \
+				oldPtr = pg_atomic_read_u64(&procArray->cachedSnapshotPtr); \
+				newPtr = oldPtr | SNAPSHOT_CACHE_INVALID_FLAG; \
+			} while (!pg_atomic_compare_exchange_u64(&procArray->cachedSnapshotPtr, &oldPtr, newPtr)); \
+		} \
+	} while (0)
+
+/*
+ * Invalidate snapshot cache after acquiring exclusive ProcArrayLock.
+ * This clears the cache completely.
+ */
 #define InvalidateSnapshotCache() \
 	do { \
 		if (procArray != NULL) \
@@ -713,6 +741,14 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
 		 * src/backend/access/transam/README.
 		 */
 		Assert(TransactionIdIsValid(proc->xid));
+
+		/*
+		 * Mark the snapshot cache as invalid BEFORE acquiring ProcArrayLock.
+		 * This prevents other backends from using or updating the cache while
+		 * we're about to modify transaction state. The invalid flag will be
+		 * cleared when we set the cache to 0 under the exclusive lock.
+		 */
+		MarkSnapshotCacheInvalid();
 
 		/*
 		 * If we can immediately acquire ProcArrayLock, we clear our own XID
@@ -2189,11 +2225,12 @@ GetSnapshotDataReuse(Snapshot snapshot)
  * TryUseCachedSnapshot -- try to use a cached snapshot from shared memory
  *
  * This function attempts to copy a snapshot that was previously cached by
- * another backend. It reads the cached snapshot pointer atomically, copies
- * the snapshot data, and then rechecks the pointer to ensure the snapshot
- * is still valid. Returns true if a valid cached snapshot was used.
+ * another backend. It reads the cached snapshot pointer atomically WITHOUT
+ * holding ProcArrayLock, copies the snapshot data, and then rechecks the
+ * pointer to ensure the snapshot is still valid and hasn't been marked invalid.
+ * Returns true if a valid cached snapshot was used.
  *
- * Must be called with ProcArrayLock held in shared mode.
+ * Must be called WITHOUT holding ProcArrayLock.
  */
 static bool
 TryUseCachedSnapshot(Snapshot snapshot)
@@ -2211,15 +2248,12 @@ TryUseCachedSnapshot(Snapshot snapshot)
 	uint64		xactCompletionCount;
 	TransactionId *xip;
 	TransactionId *subxip;
-	int			maxProcs = procArray->maxProcs;
 
-	Assert(LWLockHeldByMe(ProcArrayLock));
-
-	/* Read the cached snapshot pointer */
+	/* Read the cached snapshot pointer atomically */
 	cachePtr = pg_atomic_read_u64(&procArray->cachedSnapshotPtr);
 
-	/* If no cached snapshot available, return false */
-	if (cachePtr == 0)
+	/* If no cached snapshot available or cache is being invalidated, return false */
+	if (cachePtr == 0 || IsSnapshotCacheInvalid(cachePtr))
 		return false;
 
 	/* Extract proc number from the tagged pointer */
@@ -2245,10 +2279,10 @@ TryUseCachedSnapshot(Snapshot snapshot)
 	if (subxcnt > 0)
 		memcpy(snapshot->subxip, subxip, subxcnt * sizeof(TransactionId));
 
-	/* Recheck the cached snapshot pointer to ensure it hasn't changed */
+	/* Recheck the cached snapshot pointer to ensure it hasn't changed or been invalidated */
 	cachePtr2 = pg_atomic_read_u64(&procArray->cachedSnapshotPtr);
-	if (cachePtr != cachePtr2)
-		return false;		/* Cache was invalidated, can't use it */
+	if (cachePtr != cachePtr2 || IsSnapshotCacheInvalid(cachePtr2))
+		return false;		/* Cache was invalidated or changed, can't use it */
 
 	/* Apply the cached snapshot data */
 	snapshot->xmin = xmin;
@@ -2259,12 +2293,29 @@ TryUseCachedSnapshot(Snapshot snapshot)
 	snapshot->takenDuringRecovery = takenDuringRecovery;
 	snapshot->snapXactCompletionCount = xactCompletionCount;
 
+	/*
+	 * Now acquire ProcArrayLock to safely update backend-local state.
+	 * This is brief and doesn't defeat the optimization since we've already
+	 * done the expensive work of copying the snapshot data.
+	 */
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+
+	/* Final check - ensure cache is still valid after acquiring lock */
+	cachePtr2 = pg_atomic_read_u64(&procArray->cachedSnapshotPtr);
+	if (cachePtr != cachePtr2 || IsSnapshotCacheInvalid(cachePtr2))
+	{
+		LWLockRelease(ProcArrayLock);
+		return false;		/* Cache was invalidated, can't use it */
+	}
+
 	/* Update backend-local state */
 	if (!TransactionIdIsValid(MyProc->xmin))
 		MyProc->xmin = TransactionXmin = snapshot->xmin;
 
 	RecentXmin = snapshot->xmin;
 	Assert(TransactionIdPrecedesOrEquals(TransactionXmin, RecentXmin));
+
+	LWLockRelease(ProcArrayLock);
 
 	snapshot->curcid = GetCurrentCommandId(false);
 	snapshot->active_count = 0;
@@ -2362,20 +2413,22 @@ GetSnapshotData(Snapshot snapshot)
 	}
 
 	/*
-	 * It is sufficient to get shared lock on ProcArrayLock, even if we are
-	 * going to set MyProc->xmin.
+	 * Try to use a cached snapshot from another backend WITHOUT holding
+	 * ProcArrayLock. This is the main optimization - we can reuse a snapshot
+	 * built by another backend without any lock contention.
+	 * Skip this during bootstrap when structures aren't fully initialized.
+	 */
+	if (!IsBootstrapProcessingMode() && TryUseCachedSnapshot(snapshot))
+		return snapshot;
+
+	/*
+	 * Couldn't use cached snapshot. Acquire shared lock on ProcArrayLock
+	 * to build a new snapshot.
 	 */
 	LWLockAcquire(ProcArrayLock, LW_SHARED);
 
 	/* First try to reuse the existing snapshot if possible */
 	if (GetSnapshotDataReuse(snapshot))
-	{
-		LWLockRelease(ProcArrayLock);
-		return snapshot;
-	}
-
-	/* Try to use a cached snapshot from another backend (skip during bootstrap) */
-	if (!IsBootstrapProcessingMode() && TryUseCachedSnapshot(snapshot))
 	{
 		LWLockRelease(ProcArrayLock);
 		return snapshot;
@@ -2592,9 +2645,10 @@ GetSnapshotData(Snapshot snapshot)
 		oldCachePtr = pg_atomic_read_u64(&procArray->cachedSnapshotPtr);
 		tag = GetSnapshotCacheTag(oldCachePtr);
 		/* Increment tag, wrapping around if needed (but never using 0) */
-		tag = (tag + 1) & SNAPSHOT_CACHE_TAG_MASK;
+		tag = (tag + 1) & ((1 << SNAPSHOT_CACHE_TAG_BITS) - 1);
 		if (tag == 0)
 			tag = 1;
+		/* Create new pointer without invalid flag set */
 		newCachePtr = MakeSnapshotCachePtr(myProcNo, tag);
 		pg_atomic_write_u64(&procArray->cachedSnapshotPtr, newCachePtr);
 	}
