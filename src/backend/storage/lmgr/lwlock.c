@@ -82,6 +82,8 @@
 #include "port/pg_bitutils.h"
 #include "postmaster/postmaster.h"
 #include "storage/proc.h"
+#include "storage/procarray.h"
+#include "storage/buf_internals.h"
 #include "storage/proclist.h"
 #include "storage/spin.h"
 #include "utils/memutils.h"
@@ -169,6 +171,7 @@ static const char *const BuiltinTrancheNames[] = {
 	[LWTRANCHE_SUBTRANS_SLRU] = "SubtransSLRU",
 	[LWTRANCHE_XACT_SLRU] = "XactSLRU",
 	[LWTRANCHE_PARALLEL_VACUUM_DSA] = "ParallelVacuumDSA",
+	[LWTRANCHE_PROCARRAY_ADAPTIVE] = "ProcArrayAdaptive",
 };
 
 StaticAssertDecl(lengthof(BuiltinTrancheNames) ==
@@ -232,7 +235,6 @@ NamedLWLockTranche *NamedLWLockTrancheArray = NULL;
 static void InitializeLWLocks(void);
 static inline void LWLockReportWaitStart(LWLock *lock);
 static inline void LWLockReportWaitEnd(void);
-static const char *GetLWTrancheName(uint16 trancheId);
 
 #define T_NAME(lock) \
 	GetLWTrancheName((lock)->tranche)
@@ -741,7 +743,7 @@ LWLockReportWaitEnd(void)
 /*
  * Return the name of an LWLock tranche.
  */
-static const char *
+const char *
 GetLWTrancheName(uint16 trancheId)
 {
 	/* Built-in tranche or individual LWLock? */
@@ -1877,6 +1879,10 @@ LWLockReleaseClearVar(LWLock *lock, pg_atomic_uint64 *valptr, uint64 val)
 void
 LWLockReleaseAll(void)
 {
+	AdaptiveLWLockReleaseAll();
+
+	pg_write_barrier();    /* ensure we see latest lock state */
+
 	while (num_held_lwlocks > 0)
 	{
 		HOLD_INTERRUPTS();		/* match the upcoming RESUME_INTERRUPTS */

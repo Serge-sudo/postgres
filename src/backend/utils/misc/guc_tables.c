@@ -534,6 +534,9 @@ char	   *backtrace_functions;
 
 int			temp_file_limit = -1;
 
+bool enable_adaptive_procarraylock;
+bool enable_adaptive_buffer_mapping_lock;
+
 int			num_temp_buffers = 1024;
 
 char	   *cluster_name = "";
@@ -1626,6 +1629,36 @@ struct config_bool ConfigureNamesBool[] =
 		&default_with_oids,
 		false,
 		check_default_with_oids, NULL, NULL
+	},
+	{
+		{
+			"enable_adaptive_procarraylock",
+			PGC_POSTMASTER,
+			UNGROUPED,
+			gettext_noop("Enables adaptive procarray lock."),
+			NULL,
+			0
+		},
+		&enable_adaptive_procarraylock,
+		true,
+		NULL,
+		NULL,
+		NULL
+	},
+	{
+		{
+			"enable_adaptive_buffer_mapping_lock",
+			PGC_POSTMASTER,
+			UNGROUPED,
+			gettext_noop("Enables adaptive buffer mapping lock."),
+			NULL,
+			0
+		},
+		&enable_adaptive_buffer_mapping_lock,
+		true,
+		NULL,
+		NULL,
+		NULL
 	},
 	{
 		{"logging_collector", PGC_POSTMASTER, LOGGING_WHERE,

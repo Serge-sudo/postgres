@@ -580,7 +580,7 @@ GetStrictOldestNonRemovableTransactionId(Relation rel)
 	{
 		/* Shared relation: take into account all running xids */
 		runningTransactions = GetRunningTransactionData();
-		LWLockRelease(ProcArrayLock);
+		ProcArrayLockRelease();
 		LWLockRelease(XidGenLock);
 		return runningTransactions->oldestRunningXid;
 	}
@@ -591,7 +591,7 @@ GetStrictOldestNonRemovableTransactionId(Relation rel)
 		 * database
 		 */
 		runningTransactions = GetRunningTransactionData();
-		LWLockRelease(ProcArrayLock);
+		ProcArrayLockRelease();
 		LWLockRelease(XidGenLock);
 		return runningTransactions->oldestDatabaseRunningXid;
 	}

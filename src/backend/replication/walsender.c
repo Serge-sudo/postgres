@@ -57,6 +57,7 @@
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
 #include "backup/basebackup.h"
+#include "storage/procarray.h"
 #include "backup/basebackup_incremental.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_type.h"
@@ -306,10 +307,10 @@ InitWalSender(void)
 	if (MyDatabaseId == InvalidOid)
 	{
 		Assert(MyProc->xmin == InvalidTransactionId);
-		LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+		ProcArrayLockAcquire(LW_EXCLUSIVE);
 		MyProc->statusFlags |= PROC_AFFECTS_ALL_HORIZONS;
 		ProcGlobal->statusFlags[MyProc->pgxactoff] = MyProc->statusFlags;
-		LWLockRelease(ProcArrayLock);
+		ProcArrayLockRelease();
 	}
 
 	/* Initialize empty timestamp buffer for lag tracking. */
