@@ -2673,6 +2673,9 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 
 			buf_state = old_buf_state;
 
+			/* reset */
+			ref->is_hot = false;
+
 			/*
 			 * Check if buffer is already marked as hot. Hot buffers don't
 			 * use refcount - we just track this backend's use of the hot buffer.
@@ -2684,11 +2687,24 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 				/* Track that we're using a hot buffer */
 				ref->is_hot = true;
 				if (PrivateHotBufferCount == 0)
+				{
 					SetHotBufferBit();
-				PrivateHotBufferCount++;
+					pg_write_barrier();
+				}
+
+				/* recheck */
+				old_buf_state = pg_atomic_read_u32(&buf->state);
 				
-				VALGRIND_MAKE_MEM_DEFINED(BufHdrGetBlock(buf), BLCKSZ);
-				break;
+				if (old_buf_state & BM_HOT)
+				{
+					PrivateHotBufferCount++;
+					VALGRIND_MAKE_MEM_DEFINED(BufHdrGetBlock(buf), BLCKSZ);
+					break;
+				} else if (PrivateHotBufferCount == 0)
+				{
+					ClearHotBufferBit();
+				}
+				continue;
 			}
 
 			/* increase refcount */
@@ -2718,8 +2734,10 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 				 */
 				ref->is_hot = true;
 				if (PrivateHotBufferCount == 0)
+				{
 					SetHotBufferBit();
-				PrivateHotBufferCount++;
+					pg_write_barrier();
+				}
 			}
 
 			if (strategy == NULL)
@@ -2743,6 +2761,9 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 			{
 				result = (buf_state & BM_VALID) != 0;
 
+				if (ref->is_hot)
+					PrivateHotBufferCount++;
+
 				/*
 				 * Assume that we acquired a buffer pin for the purposes of
 				 * Valgrind buffer client checks (even in !result case) to
@@ -2752,6 +2773,11 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 				 */
 				VALGRIND_MAKE_MEM_DEFINED(BufHdrGetBlock(buf), BLCKSZ);
 				break;
+			}
+			else (ref->is_hot && PrivateHotBufferCount == 0)
+			{
+				SetHotBufferBit();
+				pg_write_barrier();
 			}
 		}
 	}
@@ -2890,7 +2916,10 @@ UnpinBufferNoOwner(BufferDesc *buf)
 			Assert(PrivateHotBufferCount > 0);
 			PrivateHotBufferCount--;
 			if (PrivateHotBufferCount == 0)
+			{
 				ClearHotBufferBit();
+				pg_write_barrier();
+			}
 		}
 
 		/*
