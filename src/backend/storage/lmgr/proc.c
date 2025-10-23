@@ -61,6 +61,7 @@ int			IdleInTransactionSessionTimeout = 0;
 int			TransactionTimeout = 0;
 int			IdleSessionTimeout = 0;
 bool		log_lock_waits = false;
+bool		enable_per_lock_semaphore = false;
 
 /* Pointer to this process's PGPROC struct, if any */
 PGPROC	   *MyProc = NULL;
@@ -121,11 +122,24 @@ ProcGlobalShmemSize(void)
 int
 ProcGlobalSemas(void)
 {
+	int			numSemas;
+
 	/*
-	 * We need a sema per backend (including autovacuum), plus one for each
+	 * We need a semaphore per backend (including autovacuum), plus one for each
 	 * auxiliary process.
 	 */
-	return MaxBackends + NUM_AUXILIARY_PROCS;
+	numSemas = MaxBackends + NUM_AUXILIARY_PROCS;
+
+	/*
+	 * If per-lock semaphores are enabled, we need additional semaphores:
+	 * - PGPROC_LWSEM_ARRAY_SIZE for lwSem array per process
+	 * - 1 for procArrayGroupSem per process
+	 * - 1 for clogGroupSem per process
+	 */
+	if (enable_per_lock_semaphore)
+		numSemas = numSemas * (1 + PGPROC_LWSEM_ARRAY_SIZE + 2);
+
+	return numSemas;
 }
 
 /*
@@ -225,6 +239,28 @@ InitProcGlobal(void)
 		if (i < MaxBackends + NUM_AUXILIARY_PROCS)
 		{
 			proc->sem = PGSemaphoreCreate();
+			
+			/* Only allocate per-lock semaphores if feature is enabled */
+			if (enable_per_lock_semaphore)
+			{
+				/* Allocate and initialize lwSem array */
+				proc->lwSem = (PGSemaphore *) ShmemAlloc(PGPROC_LWSEM_ARRAY_SIZE * sizeof(PGSemaphore));
+				for (j = 0; j < PGPROC_LWSEM_ARRAY_SIZE; j++)
+				{
+					proc->lwSem[j] = PGSemaphoreCreate();
+				}
+				
+				/* Create group semaphores */
+				proc->procArrayGroupSem = PGSemaphoreCreate();
+				proc->clogGroupSem = PGSemaphoreCreate();
+			}
+			else
+			{
+				proc->lwSem = NULL;
+				proc->procArrayGroupSem = NULL;
+				proc->clogGroupSem = NULL;
+			}
+			
 			InitSharedLatch(&(proc->procLatch));
 			LWLockInitialize(&(proc->fpInfoLock), LWTRANCHE_LOCK_FASTPATH);
 		}
@@ -298,6 +334,7 @@ void
 InitProcess(void)
 {
 	dlist_head *procgloballist;
+	int			i;
 
 	/*
 	 * ProcGlobal should be set up already (if we are a backend, we inherit
@@ -406,13 +443,9 @@ InitProcess(void)
 	MyProc->waitProcLock = NULL;
 	pg_atomic_write_u64(&MyProc->waitStart, 0);
 #ifdef USE_ASSERT_CHECKING
-	{
-		int			i;
-
-		/* Last process should have released all locks. */
-		for (i = 0; i < NUM_LOCK_PARTITIONS; i++)
-			Assert(dlist_is_empty(&(MyProc->myProcLocks[i])));
-	}
+	/* Last process should have released all locks. */
+	for (i = 0; i < NUM_LOCK_PARTITIONS; i++)
+		Assert(dlist_is_empty(&(MyProc->myProcLocks[i])));
 #endif
 	MyProc->recoveryConflictPending = false;
 
@@ -458,6 +491,19 @@ InitProcess(void)
 	 * necessary anymore, but seems like a good idea for cleanliness.)
 	 */
 	PGSemaphoreReset(MyProc->sem);
+	
+	/*
+	 * Reset the lwSem array and group semaphores if feature is enabled.
+	 */
+	if (enable_per_lock_semaphore)
+	{
+		for (i = 0; i < PGPROC_LWSEM_ARRAY_SIZE; i++)
+		{
+			PGSemaphoreReset(MyProc->lwSem[i]);
+		}
+		PGSemaphoreReset(MyProc->procArrayGroupSem);
+		PGSemaphoreReset(MyProc->clogGroupSem);
+	}
 
 	/*
 	 * Arrange to clean up at backend exit.
@@ -529,6 +575,7 @@ InitAuxiliaryProcess(void)
 {
 	PGPROC	   *auxproc;
 	int			proctype;
+	int			i;
 
 	/*
 	 * ProcGlobal should be set up already (if we are a backend, we inherit
@@ -599,13 +646,9 @@ InitAuxiliaryProcess(void)
 	MyProc->waitProcLock = NULL;
 	pg_atomic_write_u64(&MyProc->waitStart, 0);
 #ifdef USE_ASSERT_CHECKING
-	{
-		int			i;
-
-		/* Last process should have released all locks. */
-		for (i = 0; i < NUM_LOCK_PARTITIONS; i++)
-			Assert(dlist_is_empty(&(MyProc->myProcLocks[i])));
-	}
+	/* Last process should have released all locks. */
+	for (i = 0; i < NUM_LOCK_PARTITIONS; i++)
+		Assert(dlist_is_empty(&(MyProc->myProcLocks[i])));
 #endif
 
 	/*
@@ -629,6 +672,19 @@ InitAuxiliaryProcess(void)
 	 * necessary anymore, but seems like a good idea for cleanliness.)
 	 */
 	PGSemaphoreReset(MyProc->sem);
+	
+	/*
+	 * Reset the lwSem array and group semaphores if feature is enabled.
+	 */
+	if (enable_per_lock_semaphore)
+	{
+		for (i = 0; i < PGPROC_LWSEM_ARRAY_SIZE; i++)
+		{
+			PGSemaphoreReset(MyProc->lwSem[i]);
+		}
+		PGSemaphoreReset(MyProc->procArrayGroupSem);
+		PGSemaphoreReset(MyProc->clogGroupSem);
+	}
 
 	/*
 	 * Arrange to clean up at process exit.

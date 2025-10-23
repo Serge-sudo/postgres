@@ -530,13 +530,14 @@ TransactionGroupUpdateXidStatus(TransactionId xid, XidStatus status,
 	if (nextidx != INVALID_PROC_NUMBER)
 	{
 		int			extraWaits = 0;
+		PGSemaphore sem = enable_per_lock_semaphore ? proc->clogGroupSem : proc->sem;
 
 		/* Sleep until the leader updates our XID status. */
 		pgstat_report_wait_start(WAIT_EVENT_XACT_GROUP_UPDATE);
 		for (;;)
 		{
 			/* acts as a read barrier */
-			PGSemaphoreLock(proc->sem);
+			PGSemaphoreLock(sem);
 			if (!proc->clogGroupMember)
 				break;
 			extraWaits++;
@@ -547,7 +548,7 @@ TransactionGroupUpdateXidStatus(TransactionId xid, XidStatus status,
 
 		/* Fix semaphore count for any absorbed wakeups */
 		while (extraWaits-- > 0)
-			PGSemaphoreUnlock(proc->sem);
+			PGSemaphoreUnlock(sem);
 		return true;
 	}
 
@@ -636,6 +637,7 @@ TransactionGroupUpdateXidStatus(TransactionId xid, XidStatus status,
 	while (wakeidx != INVALID_PROC_NUMBER)
 	{
 		PGPROC	   *wakeproc = &ProcGlobal->allProcs[wakeidx];
+		PGSemaphore sem = enable_per_lock_semaphore ? wakeproc->clogGroupSem : wakeproc->sem;
 
 		wakeidx = pg_atomic_read_u32(&wakeproc->clogGroupNext);
 		pg_atomic_write_u32(&wakeproc->clogGroupNext, INVALID_PROC_NUMBER);
@@ -646,7 +648,7 @@ TransactionGroupUpdateXidStatus(TransactionId xid, XidStatus status,
 		wakeproc->clogGroupMember = false;
 
 		if (wakeproc != MyProc)
-			PGSemaphoreUnlock(wakeproc->sem);
+			PGSemaphoreUnlock(sem);
 	}
 
 	return true;

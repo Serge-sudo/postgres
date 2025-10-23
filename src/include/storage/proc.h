@@ -38,6 +38,12 @@
  */
 #define PGPROC_MAX_CACHED_SUBXIDS 64	/* XXX guessed-at value */
 
+/*
+ * Number of semaphores in lwSem array per PGPROC.
+ * Includes all fixed lwlocks plus 32 extra for user-defined tranches.
+ */
+#define PGPROC_LWSEM_ARRAY_SIZE (NUM_FIXED_LWLOCKS + 32)
+
 typedef struct XidCacheStatus
 {
 	/* number of cached subxids, never more than PGPROC_MAX_CACHED_SUBXIDS */
@@ -167,6 +173,15 @@ struct PGPROC
 
 	PGSemaphore sem;			/* ONE semaphore to sleep on */
 	ProcWaitStatus waitStatus;
+
+	/*
+	 * Separate semaphores for different LWLock types.
+	 * Allocate extra 32 semaphores for user-defined tranches.
+	 * User-defined tranches after 32 will use the last semaphore.
+	 */
+	PGSemaphore *lwSem;
+	PGSemaphore procArrayGroupSem;
+	PGSemaphore clogGroupSem;
 
 	Latch		procLatch;		/* generic latch for process */
 
@@ -450,6 +465,7 @@ extern PGDLLIMPORT int IdleInTransactionSessionTimeout;
 extern PGDLLIMPORT int TransactionTimeout;
 extern PGDLLIMPORT int IdleSessionTimeout;
 extern PGDLLIMPORT bool log_lock_waits;
+extern PGDLLIMPORT bool enable_per_lock_semaphore;
 
 
 /*
