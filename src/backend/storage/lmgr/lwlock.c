@@ -98,15 +98,41 @@ extern slock_t *ShmemLock;
 #define LW_FLAG_RELEASE_OK			((uint32) 1 << 29)
 #define LW_FLAG_LOCKED				((uint32) 1 << 28)
 
-#define LW_VAL_EXCLUSIVE			((uint32) 1 << 24)
+/*
+ * already (power of 2)-1, i.e. suitable for a mask
+ *
+ * Originally, the LW_SHARED lock reference count was maintained in bits
+ * [MAX_BACKEND_BITS-1:0] of LWLock.state, with a theoretical maximum of
+ * MAX_BACKENDS (when all MAX_BACKENDS processes hold the lock concurrently).
+ *
+ * To reduce lock acquisition overhead, we optimized LWLockAttemptLock by
+ * merging the read and update operations for the LW_SHARED lock's state.
+ * This eliminates the need for separate atomic instructions - a critical
+ * improvement given the high cost of atomic operations on high-core-count
+ * systems.
+ *
+ * This optimization introduces a scenario where the reference count may
+ * temporarily increment even when a reader fails to acquire an exclusive lock.
+ * However, since each process retries lock acquisition up to *twice* before
+ * waiting on a semaphore, the reference count is bounded by MAX_BACKENDS * 2.
+ *
+ * To ensure compatibility with this upper bound:
+ * 1. LW_SHARED_MASK has been extended by 1 bit
+ * 2. LW_VAL_EXCLUSIVE is left-shifted by 1 bit
+ */
+#define LW_SHARED_MASK				((MAX_BACKENDS << 1) + 1)
+#define LW_VAL_EXCLUSIVE			(LW_SHARED_MASK + 1)
+#define LW_LOCK_MASK				(LW_SHARED_MASK	| LW_VAL_EXCLUSIVE)
 #define LW_VAL_SHARED				1
 
-#define LW_LOCK_MASK				((uint32) ((1 << 25)-1))
-/* Must be greater than MAX_BACKENDS - which is 2^23-1, so we're fine. */
-#define LW_SHARED_MASK				((uint32) ((1 << 24)-1))
+#define LW_FLAG_BITS				3
+#define LW_FLAG_MASK				(((1<<LW_FLAG_BITS)-1)<<(32-LW_FLAG_BITS))
 
-StaticAssertDecl(LW_VAL_EXCLUSIVE > (uint32) MAX_BACKENDS,
-				 "MAX_BACKENDS too big for lwlock.c");
+/* assumes MAX_BACKENDS is a (power of 2) - 1, checked below */
+StaticAssertDecl(((MAX_BACKENDS + 1) & MAX_BACKENDS) == 0,
+ 				 "MAX_BACKENDS + 1 needs to be a power of 2");
+StaticAssertDecl((LW_SHARED_MASK & LW_FLAG_MASK) == 0,
+				 "LW_SHARED_MASK and LW_FLAG_MASK overlap");
 
 /*
  * There are three sorts of LWLock "tranches":
@@ -268,6 +294,8 @@ PRINT_LWDEBUG(const char *where, LWLock *lock, LWLockMode mode)
 	if (Trace_lwlocks)
 	{
 		uint32		state = pg_atomic_read_u32(&lock->state);
+		uint32		excl = (state & LW_VAL_EXCLUSIVE) != 0;
+		uint32		shared = excl ? 0 : state & LW_SHARED_MASK;
 
 		ereport(LOG,
 				(errhidestmt(true),
@@ -275,8 +303,8 @@ PRINT_LWDEBUG(const char *where, LWLock *lock, LWLockMode mode)
 				 errmsg_internal("%d: %s(%s %p): excl %u shared %u haswaiters %u waiters %u rOK %d",
 								 MyProcPid,
 								 where, T_NAME(lock), lock,
-								 (state & LW_VAL_EXCLUSIVE) != 0,
-								 state & LW_SHARED_MASK,
+								 excl,
+								 shared,
 								 (state & LW_FLAG_HAS_WAITERS) != 0,
 								 pg_atomic_read_u32(&lock->nwaiters),
 								 (state & LW_FLAG_RELEASE_OK) != 0)));
@@ -780,14 +808,53 @@ GetLWLockIdentifier(uint32 classId, uint16 eventId)
  * This function will not block waiting for a lock to become free - that's the
  * caller's job.
  *
+ * willwait: true if the caller is willing to wait for the lock to become free
+ *          false if the caller is not willing to wait.
+ *
  * Returns true if the lock isn't free and we need to wait.
  */
 static bool
-LWLockAttemptLock(LWLock *lock, LWLockMode mode)
+LWLockAttemptLock(LWLock *lock, LWLockMode mode, bool willwait)
 {
 	uint32		old_state;
 
 	Assert(mode == LW_EXCLUSIVE || mode == LW_SHARED);
+	/*
+	 * Optimized shared lock acquisition using atomic fetch-and-add.
+	 *
+	 * This optimization aims to lower the cost of acquiring shared locks
+	 * by reducing the number of atomic operations, which can be expensive
+	 * on systems with many CPU cores.
+	 *
+	 * It is only activated when willwait=true, ensuring that the reference
+	 * count does not grow unchecked and overflow into the LW_VAL_EXCLUSIVE bit.
+	 *
+	 * Three scenarios can occur when acquiring a shared lock:
+	 * 1) Lock is free: atomically increment reference count and acquire
+	 * 2) Lock held in shared mode: atomically increment reference count and acquire
+	 * 3) Lock held exclusively: atomically increment reference count but fail to acquire
+	 *
+	 * Scenarios 1 and 2 work as expected - we successfully increment the count
+	 * and acquire the lock.
+	 *
+	 * Scenario 3 is counterintuitive: we increment the reference count even though
+	 * we cannot acquire the lock due to the exclusive holder. This creates a
+	 * temporarily invalid reference count, but it's acceptable because:
+	 * - The LW_VAL_EXCLUSIVE flag takes precedence in determining lock state
+	 * - Each process retries at most twice before blocking on a semaphore
+	 * - This bounds the "overcounted" references to MAX_BACKENDS * 2
+	 * - The bound fits within LW_SHARED_MASK capacity
+	 * - The lock->state including "overcounted" references is reset when the exclusive
+	 *   lock is released.
+	 *
+	 * See LW_SHARED_MASK definition comments for additional details.
+	 */
+	if (willwait && mode == LW_SHARED)
+	{
+		old_state = pg_atomic_fetch_add_u32(&lock->state, LW_VAL_SHARED);
+		Assert((old_state & LW_LOCK_MASK) != LW_LOCK_MASK);
+		return (old_state & LW_VAL_EXCLUSIVE) != 0;
+	}
 
 	/*
 	 * Read once outside the loop, later iterations will get the newer value
@@ -1232,7 +1299,7 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 		 * Try to grab the lock the first time, we're not in the waitqueue
 		 * yet/anymore.
 		 */
-		mustwait = LWLockAttemptLock(lock, mode);
+		mustwait = LWLockAttemptLock(lock, mode, true);
 
 		if (!mustwait)
 		{
@@ -1255,7 +1322,7 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 		LWLockQueueSelf(lock, mode);
 
 		/* we're now guaranteed to be woken up if necessary */
-		mustwait = LWLockAttemptLock(lock, mode);
+		mustwait = LWLockAttemptLock(lock, mode, true);
 
 		/* ok, grabbed the lock the second time round, need to undo queueing */
 		if (!mustwait)
@@ -1286,6 +1353,7 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 
 		for (;;)
 		{
+			/* When signaled, lock->state has been zero-initialized by the previous holder */
 			PGSemaphoreLock(proc->sem);
 			if (proc->lwWaiting == LW_WS_NOT_WAITING)
 				break;
@@ -1358,7 +1426,7 @@ LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
 	HOLD_INTERRUPTS();
 
 	/* Check for the lock */
-	mustwait = LWLockAttemptLock(lock, mode);
+	mustwait = LWLockAttemptLock(lock, mode, false);
 
 	if (mustwait)
 	{
@@ -1425,13 +1493,13 @@ LWLockAcquireOrWait(LWLock *lock, LWLockMode mode)
 	 * NB: We're using nearly the same twice-in-a-row lock acquisition
 	 * protocol as LWLockAcquire(). Check its comments for details.
 	 */
-	mustwait = LWLockAttemptLock(lock, mode);
+	mustwait = LWLockAttemptLock(lock, mode, true);
 
 	if (mustwait)
 	{
 		LWLockQueueSelf(lock, LW_WAIT_UNTIL_FREE);
 
-		mustwait = LWLockAttemptLock(lock, mode);
+		mustwait = LWLockAttemptLock(lock, mode, true);
 
 		if (mustwait)
 		{
@@ -1451,6 +1519,7 @@ LWLockAcquireOrWait(LWLock *lock, LWLockMode mode)
 
 			for (;;)
 			{
+				/* When signaled, lock->state has been zero-initialized by the previous holder */
 				PGSemaphoreLock(proc->sem);
 				if (proc->lwWaiting == LW_WS_NOT_WAITING)
 					break;
@@ -1811,7 +1880,15 @@ LWLockRelease(LWLock *lock)
 	 * others, even if we still have to wakeup other waiters.
 	 */
 	if (mode == LW_EXCLUSIVE)
-		oldstate = pg_atomic_sub_fetch_u32(&lock->state, LW_VAL_EXCLUSIVE);
+	{
+		/*
+		 * To release the exclusive lock, all bits of LW_LOCK_MASK,
+		 * including any "overcounted" increments from blocked readers,
+		 * are cleared.
+		 */
+		oldstate = pg_atomic_fetch_and_u32(&lock->state, ~LW_LOCK_MASK);
+		oldstate &= ~LW_LOCK_MASK;
+	}
 	else
 		oldstate = pg_atomic_sub_fetch_u32(&lock->state, LW_VAL_SHARED);
 
