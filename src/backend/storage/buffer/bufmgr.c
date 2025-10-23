@@ -2774,7 +2774,7 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 				VALGRIND_MAKE_MEM_DEFINED(BufHdrGetBlock(buf), BLCKSZ);
 				break;
 			}
-			else (ref->is_hot && PrivateHotBufferCount == 0)
+			else if(ref->is_hot && PrivateHotBufferCount == 0)
 			{
 				SetHotBufferBit();
 				pg_write_barrier();
