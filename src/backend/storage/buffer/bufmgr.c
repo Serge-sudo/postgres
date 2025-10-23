@@ -89,6 +89,7 @@ typedef struct PrivateRefCountEntry
 {
 	Buffer		buffer;
 	int32		refcount;
+	bool		is_hot;			/* true if this buffer is marked as hot */
 } PrivateRefCountEntry;
 
 /* 64 bytes, about the size of a cache line on common systems */
@@ -210,11 +211,19 @@ static int32 PrivateRefCountOverflowed = 0;
 static uint32 PrivateRefCountClock = 0;
 static PrivateRefCountEntry *ReservedRefCountEntry = NULL;
 
+/* Hot buffer tracking: count of hot buffers this backend has pinned */
+static int32 PrivateHotBufferCount = 0;
+
 static void ReservePrivateRefCountEntry(void);
 static PrivateRefCountEntry *NewPrivateRefCountEntry(Buffer buffer);
 static PrivateRefCountEntry *GetPrivateRefCountEntry(Buffer buffer, bool do_move);
 static inline int32 GetPrivateRefCount(Buffer buffer);
 static void ForgetPrivateRefCountEntry(PrivateRefCountEntry *ref);
+
+/* Hot buffer management functions */
+static void SetHotBufferBit(void);
+static void ClearHotBufferBit(void);
+static bool HotBufferHasReferences(void);
 
 /* ResourceOwner callbacks to hold in-progress I/Os and buffer pins */
 static void ResOwnerReleaseBufferIO(Datum res);
@@ -326,6 +335,7 @@ NewPrivateRefCountEntry(Buffer buffer)
 	/* and fill it */
 	res->buffer = buffer;
 	res->refcount = 0;
+	res->is_hot = false;
 
 	return res;
 }
@@ -2664,8 +2674,46 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 
 			buf_state = old_buf_state;
 
+			/*
+			 * Check if buffer is already marked as hot. Hot buffers are
+			 * permanently pinned and we don't modify their refcount.
+			 */
+			if (buf_state & BM_HOT)
+			{
+				result = (buf_state & BM_VALID) != 0;
+				
+				/* Track that we're using a hot buffer */
+				if (!ref->is_hot)
+				{
+					ref->is_hot = true;
+					if (PrivateHotBufferCount == 0)
+						SetHotBufferBit();
+					PrivateHotBufferCount++;
+				}
+				
+				VALGRIND_MAKE_MEM_DEFINED(BufHdrGetBlock(buf), BLCKSZ);
+				break;
+			}
+
 			/* increase refcount */
 			buf_state += BUF_REFCOUNT_ONE;
+
+			/*
+			 * Check if we've exceeded the hot buffer threshold. If so, mark
+			 * the buffer as hot and reset its refcount.
+			 */
+			if (BUF_STATE_GET_REFCOUNT(buf_state) > BM_HOT_REFCOUNT_THRESHOLD)
+			{
+				/* Reset refcount and set hot flag */
+				buf_state &= ~BUF_REFCOUNT_MASK;
+				buf_state |= BM_HOT;
+				
+				/* Track that we're using a hot buffer */
+				ref->is_hot = true;
+				if (PrivateHotBufferCount == 0)
+					SetHotBufferBit();
+				PrivateHotBufferCount++;
+			}
 
 			if (strategy == NULL)
 			{
@@ -2718,6 +2766,18 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 		 * cannot meddle with that.
 		 */
 		result = (pg_atomic_read_u32(&buf->state) & BM_VALID) != 0;
+		
+		/*
+		 * Check if buffer became hot since we first pinned it.
+		 * If so, track it in our private state.
+		 */
+		if (!ref->is_hot && (pg_atomic_read_u32(&buf->state) & BM_HOT))
+		{
+			ref->is_hot = true;
+			if (PrivateHotBufferCount == 0)
+				SetHotBufferBit();
+			PrivateHotBufferCount++;
+		}
 	}
 
 	ref->refcount++;
@@ -2819,6 +2879,19 @@ UnpinBufferNoOwner(BufferDesc *buf)
 		uint32		old_buf_state;
 
 		/*
+		 * If this buffer was marked as hot in our private tracking,
+		 * decrement our hot buffer count. If it reaches zero, clear
+		 * our bit in the shared bitmap.
+		 */
+		if (ref->is_hot)
+		{
+			Assert(PrivateHotBufferCount > 0);
+			PrivateHotBufferCount--;
+			if (PrivateHotBufferCount == 0)
+				ClearHotBufferBit();
+		}
+
+		/*
 		 * Mark buffer non-accessible to Valgrind.
 		 *
 		 * Note that the buffer may have already been marked non-accessible
@@ -2831,12 +2904,25 @@ UnpinBufferNoOwner(BufferDesc *buf)
 		Assert(!LWLockHeldByMe(BufferDescriptorGetContentLock(buf)));
 
 		/*
+		 * For hot buffers, we don't decrement the shared reference count
+		 * as they are permanently pinned. For normal buffers, decrement
+		 * the shared reference count.
+		 */
+		old_buf_state = pg_atomic_read_u32(&buf->state);
+		
+		/* Hot buffers don't need refcount manipulation */
+		if (old_buf_state & BM_HOT)
+		{
+			ForgetPrivateRefCountEntry(ref);
+			return;
+		}
+
+		/*
 		 * Decrement the shared reference count.
 		 *
 		 * Since buffer spinlock holder can update status using just write,
 		 * it's not safe to use atomic decrement here; thus use a CAS loop.
 		 */
-		old_buf_state = pg_atomic_read_u32(&buf->state);
 		for (;;)
 		{
 			if (old_buf_state & BM_LOCKED)
@@ -6009,6 +6095,117 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 							IOOP_WRITEBACK, io_start, wb_context->nr_pending);
 
 	wb_context->nr_pending = 0;
+}
+
+/*
+ * Hot buffer management
+ */
+
+/*
+ * HotBufferShmemSize -- compute space needed for hot buffer bitmap
+ */
+Size
+HotBufferShmemSize(void)
+{
+	Size		size = 0;
+	int			nbits;
+	int			nuint32s;
+
+	/* We need MaxBackends bits, one per backend */
+	nbits = MaxBackends;
+	/* Round up to the nearest uint32 */
+	nuint32s = (nbits + 31) / 32;
+	
+	size = offsetof(HotBufferControl, bitmap);
+	size = add_size(size, mul_size(nuint32s, sizeof(pg_atomic_uint32)));
+	
+	return size;
+}
+
+/*
+ * HotBufferInit -- initialize the hot buffer bitmap in shared memory
+ */
+void
+HotBufferInit(void)
+{
+	bool		found;
+	int			nbits;
+	int			nuint32s;
+	int			i;
+
+	/* We need MaxBackends bits, one per backend */
+	nbits = MaxBackends;
+	/* Round up to the nearest uint32 */
+	nuint32s = (nbits + 31) / 32;
+
+	HotBufferBitmap = (HotBufferControl *)
+		ShmemInitStruct("Hot Buffer Bitmap",
+						offsetof(HotBufferControl, bitmap) +
+						nuint32s * sizeof(pg_atomic_uint32),
+						&found);
+
+	if (!found)
+	{
+		/* Initialize the spinlock */
+		SpinLockInit(&HotBufferBitmap->lock);
+		
+		/* Initialize all bitmap entries to 0 */
+		for (i = 0; i < nuint32s; i++)
+			pg_atomic_init_u32(&HotBufferBitmap->bitmap[i], 0);
+	}
+}
+
+/*
+ * SetHotBufferBit -- set the bit for current backend in hot buffer bitmap
+ */
+static void
+SetHotBufferBit(void)
+{
+	ProcNumber	procno = GetNumberFromPGProc(MyProc);
+	int			word_idx = procno / 32;
+	uint32		bit_mask = 1U << (procno % 32);
+	uint32		old_val;
+
+	/* Atomically set the bit */
+	old_val = pg_atomic_fetch_or_u32(&HotBufferBitmap->bitmap[word_idx], bit_mask);
+	
+	/* If bit wasn't already set, we're done */
+	(void) old_val;
+}
+
+/*
+ * ClearHotBufferBit -- clear the bit for current backend in hot buffer bitmap
+ */
+static void
+ClearHotBufferBit(void)
+{
+	ProcNumber	procno = GetNumberFromPGProc(MyProc);
+	int			word_idx = procno / 32;
+	uint32		bit_mask = 1U << (procno % 32);
+
+	/* Atomically clear the bit */
+	pg_atomic_fetch_and_u32(&HotBufferBitmap->bitmap[word_idx], ~bit_mask);
+}
+
+/*
+ * HotBufferHasReferences -- check if any backend has hot buffer references
+ *
+ * Returns true if any backend has its bit set in the hot buffer bitmap.
+ */
+static bool
+HotBufferHasReferences(void)
+{
+	int			nbits = MaxBackends;
+	int			nuint32s = (nbits + 31) / 32;
+	int			i;
+
+	for (i = 0; i < nuint32s; i++)
+	{
+		if (pg_atomic_read_u32(&HotBufferBitmap->bitmap[i]) != 0)
+			return true;
+	}
+	
+	return false;
 }
 
 /* ResourceOwner callbacks */

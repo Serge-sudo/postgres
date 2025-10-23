@@ -297,10 +297,12 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 			 * put a valid buffer in the freelist and then someone else used
 			 * it before we got to it.  It's probably impossible altogether as
 			 * of 8.3, but we'd better check anyway.)
+			 * Also skip hot buffers.
 			 */
 			local_buf_state = LockBufHdr(buf);
 			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
-				&& BUF_STATE_GET_USAGECOUNT(local_buf_state) == 0)
+				&& BUF_STATE_GET_USAGECOUNT(local_buf_state) == 0
+				&& !(local_buf_state & BM_HOT))
 			{
 				if (strategy != NULL)
 					AddBufferToRing(strategy, buf);
@@ -320,8 +322,16 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 		/*
 		 * If the buffer is pinned or has a nonzero usage_count, we cannot use
 		 * it; decrement the usage_count (unless pinned) and keep scanning.
+		 * Also skip hot buffers - they are permanently pinned.
 		 */
 		local_buf_state = LockBufHdr(buf);
+
+		/* Skip hot buffers - they cannot be evicted */
+		if (local_buf_state & BM_HOT)
+		{
+			UnlockBufHdr(buf, local_buf_state);
+			continue;
+		}
 
 		if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
 		{
