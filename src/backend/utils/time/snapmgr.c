@@ -448,6 +448,12 @@ InvalidateCatalogSnapshotConditionally(void)
 		InvalidateCatalogSnapshot();
 }
 
+bool
+isCurrentSnapshot(Snapshot snapshot)
+{
+	return (snapshot == &CurrentSnapshotData);
+}
+
 /*
  * SnapshotSetCommandId
  *		Propagate CommandCounterIncrement into the static snapshots, if set
