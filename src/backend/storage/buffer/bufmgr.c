@@ -2862,14 +2862,53 @@ PinBuffer_Locked(BufferDesc *buf)
 	 */
 	buf_state = pg_atomic_read_u32(&buf->state);
 	Assert(buf_state & BM_LOCKED);
-	buf_state += BUF_REFCOUNT_ONE;
-	UnlockBufHdr(buf, buf_state);
-
+	
 	b = BufferDescriptorGetBuffer(buf);
-
 	ref = NewPrivateRefCountEntry(b);
-	ref->refcount++;
+	
+	/*
+	 * Check if buffer is already marked as hot. If so, don't increment
+	 * refcount - just track this as a hot pin.
+	 */
+	if (buf_state & BM_HOT)
+	{
+		/* Track that we're using a hot buffer */
+		ref->is_hot = true;
+		if (PrivateHotBufferCount == 0)
+			SetHotBufferBit();
+		PrivateHotBufferCount++;
+		
+		UnlockBufHdr(buf, buf_state);
+	}
+	else
+	{
+		/* Increment refcount */
+		buf_state += BUF_REFCOUNT_ONE;
+		
+		/*
+		 * Check if we've exceeded the hot buffer threshold. If so, mark
+		 * the buffer as hot and don't hold a normal pin.
+		 */
+		if (BUF_STATE_GET_REFCOUNT(buf_state) > BM_HOT_REFCOUNT_THRESHOLD)
+		{
+			/* 
+			 * Set hot flag and subtract the increment we just added,
+			 * since we're tracking this as a hot pin instead.
+			 */
+			buf_state -= BUF_REFCOUNT_ONE;
+			buf_state |= BM_HOT;
+			
+			/* Track that we're using a hot buffer */
+			ref->is_hot = true;
+			if (PrivateHotBufferCount == 0)
+				SetHotBufferBit();
+			PrivateHotBufferCount++;
+		}
+		
+		UnlockBufHdr(buf, buf_state);
+	}
 
+	ref->refcount++;
 	ResourceOwnerRememberBuffer(CurrentResourceOwner, b);
 }
 
