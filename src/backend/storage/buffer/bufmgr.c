@@ -2677,19 +2677,17 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 			/*
 			 * Check if buffer is already marked as hot. Hot buffers are
 			 * permanently pinned and we don't modify their refcount.
+			 * We track this backend's use of the hot buffer.
 			 */
 			if (buf_state & BM_HOT)
 			{
 				result = (buf_state & BM_VALID) != 0;
 				
 				/* Track that we're using a hot buffer */
-				if (!ref->is_hot)
-				{
-					ref->is_hot = true;
-					if (PrivateHotBufferCount == 0)
-						SetHotBufferBit();
-					PrivateHotBufferCount++;
-				}
+				ref->is_hot = true;
+				if (PrivateHotBufferCount == 0)
+					SetHotBufferBit();
+				PrivateHotBufferCount++;
 				
 				VALGRIND_MAKE_MEM_DEFINED(BufHdrGetBlock(buf), BLCKSZ);
 				break;
@@ -2700,15 +2698,20 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 
 			/*
 			 * Check if we've exceeded the hot buffer threshold. If so, mark
-			 * the buffer as hot and reset its refcount.
+			 * the buffer as hot. We keep the refcount as-is because other
+			 * backends may have already pinned this buffer before it became
+			 * hot, and they need the refcount to properly unpin.
 			 */
 			if (BUF_STATE_GET_REFCOUNT(buf_state) > BM_HOT_REFCOUNT_THRESHOLD)
 			{
-				/* Reset refcount and set hot flag */
-				buf_state &= ~BUF_REFCOUNT_MASK;
+				/* Set hot flag but keep the refcount */
 				buf_state |= BM_HOT;
 				
-				/* Track that we're using a hot buffer */
+				/*
+				 * Only the backend that sets BM_HOT flag tracks it as hot.
+				 * Other backends that already had pins won't have is_hot set
+				 * and will use normal unpin logic.
+				 */
 				ref->is_hot = true;
 				if (PrivateHotBufferCount == 0)
 					SetHotBufferBit();
@@ -2768,16 +2771,11 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 		result = (pg_atomic_read_u32(&buf->state) & BM_VALID) != 0;
 		
 		/*
-		 * Check if buffer became hot since we first pinned it.
-		 * If so, track it in our private state.
+		 * Note: If buffer became hot after we first pinned it, we don't
+		 * update our is_hot tracking. We continue using normal refcount
+		 * logic for all our pins, since we had the buffer pinned before
+		 * it became hot.
 		 */
-		if (!ref->is_hot && (pg_atomic_read_u32(&buf->state) & BM_HOT))
-		{
-			ref->is_hot = true;
-			if (PrivateHotBufferCount == 0)
-				SetHotBufferBit();
-			PrivateHotBufferCount++;
-		}
 	}
 
 	ref->refcount++;
@@ -2904,14 +2902,12 @@ UnpinBufferNoOwner(BufferDesc *buf)
 		Assert(!LWLockHeldByMe(BufferDescriptorGetContentLock(buf)));
 
 		/*
-		 * For hot buffers, we don't decrement the shared reference count
-		 * as they are permanently pinned. For normal buffers, decrement
-		 * the shared reference count.
+		 * If this backend marked the buffer as hot (by setting BM_HOT flag
+		 * or by pinning after it was already hot), we don't decrement the
+		 * shared refcount. Otherwise, we decrement normally - this handles
+		 * backends that pinned before the buffer became hot.
 		 */
-		old_buf_state = pg_atomic_read_u32(&buf->state);
-		
-		/* Hot buffers don't need refcount manipulation */
-		if (old_buf_state & BM_HOT)
+		if (ref->is_hot)
 		{
 			ForgetPrivateRefCountEntry(ref);
 			return;
@@ -2923,6 +2919,7 @@ UnpinBufferNoOwner(BufferDesc *buf)
 		 * Since buffer spinlock holder can update status using just write,
 		 * it's not safe to use atomic decrement here; thus use a CAS loop.
 		 */
+		old_buf_state = pg_atomic_read_u32(&buf->state);
 		for (;;)
 		{
 			if (old_buf_state & BM_LOCKED)
