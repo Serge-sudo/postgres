@@ -320,18 +320,19 @@ typedef struct WritebackContext
  * Each backend has one bit in the bitmap. When a backend pins a hot buffer,
  * its bit is set. When all hot buffers are unpinned by a backend, its bit
  * is cleared.
+ *
+ * We use a simple char array instead of atomics since each backend only
+ * modifies its own bit. Memory barriers ensure visibility.
  */
 typedef struct HotBufferControl
 {
-	/* Spinlock to protect the bitmap */
-	slock_t		lock;
-	
+	int			nbytes;			/* Number of bytes in bitmap */
 	/*
 	 * Bitmap tracking which backends have hot buffer references.
 	 * One bit per backend, indexed by backend pgprocno.
 	 * Size is calculated to hold MaxBackends bits.
 	 */
-	pg_atomic_uint32 bitmap[FLEXIBLE_ARRAY_MEMBER];
+	char		bitmap[FLEXIBLE_ARRAY_MEMBER];
 } HotBufferControl;
 
 /* in buf_init.c */

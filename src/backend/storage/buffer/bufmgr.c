@@ -6177,16 +6177,14 @@ Size
 HotBufferShmemSize(void)
 {
 	Size		size = 0;
-	int			nbits;
-	int			nuint32s;
+	int			nbytes;
 
 	/* We need MaxBackends bits, one per backend */
-	nbits = MaxBackends;
-	/* Round up to the nearest uint32 */
-	nuint32s = (nbits + 31) / 32;
+	/* Round up to the nearest byte */
+	nbytes = (MaxBackends + 7) / 8;
 	
 	size = offsetof(HotBufferControl, bitmap);
-	size = add_size(size, mul_size(nuint32s, sizeof(pg_atomic_uint32)));
+	size = add_size(size, nbytes);
 	
 	return size;
 }
@@ -6198,29 +6196,23 @@ void
 HotBufferInit(void)
 {
 	bool		found;
-	int			nbits;
-	int			nuint32s;
-	int			i;
+	int			nbytes;
 
 	/* We need MaxBackends bits, one per backend */
-	nbits = MaxBackends;
-	/* Round up to the nearest uint32 */
-	nuint32s = (nbits + 31) / 32;
+	nbytes = (MaxBackends + 7) / 8;
 
 	HotBufferBitmap = (HotBufferControl *)
 		ShmemInitStruct("Hot Buffer Bitmap",
-						offsetof(HotBufferControl, bitmap) +
-						nuint32s * sizeof(pg_atomic_uint32),
+						offsetof(HotBufferControl, bitmap) + nbytes,
 						&found);
 
 	if (!found)
 	{
-		/* Initialize the spinlock */
-		SpinLockInit(&HotBufferBitmap->lock);
+		/* Store the size */
+		HotBufferBitmap->nbytes = nbytes;
 		
 		/* Initialize all bitmap entries to 0 */
-		for (i = 0; i < nuint32s; i++)
-			pg_atomic_init_u32(&HotBufferBitmap->bitmap[i], 0);
+		memset(HotBufferBitmap->bitmap, 0, nbytes);
 	}
 }
 
@@ -6231,15 +6223,14 @@ static void
 SetHotBufferBit(void)
 {
 	ProcNumber	procno = GetNumberFromPGProc(MyProc);
-	int			word_idx = procno / 32;
-	uint32		bit_mask = 1U << (procno % 32);
-	uint32		old_val;
+	int			byte_idx = procno / 8;
+	int			bit_idx = procno % 8;
 
-	/* Atomically set the bit */
-	old_val = pg_atomic_fetch_or_u32(&HotBufferBitmap->bitmap[word_idx], bit_mask);
+	/* Set the bit for this backend */
+	HotBufferBitmap->bitmap[byte_idx] |= (1 << bit_idx);
 	
-	/* If bit wasn't already set, we're done */
-	(void) old_val;
+	/* Memory barrier to ensure visibility */
+	pg_write_barrier();
 }
 
 /*
@@ -6249,11 +6240,14 @@ static void
 ClearHotBufferBit(void)
 {
 	ProcNumber	procno = GetNumberFromPGProc(MyProc);
-	int			word_idx = procno / 32;
-	uint32		bit_mask = 1U << (procno % 32);
+	int			byte_idx = procno / 8;
+	int			bit_idx = procno % 8;
 
-	/* Atomically clear the bit */
-	pg_atomic_fetch_and_u32(&HotBufferBitmap->bitmap[word_idx], ~bit_mask);
+	/* Clear the bit for this backend */
+	HotBufferBitmap->bitmap[byte_idx] &= ~(1 << bit_idx);
+	
+	/* Memory barrier to ensure visibility */
+	pg_write_barrier();
 }
 
 /*
@@ -6264,17 +6258,13 @@ ClearHotBufferBit(void)
 bool
 HotBufferHasReferences(void)
 {
-	int			nbits = MaxBackends;
-	int			nuint32s = (nbits + 31) / 32;
-	int			i;
+	int			nbytes = (MaxBackends + 7) / 8;
+	uint64		total_bits;
 
-	for (i = 0; i < nuint32s; i++)
-	{
-		if (pg_atomic_read_u32(&HotBufferBitmap->bitmap[i]) != 0)
-			return true;
-	}
+	/* Count set bits using pg_popcount_optimized */
+	total_bits = pg_popcount_optimized((const char *) HotBufferBitmap->bitmap, nbytes);
 	
-	return false;
+	return total_bits > 0;
 }
 
 /* ResourceOwner callbacks */
