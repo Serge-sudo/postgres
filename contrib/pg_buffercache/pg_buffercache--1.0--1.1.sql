@@ -8,4 +8,4 @@ CREATE OR REPLACE VIEW pg_buffercache AS
 	SELECT P.* FROM pg_buffercache_pages() AS P
 	(bufferid integer, relfilenode oid, reltablespace oid, reldatabase oid,
 	 relforknumber int2, relblocknumber int8, isdirty bool, usagecount int2,
-	 pinning_backends int4);
+	 pinning_backends int4, hot bool);
