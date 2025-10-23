@@ -61,6 +61,7 @@ int			IdleInTransactionSessionTimeout = 0;
 int			TransactionTimeout = 0;
 int			IdleSessionTimeout = 0;
 bool		log_lock_waits = false;
+bool		enable_per_lock_semaphore = false;
 
 /* Pointer to this process's PGPROC struct, if any */
 PGPROC	   *MyProc = NULL;
@@ -122,10 +123,13 @@ int
 ProcGlobalSemas(void)
 {
 	/*
-	 * We need a sema per backend (including autovacuum), plus one for each
-	 * auxiliary process.
+	 * We need semaphores per backend (including autovacuum) and auxiliary process:
+	 * - 1 for the original sem
+	 * - PGPROC_LWSEM_ARRAY_SIZE for lwSem array
+	 * - 1 for procArrayGroupSem
+	 * - 1 for clogGroupSem
 	 */
-	return MaxBackends + NUM_AUXILIARY_PROCS;
+	return (MaxBackends + NUM_AUXILIARY_PROCS) * (1 + PGPROC_LWSEM_ARRAY_SIZE + 2);
 }
 
 /*
@@ -225,6 +229,18 @@ InitProcGlobal(void)
 		if (i < MaxBackends + NUM_AUXILIARY_PROCS)
 		{
 			proc->sem = PGSemaphoreCreate();
+			
+			/* Allocate and initialize lwSem array */
+			proc->lwSem = (PGSemaphore *) ShmemAlloc(PGPROC_LWSEM_ARRAY_SIZE * sizeof(PGSemaphore));
+			for (j = 0; j < PGPROC_LWSEM_ARRAY_SIZE; j++)
+			{
+				proc->lwSem[j] = PGSemaphoreCreate();
+			}
+			
+			/* Create group semaphores */
+			proc->procArrayGroupSem = PGSemaphoreCreate();
+			proc->clogGroupSem = PGSemaphoreCreate();
+			
 			InitSharedLatch(&(proc->procLatch));
 			LWLockInitialize(&(proc->fpInfoLock), LWTRANCHE_LOCK_FASTPATH);
 		}
@@ -298,6 +314,7 @@ void
 InitProcess(void)
 {
 	dlist_head *procgloballist;
+	int			i;
 
 	/*
 	 * ProcGlobal should be set up already (if we are a backend, we inherit
@@ -458,6 +475,16 @@ InitProcess(void)
 	 * necessary anymore, but seems like a good idea for cleanliness.)
 	 */
 	PGSemaphoreReset(MyProc->sem);
+	
+	/*
+	 * Reset the lwSem array and group semaphores as well.
+	 */
+	for (i = 0; i < PGPROC_LWSEM_ARRAY_SIZE; i++)
+	{
+		PGSemaphoreReset(MyProc->lwSem[i]);
+	}
+	PGSemaphoreReset(MyProc->procArrayGroupSem);
+	PGSemaphoreReset(MyProc->clogGroupSem);
 
 	/*
 	 * Arrange to clean up at backend exit.
@@ -529,6 +556,7 @@ InitAuxiliaryProcess(void)
 {
 	PGPROC	   *auxproc;
 	int			proctype;
+	int			i;
 
 	/*
 	 * ProcGlobal should be set up already (if we are a backend, we inherit
@@ -629,6 +657,16 @@ InitAuxiliaryProcess(void)
 	 * necessary anymore, but seems like a good idea for cleanliness.)
 	 */
 	PGSemaphoreReset(MyProc->sem);
+	
+	/*
+	 * Reset the lwSem array and group semaphores as well.
+	 */
+	for (i = 0; i < PGPROC_LWSEM_ARRAY_SIZE; i++)
+	{
+		PGSemaphoreReset(MyProc->lwSem[i]);
+	}
+	PGSemaphoreReset(MyProc->procArrayGroupSem);
+	PGSemaphoreReset(MyProc->clogGroupSem);
 
 	/*
 	 * Arrange to clean up at process exit.

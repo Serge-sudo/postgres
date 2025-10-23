@@ -233,6 +233,7 @@ static void InitializeLWLocks(void);
 static inline void LWLockReportWaitStart(LWLock *lock);
 static inline void LWLockReportWaitEnd(void);
 static const char *GetLWTrancheName(uint16 trancheId);
+static PGSemaphore pangolin_semaphore_for_lwlock(PGPROC *proc, LWLock *lock);
 
 #define T_NAME(lock) \
 	GetLWTrancheName((lock)->tranche)
@@ -774,6 +775,30 @@ GetLWLockIdentifier(uint32 classId, uint16 eventId)
 }
 
 /*
+ * pangolin_semaphore_for_lwlock - select appropriate semaphore for an LWLock
+ *
+ * Returns the semaphore to use for the given lock when enable_per_lock_semaphore
+ * is enabled. For locks in MainLWLockArray, returns a dedicated semaphore.
+ * For user-defined tranches, returns one of the extra semaphores allocated
+ * for that purpose, or the last semaphore if the tranche ID is too high.
+ */
+static PGSemaphore
+pangolin_semaphore_for_lwlock(PGPROC *proc, LWLock *lock)
+{
+	LWLockPadded *ptr = (LWLockPadded *) lock;
+	
+	/* For locks in MainLWLockArray, use corresponding dedicated semaphore */
+	if (ptr >= MainLWLockArray && ptr < MainLWLockArray + NUM_FIXED_LWLOCKS)
+		return proc->lwSem[ptr - MainLWLockArray];
+	
+	/*
+	 * For user-defined tranches, use one of the extra 32 semaphores.
+	 * If tranche ID exceeds the allocated range, use the last semaphore.
+	 */
+	return proc->lwSem[NUM_FIXED_LWLOCKS + Min(lock->tranche - NUM_FIXED_LWLOCKS, 31)];
+}
+
+/*
  * Internal function that tries to atomically acquire the lwlock in the passed
  * in mode.
  *
@@ -1025,7 +1050,10 @@ LWLockWakeup(LWLock *lock)
 		 */
 		pg_write_barrier();
 		waiter->lwWaiting = LW_WS_NOT_WAITING;
-		PGSemaphoreUnlock(waiter->sem);
+		if (enable_per_lock_semaphore)
+			PGSemaphoreUnlock(pangolin_semaphore_for_lwlock(waiter, lock));
+		else
+			PGSemaphoreUnlock(waiter->sem);
 	}
 }
 
@@ -1135,7 +1163,10 @@ LWLockDequeueSelf(LWLock *lock)
 		 */
 		for (;;)
 		{
-			PGSemaphoreLock(MyProc->sem);
+			if (enable_per_lock_semaphore)
+				PGSemaphoreLock(pangolin_semaphore_for_lwlock(MyProc, lock));
+			else
+				PGSemaphoreLock(MyProc->sem);
 			if (MyProc->lwWaiting == LW_WS_NOT_WAITING)
 				break;
 			extraWaits++;
@@ -1145,7 +1176,12 @@ LWLockDequeueSelf(LWLock *lock)
 		 * Fix the process wait semaphore's count for any absorbed wakeups.
 		 */
 		while (extraWaits-- > 0)
-			PGSemaphoreUnlock(MyProc->sem);
+		{
+			if (enable_per_lock_semaphore)
+				PGSemaphoreUnlock(pangolin_semaphore_for_lwlock(MyProc, lock));
+			else
+				PGSemaphoreUnlock(MyProc->sem);
+		}
 	}
 
 #ifdef LOCK_DEBUG

@@ -1510,6 +1510,15 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"enable_per_lock_semaphore", PGC_POSTMASTER, DEVELOPER_OPTIONS,
+			gettext_noop("Enable separate semaphores for different LWLock types."),
+			NULL
+		},
+		&enable_per_lock_semaphore,
+		false,
+		NULL, NULL, NULL
+	},
+	{
 		{"log_recovery_conflict_waits", PGC_SIGHUP, LOGGING_WHAT,
 			gettext_noop("Logs standby recovery conflict waits."),
 			NULL
