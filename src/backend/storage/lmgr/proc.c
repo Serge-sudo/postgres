@@ -423,13 +423,9 @@ InitProcess(void)
 	MyProc->waitProcLock = NULL;
 	pg_atomic_write_u64(&MyProc->waitStart, 0);
 #ifdef USE_ASSERT_CHECKING
-	{
-		int			i;
-
-		/* Last process should have released all locks. */
-		for (i = 0; i < NUM_LOCK_PARTITIONS; i++)
-			Assert(dlist_is_empty(&(MyProc->myProcLocks[i])));
-	}
+	/* Last process should have released all locks. */
+	for (i = 0; i < NUM_LOCK_PARTITIONS; i++)
+		Assert(dlist_is_empty(&(MyProc->myProcLocks[i])));
 #endif
 	MyProc->recoveryConflictPending = false;
 
@@ -627,13 +623,9 @@ InitAuxiliaryProcess(void)
 	MyProc->waitProcLock = NULL;
 	pg_atomic_write_u64(&MyProc->waitStart, 0);
 #ifdef USE_ASSERT_CHECKING
-	{
-		int			i;
-
-		/* Last process should have released all locks. */
-		for (i = 0; i < NUM_LOCK_PARTITIONS; i++)
-			Assert(dlist_is_empty(&(MyProc->myProcLocks[i])));
-	}
+	/* Last process should have released all locks. */
+	for (i = 0; i < NUM_LOCK_PARTITIONS; i++)
+		Assert(dlist_is_empty(&(MyProc->myProcLocks[i])));
 #endif
 
 	/*

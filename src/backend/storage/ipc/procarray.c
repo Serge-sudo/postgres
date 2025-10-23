@@ -822,13 +822,14 @@ ProcArrayGroupClearXid(PGPROC *proc, TransactionId latestXid)
 	if (nextidx != INVALID_PROC_NUMBER)
 	{
 		int			extraWaits = 0;
+		PGSemaphore sem = enable_per_lock_semaphore ? proc->procArrayGroupSem : proc->sem;
 
 		/* Sleep until the leader clears our XID. */
 		pgstat_report_wait_start(WAIT_EVENT_PROCARRAY_GROUP_UPDATE);
 		for (;;)
 		{
 			/* acts as a read barrier */
-			PGSemaphoreLock(proc->sem);
+			PGSemaphoreLock(sem);
 			if (!proc->procArrayGroupMember)
 				break;
 			extraWaits++;
@@ -839,7 +840,7 @@ ProcArrayGroupClearXid(PGPROC *proc, TransactionId latestXid)
 
 		/* Fix semaphore count for any absorbed wakeups */
 		while (extraWaits-- > 0)
-			PGSemaphoreUnlock(proc->sem);
+			PGSemaphoreUnlock(sem);
 		return;
 	}
 
@@ -881,6 +882,7 @@ ProcArrayGroupClearXid(PGPROC *proc, TransactionId latestXid)
 	while (wakeidx != INVALID_PROC_NUMBER)
 	{
 		PGPROC	   *nextproc = &allProcs[wakeidx];
+		PGSemaphore sem = enable_per_lock_semaphore ? nextproc->procArrayGroupSem : nextproc->sem;
 
 		wakeidx = pg_atomic_read_u32(&nextproc->procArrayGroupNext);
 		pg_atomic_write_u32(&nextproc->procArrayGroupNext, INVALID_PROC_NUMBER);
@@ -891,7 +893,7 @@ ProcArrayGroupClearXid(PGPROC *proc, TransactionId latestXid)
 		nextproc->procArrayGroupMember = false;
 
 		if (nextproc != MyProc)
-			PGSemaphoreUnlock(nextproc->sem);
+			PGSemaphoreUnlock(sem);
 	}
 }
 
