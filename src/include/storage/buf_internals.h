@@ -451,6 +451,7 @@ extern void ScheduleBufferTagForWriteback(WritebackContext *wb_context,
 /* Hot buffer management in bufmgr.c */
 extern Size HotBufferShmemSize(void);
 extern void HotBufferInit(void);
+extern bool HotBufferHasReferences(void);
 
 /* freelist.c */
 extern IOContext IOContextForStrategy(BufferAccessStrategy strategy);

@@ -223,7 +223,6 @@ static void ForgetPrivateRefCountEntry(PrivateRefCountEntry *ref);
 /* Hot buffer management functions */
 static void SetHotBufferBit(void);
 static void ClearHotBufferBit(void);
-static bool HotBufferHasReferences(void);
 
 /* ResourceOwner callbacks to hold in-progress I/Os and buffer pins */
 static void ResOwnerReleaseBufferIO(Datum res);
@@ -2675,9 +2674,8 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 			buf_state = old_buf_state;
 
 			/*
-			 * Check if buffer is already marked as hot. Hot buffers are
-			 * permanently pinned and we don't modify their refcount.
-			 * We track this backend's use of the hot buffer.
+			 * Check if buffer is already marked as hot. Hot buffers don't
+			 * use refcount - we just track this backend's use of the hot buffer.
 			 */
 			if (buf_state & BM_HOT)
 			{
@@ -2698,13 +2696,19 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 
 			/*
 			 * Check if we've exceeded the hot buffer threshold. If so, mark
-			 * the buffer as hot. We keep the refcount as-is because other
-			 * backends may have already pinned this buffer before it became
-			 * hot, and they need the refcount to properly unpin.
+			 * the buffer as hot. We DON'T increment refcount when setting
+			 * BM_HOT - the backend making it hot doesn't hold a normal pin.
+			 * We keep the existing refcount because other backends may have
+			 * already pinned this buffer before it became hot, and they need
+			 * the refcount to properly unpin.
 			 */
 			if (BUF_STATE_GET_REFCOUNT(buf_state) > BM_HOT_REFCOUNT_THRESHOLD)
 			{
-				/* Set hot flag but keep the refcount */
+				/* 
+				 * Set hot flag and subtract the increment we just added,
+				 * since we're tracking this as a hot pin instead.
+				 */
+				buf_state -= BUF_REFCOUNT_ONE;
 				buf_state |= BM_HOT;
 				
 				/*
@@ -6189,7 +6193,7 @@ ClearHotBufferBit(void)
  *
  * Returns true if any backend has its bit set in the hot buffer bitmap.
  */
-static bool
+bool
 HotBufferHasReferences(void)
 {
 	int			nbits = MaxBackends;
