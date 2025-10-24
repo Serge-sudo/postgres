@@ -61,7 +61,7 @@
 #include "utils/rel.h"
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
-
+#include "port/pg_bitutils.h"
 
 /* Note: these two macros only work on shared buffers, not local ones! */
 #define BufHdrGetBlock(bufHdr)	((Block) (BufferBlocks + ((Size) (bufHdr)->buf_id) * BLCKSZ))
@@ -89,6 +89,7 @@ typedef struct PrivateRefCountEntry
 {
 	Buffer		buffer;
 	int32		refcount;
+	bool		is_hot;			/* true if this buffer is marked as hot */
 } PrivateRefCountEntry;
 
 /* 64 bytes, about the size of a cache line on common systems */
@@ -140,6 +141,7 @@ bool		zero_damaged_pages = false;
 int			bgwriter_lru_maxpages = 100;
 double		bgwriter_lru_multiplier = 2.0;
 bool		track_io_timing = false;
+bool		enable_hot_buffers = true;
 
 /*
  * How many buffers PrefetchBuffer callers should try to stay ahead of their
@@ -210,11 +212,17 @@ static int32 PrivateRefCountOverflowed = 0;
 static uint32 PrivateRefCountClock = 0;
 static PrivateRefCountEntry *ReservedRefCountEntry = NULL;
 
+/* Hot buffer tracking: count of hot buffers this backend has pinned */
+static int32 PrivateHotBufferCount = 0;
+
 static void ReservePrivateRefCountEntry(void);
 static PrivateRefCountEntry *NewPrivateRefCountEntry(Buffer buffer);
 static PrivateRefCountEntry *GetPrivateRefCountEntry(Buffer buffer, bool do_move);
 static inline int32 GetPrivateRefCount(Buffer buffer);
 static void ForgetPrivateRefCountEntry(PrivateRefCountEntry *ref);
+
+/* Hot buffer management functions */
+static void SetHotBufferBit(void);
 
 /* ResourceOwner callbacks to hold in-progress I/Os and buffer pins */
 static void ResOwnerReleaseBufferIO(Datum res);
@@ -326,6 +334,7 @@ NewPrivateRefCountEntry(Buffer buffer)
 	/* and fill it */
 	res->buffer = buffer;
 	res->refcount = 0;
+	res->is_hot = false;
 
 	return res;
 }
@@ -2664,8 +2673,76 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 
 			buf_state = old_buf_state;
 
+			/* reset */
+			ref->is_hot = false;
+
+			/*
+			 * Check if buffer is already marked as hot. Hot buffers don't
+			 * use refcount - we just track this backend's use of the hot buffer.
+			 * Only check if hot buffers feature is enabled.
+			 */
+			if (enable_hot_buffers && (buf_state & BM_HOT))
+			{
+				result = (buf_state & BM_VALID) != 0;
+				
+				/* Track that we're using a hot buffer */
+				ref->is_hot = true;
+				if (PrivateHotBufferCount == 0)
+				{
+					SetHotBufferBit();
+					pg_write_barrier();
+				}
+
+				/* recheck */
+				old_buf_state = pg_atomic_read_u32(&buf->state);
+				
+				if (old_buf_state & BM_HOT)
+				{
+					PrivateHotBufferCount++;
+					VALGRIND_MAKE_MEM_DEFINED(BufHdrGetBlock(buf), BLCKSZ);
+					break;
+				} else if (PrivateHotBufferCount == 0)
+				{
+					/* clear hot buffer bit, if we couldn't get it */
+					ClearHotBufferBit();
+				}
+				continue;
+			}
+
 			/* increase refcount */
 			buf_state += BUF_REFCOUNT_ONE;
+
+			/*
+			 * Check if we've exceeded the hot buffer threshold. If so, mark
+			 * the buffer as hot. We DON'T increment refcount when setting
+			 * BM_HOT - the backend making it hot doesn't hold a normal pin.
+			 * We keep the existing refcount because other backends may have
+			 * already pinned this buffer before it became hot, and they need
+			 * the refcount to properly unpin.
+			 * Only do this if hot buffers feature is enabled.
+			 */
+			if (enable_hot_buffers && 
+				BUF_STATE_GET_REFCOUNT(buf_state) > BM_HOT_REFCOUNT_THRESHOLD)
+			{
+				/* 
+				 * Set hot flag and subtract the increment we just added,
+				 * since we're tracking this as a hot pin instead.
+				 */
+				buf_state -= BUF_REFCOUNT_ONE;
+				buf_state |= BM_HOT;
+				
+				/*
+				 * Only the backend that sets BM_HOT flag tracks it as hot.
+				 * Other backends that already had pins won't have is_hot set
+				 * and will use normal unpin logic.
+				 */
+				ref->is_hot = true;
+				if (PrivateHotBufferCount == 0)
+				{
+					SetHotBufferBit();
+					pg_write_barrier();
+				}
+			}
 
 			if (strategy == NULL)
 			{
@@ -2688,6 +2765,9 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 			{
 				result = (buf_state & BM_VALID) != 0;
 
+				if (ref->is_hot)
+					PrivateHotBufferCount++;
+
 				/*
 				 * Assume that we acquired a buffer pin for the purposes of
 				 * Valgrind buffer client checks (even in !result case) to
@@ -2697,6 +2777,11 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 				 */
 				VALGRIND_MAKE_MEM_DEFINED(BufHdrGetBlock(buf), BLCKSZ);
 				break;
+			}
+			else if(ref->is_hot && PrivateHotBufferCount == 0)
+			{
+				SetHotBufferBit();
+				pg_write_barrier();
 			}
 		}
 	}
@@ -2718,6 +2803,13 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 		 * cannot meddle with that.
 		 */
 		result = (pg_atomic_read_u32(&buf->state) & BM_VALID) != 0;
+		
+		/*
+		 * Note: If buffer became hot after we first pinned it, we don't
+		 * update our is_hot tracking. We continue using normal refcount
+		 * logic for all our pins, since we had the buffer pinned before
+		 * it became hot.
+		 */
 	}
 
 	ref->refcount++;
@@ -2754,6 +2846,7 @@ PinBuffer_Locked(BufferDesc *buf)
 	Buffer		b;
 	PrivateRefCountEntry *ref;
 	uint32		buf_state;
+	bool		is_hot = false;
 
 	/*
 	 * As explained, We don't expect any preexisting pins. That allows us to
@@ -2774,14 +2867,61 @@ PinBuffer_Locked(BufferDesc *buf)
 	 */
 	buf_state = pg_atomic_read_u32(&buf->state);
 	Assert(buf_state & BM_LOCKED);
-	buf_state += BUF_REFCOUNT_ONE;
+	
+	/*
+	 * Check if buffer is already marked as hot. If so, don't increment
+	 * refcount - just track this as a hot pin.
+	 * Only check if hot buffers feature is enabled.
+	 */
+	if (enable_hot_buffers && (buf_state & BM_HOT))
+	{
+		/* Track that we're using a hot buffer */
+		is_hot = true;
+		if (PrivateHotBufferCount == 0)
+		{
+			SetHotBufferBit();
+			pg_write_barrier();
+		}
+			
+		PrivateHotBufferCount++;
+	}
+	else
+	{
+		/* Increment refcount */
+		buf_state += BUF_REFCOUNT_ONE;
+		
+		/*
+		 * Check if we've exceeded the hot buffer threshold. If so, mark
+		 * the buffer as hot and don't hold a normal pin.
+		 * Only do this if hot buffers feature is enabled.
+		 */
+		if (enable_hot_buffers &&
+			BUF_STATE_GET_REFCOUNT(buf_state) > BM_HOT_REFCOUNT_THRESHOLD)
+		{
+			/* 
+			 * Set hot flag and subtract the increment we just added,
+			 * since we're tracking this as a hot pin instead.
+			 */
+			buf_state -= BUF_REFCOUNT_ONE;
+			buf_state |= BM_HOT;
+			
+			/* Track that we're using a hot buffer */
+			is_hot = true;
+			if (PrivateHotBufferCount == 0)
+			{
+				SetHotBufferBit();
+				pg_write_barrier();
+			}
+			PrivateHotBufferCount++;
+		}
+	}
 	UnlockBufHdr(buf, buf_state);
 
 	b = BufferDescriptorGetBuffer(buf);
 
 	ref = NewPrivateRefCountEntry(b);
 	ref->refcount++;
-
+	ref->is_hot = is_hot;
 	ResourceOwnerRememberBuffer(CurrentResourceOwner, b);
 }
 
@@ -2819,6 +2959,17 @@ UnpinBufferNoOwner(BufferDesc *buf)
 		uint32		old_buf_state;
 
 		/*
+		 * If this buffer was marked as hot in our private tracking,
+		 * decrement our hot buffer count. If it reaches zero, clear
+		 * our bit in the shared bitmap.
+		 */
+		if (ref->is_hot)
+		{
+			Assert(PrivateHotBufferCount > 0);
+			PrivateHotBufferCount--;
+		}
+
+		/*
 		 * Mark buffer non-accessible to Valgrind.
 		 *
 		 * Note that the buffer may have already been marked non-accessible
@@ -2829,6 +2980,18 @@ UnpinBufferNoOwner(BufferDesc *buf)
 
 		/* I'd better not still hold the buffer content lock */
 		Assert(!LWLockHeldByMe(BufferDescriptorGetContentLock(buf)));
+
+		/*
+		 * If this backend marked the buffer as hot (by setting BM_HOT flag
+		 * or by pinning after it was already hot), we don't decrement the
+		 * shared refcount. Otherwise, we decrement normally - this handles
+		 * backends that pinned before the buffer became hot.
+		 */
+		if (ref->is_hot)
+		{
+			ForgetPrivateRefCountEntry(ref);
+			return;
+		}
 
 		/*
 		 * Decrement the shared reference count.
@@ -6009,6 +6172,109 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 							IOOP_WRITEBACK, io_start, wb_context->nr_pending);
 
 	wb_context->nr_pending = 0;
+}
+
+/*
+ * Hot buffer management
+ */
+
+/*
+ * HotBufferShmemSize -- compute space needed for hot buffer bitmap
+ */
+Size
+HotBufferShmemSize(void)
+{
+	Size		size = 0;
+	int			nbytes;
+
+	/* We need MaxBackends bits, one per backend */
+	/* Round up to the nearest byte */
+	nbytes = (MaxBackends + 7) / 8;
+	
+	size = offsetof(HotBufferControl, bitmap);
+	size = add_size(size, nbytes);
+	
+	return size;
+}
+
+/*
+ * HotBufferInit -- initialize the hot buffer bitmap in shared memory
+ */
+void
+HotBufferInit(void)
+{
+	bool		found;
+	int			nbytes;
+
+	/* We need MaxBackends bits, one per backend */
+	nbytes = (MaxBackends + 7) / 8;
+
+	HotBufferBitmap = (HotBufferControl *)
+		ShmemInitStruct("Hot Buffer Bitmap",
+						offsetof(HotBufferControl, bitmap) + nbytes,
+						&found);
+
+	if (!found)
+	{
+		/* Store the size */
+		HotBufferBitmap->nbytes = nbytes;
+		
+		/* Initialize all bitmap entries to 0 */
+		memset(HotBufferBitmap->bitmap, 0, nbytes);
+	}
+}
+
+/*
+ * SetHotBufferBit -- set the bit for current backend in hot buffer bitmap
+ */
+static void
+SetHotBufferBit(void)
+{
+	ProcNumber	procno = GetNumberFromPGProc(MyProc);
+	int			byte_idx = procno / 8;
+	int			bit_idx = procno % 8;
+
+	/* Set the bit for this backend */
+	HotBufferBitmap->bitmap[byte_idx] |= (1 << bit_idx);
+	
+	/* Memory barrier to ensure visibility */
+	pg_write_barrier();
+}
+
+/*
+ * ClearHotBufferBit -- clear the bit for current backend in hot buffer bitmap
+ */
+void
+ClearHotBufferBit(void)
+{
+	ProcNumber	procno = GetNumberFromPGProc(MyProc);
+	int			byte_idx = procno / 8;
+	int			bit_idx = procno % 8;
+	
+	Assert(PrivateHotBufferCount == 0);
+
+	/* Clear the bit for this backend */
+	HotBufferBitmap->bitmap[byte_idx] &= ~(1 << bit_idx);
+	
+	/* Memory barrier to ensure visibility */
+	pg_write_barrier();
+}
+
+/*
+ * HotBufferHasReferences -- check if any backend has hot buffer references
+ *
+ * Returns true if any backend has its bit set in the hot buffer bitmap.
+ */
+bool
+HotBufferHasReferences(void)
+{
+	int			nbytes = (MaxBackends + 7) / 8;
+	uint64		total_bits;
+
+	/* Count set bits using pg_popcount_optimized */
+	total_bits = pg_popcount_optimized((const char *) HotBufferBitmap->bitmap, nbytes);
+	
+	return total_bits > 0;
 }
 
 /* ResourceOwner callbacks */

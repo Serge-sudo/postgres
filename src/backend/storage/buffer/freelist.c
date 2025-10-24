@@ -297,10 +297,12 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 			 * put a valid buffer in the freelist and then someone else used
 			 * it before we got to it.  It's probably impossible altogether as
 			 * of 8.3, but we'd better check anyway.)
+			 * Also skip hot buffers (if hot buffers feature is enabled).
 			 */
 			local_buf_state = LockBufHdr(buf);
 			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
-				&& BUF_STATE_GET_USAGECOUNT(local_buf_state) == 0)
+				&& BUF_STATE_GET_USAGECOUNT(local_buf_state) == 0
+				&& !(enable_hot_buffers && (local_buf_state & BM_HOT)))
 			{
 				if (strategy != NULL)
 					AddBufferToRing(strategy, buf);
@@ -322,6 +324,51 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 		 * it; decrement the usage_count (unless pinned) and keep scanning.
 		 */
 		local_buf_state = LockBufHdr(buf);
+
+		/*
+		 * Check if buffer is marked as hot. If it has BM_HOT set but refcount
+		 * is 0, it means all backends that pinned before it became hot have
+		 * unpinned. Check if any backends still have hot pins by examining
+		 * the shared bitmap. If no backends have hot pins, clear BM_HOT and
+		 * the buffer becomes available for reuse.
+		 * Only do this if hot buffers feature is enabled.
+		 */
+		if (enable_hot_buffers && (local_buf_state & BM_HOT))
+		{
+			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
+			{
+				/*
+				 * No normal pins remain. Check if any backends have hot pins.
+				 * Since we hold the buffer lock, no new pins can occur.
+				 */
+				if (!HotBufferHasReferences())
+				{
+					/* No hot pins either - clear BM_HOT and make available */
+					local_buf_state &= ~BM_HOT;
+					
+					/* Check if buffer is usable now */
+					if (BUF_STATE_GET_USAGECOUNT(local_buf_state) == 0)
+					{
+						/* Found a usable buffer */
+						if (strategy != NULL)
+							AddBufferToRing(strategy, buf);
+						*buf_state = local_buf_state;
+						return buf;
+					}
+					else
+					{
+						/* Decrement usage count and continue */
+						local_buf_state -= BUF_USAGECOUNT_ONE;
+						UnlockBufHdr(buf, local_buf_state);
+						trycounter = NBuffers;
+						continue;
+					}
+				}
+			}
+			/* Hot buffer still has pins - skip it */
+			UnlockBufHdr(buf, local_buf_state);
+			continue;
+		}
 
 		if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
 		{

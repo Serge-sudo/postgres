@@ -2361,7 +2361,7 @@ CommitTransaction(void)
 	ResourceOwnerRelease(TopTransactionResourceOwner,
 						 RESOURCE_RELEASE_BEFORE_LOCKS,
 						 true, true);
-
+	ClearHotBufferBit();
 	/* Check we've released all buffer pins */
 	AtEOXact_Buffers(true);
 
@@ -2663,7 +2663,7 @@ PrepareTransaction(void)
 	ResourceOwnerRelease(TopTransactionResourceOwner,
 						 RESOURCE_RELEASE_BEFORE_LOCKS,
 						 true, true);
-
+	ClearHotBufferBit();
 	/* Check we've released all buffer pins */
 	AtEOXact_Buffers(true);
 
@@ -2905,6 +2905,7 @@ AbortTransaction(void)
 		ResourceOwnerRelease(TopTransactionResourceOwner,
 							 RESOURCE_RELEASE_BEFORE_LOCKS,
 							 false, true);
+		ClearHotBufferBit();
 		AtEOXact_Buffers(false);
 		AtEOXact_RelationCache(false);
 		AtEOXact_Inval(false);

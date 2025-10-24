@@ -31,9 +31,9 @@
 /*
  * Buffer state is a single 32-bit variable where following data is combined.
  *
- * - 18 bits refcount
+ * - 17 bits refcount (reduced from 18 to make room for BM_HOT flag)
  * - 4 bits usage count
- * - 10 bits of flags
+ * - 11 bits of flags
  *
  * Combining these values allows to perform some operations without locking
  * the buffer header, by modifying them together with a CAS loop.
@@ -41,11 +41,11 @@
  * The definition of buffer state components is below.
  */
 #define BUF_REFCOUNT_ONE 1
-#define BUF_REFCOUNT_MASK ((1U << 18) - 1)
-#define BUF_USAGECOUNT_MASK 0x003C0000U
-#define BUF_USAGECOUNT_ONE (1U << 18)
-#define BUF_USAGECOUNT_SHIFT 18
-#define BUF_FLAG_MASK 0xFFC00000U
+#define BUF_REFCOUNT_MASK ((1U << 17) - 1)
+#define BUF_USAGECOUNT_MASK 0x001E0000U
+#define BUF_USAGECOUNT_ONE (1U << 17)
+#define BUF_USAGECOUNT_SHIFT 17
+#define BUF_FLAG_MASK 0xFFE00000U
 
 /* Get refcount and usagecount from buffer state */
 #define BUF_STATE_GET_REFCOUNT(state) ((state) & BUF_REFCOUNT_MASK)
@@ -57,6 +57,7 @@
  * Note: BM_TAG_VALID essentially means that there is a buffer hashtable
  * entry associated with the buffer's tag.
  */
+#define BM_HOT					(1U << 21)	/* buffer is permanently pinned (hot) */
 #define BM_LOCKED				(1U << 22)	/* buffer header is locked */
 #define BM_DIRTY				(1U << 23)	/* data needs writing */
 #define BM_VALID				(1U << 24)	/* data is valid */
@@ -77,6 +78,12 @@
  * value to be very large.
  */
 #define BM_MAX_USAGE_COUNT	5
+
+/*
+ * Threshold for making a buffer "hot". When a buffer's refcount exceeds
+ * this threshold during pinning, it is marked as BM_HOT (permanently pinned).
+ */
+#define BM_HOT_REFCOUNT_THRESHOLD	16
 
 /*
  * Buffer tag identifies which disk block the buffer contains.
@@ -306,10 +313,33 @@ typedef struct WritebackContext
 	PendingWriteback pending_writebacks[WRITEBACK_MAX_PENDING_FLUSHES];
 } WritebackContext;
 
+/*
+ * Hot buffer tracking structures
+ *
+ * HotBufferBitmap tracks which backends have references to hot buffers.
+ * Each backend has one bit in the bitmap. When a backend pins a hot buffer,
+ * its bit is set. When all hot buffers are unpinned by a backend, its bit
+ * is cleared.
+ *
+ * We use a simple char array instead of atomics since each backend only
+ * modifies its own bit. Memory barriers ensure visibility.
+ */
+typedef struct HotBufferControl
+{
+	int			nbytes;			/* Number of bytes in bitmap */
+	/*
+	 * Bitmap tracking which backends have hot buffer references.
+	 * One bit per backend, indexed by backend pgprocno.
+	 * Size is calculated to hold MaxBackends bits.
+	 */
+	char		bitmap[FLEXIBLE_ARRAY_MEMBER];
+} HotBufferControl;
+
 /* in buf_init.c */
 extern PGDLLIMPORT BufferDescPadded *BufferDescriptors;
 extern PGDLLIMPORT ConditionVariableMinimallyPadded *BufferIOCVArray;
 extern PGDLLIMPORT WritebackContext BackendWritebackContext;
+extern PGDLLIMPORT HotBufferControl *HotBufferBitmap;
 
 /* in localbuf.c */
 extern PGDLLIMPORT BufferDesc *LocalBufferDescriptors;
@@ -418,6 +448,11 @@ extern void WritebackContextInit(WritebackContext *context, int *max_pending);
 extern void IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context);
 extern void ScheduleBufferTagForWriteback(WritebackContext *wb_context,
 										  IOContext io_context, BufferTag *tag);
+
+/* Hot buffer management in bufmgr.c */
+extern Size HotBufferShmemSize(void);
+extern void HotBufferInit(void);
+extern bool HotBufferHasReferences(void);
 
 /* freelist.c */
 extern IOContext IOContextForStrategy(BufferAccessStrategy strategy);
