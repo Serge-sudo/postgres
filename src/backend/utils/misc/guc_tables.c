@@ -1417,6 +1417,16 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"enable_hot_buffers", PGC_SUSET, RESOURCES_MEM,
+			gettext_noop("Enables hot buffer optimization to reduce pin contention."),
+			gettext_noop("When enabled, frequently accessed buffers are marked as hot "
+						 "to avoid atomic reference count operations on each pin/unpin.")
+		},
+		&enable_hot_buffers,
+		true,
+		NULL, NULL, NULL
+	},
+	{
 		{"track_wal_io_timing", PGC_SUSET, STATS_CUMULATIVE,
 			gettext_noop("Collects timing statistics for WAL I/O activity."),
 			NULL

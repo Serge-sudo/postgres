@@ -141,6 +141,7 @@ bool		zero_damaged_pages = false;
 int			bgwriter_lru_maxpages = 100;
 double		bgwriter_lru_multiplier = 2.0;
 bool		track_io_timing = false;
+bool		enable_hot_buffers = true;
 
 /*
  * How many buffers PrefetchBuffer callers should try to stay ahead of their
@@ -2678,8 +2679,9 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 			/*
 			 * Check if buffer is already marked as hot. Hot buffers don't
 			 * use refcount - we just track this backend's use of the hot buffer.
+			 * Only check if hot buffers feature is enabled.
 			 */
-			if (buf_state & BM_HOT)
+			if (enable_hot_buffers && (buf_state & BM_HOT))
 			{
 				result = (buf_state & BM_VALID) != 0;
 				
@@ -2717,8 +2719,10 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 			 * We keep the existing refcount because other backends may have
 			 * already pinned this buffer before it became hot, and they need
 			 * the refcount to properly unpin.
+			 * Only do this if hot buffers feature is enabled.
 			 */
-			if (BUF_STATE_GET_REFCOUNT(buf_state) > BM_HOT_REFCOUNT_THRESHOLD)
+			if (enable_hot_buffers && 
+				BUF_STATE_GET_REFCOUNT(buf_state) > BM_HOT_REFCOUNT_THRESHOLD)
 			{
 				/* 
 				 * Set hot flag and subtract the increment we just added,
@@ -2867,8 +2871,9 @@ PinBuffer_Locked(BufferDesc *buf)
 	/*
 	 * Check if buffer is already marked as hot. If so, don't increment
 	 * refcount - just track this as a hot pin.
+	 * Only check if hot buffers feature is enabled.
 	 */
-	if (buf_state & BM_HOT)
+	if (enable_hot_buffers && (buf_state & BM_HOT))
 	{
 		/* Track that we're using a hot buffer */
 		is_hot = true;
@@ -2888,8 +2893,10 @@ PinBuffer_Locked(BufferDesc *buf)
 		/*
 		 * Check if we've exceeded the hot buffer threshold. If so, mark
 		 * the buffer as hot and don't hold a normal pin.
+		 * Only do this if hot buffers feature is enabled.
 		 */
-		if (BUF_STATE_GET_REFCOUNT(buf_state) > BM_HOT_REFCOUNT_THRESHOLD)
+		if (enable_hot_buffers &&
+			BUF_STATE_GET_REFCOUNT(buf_state) > BM_HOT_REFCOUNT_THRESHOLD)
 		{
 			/* 
 			 * Set hot flag and subtract the increment we just added,

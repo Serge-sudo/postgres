@@ -297,12 +297,12 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 			 * put a valid buffer in the freelist and then someone else used
 			 * it before we got to it.  It's probably impossible altogether as
 			 * of 8.3, but we'd better check anyway.)
-			 * Also skip hot buffers.
+			 * Also skip hot buffers (if hot buffers feature is enabled).
 			 */
 			local_buf_state = LockBufHdr(buf);
 			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
 				&& BUF_STATE_GET_USAGECOUNT(local_buf_state) == 0
-				&& !(local_buf_state & BM_HOT))
+				&& !(enable_hot_buffers && (local_buf_state & BM_HOT)))
 			{
 				if (strategy != NULL)
 					AddBufferToRing(strategy, buf);
@@ -331,8 +331,9 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 		 * unpinned. Check if any backends still have hot pins by examining
 		 * the shared bitmap. If no backends have hot pins, clear BM_HOT and
 		 * the buffer becomes available for reuse.
+		 * Only do this if hot buffers feature is enabled.
 		 */
-		if (local_buf_state & BM_HOT)
+		if (enable_hot_buffers && (local_buf_state & BM_HOT))
 		{
 			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
 			{
