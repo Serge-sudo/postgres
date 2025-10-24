@@ -83,7 +83,7 @@
  * Threshold for making a buffer "hot". When a buffer's refcount exceeds
  * this threshold during pinning, it is marked as BM_HOT (permanently pinned).
  */
-#define BM_HOT_REFCOUNT_THRESHOLD	10
+#define BM_HOT_REFCOUNT_THRESHOLD	16
 
 /*
  * Buffer tag identifies which disk block the buffer contains.

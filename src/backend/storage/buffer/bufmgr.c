@@ -61,7 +61,7 @@
 #include "utils/rel.h"
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
-
+#include "port/pg_bitutils.h"
 
 /* Note: these two macros only work on shared buffers, not local ones! */
 #define BufHdrGetBlock(bufHdr)	((Block) (BufferBlocks + ((Size) (bufHdr)->buf_id) * BLCKSZ))
@@ -222,7 +222,6 @@ static void ForgetPrivateRefCountEntry(PrivateRefCountEntry *ref);
 
 /* Hot buffer management functions */
 static void SetHotBufferBit(void);
-static void ClearHotBufferBit(void);
 
 /* ResourceOwner callbacks to hold in-progress I/Os and buffer pins */
 static void ResOwnerReleaseBufferIO(Datum res);
@@ -2702,6 +2701,7 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 					break;
 				} else if (PrivateHotBufferCount == 0)
 				{
+					/* clear hot buffer bit, if we couldn't get it */
 					ClearHotBufferBit();
 				}
 				continue;
@@ -2842,6 +2842,7 @@ PinBuffer_Locked(BufferDesc *buf)
 	Buffer		b;
 	PrivateRefCountEntry *ref;
 	uint32		buf_state;
+	bool		is_hot = false;
 
 	/*
 	 * As explained, We don't expect any preexisting pins. That allows us to
@@ -2863,9 +2864,6 @@ PinBuffer_Locked(BufferDesc *buf)
 	buf_state = pg_atomic_read_u32(&buf->state);
 	Assert(buf_state & BM_LOCKED);
 	
-	b = BufferDescriptorGetBuffer(buf);
-	ref = NewPrivateRefCountEntry(b);
-	
 	/*
 	 * Check if buffer is already marked as hot. If so, don't increment
 	 * refcount - just track this as a hot pin.
@@ -2873,12 +2871,14 @@ PinBuffer_Locked(BufferDesc *buf)
 	if (buf_state & BM_HOT)
 	{
 		/* Track that we're using a hot buffer */
-		ref->is_hot = true;
+		is_hot = true;
 		if (PrivateHotBufferCount == 0)
+		{
 			SetHotBufferBit();
+			pg_write_barrier();
+		}
+			
 		PrivateHotBufferCount++;
-		
-		UnlockBufHdr(buf, buf_state);
 	}
 	else
 	{
@@ -2899,16 +2899,22 @@ PinBuffer_Locked(BufferDesc *buf)
 			buf_state |= BM_HOT;
 			
 			/* Track that we're using a hot buffer */
-			ref->is_hot = true;
+			is_hot = true;
 			if (PrivateHotBufferCount == 0)
+			{
 				SetHotBufferBit();
+				pg_write_barrier();
+			}
 			PrivateHotBufferCount++;
 		}
-		
-		UnlockBufHdr(buf, buf_state);
 	}
+	UnlockBufHdr(buf, buf_state);
 
+	b = BufferDescriptorGetBuffer(buf);
+
+	ref = NewPrivateRefCountEntry(b);
 	ref->refcount++;
+	ref->is_hot = is_hot;
 	ResourceOwnerRememberBuffer(CurrentResourceOwner, b);
 }
 
@@ -2954,11 +2960,6 @@ UnpinBufferNoOwner(BufferDesc *buf)
 		{
 			Assert(PrivateHotBufferCount > 0);
 			PrivateHotBufferCount--;
-			if (PrivateHotBufferCount == 0)
-			{
-				ClearHotBufferBit();
-				pg_write_barrier();
-			}
 		}
 
 		/*
@@ -6236,12 +6237,14 @@ SetHotBufferBit(void)
 /*
  * ClearHotBufferBit -- clear the bit for current backend in hot buffer bitmap
  */
-static void
+void
 ClearHotBufferBit(void)
 {
 	ProcNumber	procno = GetNumberFromPGProc(MyProc);
 	int			byte_idx = procno / 8;
 	int			bit_idx = procno % 8;
+	
+	Assert(PrivateHotBufferCount == 0);
 
 	/* Clear the bit for this backend */
 	HotBufferBitmap->bitmap[byte_idx] &= ~(1 << bit_idx);
