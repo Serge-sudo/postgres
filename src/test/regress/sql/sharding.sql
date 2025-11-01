@@ -31,9 +31,12 @@ CREATE SERVER server1
 ALTER SHARD GROUP sg_test ADD MEMBER server1;
 SELECT * FROM pg_foreign_server;
 SELECT * FROM pg_shardmembers;
-DROP SERVER server1;
 ALTER SHARD GROUP sg_test DROP MEMBER server1;
+DROP SERVER server1;
 SELECT * FROM pg_shardmembers;
+CREATE SERVER server1
+    FOREIGN DATA WRAPPER postgres_fdw
+    OPTIONS (host 'localhost', dbname 'regression', port '5432');
 ALTER SHARD GROUP sg_test ADD MEMBER server1;
 SELECT * FROM pg_foreign_server;
 
