@@ -82,9 +82,18 @@ CreateShardGroup(CreateShardGroupStmt *stmt)
 	
 	/* Check if shard group already exists */
 	if (OidIsValid(get_shardgroup_oid(stmt->sgname, true)))
+	{
+		if (stmt->if_not_exists)
+		{
+			ereport(NOTICE,
+					(errmsg("shard group \"%s\" already exists, skipping",
+							stmt->sgname)));
+			return InvalidObjectAddress;
+		}
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
 				 errmsg("shard group \"%s\" already exists", stmt->sgname)));
+	}
 	
 	/* Build the tuple */
 	memset(values, 0, sizeof(values));
@@ -191,6 +200,13 @@ AlterShardGroup(AlterShardGroupStmt *stmt)
 			{
 				systable_endscan(scan);
 				table_close(memberrel, AccessShareLock);
+				if (stmt->if_not_exists)
+				{
+					ereport(NOTICE,
+							(errmsg("server \"%s\" is already a member of shard group \"%s\", skipping",
+									stmt->servername, stmt->sgname)));
+					return InvalidObjectAddress;
+				}
 				ereport(ERROR,
 						(errcode(ERRCODE_DUPLICATE_OBJECT),
 						 errmsg("server \"%s\" is already a member of shard group \"%s\"",
@@ -972,6 +988,20 @@ SyncShardGroupMetadataToMember(Oid sgid, Oid newsrvoid)
 		ereport(DEBUG1,
 				(errmsg("synced shard member \"%s\" info to shard member \"%s\"",
 						member_server->servername, server->servername)));
+	}
+
+	/* Add itself as a member */
+	{
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl,
+						 "ALTER SHARD GROUP %s ADD MEMBER IF NOT EXISTS %s;",
+						 quote_identifier(sgname),
+						 quote_identifier(cluster_name));
+		ExecuteDDLOnRemoteServer(newsrvoid, ddl.data);
+		
+		ereport(DEBUG1,
+				(errmsg("added self as shard member \"%s\" to shard group \"%s\" on member \"%s\"",
+						cluster_name, sgname, server->servername)));
 	}
 	
 	ereport(DEBUG1,

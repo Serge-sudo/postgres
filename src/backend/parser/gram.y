@@ -11507,6 +11507,16 @@ CreateShardGroupStmt:
 
 					n->sgname = $4;
 					n->options = NIL;
+					n->if_not_exists = false;
+					$$ = (Node *) n;
+				}
+			| CREATE SHARD GROUP_P IF_P NOT EXISTS name
+				{
+					CreateShardGroupStmt *n = makeNode(CreateShardGroupStmt);
+
+					n->sgname = $7;
+					n->options = NIL;
+					n->if_not_exists = true;
 					$$ = (Node *) n;
 				}
 			| CREATE SHARD GROUP_P name WITH '(' generic_option_list ')'
@@ -11515,6 +11525,16 @@ CreateShardGroupStmt:
 
 					n->sgname = $4;
 					n->options = $7;
+					n->if_not_exists = false;
+					$$ = (Node *) n;
+				}
+			| CREATE SHARD GROUP_P IF_P NOT EXISTS name WITH '(' generic_option_list ')'
+				{
+					CreateShardGroupStmt *n = makeNode(CreateShardGroupStmt);
+
+					n->sgname = $7;
+					n->options = $10;
+					n->if_not_exists = true;
 					$$ = (Node *) n;
 				}
 		;
@@ -11532,6 +11552,18 @@ AlterShardGroupStmt:
 					n->action = "ADD";
 					n->servername = $7;
 					n->options = NIL;
+					n->if_not_exists = false;
+					$$ = (Node *) n;
+				}
+			| ALTER SHARD GROUP_P name ADD_P MEMBER IF_P NOT EXISTS name
+				{
+					AlterShardGroupStmt *n = makeNode(AlterShardGroupStmt);
+
+					n->sgname = $4;
+					n->action = "ADD";
+					n->servername = $10;
+					n->options = NIL;
+					n->if_not_exists = true;
 					$$ = (Node *) n;
 				}
 			| ALTER SHARD GROUP_P name ADD_P MEMBER name WITH '(' generic_option_list ')'
@@ -11542,6 +11574,18 @@ AlterShardGroupStmt:
 					n->action = "ADD";
 					n->servername = $7;
 					n->options = $10;
+					n->if_not_exists = false;
+					$$ = (Node *) n;
+				}
+			| ALTER SHARD GROUP_P name ADD_P MEMBER IF_P NOT EXISTS name WITH '(' generic_option_list ')'
+				{
+					AlterShardGroupStmt *n = makeNode(AlterShardGroupStmt);
+
+					n->sgname = $4;
+					n->action = "ADD";
+					n->servername = $10;
+					n->options = $13;
+					n->if_not_exists = true;
 					$$ = (Node *) n;
 				}
 			| ALTER SHARD GROUP_P name DROP MEMBER name
@@ -11552,6 +11596,7 @@ AlterShardGroupStmt:
 					n->action = "DROP";
 					n->servername = $7;
 					n->options = NIL;
+					n->if_not_exists = false;
 					$$ = (Node *) n;
 				}
 		;
