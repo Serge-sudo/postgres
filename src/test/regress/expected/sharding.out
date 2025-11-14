@@ -153,6 +153,28 @@ SELECT * FROM pg_shardmembers;
  16494 | 16491 | 16492 |        100 | u       | 
 (1 row)
 
+-- Test DROP MEMBER restriction when foreign tables depend on the member
+-- Create a server to act as data source
+CREATE SERVER data_source
+    FOREIGN DATA WRAPPER postgres_fdw
+    OPTIONS (host 'localhost', dbname 'regression', port '5432');
+-- Create a foreign table pointing to data_source
+CREATE FOREIGN TABLE test_foreign_data (id int, data text) SERVER data_source;
+-- Assign it to sg_test_2 shard group (which has no members yet)
+ALTER TABLE test_foreign_data SET (relsgid = (SELECT oid FROM pg_shardgroups WHERE sgname = 'sg_test_2'));
+-- Add data_source as a member to sg_test_2
+ALTER SHARD GROUP sg_test_2 ADD MEMBER data_source;
+-- Try to drop data_source from sg_test_2 - should fail due to foreign table dependency
+ALTER SHARD GROUP sg_test_2 DROP MEMBER data_source;
+ERROR:  cannot drop shard member "data_source" from shard group "sg_test_2"
+DETAIL:  Foreign tables depend on this member: public.test_foreign_data
+HINT:  Drop or reassign the dependent foreign tables first.
+-- Clean up the foreign table first
+DROP FOREIGN TABLE test_foreign_data;
+-- Now dropping should succeed
+ALTER SHARD GROUP sg_test_2 DROP MEMBER data_source;
+-- Clean up the server
+DROP SERVER data_source;
 DROP SHARD GROUP sg_test_2;
 SELECT * FROM pg_shardgroups;
   oid  | sgname  | sgowner | sgoptions 
