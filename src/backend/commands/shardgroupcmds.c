@@ -54,6 +54,7 @@ extern void SetRelationShardGroup(Oid relid, Oid sgid);
 
 /* Forward declaration of helper function for syncing tables on new shard member */
 static void SyncTablesOnNewShardMember(Oid sgid, Oid newsrvoid);
+static void SyncShardGroupMetadataToMember(Oid sgid, Oid newsrvoid);
 static void ExecuteDDLOnRemoteServer(Oid serveroid, const char *sql);
 
 
@@ -261,6 +262,9 @@ AlterShardGroup(AlterShardGroupStmt *stmt)
 		InvokeObjectPostCreateHook(ShardMemberRelationId, memberoid, 0);
 		
 		table_close(rel, RowExclusiveLock);
+		
+		/* Sync shard group metadata and members info to the new shard member */
+		SyncShardGroupMetadataToMember(sgoid, srvoid);
 		
 		/* Sync existing tables to the new shard member */
 		SyncTablesOnNewShardMember(sgoid, srvoid);
@@ -863,4 +867,119 @@ SyncTablesOnNewShardMember(Oid sgid, Oid newsrvoid)
 	}
 
 	list_free(processed_tables);
+}
+
+/*
+ * SyncShardGroupMetadataToMember
+ *		Sync shard group and member information to a newly added shard member
+ *
+ * When a new shard member is added to a shard group, this function ensures
+ * the shard group metadata and all member information is replicated to the 
+ * new member, so it knows the full layout of the shard group.
+ *
+ * This creates the shard group if it doesn't exist on the remote server,
+ * and adds all shard members (including itself) to pg_shardmembers on the
+ * remote server.
+ */
+static void
+SyncShardGroupMetadataToMember(Oid sgid, Oid newsrvoid)
+{
+	HeapTuple	sgtuple;
+	Form_pg_shardgroups sgform;
+	char	   *sgname;
+	Relation	memberrel;
+	SysScanDesc scan;
+	ScanKeyData key[1];
+	HeapTuple	tuple;
+	StringInfoData ddl;
+	ForeignServer *server;
+	List	   *member_servers = NIL;
+	ListCell   *lc;
+
+	/* Get the shard group name and details */
+	sgtuple = SearchSysCache1(SHARDGROUPOID, ObjectIdGetDatum(sgid));
+	if (!HeapTupleIsValid(sgtuple))
+		elog(ERROR, "cache lookup failed for shard group %u", sgid);
+	
+	sgform = (Form_pg_shardgroups) GETSTRUCT(sgtuple);
+	sgname = NameStr(sgform->sgname);
+	
+	/* Get the foreign server name for logging */
+	server = GetForeignServer(newsrvoid);
+	
+	ereport(DEBUG1,
+			(errmsg("syncing shard group metadata \"%s\" to member \"%s\"",
+					sgname, server->servername)));
+	
+	initStringInfo(&ddl);
+	
+	/*
+	 * Step 1: Create the shard group on the remote server if it doesn't exist
+	 * Use proper DDL command instead of direct catalog insert
+	 */
+	appendStringInfo(&ddl, "CREATE SHARD GROUP IF NOT EXISTS %s;",
+					 quote_identifier(sgname));
+	
+	ExecuteDDLOnRemoteServer(newsrvoid, ddl.data);
+	
+	/*
+	 * Step 2: Get all current shard members in this shard group
+	 */
+	memberrel = table_open(ShardMemberRelationId, AccessShareLock);
+	
+	ScanKeyInit(&key[0],
+				Anum_pg_shardmembers_sgid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(sgid));
+	
+	scan = systable_beginscan(memberrel, ShardMemberSgidSrvidIndexId, true,
+							  NULL, 1, key);
+	
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Form_pg_shardmembers smform = (Form_pg_shardmembers) GETSTRUCT(tuple);
+		ForeignServer *member_server = GetForeignServer(smform->srvid);
+		
+		/* Store member information */
+		member_servers = lappend(member_servers, member_server);
+	}
+	
+	systable_endscan(scan);
+	table_close(memberrel, AccessShareLock);
+	
+	/*
+	 * Step 3: Sync all shard members to the new member's pg_shardmembers
+	 * Use proper DDL command instead of direct catalog insert
+	 */
+	foreach(lc, member_servers)
+	{
+		ForeignServer *member_server = (ForeignServer *) lfirst(lc);
+		
+		/* Reset DDL buffer */
+		resetStringInfo(&ddl);
+		
+		/* 
+		 * Use ALTER SHARD GROUP ADD MEMBER command
+		 * This ensures proper validation and dependency handling
+		 */
+		appendStringInfo(&ddl,
+						 "ALTER SHARD GROUP %s ADD MEMBER IF NOT EXISTS %s;",
+						 quote_identifier(sgname),
+						 quote_identifier(member_server->servername));
+		
+		ExecuteDDLOnRemoteServer(newsrvoid, ddl.data);
+		
+		ereport(DEBUG1,
+				(errmsg("synced shard member \"%s\" info to shard member \"%s\"",
+						member_server->servername, server->servername)));
+	}
+	
+	ereport(DEBUG1,
+			(errmsg("successfully synced shard group \"%s\" with %d member(s) to shard member \"%s\"",
+					sgname, list_length(member_servers), server->servername)));
+	
+	/* Cleanup */
+	pfree(ddl.data);
+	list_free(member_servers);
+	ReleaseSysCache(sgtuple);
 }
