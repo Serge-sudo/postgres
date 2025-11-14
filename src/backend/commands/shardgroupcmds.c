@@ -276,6 +276,79 @@ AlterShardGroup(AlterShardGroupStmt *stmt)
 		/* Get the foreign server OID */
 		srvoid = get_foreign_server_oid(stmt->servername, false);
 		
+		/* Check if any foreign tables in this shard group depend on this member */
+		{
+			Relation	classrel;
+			Relation	ftrel;
+			SysScanDesc scan;
+			ScanKeyData key[1];
+			HeapTuple	classtuple;
+			bool		has_dependencies = false;
+			StringInfoData dep_tables;
+			
+			initStringInfo(&dep_tables);
+			
+			/* Scan pg_class for all tables in this shard group */
+			classrel = table_open(RelationRelationId, AccessShareLock);
+			
+			ScanKeyInit(&key[0],
+						Anum_pg_class_relsgid,
+						BTEqualStrategyNumber, F_OIDEQ,
+						ObjectIdGetDatum(sgoid));
+			
+			scan = systable_beginscan(classrel, InvalidOid, false, NULL, 1, key);
+			
+			while (HeapTupleIsValid(classtuple = systable_getnext(scan)))
+			{
+				Form_pg_class classForm = (Form_pg_class) GETSTRUCT(classtuple);
+				Oid			relid = classForm->oid;
+				
+				/* Check if this is a foreign table */
+				if (classForm->relkind == RELKIND_FOREIGN_TABLE)
+				{
+					HeapTuple	fttuple;
+					Form_pg_foreign_table ftform;
+					
+					/* Get the foreign table entry to check target server */
+					fttuple = SearchSysCache1(FOREIGNTABLEREL, ObjectIdGetDatum(relid));
+					if (HeapTupleIsValid(fttuple))
+					{
+						ftform = (Form_pg_foreign_table) GETSTRUCT(fttuple);
+						
+						/* Check if this foreign table points to the member being removed */
+						if (ftform->ftserver == srvoid)
+						{
+							char *relname = NameStr(classForm->relname);
+							char *nspname = get_namespace_name(classForm->relnamespace);
+							
+							if (has_dependencies)
+								appendStringInfoString(&dep_tables, ", ");
+							appendStringInfo(&dep_tables, "%s.%s", nspname, relname);
+							has_dependencies = true;
+						}
+						
+						ReleaseSysCache(fttuple);
+					}
+				}
+			}
+			
+			systable_endscan(scan);
+			table_close(classrel, AccessShareLock);
+			
+			/* If dependencies found, prevent the drop */
+			if (has_dependencies)
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+						 errmsg("cannot drop shard member \"%s\" from shard group \"%s\"",
+								stmt->servername, stmt->sgname),
+						 errdetail("Foreign tables depend on this member: %s", dep_tables.data),
+						 errhint("Drop or reassign the dependent foreign tables first.")));
+			}
+			
+			pfree(dep_tables.data);
+		}
+		
 		/* Find the member tuple */
 		rel = table_open(ShardMemberRelationId, RowExclusiveLock);
 		
