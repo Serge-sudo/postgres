@@ -239,6 +239,28 @@ AlterShardGroup(AlterShardGroupStmt *stmt)
 							 errmsg("invalid member state \"%s\"", statestr),
 							 errhint("Valid states are: up, down, readonly")));
 			}
+			else if (strcmp(defel->defname, "skip_sync") == 0)
+			{
+				/*
+				 * The skip_sync option is internal-only and is used to prevent
+				 * infinite recursion during metadata synchronization to remote
+				 * shard members. When adding a new shard member, we need to sync
+				 * metadata to it, but we don't want the remote member to recursively
+				 * sync back to us.
+				 * 
+				 * This option should not be used manually as it will skip important
+				 * synchronization steps. It's automatically added by the
+				 * SyncShardGroupMetadataToMember function.
+				 */
+				char	   *skip_sync_str = defGetString(defel);
+				if (strcmp(skip_sync_str, "true") == 0 || strcmp(skip_sync_str, "1") == 0)
+				{
+					stmt->skip_sync = true;
+					ereport(DEBUG1,
+							(errmsg("skip_sync option enabled for ALTER SHARD GROUP ADD MEMBER"),
+							 errhint("This option is for internal use to prevent metadata sync recursion.")));
+				}
+			}
 			else
 				ereport(WARNING,
 						(errmsg("unrecognized option: %s", defel->defname)));
@@ -280,10 +302,14 @@ AlterShardGroup(AlterShardGroupStmt *stmt)
 		table_close(rel, RowExclusiveLock);
 		
 		/* Sync shard group metadata and members info to the new shard member */
-		SyncShardGroupMetadataToMember(sgoid, srvoid);
-		
-		/* Sync existing tables to the new shard member */
-		SyncTablesOnNewShardMember(sgoid, srvoid);
+		/* Skip this if skip_sync is true to prevent infinite recursion */
+		if (!stmt->skip_sync)
+		{
+			SyncShardGroupMetadataToMember(sgoid, srvoid);
+			
+			/* Sync existing tables to the new shard member */
+			SyncTablesOnNewShardMember(sgoid, srvoid);
+		}
 		
 		ObjectAddressSet(address, ShardMemberRelationId, memberoid);
 	}
@@ -966,6 +992,10 @@ SyncShardGroupMetadataToMember(Oid sgid, Oid newsrvoid)
 	/*
 	 * Step 3: Sync all shard members to the new member's pg_shardmembers
 	 * Use proper DDL command instead of direct catalog insert
+	 * 
+	 * IMPORTANT: We use the internal skip_sync option here to prevent
+	 * the remote server from triggering SyncShardGroupMetadataToMember again,
+	 * which would cause infinite distributed recursion.
 	 */
 	foreach(lc, member_servers)
 	{
@@ -975,11 +1005,12 @@ SyncShardGroupMetadataToMember(Oid sgid, Oid newsrvoid)
 		resetStringInfo(&ddl);
 		
 		/* 
-		 * Use ALTER SHARD GROUP ADD MEMBER command
-		 * This ensures proper validation and dependency handling
+		 * Use ALTER SHARD GROUP ADD MEMBER command with skip_sync option
+		 * to prevent recursion. The skip_sync option is internal-only
+		 * and gets passed through the WITH clause syntax.
 		 */
 		appendStringInfo(&ddl,
-						 "ALTER SHARD GROUP %s ADD MEMBER IF NOT EXISTS %s;",
+						 "ALTER SHARD GROUP %s ADD MEMBER IF NOT EXISTS %s WITH (skip_sync 'true');",
 						 quote_identifier(sgname),
 						 quote_identifier(member_server->servername));
 		
@@ -994,7 +1025,7 @@ SyncShardGroupMetadataToMember(Oid sgid, Oid newsrvoid)
 	{
 		resetStringInfo(&ddl);
 		appendStringInfo(&ddl,
-						 "ALTER SHARD GROUP %s ADD MEMBER IF NOT EXISTS %s;",
+						 "ALTER SHARD GROUP %s ADD MEMBER IF NOT EXISTS %s WITH (skip_sync 'true');",
 						 quote_identifier(sgname),
 						 quote_identifier(cluster_name));
 		ExecuteDDLOnRemoteServer(newsrvoid, ddl.data);

@@ -11553,6 +11553,7 @@ AlterShardGroupStmt:
 					n->servername = $7;
 					n->options = NIL;
 					n->if_not_exists = false;
+					n->skip_sync = false;
 					$$ = (Node *) n;
 				}
 			| ALTER SHARD GROUP_P name ADD_P MEMBER IF_P NOT EXISTS name
@@ -11564,6 +11565,7 @@ AlterShardGroupStmt:
 					n->servername = $10;
 					n->options = NIL;
 					n->if_not_exists = true;
+					n->skip_sync = false;
 					$$ = (Node *) n;
 				}
 			| ALTER SHARD GROUP_P name ADD_P MEMBER name WITH '(' generic_option_list ')'
@@ -11575,6 +11577,7 @@ AlterShardGroupStmt:
 					n->servername = $7;
 					n->options = $10;
 					n->if_not_exists = false;
+					n->skip_sync = false;
 					$$ = (Node *) n;
 				}
 			| ALTER SHARD GROUP_P name ADD_P MEMBER IF_P NOT EXISTS name WITH '(' generic_option_list ')'
@@ -11586,6 +11589,7 @@ AlterShardGroupStmt:
 					n->servername = $10;
 					n->options = $13;
 					n->if_not_exists = true;
+					n->skip_sync = false;
 					$$ = (Node *) n;
 				}
 			| ALTER SHARD GROUP_P name DROP MEMBER name
@@ -11597,6 +11601,7 @@ AlterShardGroupStmt:
 					n->servername = $7;
 					n->options = NIL;
 					n->if_not_exists = false;
+					n->skip_sync = false;
 					$$ = (Node *) n;
 				}
 		;
