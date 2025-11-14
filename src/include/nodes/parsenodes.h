@@ -4244,6 +4244,7 @@ typedef struct CreateShardGroupStmt
 	NodeTag		type;
 	char	   *sgname;			/* shard group name */
 	List	   *options;		/* list of DefElem nodes */
+	bool		if_not_exists;	/* just do nothing if it already exists? */
 } CreateShardGroupStmt;
 
 /* ----------------------
@@ -4257,17 +4258,7 @@ typedef struct AlterShardGroupStmt
 	char	   *action;			/* "ADD" or "DROP" */
 	char	   *servername;		/* member server name */
 	List	   *options;		/* list of DefElem nodes (for ADD) */
+	bool		if_not_exists;	/* just do nothing if member already exists? (for ADD) */
 } AlterShardGroupStmt;
-
-/* ----------------------
- *		ALTER TABLE SET SHARD GROUP Statement
- * ----------------------
- */
-typedef struct AlterTableSetShardGroupStmt
-{
-	NodeTag		type;
-	RangeVar   *relation;		/* table name */
-	char	   *sgname;			/* shard group name */
-} AlterTableSetShardGroupStmt;
 
 #endif							/* PARSENODES_H */

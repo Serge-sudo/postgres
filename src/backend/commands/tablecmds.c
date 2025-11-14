@@ -68,6 +68,7 @@
 #include "commands/user.h"
 #include "commands/vacuum.h"
 #include "executor/executor.h"
+#include "executor/spi.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
 #include "miscadmin.h"
@@ -107,6 +108,8 @@
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/typcache.h"
+#include "catalog/pg_user_mapping.h"
+#include "utils/guc.h"
 #include "utils/usercontext.h"
 
 /*
@@ -675,6 +678,8 @@ static List *GetParentedForeignKeyRefs(Relation partition);
 static void ATDetachCheckNoForeignKeyRefs(Relation partition);
 static char GetAttributeCompression(Oid atttypid, const char *compression);
 static char GetAttributeStorage(Oid atttypid, const char *storagemode);
+static void CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
+									   Oid parentOid, PartitionBoundSpec *partbound);
 
 
 /* ----------------------------------------------------------------
@@ -745,6 +750,13 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	}
 	else
 		partitioned = false;
+
+	if (stmt->shardgroup && !(stmt->is_distributed || stmt->is_worldwide))
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				 errmsg("SHARD GROUP can only be used on DISTRIBUTED or WORLDWIDE tables")));
+	}
 
 	/*
 	 * Look up the namespace in which we are supposed to create the relation,
@@ -1275,7 +1287,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	 * Handle sharding-related features: distributed tables, worldwide tables,
 	 * and shard group assignment.
 	 */
-	if (stmt->is_distributed || stmt->is_worldwide || stmt->shardgroup)
+	if (stmt->is_distributed || stmt->is_worldwide)
 	{
 		Oid			sgid = InvalidOid;
 		
@@ -1302,33 +1314,38 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 								get_database_name(MyDatabaseId)),
 						 errhint("Use ALTER DATABASE SET DEFAULT SHARD GROUP or specify SHARD GROUP explicitly.")));
 		}
-		
-		/* Handle distributed tables */
-		if (stmt->is_distributed)
-		{
-			/* Distributed tables are created as partitioned tables */
-			/* TODO: Validate distribution columns exist */
-			/* TODO: Store distribution key metadata */
-			/* TODO: Create distribution key similar to partition key */
-			ereport(NOTICE,
-					(errmsg("DISTRIBUTED BY clause not yet fully implemented"),
-					 errdetail("Table will be created as distributed table.")));
-		}
-		
-		/* Handle worldwide tables */
-		if (stmt->is_worldwide)
-		{
-			/* TODO: Validate table is suitable for worldwide replication */
-			ereport(NOTICE,
-					(errmsg("WORLDWIDE table not yet fully implemented"),
-					 errdetail("Table will be created as worldwide table.")));
-		}
-		
+	
 		/* Set the shard group for the relation */
 		if (OidIsValid(sgid))
 		{
 			SetRelationShardGroup(relationId, sgid);
+			
+			/*
+			 * Create tables on shard members (foreign servers)
+			 * For partitions: create partitions on remote servers with PARTITION OF
+			 * For regular tables: create tables on remote servers
+			 */
+			if (stmt->partbound != NULL)
+			{
+				/* For partitions, pass parent OID and bound spec */
+				Oid parentId = linitial_oid(inheritOids);
+				CreateTablesOnShardMembers(relationId, sgid, true, parentId, stmt->partbound);
+			}
+			else
+			{
+				/* For regular tables, no parent or bound */
+				CreateTablesOnShardMembers(relationId, sgid, false, InvalidOid, NULL);
+			}
 		}
+	}
+	else if (stmt->partbound != NULL && OidIsValid(rel->rd_rel->relsgid))
+	{
+		/*
+		 * For partitions that inherit shard group from parent:
+		 * Also create tables on shard members
+		 */
+		Oid parentId = linitial_oid(inheritOids);
+		CreateTablesOnShardMembers(relationId, rel->rd_rel->relsgid, true, parentId, stmt->partbound);
 	}
 
 	ObjectAddressSet(address, RelationRelationId, relationId);
@@ -1340,6 +1357,298 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	relation_close(rel, NoLock);
 
 	return address;
+}
+
+/*
+ * ExecuteDDLOnRemoteServer
+ *		Execute DDL command on a remote server using FDW callback
+ *
+ * This function uses the ExecForeignDDL callback if available in the FDW.
+ * For postgres_fdw, this will use the existing connection infrastructure
+ * and participate in 2PC transactions automatically.
+ */
+static void
+ExecuteDDLOnRemoteServer(Oid serveroid, const char *sql)
+{
+	ForeignServer *server;
+	ForeignDataWrapper *fdw;
+	FdwRoutine *fdwroutine;
+
+	/* Get server and FDW information */
+	server = GetForeignServer(serveroid);
+	fdw = GetForeignDataWrapper(server->fdwid);
+
+	/* Get the FDW routine */
+	fdwroutine = GetFdwRoutine(fdw->fdwhandler);
+
+	/* Check if FDW supports DDL execution */
+	if (fdwroutine->ExecForeignDDL != NULL)
+	{
+		/* Execute DDL using FDW callback - this participates in 2PC */
+		fdwroutine->ExecForeignDDL(serveroid, sql);
+		
+		ereport(DEBUG1,
+				(errmsg("executed DDL on foreign server \"%s\" using FDW callback",
+						server->servername)));
+	}
+	else
+	{
+		/* FDW doesn't support DDL execution, show NOTICE */
+		ereport(NOTICE,
+				(errmsg("table should be created on shard member \"%s\"",
+						server->servername),
+				 errdetail("Execute: %s", sql),
+				 errhint("The FDW for this server does not support automatic DDL execution. "
+						 "Execute this DDL manually on the remote server.")));
+	}
+}
+
+/*
+ * CreateTablesOnShardMembers
+ *		Create tables on foreign servers (shard members) after table creation
+ *
+ * For regular tables: creates tables on remote servers
+ * For partitions of distributed tables: creates partitions on remote servers using
+ * CREATE TABLE ... PARTITION OF syntax with the partition bound specification
+ *
+ * This function executes CREATE TABLE/PARTITION OF commands on remote servers
+ * using postgres_fdw connections. The implementation:
+ * 1. For non-partition tables: CREATE TABLE on each remote server
+ * 2. For partitions: CREATE TABLE ... PARTITION OF on each remote server
+ *
+ * Uses cluster_name GUC as the unique identifier for this server in the cluster.
+ */
+static void
+CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
+							Oid parentOid, PartitionBoundSpec *partbound)
+{
+	List	   *members;
+	ListCell   *lc;
+	Relation	rel;
+	TupleDesc	tupdesc;
+	StringInfoData create_table_sql;
+	char	   *relname;
+	char	   *nspname;
+	int			i;
+	int			first_col;
+	extern char *cluster_name;
+
+	/* Get list of shard members */
+	members = get_shardgroup_members(sgid);
+	if (members == NIL)
+		return;	/* No members, nothing to do */
+
+	/* Check if cluster_name is set - required for creating foreign tables on remote servers */
+	if (!cluster_name || cluster_name[0] == '\0')
+	{
+		ereport(WARNING,
+				(errcode(ERRCODE_CONFIG_FILE_ERROR),
+				 errmsg("cluster_name is not set, cannot create tables on remote shard members"),
+				 errhint("Set cluster_name in postgresql.conf to enable automatic table creation on shard members.")));
+		list_free(members);
+		return;
+	}
+
+	/* Open the relation to get its structure */
+	rel = table_open(relationId, AccessShareLock);
+	tupdesc = RelationGetDescr(rel);
+	relname = RelationGetRelationName(rel);
+	nspname = get_namespace_name(RelationGetNamespace(rel));
+
+	/* Build the CREATE TABLE DDL */
+	initStringInfo(&create_table_sql);
+	
+	if (is_partition && OidIsValid(parentOid) && partbound != NULL)
+	{
+		Relation	parent;
+		char	   *parentname;
+		char	   *parentnspname;
+		
+		/*
+		 * For partitions of distributed tables:
+		 * On foreign servers, create partitions using PARTITION OF syntax
+		 * This creates the partition structure on remote servers with proper bounds
+		 */
+		parent = table_open(parentOid, AccessShareLock);
+		parentname = RelationGetRelationName(parent);
+		parentnspname = get_namespace_name(RelationGetNamespace(parent));
+		
+		appendStringInfo(&create_table_sql, "CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s ",
+						 quote_identifier(nspname),
+						 quote_identifier(relname),
+						 quote_identifier(parentnspname),
+						 quote_identifier(parentname));
+		
+		/* Add the partition bound specification */
+		if (partbound->is_default)
+		{
+			appendStringInfoString(&create_table_sql, "DEFAULT");
+		}
+		else
+		{
+			switch (partbound->strategy)
+			{
+				case PARTITION_STRATEGY_HASH:
+					appendStringInfo(&create_table_sql, "FOR VALUES WITH (modulus %d, remainder %d)",
+									 partbound->modulus, partbound->remainder);
+					break;
+					
+				case PARTITION_STRATEGY_LIST:
+					{
+						ListCell   *cell;
+						const char *sep = "";
+						
+						appendStringInfoString(&create_table_sql, "FOR VALUES IN (");
+						foreach(cell, partbound->listdatums)
+						{
+							A_Const	   *aconst = lfirst(cell);
+							
+							appendStringInfoString(&create_table_sql, sep);
+							
+							/* Format the constant value based on its type */
+							if (aconst->isnull)
+							{
+								appendStringInfoString(&create_table_sql, "NULL");
+							}
+							else
+							{
+								switch (nodeTag(&aconst->val.node))
+								{
+									case T_Integer:
+										appendStringInfo(&create_table_sql, "%ld", 
+														castNode(Integer, &aconst->val.node)->ival);
+										break;
+									case T_Float:
+										appendStringInfoString(&create_table_sql,
+															  castNode(Float, &aconst->val.node)->fval);
+										break;
+									case T_Boolean:
+										appendStringInfoString(&create_table_sql,
+															  castNode(Boolean, &aconst->val.node)->boolval ? "true" : "false");
+										break;
+									case T_String:
+										/* Quote string literals */
+										appendStringInfo(&create_table_sql, "'%s'",
+														castNode(String, &aconst->val.node)->sval);
+										break;
+									case T_BitString:
+										appendStringInfo(&create_table_sql, "B'%s'",
+														castNode(BitString, &aconst->val.node)->bsval);
+										break;
+									default:
+										elog(ERROR, "unrecognized node type in partition bound: %d",
+											 (int) nodeTag(&aconst->val.node));
+										break;
+								}
+							}
+							
+							sep = ", ";
+						}
+						appendStringInfoChar(&create_table_sql, ')');
+					}
+					break;
+					
+				case PARTITION_STRATEGY_RANGE:
+					{
+						char	   *lower_str;
+						char	   *upper_str;
+						
+						/* Deparse lower and upper bounds lists */
+						lower_str = deparse_expression((Node *) partbound->lowerdatums,
+													   NIL, false, false);
+						upper_str = deparse_expression((Node *) partbound->upperdatums,
+													   NIL, false, false);
+						
+						appendStringInfo(&create_table_sql, "FOR VALUES FROM %s TO %s",
+										 lower_str, upper_str);
+						
+						pfree(lower_str);
+						pfree(upper_str);
+					}
+					break;
+					
+				default:
+					elog(ERROR, "unrecognized partition strategy: %d",
+						 (int) partbound->strategy);
+					break;
+			}
+		}
+
+		appendStringInfo(&create_table_sql, " SERVER %s",
+						 quote_identifier(cluster_name));
+
+		table_close(parent, AccessShareLock);
+		pfree(parentnspname);
+	}
+	else
+	{
+		/*
+		 * For regular distributed/worldwide tables (including partitioned tables):
+		 * Create actual tables on foreign servers
+		 */
+		appendStringInfo(&create_table_sql, "CREATE TABLE IF NOT EXISTS %s.%s (",
+						 quote_identifier(nspname),
+						 quote_identifier(relname));
+		
+		first_col = 1;
+		for (i = 0; i < tupdesc->natts; i++)
+		{
+			Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+
+			if (attr->attisdropped)
+				continue;
+
+			if (!first_col)
+				appendStringInfo(&create_table_sql, ", ");
+			first_col = 0;
+
+			appendStringInfo(&create_table_sql, "%s %s",
+							 quote_identifier(NameStr(attr->attname)),
+							 format_type_with_typemod(attr->atttypid, attr->atttypmod));
+
+			/* Add NOT NULL constraint if present */
+			if (attr->attnotnull)
+				appendStringInfo(&create_table_sql, " NOT NULL");
+		}
+		appendStringInfo(&create_table_sql, ")");
+		
+		/* If this is a partitioned table, add PARTITION BY clause */
+		if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+		{
+			PartitionKey partkey = RelationGetPartitionKey(rel);
+			char	   *partkey_str;
+			
+			if (partkey != NULL)
+			{
+				/* Get the partition key definition */
+				partkey_str = pg_get_partkeydef_columns(relationId, false);
+				
+				appendStringInfo(&create_table_sql, " PARTITION BY %s (%s)",
+								 partkey->strategy == PARTITION_STRATEGY_HASH ? "HASH" :
+								 partkey->strategy == PARTITION_STRATEGY_LIST ? "LIST" :
+								 partkey->strategy == PARTITION_STRATEGY_RANGE ? "RANGE" : "UNKNOWN",
+								 partkey_str);
+				pfree(partkey_str);
+			}
+		}
+	}
+
+	/*
+	 * Execute the DDL on each shard member.
+	 * This uses postgres_fdw connections and participates in 2PC.
+	 */
+	foreach(lc, members)
+	{
+		Oid			serveroid = lfirst_oid(lc);
+
+		/* Execute the DDL command on the remote server */
+		ExecuteDDLOnRemoteServer(serveroid, create_table_sql.data);
+	}
+
+	table_close(rel, AccessShareLock);
+	pfree(create_table_sql.data);
+	pfree(nspname);
+	list_free(members);
 }
 
 /*

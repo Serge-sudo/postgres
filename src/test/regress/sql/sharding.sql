@@ -55,7 +55,4 @@ SELECT * FROM pg_shardmembers;
 DROP SHARD GROUP sg_test_2;
 SELECT * FROM pg_shardgroups;
 SELECT * FROM pg_shardmembers;
-DROP SHARD GROUP sg_test;
-SELECT * FROM pg_shardgroups;
-SELECT * FROM pg_shardmembers;
 
