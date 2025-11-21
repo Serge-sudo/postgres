@@ -30,6 +30,7 @@
 #include "catalog/pg_shdepend.h"
 #include "catalog/pg_shardgroups.h"
 #include "catalog/pg_shardmembers.h"
+#include "catalog/partition.h"
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "commands/shardgroupcmds.h"
@@ -62,6 +63,11 @@ static void ExecuteDDLOnRemoteServer(Oid serveroid, const char *sql);
 static uint32 hash_string_to_uint32(const char *str);
 static void ReshardShardGroup(Oid sgid);
 static void DetachShardMember(Oid sgid, Oid srvoid);
+
+/* Helper functions for partition migration */
+static void MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgid);
+static Oid FindPartitionHostMember(Oid partitionOid, Oid sgid);
+static List *GetShardGroupPartitions(Oid sgid);
 
 /* Number of virtual nodes per shard member for consistent hashing */
 #define VIRTUAL_NODES_PER_MEMBER 150
@@ -1292,6 +1298,266 @@ GetPartitionTargetMember(Oid sgid, const char *partition_name)
 }
 
 /*
+ * GetShardGroupPartitions
+ *		Get all partition OIDs that belong to tables in the shard group
+ *
+ * Returns a list of partition relation OIDs
+ */
+static List *
+GetShardGroupPartitions(Oid sgid)
+{
+	Relation	classrel;
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	List	   *partitions = NIL;
+	
+	/* Scan pg_class for partitions in this shard group */
+	classrel = table_open(RelationRelationId, AccessShareLock);
+	scan = systable_beginscan(classrel, InvalidOid, false, NULL, 0, NULL);
+	
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Form_pg_class classform = (Form_pg_class) GETSTRUCT(tuple);
+		
+		/* Only interested in partition tables */
+		if (classform->relkind != RELKIND_RELATION &&
+			classform->relkind != RELKIND_FOREIGN_TABLE)
+			continue;
+		
+		/* Check if this relation belongs to our shard group */
+		if (classform->relsgid == sgid)
+		{
+			/* Check if this is a partition (has a parent) */
+			if (classform->relispartition)
+			{
+				partitions = lappend_oid(partitions, classform->oid);
+			}
+		}
+	}
+	
+	systable_endscan(scan);
+	table_close(classrel, AccessShareLock);
+	
+	return partitions;
+}
+
+/*
+ * FindPartitionHostMember
+ *		Find which shard member currently hosts the real table for a partition
+ *
+ * Returns InvalidOid if the partition is a foreign table on the local server
+ * (meaning the real table is on another member), or the member OID if found.
+ * For foreign tables, we need to check which server the foreign table points to.
+ */
+static Oid
+FindPartitionHostMember(Oid partitionOid, Oid sgid)
+{
+	Relation	rel;
+	Oid			result = InvalidOid;
+	extern char *cluster_name;
+	
+	/* Open the relation */
+	rel = table_open(partitionOid, AccessShareLock);
+	
+	if (rel->rd_rel->relkind == RELKIND_RELATION)
+	{
+		/* This is a real table on the local server */
+		/* Find the corresponding shard member for the local server */
+		List	   *members = get_shardgroup_members(sgid);
+		ListCell   *lc;
+		
+		foreach(lc, members)
+		{
+			Oid			serveroid = lfirst_oid(lc);
+			ForeignServer *server = GetForeignServer(serveroid);
+			
+			/* Check if this server represents the local cluster */
+			if (cluster_name && strcmp(server->servername, cluster_name) == 0)
+			{
+				result = serveroid;
+				break;
+			}
+		}
+		
+		list_free(members);
+	}
+	else if (rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
+	{
+		/* This is a foreign table - get the server it points to */
+		ForeignTable *ft = GetForeignTable(partitionOid);
+		result = ft->serverid;
+	}
+	
+	table_close(rel, AccessShareLock);
+	
+	return result;
+}
+
+/*
+ * MigratePartitionToMember
+ *		Migrate a partition from one member to another
+ *
+ * Steps:
+ * 1. Copy data from source to destination using foreign table access
+ * 2. Drop the real table on source
+ * 3. Create foreign table on source pointing to destination
+ * 4. Update foreign tables on other members to point to destination
+ */
+static void
+MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgid)
+{
+	Relation	rel;
+	char	   *relname;
+	char	   *nspname;
+	ForeignServer *toServerInfo;
+	ForeignServer *fromServerInfo;
+	StringInfoData ddl;
+	Relation	parent;
+	char	   *parentname;
+	char	   *parentnspname;
+	List	   *members;
+	ListCell   *lc;
+	extern char *cluster_name;
+	
+	/* Open the partition relation */
+	rel = table_open(partitionOid, AccessShareLock);
+	relname = pstrdup(RelationGetRelationName(rel));
+	nspname = get_namespace_name(RelationGetNamespace(rel));
+	
+	/* Get parent table info */
+	if (rel->rd_rel->relispartition)
+	{
+		Oid parentOid = get_partition_parent(partitionOid, false);
+		parent = table_open(parentOid, AccessShareLock);
+		parentname = pstrdup(RelationGetRelationName(parent));
+		parentnspname = get_namespace_name(RelationGetNamespace(parent));
+		table_close(parent, AccessShareLock);
+	}
+	else
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("relation \"%s\" is not a partition", relname)));
+		table_close(rel, AccessShareLock);
+		return;
+	}
+	
+	table_close(rel, AccessShareLock);
+	
+	toServerInfo = GetForeignServer(toServer);
+	fromServerInfo = GetForeignServer(fromServer);
+	
+	initStringInfo(&ddl);
+	
+	ereport(NOTICE,
+			(errmsg("migrating partition \"%s.%s\" from \"%s\" to \"%s\"",
+					nspname, relname, fromServerInfo->servername, toServerInfo->servername)));
+	
+	/*
+	 * Step 1: Create real table on destination with data from source
+	 * We do this by executing CREATE TABLE ... PARTITION OF on the destination
+	 * and then copying data
+	 */
+	
+	/* First, get the partition bound specification */
+	char *partition_def = pg_get_partkeydef_worker(partitionOid, 0, false, false, false, false);
+	
+	if (partition_def)
+	{
+		/* Create the partition on destination */
+		appendStringInfo(&ddl, "CREATE TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s;",
+						 quote_identifier(nspname),
+						 quote_identifier(relname),
+						 quote_identifier(parentnspname),
+						 quote_identifier(parentname),
+						 partition_def);
+		
+		ExecuteDDLOnRemoteServer(toServer, ddl.data);
+		
+		/* Copy data from source to destination */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, "INSERT INTO %s.%s SELECT * FROM %s.%s;",
+						 quote_identifier(nspname),
+						 quote_identifier(relname),
+						 quote_identifier(nspname),
+						 quote_identifier(relname));
+		
+		ExecuteDDLOnRemoteServer(toServer, ddl.data);
+	}
+	
+	/*
+	 * Step 2: Drop real table on source and create foreign table
+	 */
+	resetStringInfo(&ddl);
+	appendStringInfo(&ddl, "DROP TABLE IF EXISTS %s.%s CASCADE;",
+					 quote_identifier(nspname),
+					 quote_identifier(relname));
+	
+	ExecuteDDLOnRemoteServer(fromServer, ddl.data);
+	
+	/* Create foreign table on source pointing to destination */
+	resetStringInfo(&ddl);
+	if (partition_def)
+	{
+		appendStringInfo(&ddl, "CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s SERVER %s;",
+						 quote_identifier(nspname),
+						 quote_identifier(relname),
+						 quote_identifier(parentnspname),
+						 quote_identifier(parentname),
+						 partition_def,
+						 quote_identifier(toServerInfo->servername));
+		
+		ExecuteDDLOnRemoteServer(fromServer, ddl.data);
+	}
+	
+	/*
+	 * Step 3: Update foreign tables on all other members
+	 */
+	members = get_shardgroup_members(sgid);
+	foreach(lc, members)
+	{
+		Oid serveroid = lfirst_oid(lc);
+		
+		/* Skip source and destination */
+		if (serveroid == fromServer || serveroid == toServer)
+			continue;
+		
+		/* Drop and recreate foreign table pointing to destination */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, "DROP FOREIGN TABLE IF EXISTS %s.%s CASCADE;",
+						 quote_identifier(nspname),
+						 quote_identifier(relname));
+		
+		ExecuteDDLOnRemoteServer(serveroid, ddl.data);
+		
+		resetStringInfo(&ddl);
+		if (partition_def)
+		{
+			appendStringInfo(&ddl, "CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s SERVER %s;",
+							 quote_identifier(nspname),
+							 quote_identifier(relname),
+							 quote_identifier(parentnspname),
+							 quote_identifier(parentname),
+							 partition_def,
+							 quote_identifier(toServerInfo->servername));
+			
+			ExecuteDDLOnRemoteServer(serveroid, ddl.data);
+		}
+	}
+	
+	list_free(members);
+	pfree(ddl.data);
+	pfree(relname);
+	pfree(nspname);
+	pfree(parentname);
+	pfree(parentnspname);
+	
+	ereport(DEBUG1,
+			(errmsg("successfully migrated partition \"%s.%s\" to \"%s\"",
+					nspname, relname, toServerInfo->servername)));
+}
+
+/*
  * ReshardShardGroup
  *		Redistribute partitions across shard members using consistent hashing
  *
@@ -1302,18 +1568,79 @@ GetPartitionTargetMember(Oid sgid, const char *partition_name)
 static void
 ReshardShardGroup(Oid sgid)
 {
-	ereport(NOTICE,
-			(errmsg("RESHARD command is not yet fully implemented"),
-			 errhint("This will redistribute partitions using consistent hashing.")));
+	List	   *partitions;
+	ListCell   *lc;
+	int			moved_count = 0;
+	int			total_count = 0;
 	
-	/* TODO: Implement partition redistribution
-	 * 1. Get all partitions in tables belonging to this shard group
-	 * 2. For each partition, determine target member using GetPartitionTargetMember
-	 * 3. If partition is on wrong member, migrate it:
-	 *    a. Copy data to correct member
-	 *    b. Drop local table and create foreign table reference
-	 *    c. Update foreign table references on other members
-	 */
+	ereport(NOTICE,
+			(errmsg("resharding shard group partitions using consistent hashing")));
+	
+	/* Get all partitions in the shard group */
+	partitions = GetShardGroupPartitions(sgid);
+	
+	if (partitions == NIL)
+	{
+		ereport(NOTICE,
+				(errmsg("no partitions found in shard group")));
+		return;
+	}
+	
+	/* For each partition, check if it's on the correct member */
+	foreach(lc, partitions)
+	{
+		Oid			partitionOid = lfirst_oid(lc);
+		Relation	rel;
+		char	   *relname;
+		Oid			currentHost;
+		Oid			targetHost;
+		
+		total_count++;
+		
+		/* Get partition name */
+		rel = table_open(partitionOid, AccessShareLock);
+		relname = pstrdup(RelationGetRelationName(rel));
+		table_close(rel, AccessShareLock);
+		
+		/* Find current host */
+		currentHost = FindPartitionHostMember(partitionOid, sgid);
+		
+		if (!OidIsValid(currentHost))
+		{
+			ereport(WARNING,
+					(errmsg("could not determine current host for partition \"%s\", skipping",
+							relname)));
+			pfree(relname);
+			continue;
+		}
+		
+		/* Determine target host using consistent hashing */
+		targetHost = GetPartitionTargetMember(sgid, relname);
+		
+		if (!OidIsValid(targetHost))
+		{
+			ereport(WARNING,
+					(errmsg("could not determine target host for partition \"%s\", skipping",
+							relname)));
+			pfree(relname);
+			continue;
+		}
+		
+		/* If partition is on wrong member, migrate it */
+		if (currentHost != targetHost)
+		{
+			MigratePartitionToMember(partitionOid, currentHost, targetHost, sgid);
+			moved_count++;
+		}
+		
+		pfree(relname);
+	}
+	
+	list_free(partitions);
+	
+	ereport(NOTICE,
+			(errmsg("reshard complete: %d of %d partitions migrated",
+					moved_count, total_count)));
 }
 
 /*
@@ -1326,16 +1653,122 @@ ReshardShardGroup(Oid sgid)
 static void
 DetachShardMember(Oid sgid, Oid srvoid)
 {
-	ereport(NOTICE,
-			(errmsg("DETACH command is not yet fully implemented"),
-			 errhint("This will move all tables from the specified member.")));
+	List	   *partitions;
+	ListCell   *lc;
+	int			moved_count = 0;
+	int			total_count = 0;
+	ForeignServer *server;
 	
-	/* TODO: Implement member detachment
-	 * 1. Find all real tables (non-foreign tables) on the specified member
-	 * 2. For each table, determine new target member using GetPartitionTargetMember
-	 * 3. Migrate each table:
-	 *    a. Copy data to target member
-	 *    b. Drop local table and create foreign table reference
-	 *    c. Update foreign table references on other members
-	 */
+	server = GetForeignServer(srvoid);
+	
+	ereport(NOTICE,
+			(errmsg("detaching shard member \"%s\" - moving all partitions to other members",
+					server->servername)));
+	
+	/* Get all partitions in the shard group */
+	partitions = GetShardGroupPartitions(sgid);
+	
+	if (partitions == NIL)
+	{
+		ereport(NOTICE,
+				(errmsg("no partitions found in shard group")));
+		return;
+	}
+	
+	/* For each partition, check if it's hosted on the member being detached */
+	foreach(lc, partitions)
+	{
+		Oid			partitionOid = lfirst_oid(lc);
+		Relation	rel;
+		char	   *relname;
+		Oid			currentHost;
+		Oid			targetHost;
+		
+		/* Get partition name */
+		rel = table_open(partitionOid, AccessShareLock);
+		relname = pstrdup(RelationGetRelationName(rel));
+		table_close(rel, AccessShareLock);
+		
+		/* Find current host */
+		currentHost = FindPartitionHostMember(partitionOid, sgid);
+		
+		if (!OidIsValid(currentHost))
+		{
+			ereport(WARNING,
+					(errmsg("could not determine current host for partition \"%s\", skipping",
+							relname)));
+			pfree(relname);
+			continue;
+		}
+		
+		/* Only process partitions hosted on the member being detached */
+		if (currentHost == srvoid)
+		{
+			total_count++;
+			
+			/* Determine target host using consistent hashing */
+			/* We need to find a different member than the one being detached */
+			targetHost = GetPartitionTargetMember(sgid, relname);
+			
+			if (!OidIsValid(targetHost))
+			{
+				ereport(WARNING,
+						(errmsg("could not determine target host for partition \"%s\", skipping",
+								relname)));
+				pfree(relname);
+				continue;
+			}
+			
+			/* If consistent hashing still points to the member being detached,
+			 * we need to find an alternative member */
+			if (targetHost == srvoid)
+			{
+				List *members = get_shardgroup_members(sgid);
+				ListCell *cell;
+				Oid altTarget = InvalidOid;
+				
+				foreach(cell, members)
+				{
+					Oid candidateOid = lfirst_oid(cell);
+					if (candidateOid != srvoid)
+					{
+						altTarget = candidateOid;
+						break;
+					}
+				}
+				
+				list_free(members);
+				
+				if (!OidIsValid(altTarget))
+				{
+					ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("cannot detach last member of shard group"),
+							 errhint("Shard group must have at least one other member.")));
+				}
+				
+				targetHost = altTarget;
+			}
+			
+			/* Migrate the partition */
+			MigratePartitionToMember(partitionOid, currentHost, targetHost, sgid);
+			moved_count++;
+		}
+		
+		pfree(relname);
+	}
+	
+	list_free(partitions);
+	
+	if (total_count == 0)
+	{
+		ereport(NOTICE,
+				(errmsg("member \"%s\" had no partitions to detach", server->servername)));
+	}
+	else
+	{
+		ereport(NOTICE,
+				(errmsg("detach complete: %d partitions moved from \"%s\"",
+						moved_count, server->servername)));
+	}
 }
