@@ -3715,19 +3715,51 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 			OptTypedTableElementList PartitionBoundSpec OptPartitionSpec
 			table_access_method_clause OptWith OnCommitOption OptTableSpace
 				{
-					$$ = (Node *) transformShardOfPartition($4, $7, $9,
-															$2, $8, $10,
-															$11, $12, $13, $14,
-															false);
+					CreateStmt *n = makeNode(CreateStmt);
+
+					$4->relpersistence = $2;
+					n->relation = $4;
+					n->tableElts = $8;
+					n->inhRelations = list_make1($7);
+					n->partbound = $9;
+					n->partspec = $10;
+					n->ofTypename = NULL;
+					n->constraints = NIL;
+					n->options = $12;
+					n->oncommit = $13;
+					n->tablespacename = $14;
+					n->accessMethod = $11;
+					n->if_not_exists = false;
+					n->is_distributed = false;
+					n->is_worldwide = false;
+					n->shardgroup = NULL;
+					n->is_shard_partition = true;  /* SHARD OF flag */
+					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE IF_P NOT EXISTS qualified_name SHARD OF
 			qualified_name OptTypedTableElementList PartitionBoundSpec OptPartitionSpec
 			table_access_method_clause OptWith OnCommitOption OptTableSpace
 				{
-					$$ = (Node *) transformShardOfPartition($7, $10, $12,
-															$2, $11, $13,
-															$14, $15, $16, $17,
-															true);
+					CreateStmt *n = makeNode(CreateStmt);
+
+					$7->relpersistence = $2;
+					n->relation = $7;
+					n->tableElts = $11;
+					n->inhRelations = list_make1($10);
+					n->partbound = $12;
+					n->partspec = $13;
+					n->ofTypename = NULL;
+					n->constraints = NIL;
+					n->options = $15;
+					n->oncommit = $16;
+					n->tablespacename = $17;
+					n->accessMethod = $14;
+					n->if_not_exists = true;
+					n->is_distributed = false;
+					n->is_worldwide = false;
+					n->shardgroup = NULL;
+					n->is_shard_partition = true;  /* SHARD OF flag */
+					$$ = (Node *) n;
 				}
 		| CREATE OptTemp WORLDWIDE TABLE qualified_name '(' OptTableElementList ')'
 			OptInherit table_access_method_clause OptWith OnCommitOption OptTableSpace OptShardGroup
