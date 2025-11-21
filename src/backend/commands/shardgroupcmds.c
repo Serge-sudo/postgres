@@ -1063,15 +1063,22 @@ SyncShardGroupMetadataToMember(Oid sgid, Oid newsrvoid)
 static void
 NotifyExistingMembersAboutNewMember(Oid sgid, Oid newsrvoid)
 {
+	/* Relation and scan variables */
 	Relation	memberrel;
 	SysScanDesc scan;
 	ScanKeyData key[1];
 	HeapTuple	tuple;
-	ForeignServer *newserver;
-	StringInfoData ddl;
 	HeapTuple	sgtuple;
+	
+	/* Shard group information */
 	Form_pg_shardgroups sgform;
 	char	   *sgname;
+	
+	/* Server information */
+	ForeignServer *newserver;
+	
+	/* DDL buffer */
+	StringInfoData ddl;
 	
 	/* Get the shard group name */
 	sgtuple = SearchSysCache1(SHARDGROUPOID, ObjectIdGetDatum(sgid));
