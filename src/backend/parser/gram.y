@@ -3588,7 +3588,6 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->is_distributed = ($14 != NULL);
 					n->partspec = ($14 != NULL) ? $14 : n->partspec;  /* DISTRIBUTED BY overrides PARTITION BY */
 					n->is_worldwide = false;
-					n->is_shard_partition = false;
 					n->shardgroup = $15;
 					$$ = (Node *) n;
 				}
@@ -3613,7 +3612,6 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->is_distributed = ($17 != NULL);
 					n->partspec = ($17 != NULL) ? $17 : n->partspec;  /* DISTRIBUTED BY overrides PARTITION BY */
 					n->is_worldwide = false;
-					n->is_shard_partition = false;
 					n->shardgroup = $18;
 					$$ = (Node *) n;
 				}
@@ -3638,7 +3636,6 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->if_not_exists = false;
 					n->is_distributed = false;
 					n->is_worldwide = false;
-					n->is_shard_partition = false;
 					n->shardgroup = NULL;
 					$$ = (Node *) n;
 				}
@@ -3663,7 +3660,6 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->if_not_exists = true;
 					n->is_distributed = false;
 					n->is_worldwide = false;
-					n->is_shard_partition = false;
 					n->shardgroup = NULL;
 					$$ = (Node *) n;
 				}
@@ -3688,7 +3684,6 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->if_not_exists = false;
 					n->is_distributed = false;
 					n->is_worldwide = false;
-					n->is_shard_partition = false;
 					n->shardgroup = NULL;
 					$$ = (Node *) n;
 				}
@@ -3713,61 +3708,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->if_not_exists = true;
 					n->is_distributed = false;
 					n->is_worldwide = false;
-					n->is_shard_partition = false;
 					n->shardgroup = NULL;
-					n->is_shard_partition = false;
-					$$ = (Node *) n;
-				}
-		| CREATE OptTemp TABLE qualified_name SHARD OF qualified_name
-			OptTypedTableElementList PartitionBoundSpec OptPartitionSpec
-			table_access_method_clause OptWith OnCommitOption OptTableSpace
-				{
-					CreateStmt *n = makeNode(CreateStmt);
-
-					$4->relpersistence = $2;
-					n->relation = $4;
-					n->tableElts = $8;
-					n->inhRelations = list_make1($7);
-					n->partbound = $9;
-					n->partspec = $10;
-					n->ofTypename = NULL;
-					n->constraints = NIL;
-					n->accessMethod = $11;
-					n->options = $12;
-					n->oncommit = $13;
-					n->tablespacename = $14;
-					n->if_not_exists = false;
-					n->is_distributed = false;
-					n->is_worldwide = false;
-					n->is_shard_partition = false;
-					n->shardgroup = NULL;
-					n->is_shard_partition = true;
-					$$ = (Node *) n;
-				}
-		| CREATE OptTemp TABLE IF_P NOT EXISTS qualified_name SHARD OF
-			qualified_name OptTypedTableElementList PartitionBoundSpec OptPartitionSpec
-			table_access_method_clause OptWith OnCommitOption OptTableSpace
-				{
-					CreateStmt *n = makeNode(CreateStmt);
-
-					$7->relpersistence = $2;
-					n->relation = $7;
-					n->tableElts = $11;
-					n->inhRelations = list_make1($10);
-					n->partbound = $12;
-					n->partspec = $13;
-					n->ofTypename = NULL;
-					n->constraints = NIL;
-					n->accessMethod = $14;
-					n->options = $15;
-					n->oncommit = $16;
-					n->tablespacename = $17;
-					n->if_not_exists = true;
-					n->is_distributed = false;
-					n->is_worldwide = false;
-					n->is_shard_partition = false;
-					n->shardgroup = NULL;
-					n->is_shard_partition = true;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp WORLDWIDE TABLE qualified_name '(' OptTableElementList ')'
@@ -3789,7 +3730,6 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->if_not_exists = false;
 					n->is_distributed = false;
 					n->is_worldwide = true;
-					n->is_shard_partition = false;
 					n->shardgroup = $14;
 					$$ = (Node *) n;
 				}
@@ -3813,7 +3753,6 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->if_not_exists = true;
 					n->is_distributed = false;
 					n->is_worldwide = true;
-					n->is_shard_partition = false;
 					n->shardgroup = $17;
 					$$ = (Node *) n;
 				}
