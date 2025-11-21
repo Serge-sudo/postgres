@@ -1205,10 +1205,14 @@ hash_string_to_uint32(const char *str)
  * (virtual nodes), and the partition is assigned to the member whose
  * virtual node is closest in the ring.
  *
+ * If exclude_member is valid, that member will be excluded from consideration,
+ * which is useful during DETACH operations to ensure partitions aren't assigned
+ * to the member being detached.
+ *
  * Returns the OID of the foreign server that should host the partition.
  */
 Oid
-GetPartitionTargetMember(Oid sgid, const char *partition_name)
+GetPartitionTargetMember(Oid sgid, const char *partition_name, Oid exclude_member)
 {
 	Relation	memberrel;
 	SysScanDesc scan;
@@ -1250,8 +1254,14 @@ GetPartitionTargetMember(Oid sgid, const char *partition_name)
 	foreach(lc, members)
 	{
 		Oid			serveroid = lfirst_oid(lc);
-		ForeignServer *server = GetForeignServer(serveroid);
+		ForeignServer *server;
 		int			i;
+		
+		/* Skip the excluded member if specified */
+		if (OidIsValid(exclude_member) && serveroid == exclude_member)
+			continue;
+		
+		server = GetForeignServer(serveroid);
 		
 		/* Create multiple virtual nodes for this member */
 		for (i = 0; i < VIRTUAL_NODES_PER_MEMBER; i++)
@@ -1345,9 +1355,12 @@ GetShardGroupPartitions(Oid sgid)
  * FindPartitionHostMember
  *		Find which shard member currently hosts the real table for a partition
  *
- * Returns InvalidOid if the partition is a foreign table on the local server
- * (meaning the real table is on another member), or the member OID if found.
- * For foreign tables, we need to check which server the foreign table points to.
+ * Returns the member OID that hosts the real table for the partition:
+ * - If the partition is a real table on the local server, returns the server OID
+ *   representing the local cluster in the shard group
+ * - If the partition is a foreign table on the local server, returns the server OID
+ *   that the foreign table points to (where the real table is hosted)
+ * - Returns InvalidOid if unable to determine the host
  */
 static Oid
 FindPartitionHostMember(Oid partitionOid, Oid sgid)
@@ -1629,7 +1642,7 @@ ReshardShardGroup(Oid sgid)
 		}
 		
 		/* Determine target host using consistent hashing */
-		targetHost = GetPartitionTargetMember(sgid, relname);
+		targetHost = GetPartitionTargetMember(sgid, relname, InvalidOid);
 		
 		if (!OidIsValid(targetHost))
 		{
@@ -1720,48 +1733,19 @@ DetachShardMember(Oid sgid, Oid srvoid)
 		{
 			total_count++;
 			
-			/* Determine target host using consistent hashing */
-			/* We need to find a different member than the one being detached */
-			targetHost = GetPartitionTargetMember(sgid, relname);
+			/* 
+			 * Determine target host using consistent hashing,
+			 * excluding the member being detached to ensure we find
+			 * a different target.
+			 */
+			targetHost = GetPartitionTargetMember(sgid, relname, srvoid);
 			
 			if (!OidIsValid(targetHost))
 			{
-				ereport(WARNING,
-						(errmsg("could not determine target host for partition \"%s\", skipping",
-								relname)));
-				pfree(relname);
-				continue;
-			}
-			
-			/* If consistent hashing still points to the member being detached,
-			 * we need to find an alternative member */
-			if (targetHost == srvoid)
-			{
-				List *members = get_shardgroup_members(sgid);
-				ListCell *cell;
-				Oid altTarget = InvalidOid;
-				
-				foreach(cell, members)
-				{
-					Oid candidateOid = lfirst_oid(cell);
-					if (candidateOid != srvoid)
-					{
-						altTarget = candidateOid;
-						break;
-					}
-				}
-				
-				list_free(members);
-				
-				if (!OidIsValid(altTarget))
-				{
-					ereport(ERROR,
-							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-							 errmsg("cannot detach last member of shard group"),
-							 errhint("Shard group must have at least one other member.")));
-				}
-				
-				targetHost = altTarget;
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("cannot detach last member of shard group"),
+						 errhint("Shard group must have at least one other member.")));
 			}
 			
 			/* Migrate the partition */

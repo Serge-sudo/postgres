@@ -1465,7 +1465,7 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 	if (is_partition && OidIsValid(parentOid) && partbound != NULL)
 	{
 		/* Use consistent hashing to determine target member for this partition */
-		target_member = GetPartitionTargetMember(sgid, relname);
+		target_member = GetPartitionTargetMember(sgid, relname, InvalidOid);
 		if (OidIsValid(target_member))
 			target_server = GetForeignServer(target_member);
 	}
