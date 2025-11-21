@@ -20,6 +20,16 @@ struct AttrMap;					/* avoid including attmap.h here */
 
 
 extern List *transformCreateStmt(CreateStmt *stmt, const char *queryString);
+extern Node *transformShardOfPartition(RangeVar *relation, RangeVar *parent,
+									   PartitionBoundSpec *partbound,
+									   char relpersistence,
+									   List *tableElts,
+									   PartitionSpec *partspec,
+									   char *accessMethod,
+									   List *options,
+									   OnCommitAction oncommit,
+									   char *tablespacename,
+									   bool if_not_exists);
 extern AlterTableStmt *transformAlterTableStmt(Oid relid, AlterTableStmt *stmt,
 											   const char *queryString,
 											   List **beforeStmts,

@@ -3711,6 +3711,24 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->shardgroup = NULL;
 					$$ = (Node *) n;
 				}
+		| CREATE OptTemp TABLE qualified_name SHARD OF qualified_name
+			OptTypedTableElementList PartitionBoundSpec OptPartitionSpec
+			table_access_method_clause OptWith OnCommitOption OptTableSpace
+				{
+					$$ = (Node *) transformShardOfPartition($4, $7, $9,
+															$2, $8, $10,
+															$11, $12, $13, $14,
+															false);
+				}
+		| CREATE OptTemp TABLE IF_P NOT EXISTS qualified_name SHARD OF
+			qualified_name OptTypedTableElementList PartitionBoundSpec OptPartitionSpec
+			table_access_method_clause OptWith OnCommitOption OptTableSpace
+				{
+					$$ = (Node *) transformShardOfPartition($7, $10, $12,
+															$2, $11, $13,
+															$14, $15, $16, $17,
+															true);
+				}
 		| CREATE OptTemp WORLDWIDE TABLE qualified_name '(' OptTableElementList ')'
 			OptInherit table_access_method_clause OptWith OnCommitOption OptTableSpace OptShardGroup
 				{
