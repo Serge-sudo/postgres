@@ -680,6 +680,8 @@ static char GetAttributeCompression(Oid atttypid, const char *compression);
 static char GetAttributeStorage(Oid atttypid, const char *storagemode);
 static void CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 									   Oid parentOid, PartitionBoundSpec *partbound);
+static bool ShouldCreatePartitionAsForeign(CreateStmt *stmt, List *inheritOids,
+										   Oid *target_server_oid);
 
 
 /* ----------------------------------------------------------------
@@ -1286,6 +1288,10 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	/*
 	 * Handle sharding-related features: distributed tables, worldwide tables,
 	 * and shard group assignment.
+	 *
+	 * For partitions of distributed tables: use consistent hashing to determine
+	 * if this partition should be created as a foreign table (pointing to the
+	 * target member determined by consistent hashing).
 	 */
 	if (stmt->is_distributed || stmt->is_worldwide)
 	{
@@ -1321,13 +1327,50 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 			SetRelationShardGroup(relationId, sgid);
 			
 			/*
-			 * Create tables on shard members (foreign servers)
-			 * For partitions: create partitions on remote servers with PARTITION OF
-			 * For regular tables: create tables on remote servers
+			 * For partitions: check if this partition should be created as a foreign table
+			 * (because consistent hashing determines it should be on a remote member).
+			 * If so, convert to foreign table now before creating on remote servers.
 			 */
 			if (stmt->partbound != NULL)
 			{
-				/* For partitions, pass parent OID and bound spec */
+				Oid		target_server_oid = InvalidOid;
+				
+				/* Check if partition should be foreign using consistent hashing */
+				if (ShouldCreatePartitionAsForeign(stmt, inheritOids, &target_server_oid))
+				{
+					ForeignServer *target_server = GetForeignServer(target_server_oid);
+					CreateForeignTableStmt *ftstmt;
+					List *ftoptions = NIL;
+					
+					/* Create a CreateForeignTableStmt to convert this to a foreign table */
+					ftstmt = makeNode(CreateForeignTableStmt);
+					ftstmt->base.type = T_CreateForeignTableStmt;
+					ftstmt->base.relation = stmt->relation;
+					ftstmt->servername = pstrdup(target_server->servername);
+					
+					/* Add schema_name and table_name options for postgres_fdw */
+					ftoptions = lappend(ftoptions,
+										makeDefElem("schema_name",
+													(Node *) makeString(get_namespace_name(RelationGetNamespace(rel))),
+													-1));
+					ftoptions = lappend(ftoptions,
+										makeDefElem("table_name",
+													(Node *) makeString(relname),
+													-1));
+					ftstmt->options = ftoptions;
+					
+					/* Convert the relation to a foreign table */
+					CreateForeignTable(ftstmt, relationId);
+					
+					/*
+					 * Now create the real partition table only on the target member.
+					 * Note: CreateTablesOnShardMembers will handle this by creating
+					 * the real table on target_server_oid and skipping foreign table
+					 * creation since we already have a foreign table locally.
+					 */
+				}
+				
+				/* Create tables/partitions on shard members */
 				Oid parentId = linitial_oid(inheritOids);
 				CreateTablesOnShardMembers(relationId, sgid, true, parentId, stmt->partbound);
 			}
@@ -1342,10 +1385,42 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	{
 		/*
 		 * For partitions that inherit shard group from parent:
-		 * Also create tables on shard members
+		 * Check if this partition should be created as a foreign table.
 		 */
+		Oid		target_server_oid = InvalidOid;
+		Oid		sgid = rel->rd_rel->relsgid;
+		
+		/* Check if partition should be foreign using consistent hashing */
+		if (ShouldCreatePartitionAsForeign(stmt, inheritOids, &target_server_oid))
+		{
+			ForeignServer *target_server = GetForeignServer(target_server_oid);
+			CreateForeignTableStmt *ftstmt;
+			List *ftoptions = NIL;
+			
+			/* Create a CreateForeignTableStmt to convert this to a foreign table */
+			ftstmt = makeNode(CreateForeignTableStmt);
+			ftstmt->base.type = T_CreateForeignTableStmt;
+			ftstmt->base.relation = stmt->relation;
+			ftstmt->servername = pstrdup(target_server->servername);
+			
+			/* Add schema_name and table_name options for postgres_fdw */
+			ftoptions = lappend(ftoptions,
+								makeDefElem("schema_name",
+											(Node *) makeString(get_namespace_name(RelationGetNamespace(rel))),
+											-1));
+			ftoptions = lappend(ftoptions,
+								makeDefElem("table_name",
+											(Node *) makeString(relname),
+											-1));
+			ftstmt->options = ftoptions;
+			
+			/* Convert the relation to a foreign table */
+			CreateForeignTable(ftstmt, relationId);
+		}
+		
+		/* Create tables/partitions on shard members */
 		Oid parentId = linitial_oid(inheritOids);
-		CreateTablesOnShardMembers(relationId, rel->rd_rel->relsgid, true, parentId, stmt->partbound);
+		CreateTablesOnShardMembers(relationId, sgid, true, parentId, stmt->partbound);
 	}
 
 	ObjectAddressSet(address, RelationRelationId, relationId);
@@ -1668,15 +1743,23 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 	/*
 	 * Execute the DDL on each shard member.
 	 * For partitions with consistent hashing:
-	 *   - Create real table on target member
-	 *   - Create foreign table references on other members
+	 *   - Create real table on target member (skip if it's the local server - already created)
+	 *   - Create foreign table references on other members (skip if it's the local server - already created)
 	 * For non-partitions:
-	 *   - Create real tables on all members (existing behavior)
+	 *   - Create real tables on all members except local (which is already created)
 	 */
 	foreach(lc, members)
 	{
 		Oid			serveroid = lfirst_oid(lc);
+		ForeignServer *server;
 		const char *sql_to_execute;
+		
+		/* Get server info to check if it's the local server */
+		server = GetForeignServer(serveroid);
+		
+		/* Skip the local server - table/partition is already created locally */
+		if (cluster_name && strcmp(server->servername, cluster_name) == 0)
+			continue;
 
 		if (is_partition && OidIsValid(target_member))
 		{
@@ -1717,6 +1800,66 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 		pfree(create_foreign_table_sql.data);
 	pfree(nspname);
 	list_free(members);
+}
+
+/*
+ * ShouldCreatePartitionAsForeign
+ *		Determine if a partition should be created as a foreign table
+ *
+ * For partitions of distributed tables, this function uses consistent hashing
+ * to determine which shard member should host the real table. If the target
+ * member is not the local server, returns true and sets target_server_oid.
+ *
+ * Returns:
+ *   true if partition should be created as foreign table (with target_server_oid set)
+ *   false if partition should be created as regular local table
+ */
+static bool
+ShouldCreatePartitionAsForeign(CreateStmt *stmt, List *inheritOids,
+							   Oid *target_server_oid)
+{
+	Oid			parentOid;
+	Relation	parent;
+	Oid			sgid;
+	Oid			target_member;
+	ForeignServer *target_server;
+	extern char *cluster_name;
+	
+	/* Only relevant for partitions */
+	if (stmt->partbound == NULL || inheritOids == NIL)
+		return false;
+	
+	/* Get parent table */
+	parentOid = linitial_oid(inheritOids);
+	parent = table_open(parentOid, AccessShareLock);
+	sgid = parent->rd_rel->relsgid;
+	table_close(parent, AccessShareLock);
+	
+	/* Only relevant if parent is in a shard group */
+	if (!OidIsValid(sgid))
+		return false;
+	
+	/* Check if cluster_name is set */
+	if (!cluster_name || cluster_name[0] == '\0')
+		return false;
+	
+	/* Use consistent hashing to determine target member */
+	target_member = GetPartitionTargetMember(sgid, stmt->relation->relname, InvalidOid);
+	if (!OidIsValid(target_member))
+		return false;
+	
+	target_server = GetForeignServer(target_member);
+	
+	/* Check if target is the local server */
+	if (strcmp(target_server->servername, cluster_name) == 0)
+	{
+		/* Target is local server - create as regular table */
+		return false;
+	}
+	
+	/* Target is remote server - create as foreign table */
+	*target_server_oid = target_member;
+	return true;
 }
 
 /*
