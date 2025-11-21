@@ -65,6 +65,8 @@ static void DetachShardMember(Oid sgid, Oid srvoid);
 
 /* Number of virtual nodes per shard member for consistent hashing */
 #define VIRTUAL_NODES_PER_MEMBER 150
+/* Maximum length for virtual node key strings */
+#define VNODE_KEY_MAX_LEN 256
 
 
 /*
@@ -1248,7 +1250,7 @@ GetPartitionTargetMember(Oid sgid, const char *partition_name)
 		/* Create multiple virtual nodes for this member */
 		for (i = 0; i < VIRTUAL_NODES_PER_MEMBER; i++)
 		{
-			char		vnode_key[256];
+			char		vnode_key[VNODE_KEY_MAX_LEN];
 			uint32		vnode_hash;
 			uint32		distance;
 			
@@ -1263,12 +1265,17 @@ GetPartitionTargetMember(Oid sgid, const char *partition_name)
 			
 			/* 
 			 * Calculate distance on the ring (clockwise from partition to vnode)
-			 * Handle wraparound correctly to avoid overflow
+			 * Handle wraparound correctly to avoid overflow.
+			 * Use uint64_t for intermediate calculation to prevent overflow.
 			 */
 			if (vnode_hash >= partition_hash)
 				distance = vnode_hash - partition_hash;
 			else
-				distance = vnode_hash + (UINT32_MAX - partition_hash) + 1;
+			{
+				/* Calculate wraparound distance using uint64_t to avoid overflow */
+				uint64_t wrap_distance = (uint64_t)UINT32_MAX - partition_hash + vnode_hash + 1;
+				distance = (uint32_t)wrap_distance;
+			}
 			
 			/* Track the closest virtual node */
 			if (distance < min_distance)

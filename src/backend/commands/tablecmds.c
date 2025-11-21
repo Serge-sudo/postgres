@@ -1688,7 +1688,11 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 			}
 			else if (create_foreign_table_sql.len > 0)
 			{
-				/* Create foreign table reference on other members */
+				/* 
+				 * Create foreign table reference on other members
+				 * Note: create_foreign_table_sql is only initialized when 
+				 * OidIsValid(target_member) && target_server != NULL
+				 */
 				sql_to_execute = create_foreign_table_sql.data;
 			}
 			else
