@@ -58,6 +58,11 @@ static void SyncShardGroupMetadataToMember(Oid sgid, Oid newsrvoid);
 static void NotifyExistingMembersAboutNewMember(Oid sgid, Oid newsrvoid);
 static void ExecuteDDLOnRemoteServer(Oid serveroid, const char *sql);
 
+/* Consistent hashing functions */
+static uint32 hash_string_to_uint32(const char *str);
+static void ReshardShardGroup(Oid sgid);
+static void DetachShardMember(Oid sgid, Oid srvoid);
+
 
 /*
  * CREATE SHARD GROUP
@@ -444,6 +449,19 @@ AlterShardGroup(AlterShardGroupStmt *stmt)
 		}
 		
 		ObjectAddressSet(address, ShardMemberRelationId, memberoid);
+	}
+	else if (strcmp(stmt->action, "RESHARD") == 0)
+	{
+		/* Redistribute partitions across shard members using consistent hashing */
+		ReshardShardGroup(sgoid);
+		ObjectAddressSet(address, ShardGroupRelationId, sgoid);
+	}
+	else if (strcmp(stmt->action, "DETACH") == 0)
+	{
+		/* Move all real tables from specified member to other members */
+		srvoid = get_foreign_server_oid(stmt->servername, false);
+		DetachShardMember(sgoid, srvoid);
+		ObjectAddressSet(address, ShardMemberRelationId, InvalidOid);
 	}
 	else
 	{
@@ -1148,4 +1166,161 @@ NotifyExistingMembersAboutNewMember(Oid sgid, Oid newsrvoid)
 	ereport(DEBUG1,
 			(errmsg("successfully notified existing members about new shard member \"%s\"",
 					newserver->servername)));
+}
+
+/*
+ * hash_string_to_uint32
+ *		Simple hash function to convert a string to a 32-bit unsigned integer
+ *
+ * Uses DJB2 hash algorithm for consistent hashing
+ */
+static uint32
+hash_string_to_uint32(const char *str)
+{
+	uint32		hash = 5381;
+	int			c;
+
+	while ((c = *str++))
+		hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
+
+	return hash;
+}
+
+/*
+ * GetPartitionTargetMember
+ *		Determine which shard member should host a partition using consistent hashing
+ *
+ * Uses ring hashing: each member is placed on a hash ring multiple times
+ * (virtual nodes), and the partition is assigned to the member whose
+ * virtual node is closest in the ring.
+ *
+ * Returns the OID of the foreign server that should host the partition.
+ */
+Oid
+GetPartitionTargetMember(Oid sgid, const char *partition_name)
+{
+	Relation	memberrel;
+	SysScanDesc scan;
+	ScanKeyData key[1];
+	HeapTuple	tuple;
+	List	   *members = NIL;
+	ListCell   *lc;
+	uint32		partition_hash;
+	uint32		min_distance = UINT32_MAX;
+	Oid			target_member = InvalidOid;
+	int			virtual_nodes = 150; /* Number of virtual nodes per member */
+	
+	/* Get all shard members */
+	memberrel = table_open(ShardMemberRelationId, AccessShareLock);
+	
+	ScanKeyInit(&key[0],
+				Anum_pg_shardmembers_sgid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(sgid));
+	
+	scan = systable_beginscan(memberrel, ShardMemberSgidSrvidIndexId, true,
+							  NULL, 1, key);
+	
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Form_pg_shardmembers smform = (Form_pg_shardmembers) GETSTRUCT(tuple);
+		members = lappend_oid(members, smform->srvid);
+	}
+	
+	systable_endscan(scan);
+	table_close(memberrel, AccessShareLock);
+	
+	if (members == NIL)
+		return InvalidOid;
+	
+	/* Hash the partition name */
+	partition_hash = hash_string_to_uint32(partition_name);
+	
+	/* Find the closest virtual node using ring hashing */
+	foreach(lc, members)
+	{
+		Oid			serveroid = lfirst_oid(lc);
+		ForeignServer *server = GetForeignServer(serveroid);
+		int			i;
+		
+		/* Create multiple virtual nodes for this member */
+		for (i = 0; i < virtual_nodes; i++)
+		{
+			char		vnode_key[256];
+			uint32		vnode_hash;
+			uint32		distance;
+			
+			/* Create virtual node identifier */
+			snprintf(vnode_key, sizeof(vnode_key), "%s:%d", 
+					 server->servername, i);
+			
+			vnode_hash = hash_string_to_uint32(vnode_key);
+			
+			/* Calculate distance on the ring */
+			if (vnode_hash >= partition_hash)
+				distance = vnode_hash - partition_hash;
+			else
+				distance = (UINT32_MAX - partition_hash) + vnode_hash;
+			
+			/* Track the closest virtual node */
+			if (distance < min_distance)
+			{
+				min_distance = distance;
+				target_member = serveroid;
+			}
+		}
+	}
+	
+	list_free(members);
+	
+	return target_member;
+}
+
+/*
+ * ReshardShardGroup
+ *		Redistribute partitions across shard members using consistent hashing
+ *
+ * This command moves partitions that are currently real tables to their
+ * correct positions according to consistent hashing. Partitions that are
+ * already on the correct member are left alone.
+ */
+static void
+ReshardShardGroup(Oid sgid)
+{
+	ereport(NOTICE,
+			(errmsg("RESHARD command is not yet fully implemented"),
+			 errhint("This will redistribute partitions using consistent hashing.")));
+	
+	/* TODO: Implement partition redistribution
+	 * 1. Get all partitions in tables belonging to this shard group
+	 * 2. For each partition, determine target member using GetPartitionTargetMember
+	 * 3. If partition is on wrong member, migrate it:
+	 *    a. Copy data to correct member
+	 *    b. Drop local table and create foreign table reference
+	 *    c. Update foreign table references on other members
+	 */
+}
+
+/*
+ * DetachShardMember
+ *		Move all real tables from a shard member to other members
+ *
+ * After this operation, the specified member will only have foreign table
+ * references, allowing it to be safely dropped from the shard group.
+ */
+static void
+DetachShardMember(Oid sgid, Oid srvoid)
+{
+	ereport(NOTICE,
+			(errmsg("DETACH command is not yet fully implemented"),
+			 errhint("This will move all tables from the specified member.")));
+	
+	/* TODO: Implement member detachment
+	 * 1. Find all real tables (non-foreign tables) on the specified member
+	 * 2. For each table, determine new target member using GetPartitionTargetMember
+	 * 3. Migrate each table:
+	 *    a. Copy data to target member
+	 *    b. Drop local table and create foreign table reference
+	 *    c. Update foreign table references on other members
+	 */
 }
