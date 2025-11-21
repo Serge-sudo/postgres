@@ -63,6 +63,9 @@ static uint32 hash_string_to_uint32(const char *str);
 static void ReshardShardGroup(Oid sgid);
 static void DetachShardMember(Oid sgid, Oid srvoid);
 
+/* Number of virtual nodes per shard member for consistent hashing */
+#define VIRTUAL_NODES_PER_MEMBER 150
+
 
 /*
  * CREATE SHARD GROUP
@@ -1208,7 +1211,6 @@ GetPartitionTargetMember(Oid sgid, const char *partition_name)
 	uint32		partition_hash;
 	uint32		min_distance = UINT32_MAX;
 	Oid			target_member = InvalidOid;
-	int			virtual_nodes = 150; /* Number of virtual nodes per member */
 	
 	/* Get all shard members */
 	memberrel = table_open(ShardMemberRelationId, AccessShareLock);
@@ -1244,23 +1246,29 @@ GetPartitionTargetMember(Oid sgid, const char *partition_name)
 		int			i;
 		
 		/* Create multiple virtual nodes for this member */
-		for (i = 0; i < virtual_nodes; i++)
+		for (i = 0; i < VIRTUAL_NODES_PER_MEMBER; i++)
 		{
 			char		vnode_key[256];
 			uint32		vnode_hash;
 			uint32		distance;
 			
-			/* Create virtual node identifier */
-			snprintf(vnode_key, sizeof(vnode_key), "%s:%d", 
+			/* 
+			 * Create virtual node identifier using underscore separator
+			 * to avoid conflicts with potential colons in server names
+			 */
+			snprintf(vnode_key, sizeof(vnode_key), "%s_%d", 
 					 server->servername, i);
 			
 			vnode_hash = hash_string_to_uint32(vnode_key);
 			
-			/* Calculate distance on the ring */
+			/* 
+			 * Calculate distance on the ring (clockwise from partition to vnode)
+			 * Handle wraparound correctly to avoid overflow
+			 */
 			if (vnode_hash >= partition_hash)
 				distance = vnode_hash - partition_hash;
 			else
-				distance = (UINT32_MAX - partition_hash) + vnode_hash;
+				distance = vnode_hash + (UINT32_MAX - partition_hash) + 1;
 			
 			/* Track the closest virtual node */
 			if (distance < min_distance)
