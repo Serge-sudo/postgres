@@ -1435,11 +1435,10 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 	}
 	else
 	{
+		table_close(rel, AccessShareLock);
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("relation \"%s\" is not a partition", relname)));
-		table_close(rel, AccessShareLock);
-		return;
 	}
 	
 	table_close(rel, AccessShareLock);
@@ -1455,35 +1454,52 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 	
 	/*
 	 * Step 1: Create real table on destination with data from source
-	 * We do this by executing CREATE TABLE ... PARTITION OF on the destination
-	 * and then copying data
 	 */
 	
-	/* First, get the partition bound specification */
-	char *partition_def = pg_get_partkeydef_worker(partitionOid, 0, false, false, false, false);
+	/* Get the partition constraint definition */
+	char *partconstrdef = pg_get_partconstrdef_string(partitionOid, NULL);
 	
-	if (partition_def)
-	{
-		/* Create the partition on destination */
-		appendStringInfo(&ddl, "CREATE TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s;",
-						 quote_identifier(nspname),
-						 quote_identifier(relname),
-						 quote_identifier(parentnspname),
-						 quote_identifier(parentname),
-						 partition_def);
-		
-		ExecuteDDLOnRemoteServer(toServer, ddl.data);
-		
-		/* Copy data from source to destination */
-		resetStringInfo(&ddl);
-		appendStringInfo(&ddl, "INSERT INTO %s.%s SELECT * FROM %s.%s;",
-						 quote_identifier(nspname),
-						 quote_identifier(relname),
-						 quote_identifier(nspname),
-						 quote_identifier(relname));
-		
-		ExecuteDDLOnRemoteServer(toServer, ddl.data);
-	}
+	/* Create the partition structure on destination */
+	appendStringInfo(&ddl, 
+					 "CREATE TABLE IF NOT EXISTS %s.%s (LIKE %s.%s INCLUDING ALL);",
+					 quote_identifier(nspname),
+					 quote_identifier(relname),
+					 quote_identifier(nspname),
+					 quote_identifier(relname));
+	
+	ExecuteDDLOnRemoteServer(toServer, ddl.data);
+	
+	/*
+	 * Copy data from source to destination.
+	 * Create a temporary foreign table on destination pointing to source,
+	 * copy data through it, then drop it.
+	 */
+	resetStringInfo(&ddl);
+	appendStringInfo(&ddl, 
+					 "CREATE FOREIGN TABLE IF NOT EXISTS %s_temp SERVER %s OPTIONS (schema_name '%s', table_name '%s');",
+					 quote_identifier(relname),
+					 quote_identifier(fromServerInfo->servername),
+					 nspname,
+					 relname);
+	
+	ExecuteDDLOnRemoteServer(toServer, ddl.data);
+	
+	/* Copy data */
+	resetStringInfo(&ddl);
+	appendStringInfo(&ddl, 
+					 "INSERT INTO %s.%s SELECT * FROM %s_temp;",
+					 quote_identifier(nspname),
+					 quote_identifier(relname),
+					 quote_identifier(relname));
+	
+	ExecuteDDLOnRemoteServer(toServer, ddl.data);
+	
+	/* Drop temporary foreign table */
+	resetStringInfo(&ddl);
+	appendStringInfo(&ddl, "DROP FOREIGN TABLE IF EXISTS %s_temp;",
+					 quote_identifier(relname));
+	
+	ExecuteDDLOnRemoteServer(toServer, ddl.data);
 	
 	/*
 	 * Step 2: Drop real table on source and create foreign table
@@ -1497,18 +1513,16 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 	
 	/* Create foreign table on source pointing to destination */
 	resetStringInfo(&ddl);
-	if (partition_def)
-	{
-		appendStringInfo(&ddl, "CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s SERVER %s;",
-						 quote_identifier(nspname),
-						 quote_identifier(relname),
-						 quote_identifier(parentnspname),
-						 quote_identifier(parentname),
-						 partition_def,
-						 quote_identifier(toServerInfo->servername));
-		
-		ExecuteDDLOnRemoteServer(fromServer, ddl.data);
-	}
+	appendStringInfo(&ddl, 
+					 "CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s SERVER %s;",
+					 quote_identifier(nspname),
+					 quote_identifier(relname),
+					 quote_identifier(parentnspname),
+					 quote_identifier(parentname),
+					 partconstrdef ? partconstrdef : "",
+					 quote_identifier(toServerInfo->servername));
+	
+	ExecuteDDLOnRemoteServer(fromServer, ddl.data);
 	
 	/*
 	 * Step 3: Update foreign tables on all other members
@@ -1531,17 +1545,16 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 		ExecuteDDLOnRemoteServer(serveroid, ddl.data);
 		
 		resetStringInfo(&ddl);
-		if (partition_def)
-		{
-			appendStringInfo(&ddl, "CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s SERVER %s;",
-							 quote_identifier(nspname),
-							 quote_identifier(relname),
-							 quote_identifier(parentnspname),
-							 quote_identifier(parentname),
-							 partition_def,
-							 quote_identifier(toServerInfo->servername));
-			
-			ExecuteDDLOnRemoteServer(serveroid, ddl.data);
+		appendStringInfo(&ddl, 
+						 "CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s SERVER %s;",
+						 quote_identifier(nspname),
+						 quote_identifier(relname),
+						 quote_identifier(parentnspname),
+						 quote_identifier(parentname),
+						 partconstrdef ? partconstrdef : "",
+						 quote_identifier(toServerInfo->servername));
+		
+		ExecuteDDLOnRemoteServer(serveroid, ddl.data);
 		}
 	}
 	
@@ -1551,6 +1564,8 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 	pfree(nspname);
 	pfree(parentname);
 	pfree(parentnspname);
+	if (partconstrdef)
+		pfree(partconstrdef);
 	
 	ereport(DEBUG1,
 			(errmsg("successfully migrated partition \"%s.%s\" to \"%s\"",
