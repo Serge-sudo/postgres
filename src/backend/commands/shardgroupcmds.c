@@ -1476,11 +1476,11 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 	 */
 	resetStringInfo(&ddl);
 	appendStringInfo(&ddl, 
-					 "CREATE FOREIGN TABLE IF NOT EXISTS %s_temp SERVER %s OPTIONS (schema_name '%s', table_name '%s');",
+					 "CREATE FOREIGN TABLE IF NOT EXISTS %s_temp SERVER %s OPTIONS (schema_name %s, table_name %s);",
 					 quote_identifier(relname),
 					 quote_identifier(fromServerInfo->servername),
-					 nspname,
-					 relname);
+					 quote_literal_cstr(nspname),
+					 quote_literal_cstr(relname));
 	
 	ExecuteDDLOnRemoteServer(toServer, ddl.data);
 	
@@ -1555,7 +1555,6 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 						 quote_identifier(toServerInfo->servername));
 		
 		ExecuteDDLOnRemoteServer(serveroid, ddl.data);
-		}
 	}
 	
 	list_free(members);
