@@ -36,6 +36,7 @@ SUBDIRS = \
 		  test_regex \
 		  test_resowner \
 		  test_rls_hooks \
+		  test_sharding \
 		  test_shm_mq \
 		  test_slru \
 		  test_tidstore \
