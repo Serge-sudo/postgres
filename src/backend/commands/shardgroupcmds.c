@@ -1067,11 +1067,11 @@ NotifyExistingMembersAboutNewMember(Oid sgid, Oid newsrvoid)
 	SysScanDesc scan;
 	ScanKeyData key[1];
 	HeapTuple	tuple;
+	ForeignServer *newserver;
+	StringInfoData ddl;
 	HeapTuple	sgtuple;
 	Form_pg_shardgroups sgform;
 	char	   *sgname;
-	ForeignServer *newserver;
-	StringInfoData ddl;
 	
 	/* Get the shard group name */
 	sgtuple = SearchSysCache1(SHARDGROUPOID, ObjectIdGetDatum(sgid));
