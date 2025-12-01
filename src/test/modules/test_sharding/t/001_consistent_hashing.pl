@@ -33,50 +33,60 @@ cluster_name = 'node3'
 ));
 $node3->start;
 
+my $node1_port = $node1->port;
+my $node1_host = $node1->host;
+my $node2_port = $node2->port;
+my $node2_host = $node2->host;
+my $node3_port = $node3->port;
+my $node3_host = $node3->host;
+
 # Setup foreign data wrappers and servers on each node
-# Node1 needs to connect to node2 and node3
-$node1->safe_psql('postgres', qq(
-    CREATE EXTENSION postgres_fdw;
-    CREATE SERVER node2 FOREIGN DATA WRAPPER postgres_fdw 
-        OPTIONS (host 'localhost', port '@{[$node2->port]}', dbname 'postgres');
-    CREATE USER MAPPING FOR CURRENT_USER SERVER node2 
-        OPTIONS (user 'postgres');
-    CREATE SERVER node3 FOREIGN DATA WRAPPER postgres_fdw 
-        OPTIONS (host 'localhost', port '@{[$node3->port]}', dbname 'postgres');
-    CREATE USER MAPPING FOR CURRENT_USER SERVER node3 
-        OPTIONS (user 'postgres');
-));
 
-# Node2 needs to connect to node1 and node3
-$node2->safe_psql('postgres', qq(
-    CREATE EXTENSION postgres_fdw;
-    CREATE SERVER node1 FOREIGN DATA WRAPPER postgres_fdw 
-        OPTIONS (host 'localhost', port '@{[$node1->port]}', dbname 'postgres');
-    CREATE USER MAPPING FOR CURRENT_USER SERVER node1 
-        OPTIONS (user 'postgres');
-    CREATE SERVER node3 FOREIGN DATA WRAPPER postgres_fdw 
-        OPTIONS (host 'localhost', port '@{[$node3->port]}', dbname 'postgres');
-    CREATE USER MAPPING FOR CURRENT_USER SERVER node3 
-        OPTIONS (user 'postgres');
-));
+# Install postgres_fdw on all nodes
+foreach my $node ($node1, $node2, $node3)
+{
+	$node->safe_psql('postgres', 'CREATE EXTENSION postgres_fdw;');
+}
 
-# Node3 needs to connect to node1 and node2
-$node3->safe_psql('postgres', qq(
-    CREATE EXTENSION postgres_fdw;
-    CREATE SERVER node1 FOREIGN DATA WRAPPER postgres_fdw 
-        OPTIONS (host 'localhost', port '@{[$node1->port]}', dbname 'postgres');
-    CREATE USER MAPPING FOR CURRENT_USER SERVER node1 
-        OPTIONS (user 'postgres');
-    CREATE SERVER node2 FOREIGN DATA WRAPPER postgres_fdw 
-        OPTIONS (host 'localhost', port '@{[$node2->port]}', dbname 'postgres');
-    CREATE USER MAPPING FOR CURRENT_USER SERVER node2 
-        OPTIONS (user 'postgres');
-));
+# Setup foreign servers on node1
+$node1->safe_psql('postgres', qq[
+	CREATE SERVER node2 FOREIGN DATA WRAPPER postgres_fdw 
+		OPTIONS (host '$node2_host', dbname 'postgres', port '$node2_port');
+	CREATE USER MAPPING FOR CURRENT_USER SERVER node2;
+	
+	CREATE SERVER node3 FOREIGN DATA WRAPPER postgres_fdw 
+		OPTIONS (host '$node3_host', dbname 'postgres', port '$node3_port');
+	CREATE USER MAPPING FOR CURRENT_USER SERVER node3;
+
+]);
+
+# Setup foreign servers on node2
+$node2->safe_psql('postgres', qq[
+	CREATE SERVER node1 FOREIGN DATA WRAPPER postgres_fdw 
+		OPTIONS (host '$node1_host', dbname 'postgres', port '$node1_port');
+	CREATE USER MAPPING FOR CURRENT_USER SERVER node1;
+	
+	CREATE SERVER node3 FOREIGN DATA WRAPPER postgres_fdw 
+		OPTIONS (host '$node3_host', dbname 'postgres', port '$node3_port');
+	CREATE USER MAPPING FOR CURRENT_USER SERVER node3;
+
+]);
+
+# Setup foreign servers on node3
+$node3->safe_psql('postgres', qq[
+	CREATE SERVER node1 FOREIGN DATA WRAPPER postgres_fdw 
+		OPTIONS (host '$node1_host', dbname 'postgres', port '$node1_port');
+	CREATE USER MAPPING FOR CURRENT_USER SERVER node1;
+	
+	CREATE SERVER node2 FOREIGN DATA WRAPPER postgres_fdw 
+		OPTIONS (host '$node2_host', dbname 'postgres', port '$node2_port');
+	CREATE USER MAPPING FOR CURRENT_USER SERVER node2;
+
+]);
 
 # Create shard group on node1
 $node1->safe_psql('postgres', qq(
     CREATE SHARD GROUP sg1;
-    ALTER SHARD GROUP sg1 ADD MEMBER node1;
     ALTER SHARD GROUP sg1 ADD MEMBER node2;
 ));
 
@@ -86,11 +96,11 @@ sleep(1);
 # Verify shard group members are visible on all nodes
 my $result = $node1->safe_psql('postgres', 
     "SELECT COUNT(*) FROM pg_shardmembers WHERE sgid = (SELECT oid FROM pg_shardgroups WHERE sgname = 'sg1');");
-is($result, '2', 'node1 sees 2 shard members');
+is($result, '1', 'node1 sees 1 shard members (excluding itself)');
 
 $result = $node2->safe_psql('postgres', 
     "SELECT COUNT(*) FROM pg_shardmembers WHERE sgid = (SELECT oid FROM pg_shardgroups WHERE sgname = 'sg1');");
-is($result, '2', 'node2 sees 2 shard members');
+is($result, '1', 'node2 sees 1 shard members (excluding itself)');
 
 # Create a distributed partitioned table on node1
 $node1->safe_psql('postgres', qq(
@@ -99,7 +109,7 @@ $node1->safe_psql('postgres', qq(
         customer_id INT,
         order_date DATE,
         amount DECIMAL(10,2)
-    ) PARTITION BY RANGE (order_date) SHARD GROUP sg1;
+    ) DISTRIBUTED BY RANGE (order_date) SHARD GROUP sg1;
 ));
 
 # Create partitions - they should be distributed via consistent hashing

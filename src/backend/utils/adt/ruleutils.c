@@ -469,6 +469,8 @@ static void get_coercion_expr(Node *arg, deparse_context *context,
 							  Node *parentNode);
 static void get_const_expr(Const *constval, deparse_context *context,
 						   int showtype);
+static void get_a_const_expr(A_Const *constval, deparse_context *context,
+						   int showtype);
 static void get_const_collation(Const *constval, deparse_context *context);
 static void get_json_format(JsonFormat *format, StringInfo buf);
 static void get_json_returning(JsonReturning *returning, StringInfo buf,
@@ -8972,6 +8974,10 @@ get_rule_expr(Node *node, deparse_context *context,
 			get_const_expr((Const *) node, context, 0);
 			break;
 
+		case T_A_Const:
+			get_a_const_expr((A_Const *) node, context, 0);
+			break;
+
 		case T_Param:
 			get_parameter((Param *) node, context);
 			break;
@@ -11246,6 +11252,82 @@ get_const_expr(Const *constval, deparse_context *context, int showtype)
 												  constval->consttypmod));
 
 	get_const_collation(constval, context);
+}
+
+static void
+get_a_const_expr(A_Const *constval, deparse_context *context, int showtype)
+{
+	StringInfo	buf = context->buf;
+
+	if (constval->isnull)
+	{
+		/*
+		 * Always label the type of a NULL constant to prevent misdecisions
+		 * about type when reparsing.
+		 */
+		appendStringInfoString(buf, "NULL");
+		if (showtype >= 0)
+		{
+			/* We don't have type info in A_Const, so just use UNKNOWN */
+			appendStringInfo(buf, "::%s",
+							 format_type_with_typemod(UNKNOWNOID,
+													  -1));
+		}
+		return;
+	}
+
+	switch (nodeTag(&constval->val))
+	{
+		case T_Integer:
+			appendStringInfoString(buf, psprintf("%ld", (long) intVal(&constval->val)));
+			break;
+		case T_Float:
+			appendStringInfoString(buf, constval->val.fval.fval);
+			break;
+		case T_Boolean:
+			if (constval->val.boolval.boolval)
+				appendStringInfoString(buf, "true");
+			else
+				appendStringInfoString(buf, "false");
+			break;
+		case T_String:
+			simple_quote_literal(buf, constval->val.sval.sval);
+			break;
+		case T_BitString:
+			simple_quote_literal(buf, constval->val.bsval.bsval);
+			break;
+		default:
+			elog(ERROR, "unrecognized A_Const type: %d", constval->type);
+	}
+	
+	if (showtype > 0)
+	{
+		switch (nodeTag(&constval->val))
+		{
+			case T_Integer:
+				appendStringInfo(buf, "::%s",
+								 format_type_with_typemod(INT4OID, -1));
+				break;
+			case T_Float:
+				appendStringInfo(buf, "::%s",
+								 format_type_with_typemod(FLOAT8OID, -1));
+				break;
+			case T_Boolean:
+				appendStringInfo(buf, "::%s",
+								 format_type_with_typemod(BOOLOID, -1));
+				break;
+			case T_String:
+				appendStringInfo(buf, "::%s",
+								 format_type_with_typemod(TEXTOID, -1));
+				break;
+			case T_BitString:
+				appendStringInfo(buf, "::%s",
+								 format_type_with_typemod(BITOID, -1));
+				break;
+			default:
+				elog(ERROR, "unrecognized A_Const type: %d", constval->type);
+		}
+	}
 }
 
 /*

@@ -1571,8 +1571,7 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 													   NIL, false, false);
 						upper_str = deparse_expression((Node *) partbound->upperdatums,
 													   NIL, false, false);
-						
-						appendStringInfo(&partition_bounds, "FOR VALUES FROM %s TO %s",
+						appendStringInfo(&partition_bounds, "FOR VALUES FROM (%s) TO (%s)",
 										 lower_str, upper_str);
 						
 						pfree(lower_str);
@@ -1708,6 +1707,7 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 		}
 
 		/* Execute the DDL command on the remote server */
+		elog(WARNING, "Executing on shard member (server OID: %u): %s", serveroid, sql_to_execute);
 		ExecuteDDLOnRemoteServer(serveroid, sql_to_execute);
 	}
 

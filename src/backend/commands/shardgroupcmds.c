@@ -345,7 +345,6 @@ AlterShardGroup(AlterShardGroupStmt *stmt)
 		/* Check if any foreign tables in this shard group depend on this member */
 		{
 			Relation	classrel;
-			Relation	ftrel;
 			SysScanDesc scan;
 			ScanKeyData key[1];
 			HeapTuple	classtuple;
@@ -470,7 +469,13 @@ AlterShardGroup(AlterShardGroupStmt *stmt)
 	else if (strcmp(stmt->action, "DETACH") == 0)
 	{
 		/* Move all real tables from specified member to other members */
-		srvoid = get_foreign_server_oid(stmt->servername, false);
+		/* if it is our local node */
+		if (strcmp(stmt->servername, cluster_name) == 0)
+		{
+			srvoid = InvalidOid; /* will be set below */
+		}
+		else
+			srvoid = get_foreign_server_oid(stmt->servername, false);
 		DetachShardMember(sgoid, srvoid);
 		ObjectAddressSet(address, ShardMemberRelationId, InvalidOid);
 	}
@@ -705,7 +710,6 @@ SyncTablesOnNewShardMember(Oid sgid, Oid newsrvoid)
 		TupleDesc	tupdesc;
 		StringInfoData ddl;
 		int			i;
-		bool		is_worldwide;
 		bool		is_partition;
 		bool		is_partitioned;
 		bool		is_foreign_table;
@@ -1212,7 +1216,7 @@ hash_string_to_uint32(const char *str)
  * Returns the OID of the foreign server that should host the partition.
  */
 Oid
-GetPartitionTargetMember(Oid sgid, const char *partition_name, Oid exclude_member)
+GetPartitionTargetMember(Oid sgid, const char *partition_name, Oid *exclude_member)
 {
 	Relation	memberrel;
 	SysScanDesc scan;
@@ -1241,6 +1245,9 @@ GetPartitionTargetMember(Oid sgid, const char *partition_name, Oid exclude_membe
 		members = lappend_oid(members, smform->srvid);
 	}
 	
+	/* add itself as a member (local server is represented by InvalidOid) */
+	members = lappend_oid(members, InvalidOid);
+	
 	systable_endscan(scan);
 	table_close(memberrel, AccessShareLock);
 	
@@ -1256,12 +1263,26 @@ GetPartitionTargetMember(Oid sgid, const char *partition_name, Oid exclude_membe
 		Oid			serveroid = lfirst_oid(lc);
 		ForeignServer *server;
 		int			i;
+		char * server_name;
 		
 		/* Skip the excluded member if specified */
-		if (OidIsValid(exclude_member) && serveroid == exclude_member)
+		if (exclude_member && serveroid == *exclude_member)
 			continue;
 		
-		server = GetForeignServer(serveroid);
+		if (serveroid == InvalidOid)
+		{
+			/* Local server - use cluster_name */
+			extern char *cluster_name;
+			if (!cluster_name || cluster_name[0] == '\0')
+				elog(ERROR, "cluster_name is not set, cannot use local server as shard member");
+			server_name = cluster_name;
+		}
+		else
+		{
+			/* Get foreign server name */
+			server = GetForeignServer(serveroid);
+			server_name = server->servername;
+		}
 		
 		/* Create multiple virtual nodes for this member */
 		for (i = 0; i < VIRTUAL_NODES_PER_MEMBER; i++)
@@ -1275,7 +1296,7 @@ GetPartitionTargetMember(Oid sgid, const char *partition_name, Oid exclude_membe
 			 * to avoid conflicts with potential colons in server names
 			 */
 			snprintf(vnode_key, sizeof(vnode_key), "%s_%d", 
-					 server->servername, i);
+					 server_name, i);
 			
 			vnode_hash = hash_string_to_uint32(vnode_key);
 			
@@ -1375,24 +1396,7 @@ FindPartitionHostMember(Oid partitionOid, Oid sgid)
 	if (rel->rd_rel->relkind == RELKIND_RELATION)
 	{
 		/* This is a real table on the local server */
-		/* Find the corresponding shard member for the local server */
-		List	   *members = get_shardgroup_members(sgid);
-		ListCell   *lc;
-		
-		foreach(lc, members)
-		{
-			Oid			serveroid = lfirst_oid(lc);
-			ForeignServer *server = GetForeignServer(serveroid);
-			
-			/* Check if this server represents the local cluster */
-			if (cluster_name && strcmp(server->servername, cluster_name) == 0)
-			{
-				result = serveroid;
-				break;
-			}
-		}
-		
-		list_free(members);
+		result = InvalidOid; /* Default to InvalidOid */
 	}
 	else if (rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
 	{
@@ -1431,6 +1435,7 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 	List	   *members;
 	ListCell   *lc;
 	extern char *cluster_name;
+	char *partconstrdef;
 	
 	/* Open the partition relation */
 	rel = table_open(partitionOid, AccessShareLock);
@@ -1470,7 +1475,7 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 	 */
 	
 	/* Get the partition constraint definition */
-	char *partconstrdef = pg_get_partconstrdef_string(partitionOid, NULL);
+	partconstrdef = pg_get_partconstrdef_string(partitionOid, NULL);
 	
 	/* Create the partition structure on destination */
 	appendStringInfo(&ddl, 
@@ -1632,17 +1637,8 @@ ReshardShardGroup(Oid sgid)
 		/* Find current host */
 		currentHost = FindPartitionHostMember(partitionOid, sgid);
 		
-		if (!OidIsValid(currentHost))
-		{
-			ereport(WARNING,
-					(errmsg("could not determine current host for partition \"%s\", skipping",
-							relname)));
-			pfree(relname);
-			continue;
-		}
-		
 		/* Determine target host using consistent hashing */
-		targetHost = GetPartitionTargetMember(sgid, relname, InvalidOid);
+		targetHost = GetPartitionTargetMember(sgid, relname, NULL);
 		
 		if (!OidIsValid(targetHost))
 		{
@@ -1718,16 +1714,7 @@ DetachShardMember(Oid sgid, Oid srvoid)
 		
 		/* Find current host */
 		currentHost = FindPartitionHostMember(partitionOid, sgid);
-		
-		if (!OidIsValid(currentHost))
-		{
-			ereport(WARNING,
-					(errmsg("could not determine current host for partition \"%s\", skipping",
-							relname)));
-			pfree(relname);
-			continue;
-		}
-		
+
 		/* Only process partitions hosted on the member being detached */
 		if (currentHost == srvoid)
 		{
@@ -1738,15 +1725,7 @@ DetachShardMember(Oid sgid, Oid srvoid)
 			 * excluding the member being detached to ensure we find
 			 * a different target.
 			 */
-			targetHost = GetPartitionTargetMember(sgid, relname, srvoid);
-			
-			if (!OidIsValid(targetHost))
-			{
-				ereport(ERROR,
-						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("cannot detach last member of shard group"),
-						 errhint("Shard group must have at least one other member.")));
-			}
+			targetHost = GetPartitionTargetMember(sgid, relname, &srvoid);
 			
 			/* Migrate the partition */
 			MigratePartitionToMember(partitionOid, currentHost, targetHost, sgid);
