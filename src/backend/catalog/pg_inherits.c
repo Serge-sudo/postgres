@@ -393,6 +393,34 @@ has_superclass(Oid relationId)
 	return result;
 }
 
+Oid
+get_parent_rel_oid(Oid relid)
+{
+	Relation	catalog;
+	SysScanDesc scan;
+	ScanKeyData skey;
+	HeapTuple	tuple;
+	Oid			parentRelId = InvalidOid;
+
+	catalog = table_open(InheritsRelationId, AccessShareLock);
+	ScanKeyInit(&skey, Anum_pg_inherits_inhrelid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(relid));
+	scan = systable_beginscan(catalog, InheritsRelidSeqnoIndexId, true,
+							  NULL, 1, &skey);
+
+	if (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Form_pg_inherits inhForm = (Form_pg_inherits) GETSTRUCT(tuple);
+
+		parentRelId = inhForm->inhparent;
+	}
+
+	systable_endscan(scan);
+	table_close(catalog, AccessShareLock);
+
+	return parentRelId;
+}
+
 /*
  * Given two type OIDs, determine whether the first is a complex type
  * (class type) that inherits from the second.

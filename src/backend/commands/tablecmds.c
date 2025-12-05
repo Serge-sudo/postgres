@@ -1435,6 +1435,8 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 	Oid			target_member = InvalidOid;
 	ForeignServer *target_server = NULL;
 	extern char *cluster_name;
+	char *target_server_name;
+	
 
 	/* Get list of shard members */
 	members = get_shardgroup_members(sgid);
@@ -1464,10 +1466,27 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 	 */
 	if (is_partition && OidIsValid(parentOid) && partbound != NULL)
 	{
+		bool found;
 		/* Use consistent hashing to determine target member for this partition */
-		target_member = GetPartitionTargetMember(sgid, relname, InvalidOid);
+		// target_member = GetPartitionTargetMember(sgid, relname, NULL, &found);
+		// if (!found)
+		// {
+		// 	ereport(ERROR,
+		// 			(errcode(ERRCODE_INTERNAL_ERROR),
+		// 			 errmsg("could not determine target member for partition \"%s\"", relname)));
+		// }
+		target_member = InvalidOid; // TODO : implement consistent hashing to get target member OID
+
 		if (OidIsValid(target_member))
+		{
 			target_server = GetForeignServer(target_member);
+			target_server_name = pstrdup(target_server->servername);
+		}
+		else
+		{
+			target_server_name = cluster_name;
+		}
+			
 	}
 
 	/* Build the CREATE TABLE DDL */
@@ -1596,16 +1615,13 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 		
 		/* Build SQL for creating foreign table partition (for other members) */
 		initStringInfo(&create_foreign_table_sql);
-		if (OidIsValid(target_member) && target_server != NULL)
-		{
-			appendStringInfo(&create_foreign_table_sql, "CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s SERVER %s",
-							 quote_identifier(nspname),
-							 quote_identifier(relname),
-							 quote_identifier(parentnspname),
-							 quote_identifier(parentname),
-							 partition_bounds.data,
-							 quote_identifier(target_server->servername));
-		}
+		appendStringInfo(&create_foreign_table_sql, "CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s SERVER %s",
+							quote_identifier(nspname),
+							quote_identifier(relname),
+							quote_identifier(parentnspname),
+							quote_identifier(parentname),
+							partition_bounds.data,
+							quote_identifier(target_server_name));
 
 		table_close(parent, AccessShareLock);
 		pfree(partition_bounds.data);
@@ -1677,7 +1693,7 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 		Oid			serveroid = lfirst_oid(lc);
 		const char *sql_to_execute;
 
-		if (is_partition && OidIsValid(target_member))
+		if (is_partition)
 		{
 			/* Using consistent hashing for partition placement */
 			if (serveroid == target_member)

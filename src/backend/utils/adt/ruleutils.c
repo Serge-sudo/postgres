@@ -8973,6 +8973,11 @@ get_rule_expr(Node *node, deparse_context *context,
 		case T_Const:
 			get_const_expr((Const *) node, context, 0);
 			break;
+			
+		case T_PartitionRangeDatum:
+			get_rule_expr((Node *) ((PartitionRangeDatum *) node)->value,
+						  context, 0);
+			break;
 
 		case T_A_Const:
 			get_a_const_expr((A_Const *) node, context, 0);
@@ -11226,6 +11231,7 @@ get_const_expr(Const *constval, deparse_context *context, int showtype)
 	switch (constval->consttype)
 	{
 		case BOOLOID:
+		case DATEOID:
 		case UNKNOWNOID:
 			/* These types can be left unlabeled */
 			needlabel = false;
