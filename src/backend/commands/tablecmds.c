@@ -1082,6 +1082,21 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 							RelationGetRelationName(parent))));
 
 		/*
+		 * If the parent table is part of a shard group (distributed table),
+		 * require the use of SHARD OF syntax instead of PARTITION OF.
+		 * This ensures that consistent hashing is applied for partition placement.
+		 */
+		if (OidIsValid(parent->rd_rel->relsgid) && !stmt->is_shard_partition)
+		{
+			table_close(parent, NoLock);
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot use PARTITION OF syntax on distributed table \"%s\"",
+							RelationGetRelationName(parent)),
+					 errhint("Use SHARD OF syntax instead to enable consistent hashing for partition placement.")));
+		}
+
+		/*
 		 * The partition constraint of the default partition depends on the
 		 * partition bounds of every other partition. It is possible that
 		 * another backend might be about to execute a query on the default

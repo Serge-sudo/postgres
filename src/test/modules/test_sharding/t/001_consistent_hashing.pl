@@ -103,16 +103,28 @@ $node1->safe_psql('postgres', qq(
 ));
 
 # Create partitions - they should be distributed via consistent hashing
+# Use SHARD OF syntax for distributed tables
 $node1->safe_psql('postgres', qq(
-    CREATE TABLE orders_2024_01 PARTITION OF orders 
+    CREATE TABLE orders_2024_01 SHARD OF orders 
         FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
-    CREATE TABLE orders_2024_02 PARTITION OF orders 
+    CREATE TABLE orders_2024_02 SHARD OF orders 
         FOR VALUES FROM ('2024-02-01') TO ('2024-03-01');
-    CREATE TABLE orders_2024_03 PARTITION OF orders 
+    CREATE TABLE orders_2024_03 SHARD OF orders 
         FOR VALUES FROM ('2024-03-01') TO ('2024-04-01');
-    CREATE TABLE orders_2024_04 PARTITION OF orders 
+    CREATE TABLE orders_2024_04 SHARD OF orders 
         FOR VALUES FROM ('2024-04-01') TO ('2024-05-01');
 ));
+
+# Test that PARTITION OF is rejected on distributed tables
+my ($ret, $stdout, $stderr) = $node1->psql('postgres', qq(
+    CREATE TABLE orders_2024_05 PARTITION OF orders 
+        FOR VALUES FROM ('2024-05-01') TO ('2024-06-01');
+));
+ok($ret != 0, 'PARTITION OF syntax rejected on distributed table');
+like($stderr, qr/cannot use PARTITION OF syntax on distributed table/, 
+     'Error message mentions PARTITION OF syntax restriction');
+like($stderr, qr/Use SHARD OF syntax instead/, 
+     'Error message suggests SHARD OF syntax');
 
 # Check that partitions are distributed (some should be real tables, some foreign)
 my $node1_real_tables = $node1->safe_psql('postgres', qq(
