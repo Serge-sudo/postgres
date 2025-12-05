@@ -35,7 +35,6 @@
 #include "catalog/pg_am.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
-#include "catalog/pg_foreign_server.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_statistic_ext.h"
@@ -43,10 +42,8 @@
 #include "commands/comment.h"
 #include "commands/defrem.h"
 #include "commands/sequence.h"
-#include "commands/shardgroupcmds.h"
 #include "commands/tablecmds.h"
 #include "commands/tablespace.h"
-#include "foreign/foreign.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -143,7 +140,6 @@ static void validateInfiniteBounds(ParseState *pstate, List *blist);
 static Const *transformPartitionBoundValue(ParseState *pstate, Node *val,
 										   const char *colName, Oid colType, int32 colTypmod,
 										   Oid partCollation);
-
 
 
 /*

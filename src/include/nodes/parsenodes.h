@@ -2666,13 +2666,7 @@ typedef struct CreateStmt
 	bool		is_distributed;	/* true for DISTRIBUTED BY (partspec contains distribution spec) */
 	bool		is_worldwide;	/* true for WORLDWIDE TABLE */
 	char	   *shardgroup;		/* SHARD GROUP name, or NULL for default */
-	int			partition_cmd_type;	/* partition command type: PARTITION_OF_COMMAND, SHARD_COMMAND, or SHARD_COMMAND_FINAL */
 } CreateStmt;
-
-/* Partition command types for CreateStmt */
-#define PARTITION_OF_COMMAND	0	/* PARTITION OF syntax used */
-#define SHARD_COMMAND			1	/* SHARD OF syntax used */
-#define SHARD_COMMAND_FINAL		2	/* SHARD OF after processing (to avoid recursion) */
 
 /* ----------
  * Definitions for constraints in CreateStmt

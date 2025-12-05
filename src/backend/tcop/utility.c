@@ -22,7 +22,6 @@
 #include "access/xlog.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_authid.h"
-#include "catalog/pg_foreign_server.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/toasting.h"
 #include "commands/alter.h"
@@ -58,7 +57,6 @@
 #include "commands/user.h"
 #include "commands/vacuum.h"
 #include "commands/view.h"
-#include "foreign/foreign.h"
 #include "miscadmin.h"
 #include "parser/parse_utilcmd.h"
 #include "postmaster/bgwriter.h"
@@ -66,10 +64,8 @@
 #include "storage/fd.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
-#include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
-#include "utils/syscache.h"
 
 /* Hook for plugins to get control in ProcessUtility() */
 ProcessUtility_hook_type ProcessUtility_hook = NULL;
@@ -85,14 +81,6 @@ static void ProcessUtilitySlow(ParseState *pstate,
 							   DestReceiver *dest,
 							   QueryCompletion *qc);
 static void ExecDropStmt(DropStmt *stmt, bool isTopLevel);
-static void ProcessShardOfPartition(ParseState *pstate,
-									CreateStmt *stmt,
-									const char *queryString,
-									ProcessUtilityContext context,
-									ParamListInfo params,
-									QueryEnvironment *queryEnv,
-									DestReceiver *dest,
-									QueryCompletion *qc);
 
 /*
  * CommandIsReadOnly: is an executable query read-only?
@@ -1150,20 +1138,6 @@ ProcessUtilitySlow(ParseState *pstate,
 				{
 					List	   *stmts;
 					RangeVar   *table_rv = NULL;
-
-					/* Check if this is a SHARD OF partition */
-					if (IsA(parsetree, CreateStmt))
-					{
-						CreateStmt *cstmt = (CreateStmt *) parsetree;
-						if (cstmt->partition_cmd_type == SHARD_COMMAND)
-						{
-							/* Handle SHARD OF logic at utility level */
-							ProcessShardOfPartition(pstate, cstmt, queryString,
-													context, params, queryEnv,
-													dest, qc);
-							break;
-						}
-					}
 
 					/* Run parse analysis ... */
 					stmts = transformCreateStmt((CreateStmt *) parsetree,
@@ -3812,156 +3786,4 @@ GetCommandLogLevel(Node *parsetree)
 	}
 
 	return lev;
-}
-
-/*
- * ProcessShardOfPartition
- *		Handle CREATE TABLE ... SHARD OF statements
- *
- * Determines the target shard member using consistent hashing and creates
- * the appropriate statement type (CreateStmt for local, CreateForeignTableStmt
- * for remote), then recursively processes it through ProcessUtility.
- */
-static void
-ProcessShardOfPartition(ParseState *pstate,
-						CreateStmt *stmt,
-						const char *queryString,
-						ProcessUtilityContext context,
-						ParamListInfo params,
-						QueryEnvironment *queryEnv,
-						DestReceiver *dest,
-						QueryCompletion *qc)
-{
-	RangeVar   *parent_rv;
-	Relation	parent_rel;
-	Oid			sgid;
-	Oid			target_member_oid;
-	Oid			local_server_oid = InvalidOid;
-	char	   *cluster_name_str;
-	char	   *partition_name;
-	Node	   *new_stmt;
-	PlannedStmt *wrapper;
-
-	/* Get parent table from inhRelations */
-	if (stmt->inhRelations == NIL)
-		ereport(ERROR,
-				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("SHARD OF requires a parent table")));
-
-	parent_rv = (RangeVar *) linitial(stmt->inhRelations);
-
-	/* Open parent relation to get shard group ID */
-	parent_rel = table_openrv(parent_rv, AccessShareLock);
-
-	/* Get shard group ID from parent */
-	sgid = parent_rel->rd_rel->relsgid;
-	if (!OidIsValid(sgid))
-	{
-		table_close(parent_rel, AccessShareLock);
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("parent table \"%s\" is not part of a shard group",
-						RelationGetRelationName(parent_rel))));
-	}
-
-	/* Get partition name */
-	partition_name = stmt->relation->relname;
-
-	/* Determine target member using consistent hashing */
-	target_member_oid = GetPartitionTargetMember(sgid, partition_name, InvalidOid);
-
-	if (!OidIsValid(target_member_oid))
-	{
-		table_close(parent_rel, AccessShareLock);
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("could not determine target member for partition \"%s\"",
-						partition_name)));
-	}
-
-	/* Get local server OID using cluster_name */
-	cluster_name_str = GetConfigOptionByName("cluster_name", NULL, false);
-	if (cluster_name_str && cluster_name_str[0] != '\0')
-	{
-		local_server_oid = get_foreign_server_oid(cluster_name_str, true);
-	}
-
-	table_close(parent_rel, AccessShareLock);
-
-	/* Decide whether to create local table or foreign table */
-	if (target_member_oid == local_server_oid)
-	{
-		/* Target is local - create regular table */
-		CreateStmt *new_cstmt = makeNode(CreateStmt);
-
-		/* Copy all fields from original statement */
-		memcpy(new_cstmt, stmt, sizeof(CreateStmt));
-
-		/* Set to SHARD_COMMAND_FINAL to avoid infinite recursion */
-		new_cstmt->partition_cmd_type = SHARD_COMMAND_FINAL;
-
-		new_stmt = (Node *) new_cstmt;
-	}
-	else
-	{
-		/* Target is remote - create foreign table */
-		CreateForeignTableStmt *ftstmt = makeNode(CreateForeignTableStmt);
-		CreateStmt *base = &ftstmt->base;
-		ForeignServer *server;
-		DefElem    *schema_elem;
-		DefElem    *table_elem;
-
-		/* Copy CreateStmt fields */
-		base->relation = stmt->relation;
-		base->tableElts = stmt->tableElts;
-		base->inhRelations = stmt->inhRelations;
-		base->partbound = stmt->partbound;
-		base->partspec = stmt->partspec;
-		base->ofTypename = stmt->ofTypename;
-		base->constraints = stmt->constraints;
-		base->options = stmt->options;
-		base->oncommit = stmt->oncommit;
-		base->tablespacename = stmt->tablespacename;
-		base->accessMethod = stmt->accessMethod;
-		base->if_not_exists = stmt->if_not_exists;
-		base->is_distributed = false;
-		base->is_worldwide = false;
-		base->shardgroup = NULL;
-		base->partition_cmd_type = SHARD_COMMAND_FINAL;  /* Set to final to avoid recursion */
-
-		/* Get server name */
-		server = GetForeignServer(target_member_oid);
-		ftstmt->servername = pstrdup(server->servername);
-
-		/* Add OPTIONS for schema_name and table_name */
-		schema_elem = makeDefElem("schema_name",
-								  (Node *) makeString(stmt->relation->schemaname ?
-													  stmt->relation->schemaname : "public"),
-								  -1);
-		table_elem = makeDefElem("table_name",
-								 (Node *) makeString(partition_name),
-								 -1);
-
-		ftstmt->options = list_make2(schema_elem, table_elem);
-
-		new_stmt = (Node *) ftstmt;
-	}
-
-	/* Wrap the new statement in a PlannedStmt and process it */
-	wrapper = makeNode(PlannedStmt);
-	wrapper->commandType = CMD_UTILITY;
-	wrapper->canSetTag = true;
-	wrapper->utilityStmt = new_stmt;
-	wrapper->stmt_location = pstate->p_sourcetext ? 0 : -1;
-	wrapper->stmt_len = 0;
-
-	/* Recursively call ProcessUtility */
-	ProcessUtility(wrapper,
-				   queryString,
-				   false,			/* not top level (avoid event triggers) */
-				   context,
-				   params,
-				   queryEnv,
-				   dest,
-				   qc);
 }
