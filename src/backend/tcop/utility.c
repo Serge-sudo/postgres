@@ -1155,7 +1155,7 @@ ProcessUtilitySlow(ParseState *pstate,
 					if (IsA(parsetree, CreateStmt))
 					{
 						CreateStmt *cstmt = (CreateStmt *) parsetree;
-						if (cstmt->is_shard_partition)
+						if (cstmt->partition_cmd_type == SHARD_COMMAND)
 						{
 							/* Handle SHARD OF logic at utility level */
 							ProcessShardOfPartition(pstate, cstmt, queryString,
@@ -3897,8 +3897,8 @@ ProcessShardOfPartition(ParseState *pstate,
 		/* Copy all fields from original statement */
 		memcpy(new_cstmt, stmt, sizeof(CreateStmt));
 
-		/* Clear the SHARD OF flag to avoid infinite recursion */
-		new_cstmt->is_shard_partition = false;
+		/* Set to SHARD_COMMAND_FINAL to avoid infinite recursion */
+		new_cstmt->partition_cmd_type = SHARD_COMMAND_FINAL;
 
 		new_stmt = (Node *) new_cstmt;
 	}
@@ -3927,7 +3927,7 @@ ProcessShardOfPartition(ParseState *pstate,
 		base->is_distributed = false;
 		base->is_worldwide = false;
 		base->shardgroup = NULL;
-		base->is_shard_partition = false;  /* Clear flag */
+		base->partition_cmd_type = SHARD_COMMAND_FINAL;  /* Set to final to avoid recursion */
 
 		/* Get server name */
 		server = GetForeignServer(target_member_oid);

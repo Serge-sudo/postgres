@@ -1086,7 +1086,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 		 * require the use of SHARD OF syntax instead of PARTITION OF.
 		 * This ensures that consistent hashing is applied for partition placement.
 		 */
-		if (OidIsValid(parent->rd_rel->relsgid) && !stmt->is_shard_partition)
+		if (OidIsValid(parent->rd_rel->relsgid) && stmt->partition_cmd_type == PARTITION_OF_COMMAND)
 		{
 			table_close(parent, NoLock);
 			ereport(ERROR,

@@ -3685,6 +3685,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->is_distributed = false;
 					n->is_worldwide = false;
 					n->shardgroup = NULL;
+					n->partition_cmd_type = PARTITION_OF_COMMAND;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE IF_P NOT EXISTS qualified_name PARTITION OF
@@ -3709,6 +3710,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->is_distributed = false;
 					n->is_worldwide = false;
 					n->shardgroup = NULL;
+					n->partition_cmd_type = PARTITION_OF_COMMAND;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE qualified_name SHARD OF qualified_name
@@ -3733,7 +3735,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->is_distributed = false;
 					n->is_worldwide = false;
 					n->shardgroup = NULL;
-					n->is_shard_partition = true;  /* SHARD OF flag */
+					n->partition_cmd_type = SHARD_COMMAND;  /* SHARD OF flag */
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE IF_P NOT EXISTS qualified_name SHARD OF
@@ -3758,7 +3760,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->is_distributed = false;
 					n->is_worldwide = false;
 					n->shardgroup = NULL;
-					n->is_shard_partition = true;  /* SHARD OF flag */
+					n->partition_cmd_type = SHARD_COMMAND;  /* SHARD OF flag */
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp WORLDWIDE TABLE qualified_name '(' OptTableElementList ')'
