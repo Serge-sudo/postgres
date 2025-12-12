@@ -72,6 +72,7 @@ static void DetachShardMember(Oid sgid, Oid srvoid);
 static void MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgid);
 static Oid FindPartitionHostMember(Oid partitionOid, Oid sgid);
 static List *GetShardGroupPartitions(Oid sgid);
+static char *PartitionBoundsSpecToString(PartitionBoundSpec *partbound);
 
 /* Number of virtual nodes per shard member for consistent hashing */
 #define VIRTUAL_NODES_PER_MEMBER 150
@@ -652,6 +653,114 @@ ExecuteDDLOnRemoteServer(Oid serveroid, const char *sql)
 }
 
 /*
+ * PartitionBoundsSpecToString
+ *		Deparse a PartitionBoundSpec into a FOR VALUES clause.
+ *
+ * Caller must pfree the returned string.
+ */
+static char *
+PartitionBoundsSpecToString(PartitionBoundSpec *partbound)
+{
+	StringInfoData partition_bounds;
+
+	Assert(partbound != NULL);
+
+	initStringInfo(&partition_bounds);
+
+	if (partbound->is_default)
+	{
+		appendStringInfoString(&partition_bounds, "DEFAULT");
+	}
+	else
+	{
+		switch (partbound->strategy)
+		{
+			case PARTITION_STRATEGY_HASH:
+				appendStringInfo(&partition_bounds,
+								 "FOR VALUES WITH (modulus %d, remainder %d)",
+								 partbound->modulus, partbound->remainder);
+				break;
+
+			case PARTITION_STRATEGY_LIST:
+				{
+					ListCell   *cell;
+					const char *sep = "";
+
+					appendStringInfoString(&partition_bounds, "FOR VALUES IN (");
+					foreach(cell, partbound->listdatums)
+					{
+						A_Const    *aconst = lfirst(cell);
+
+						appendStringInfoString(&partition_bounds, sep);
+
+						if (aconst->isnull)
+						{
+							appendStringInfoString(&partition_bounds, "NULL");
+						}
+						else
+						{
+							switch (nodeTag(&aconst->val.node))
+							{
+								case T_Integer:
+									appendStringInfo(&partition_bounds, "%d",
+													 castNode(Integer, &aconst->val.node)->ival);
+									break;
+								case T_Float:
+									appendStringInfoString(&partition_bounds,
+														   castNode(Float, &aconst->val.node)->fval);
+									break;
+								case T_Boolean:
+									appendStringInfoString(&partition_bounds,
+														   castNode(Boolean, &aconst->val.node)->boolval ? "true" : "false");
+									break;
+								case T_String:
+									appendStringInfo(&partition_bounds, "'%s'",
+													 castNode(String, &aconst->val.node)->sval);
+									break;
+								case T_BitString:
+									appendStringInfo(&partition_bounds, "B'%s'",
+													 castNode(BitString, &aconst->val.node)->bsval);
+									break;
+								default:
+									elog(ERROR, "unrecognized node type in partition bound: %d",
+										 (int) nodeTag(&aconst->val.node));
+									break;
+							}
+						}
+
+						sep = ", ";
+					}
+					appendStringInfoChar(&partition_bounds, ')');
+				}
+				break;
+
+			case PARTITION_STRATEGY_RANGE:
+				{
+					char	   *lower_str;
+					char	   *upper_str;
+
+					lower_str = deparse_expression((Node *) partbound->lowerdatums,
+												   NIL, false, false);
+					upper_str = deparse_expression((Node *) partbound->upperdatums,
+												   NIL, false, false);
+					appendStringInfo(&partition_bounds, "FOR VALUES FROM (%s) TO (%s)",
+									 lower_str, upper_str);
+					pfree(lower_str);
+					pfree(upper_str);
+				}
+				break;
+
+			default:
+				elog(ERROR, "unrecognized partition strategy: %d",
+					 (int) partbound->strategy);
+				break;
+		}
+	}
+
+	return partition_bounds.data;
+}
+
+/*
  * SyncTablesOnNewShardMember
  *		Create tables on a newly added shard member
  *
@@ -795,105 +904,12 @@ SyncTablesOnNewShardMember(Oid sgid, Oid newsrvoid)
 								quote_identifier(RelationGetRelationName(parentRel)));
 						
 			partbound = RelationGetPartitionBoundSpec(parentRel, relid);
-			
-			/* Build partition bounds specification */
-			initStringInfo(&partition_bounds);
-			
-			/* Build partition bounds specification */
-			if (partbound->is_default)
 			{
-				appendStringInfoString(&partition_bounds, "DEFAULT");
-			}
-			else
-			{
-				switch (partbound->strategy)
-				{
-					case PARTITION_STRATEGY_HASH:
-						appendStringInfo(&partition_bounds, "FOR VALUES WITH (modulus %d, remainder %d)",
-										partbound->modulus, partbound->remainder);
-						break;
-						
-					case PARTITION_STRATEGY_LIST:
-						{
-							ListCell   *cell;
-							const char *sep = "";
-							
-							appendStringInfoString(&partition_bounds, "FOR VALUES IN (");
-							foreach(cell, partbound->listdatums)
-							{
-								A_Const	   *aconst = lfirst(cell);
-								
-								appendStringInfoString(&partition_bounds, sep);
-								
-								/* Format the constant value based on its type */
-								if (aconst->isnull)
-								{
-									appendStringInfoString(&partition_bounds, "NULL");
-								}
-								else
-								{
-									switch (nodeTag(&aconst->val.node))
-									{
-										case T_Integer:
-											appendStringInfo(&partition_bounds, "%d", 
-															castNode(Integer, &aconst->val.node)->ival);
-											break;
-										case T_Float:
-											appendStringInfoString(&partition_bounds,
-																castNode(Float, &aconst->val.node)->fval);
-											break;
-										case T_Boolean:
-											appendStringInfoString(&partition_bounds,
-																castNode(Boolean, &aconst->val.node)->boolval ? "true" : "false");
-											break;
-										case T_String:
-											/* Quote string literals */
-											appendStringInfo(&partition_bounds, "'%s'",
-															castNode(String, &aconst->val.node)->sval);
-											break;
-										case T_BitString:
-											appendStringInfo(&partition_bounds, "B'%s'",
-															castNode(BitString, &aconst->val.node)->bsval);
-											break;
-										default:
-											elog(ERROR, "unrecognized node type in partition bound: %d",
-												(int) nodeTag(&aconst->val.node));
-											break;
-									}
-								}
-								
-								sep = ", ";
-							}
-							appendStringInfoChar(&partition_bounds, ')');
-						}
-						break;
-						
-					case PARTITION_STRATEGY_RANGE:
-						{
-							char	   *lower_str;
-							char	   *upper_str;
-							/* Deparse lower and upper bounds lists */
-							lower_str = deparse_expression((Node *) partbound->lowerdatums,
-														NIL, false, false);
-							upper_str = deparse_expression((Node *) partbound->upperdatums,
-														NIL, false, false);
-							appendStringInfo(&partition_bounds, "FOR VALUES FROM (%s) TO (%s)",
-											lower_str, upper_str);
+				char *partition_bounds = PartitionBoundsSpecToString(partbound);
 
-							pfree(lower_str);
-							pfree(upper_str);
-						}
-						break;
-						
-					default:
-						elog(ERROR, "unrecognized partition strategy: %d",
-							(int) partbound->strategy);
-						break;
-				}
+				appendStringInfo(&ddl, "%s ", partition_bounds);
+				pfree(partition_bounds);
 			}
-			
-			appendStringInfo(&ddl, "%s ", partition_bounds.data);
-			pfree(partition_bounds.data);
 			
 			table_close(parentRel, AccessShareLock);
 							 
@@ -1533,7 +1549,7 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 	ListCell   *lc;
 	extern char *cluster_name;
 	PartitionBoundSpec * partbound;
-	StringInfoData partition_bounds;
+	char	   *partition_bounds;
 	
 	/* Open the partition relation */
 	rel = table_open(partitionOid, AccessShareLock);
@@ -1591,100 +1607,7 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 	 */
 	
 	/* Get the partition constraint definition */
-	initStringInfo(&partition_bounds);
-	
-	/* Build partition bounds specification */
-	if (partbound->is_default)
-	{
-		appendStringInfoString(&partition_bounds, "DEFAULT");
-	}
-	else
-	{
-		switch (partbound->strategy)
-		{
-			case PARTITION_STRATEGY_HASH:
-				appendStringInfo(&partition_bounds, "FOR VALUES WITH (modulus %d, remainder %d)",
-								partbound->modulus, partbound->remainder);
-				break;
-				
-			case PARTITION_STRATEGY_LIST:
-				{
-					ListCell   *cell;
-					const char *sep = "";
-					
-					appendStringInfoString(&partition_bounds, "FOR VALUES IN (");
-					foreach(cell, partbound->listdatums)
-					{
-						A_Const	   *aconst = lfirst(cell);
-						
-						appendStringInfoString(&partition_bounds, sep);
-						
-						/* Format the constant value based on its type */
-						if (aconst->isnull)
-						{
-							appendStringInfoString(&partition_bounds, "NULL");
-						}
-						else
-						{
-							switch (nodeTag(&aconst->val.node))
-							{
-								case T_Integer:
-									appendStringInfo(&partition_bounds, "%d", 
-													castNode(Integer, &aconst->val.node)->ival);
-									break;
-								case T_Float:
-									appendStringInfoString(&partition_bounds,
-														castNode(Float, &aconst->val.node)->fval);
-									break;
-								case T_Boolean:
-									appendStringInfoString(&partition_bounds,
-														castNode(Boolean, &aconst->val.node)->boolval ? "true" : "false");
-									break;
-								case T_String:
-									/* Quote string literals */
-									appendStringInfo(&partition_bounds, "'%s'",
-													castNode(String, &aconst->val.node)->sval);
-									break;
-								case T_BitString:
-									appendStringInfo(&partition_bounds, "B'%s'",
-													castNode(BitString, &aconst->val.node)->bsval);
-									break;
-								default:
-									elog(ERROR, "unrecognized node type in partition bound: %d",
-										(int) nodeTag(&aconst->val.node));
-									break;
-							}
-						}
-						
-						sep = ", ";
-					}
-					appendStringInfoChar(&partition_bounds, ')');
-				}
-				break;
-				
-			case PARTITION_STRATEGY_RANGE:
-				{
-					char	   *lower_str;
-					char	   *upper_str;
-					/* Deparse lower and upper bounds lists */
-					lower_str = deparse_expression((Node *) partbound->lowerdatums,
-												NIL, false, false);
-					upper_str = deparse_expression((Node *) partbound->upperdatums,
-												NIL, false, false);
-					appendStringInfo(&partition_bounds, "FOR VALUES FROM (%s) TO (%s)",
-									lower_str, upper_str);
-
-					pfree(lower_str);
-					pfree(upper_str);
-				}
-				break;
-				
-			default:
-				elog(ERROR, "unrecognized partition strategy: %d",
-					(int) partbound->strategy);
-				break;
-		}
-	}
+	partition_bounds = PartitionBoundsSpecToString(partbound);
 	
 	if (toServer != InvalidOid)
 	{
@@ -1701,12 +1624,12 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 		/* Create the partition structure on destination */
 		resetStringInfo(&ddl);
 		appendStringInfo(&ddl, 
-						"CREATE TABLE IF NOT EXISTS %s.%s_temp PARTITION OF %s.%s %s WITH (no_rel_sync = true);",
+						"CREATE TABLE IF NOT EXISTS %s.%s_temp PARTITION OF %s.%s %s;",
 						quote_identifier(nspname),
 						quote_identifier(relname),
 						quote_identifier(parentnspname),
 						quote_identifier(parentname),
-						partition_bounds.data);
+						partition_bounds);
 		ExecuteDDLOnRemoteServer(toServer, ddl.data);
 			
 		/* Copy data */
@@ -1756,12 +1679,12 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 		/* Create the partition structure on destination */
 		resetStringInfo(&ddl);
 		appendStringInfo(&ddl, 
-						"CREATE TABLE IF NOT EXISTS %s.%s_temp PARTITION OF %s.%s %s WITH (no_rel_sync = true);",
+						"CREATE TABLE IF NOT EXISTS %s.%s_temp PARTITION OF %s.%s %s;",
 						quote_identifier(nspname),
 						quote_identifier(relname),
 						quote_identifier(parentnspname),
 						quote_identifier(parentname),
-						partition_bounds.data);
+						partition_bounds);
 		SPI_execute(ddl.data, false, 0);
 			
 		/* Copy data */
@@ -1811,12 +1734,12 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 		/* Create foreign table on source pointing to destination */
 		resetStringInfo(&ddl);
 		appendStringInfo(&ddl, 
-						"CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s SERVER %s WITH (no_rel_sync = true);",
+						"CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s SERVER %s;",
 						quote_identifier(nspname),
 						quote_identifier(relname),
 						quote_identifier(parentnspname),
 						quote_identifier(parentname),
-						partition_bounds.data,
+						partition_bounds,
 						quote_identifier(toServerName));
 		
 		ExecuteDDLOnRemoteServer(fromServer, ddl.data);
@@ -1836,12 +1759,12 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 		elog(WARNING, "second part 3");
 		resetStringInfo(&ddl);
 		appendStringInfo(&ddl, 
-						"CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s WITH (no_rel_sync = true) SERVER %s;",
+						"CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s SERVER %s;",
 						quote_identifier(nspname),
 						quote_identifier(relname),
 						quote_identifier(parentnspname),
 						quote_identifier(parentname),
-						partition_bounds.data,
+						partition_bounds,
 						quote_identifier(toServerName));
 						
 		SPI_execute(ddl.data, false, 0);
@@ -1877,7 +1800,7 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 						 quote_identifier(relname),
 						 quote_identifier(parentnspname),
 						 quote_identifier(parentname),
-						 partition_bounds.data,
+						 partition_bounds,
 						 quote_identifier(toServerName));
 	
 		
@@ -1889,7 +1812,7 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 	pfree(relname);
 	pfree(nspname);
 	pfree(parentname);
-	pfree(partition_bounds.data);
+	pfree(partition_bounds);
 	pfree(parentnspname);
 	
 	ereport(DEBUG1,
