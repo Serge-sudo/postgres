@@ -12,6 +12,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include <unistd.h>
 
 #include "executor/spi.h"
 #include "access/genam.h"
@@ -34,7 +35,6 @@
 #include "catalog/pg_shardmembers.h"
 #include "catalog/partition.h"
 #include "commands/dbcommands.h"
-#include <unistd.h>
 #include "common/hashfn.h"
 #include "commands/defrem.h"
 #include "commands/shardgroupcmds.h"
@@ -906,10 +906,10 @@ SyncTablesOnNewShardMember(Oid sgid, Oid newsrvoid)
 						
 			partbound = RelationGetPartitionBoundSpec(parentRel, relid);
 			{
-				char *partition_bounds = PartitionBoundsSpecToString(partbound);
+				char *bounds_str = PartitionBoundsSpecToString(partbound);
 
-				appendStringInfo(&ddl, "%s ", partition_bounds);
-				pfree(partition_bounds);
+				appendStringInfo(&ddl, "%s ", bounds_str);
+				pfree(bounds_str);
 			}
 			
 			table_close(parentRel, AccessShareLock);
@@ -1611,7 +1611,19 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 	
 	/* Get the partition constraint definition */
 	partition_bounds = PartitionBoundsSpecToString(partbound);
-	csv_path = psprintf("/tmp/%s_migration_%u.csv", relname, MyProcPid);
+	{
+		char		csv_path_template[MAXPGPATH];
+		int			csv_fd;
+
+		snprintf(csv_path_template, sizeof(csv_path_template), "/tmp/%s_migration_XXXXXX", relname);
+		csv_fd = mkstemp(csv_path_template);
+		if (csv_fd < 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not create temporary file for partition migration")));
+		close(csv_fd);
+		csv_path = pstrdup(csv_path_template);
+	}
 	stage_name = psprintf("%s_stage", relname);
 
 	/* Export data from the source partition to a CSV file */
@@ -1879,7 +1891,10 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 	pfree(partition_bounds);
 	pfree(parentnspname);
 	pfree(stage_name);
-	(void) unlink(csv_path);
+	if (unlink(csv_path) != 0)
+		ereport(WARNING,
+				(errmsg("could not remove temporary migration file \"%s\"",
+						csv_path)));
 	pfree(csv_path);
 	
 	ereport(DEBUG1,
