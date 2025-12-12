@@ -36,6 +36,7 @@
 #include "commands/dbcommands.h"
 #include "libpq-fe.h"
 #include "storage/fd.h"
+#include "contrib/postgres_fdw/postgres_fdw.h"
 #include "common/hashfn.h"
 #include "commands/defrem.h"
 #include "commands/shardgroupcmds.h"
@@ -75,8 +76,6 @@ static void MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toSer
 static Oid FindPartitionHostMember(Oid partitionOid, Oid sgid);
 static List *GetShardGroupPartitions(Oid sgid);
 static char *PartitionBoundsSpecToString(PartitionBoundSpec *partbound);
-static PGconn *OpenServerConnection(Oid serverid);
-static void CopyFileToRemote(PGconn *conn, const char *nspname, const char *relname, const char *filepath);
 
 /* Number of virtual nodes per shard member for consistent hashing */
 #define VIRTUAL_NODES_PER_MEMBER 150
@@ -1842,10 +1841,12 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 		SPI_finish();
 	}
 
-	/* Ensure destination has real table */
+	/* Ensure destination has real table and stream data via existing FDW conn */
 	if (toServer != InvalidOid)
 	{
-		dest_conn = OpenServerConnection(toServer);
+		UserMapping *um = GetUserMapping(GetUserId(), toServer);
+		PgFdwConnState *fdwstate = NULL;
+
 		resetStringInfo(&ddl);
 		appendStringInfo(&ddl,
 						 "CREATE TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s;",
@@ -1855,8 +1856,7 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 						 quote_identifier(parentname),
 						 partition_bounds);
 		ExecuteDDLOnRemoteServer(toServer, ddl.data);
-		CopyFileToRemote(dest_conn, nspname, relname, tmpfile);
-		PQfinish(dest_conn);
+		pgfdw_copy_from_local(um, nspname, relname, tmpfile, &fdwstate);
 	}
 	else
 	{

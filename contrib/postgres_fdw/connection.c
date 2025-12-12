@@ -152,6 +152,9 @@ static void do_sql_command_begin(PGconn *conn, const char *sql);
 static void do_sql_command_end(PGconn *conn, const char *sql,
 							   bool consume_input);
 static void begin_remote_xact(ConnCacheEntry *entry);
+static void pgfdw_copy_from_local_conn(PGconn *conn, const char *nspname,
+									   const char *relname,
+									   const char *filepath);
 static void pgfdw_xact_callback(XactEvent event, void *arg);
 static void deallocate_prepared_stmts(ConnCacheEntry *entry);
 static void pgfdw_subxact_callback(SubXactEvent event,
@@ -2520,4 +2523,73 @@ disconnect_cached_connections(Oid serverid)
 	}
 
 	return result;
+}
+void
+pgfdw_copy_from_local(UserMapping *user, const char *nspname,
+					  const char *relname, const char *filepath,
+					  PgFdwConnState **state)
+{
+	PGconn	   *conn = GetConnection(user, false, state);
+
+	pgfdw_copy_from_local_conn(conn, nspname, relname, filepath);
+}
+
+static void
+pgfdw_copy_from_local_conn(PGconn *conn, const char *nspname,
+						   const char *relname, const char *filepath)
+{
+	StringInfoData cmd;
+	FILE	   *fp;
+	char		buf[8192];
+	PGresult   *res;
+
+	initStringInfo(&cmd);
+	appendStringInfo(&cmd, "COPY %s.%s FROM STDIN WITH (FORMAT CSV, HEADER);",
+					 quote_identifier(nspname),
+					 quote_identifier(relname));
+
+	res = PQexec(conn, cmd.data);
+	if (res == NULL || PQresultStatus(res) != PGRES_COPY_IN)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("could not start COPY on remote server: %s",
+						PQerrorMessage(conn))));
+	PQclear(res);
+
+	fp = AllocateFile(filepath, "r");
+	if (fp == NULL)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open temporary file \"%s\" for reading", filepath)));
+
+	while (fgets(buf, sizeof(buf), fp) != NULL)
+	{
+		if (PQputCopyData(conn, buf, strlen(buf)) != 1)
+		{
+			FreeFile(fp);
+			ereport(ERROR,
+					(errcode(ERRCODE_CONNECTION_FAILURE),
+					 errmsg("could not send COPY data: %s",
+							PQerrorMessage(conn))));
+		}
+	}
+
+	FreeFile(fp);
+
+	if (PQputCopyEnd(conn, NULL) != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("could not finish COPY: %s",
+						PQerrorMessage(conn))));
+
+	res = PQgetResult(conn);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	{
+		PQclear(res);
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("COPY failed: %s", PQerrorMessage(conn))));
+	}
+	PQclear(res);
+	pfree(cmd.data);
 }

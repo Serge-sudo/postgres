@@ -158,6 +158,9 @@ extern void process_pending_request(AsyncRequest *areq);
 /* in connection.c */
 extern PGconn *GetConnection(UserMapping *user, bool will_prep_stmt,
 							 PgFdwConnState **state);
+extern void pgfdw_copy_from_local(UserMapping *user, const char *nspname,
+								  const char *relname, const char *filepath,
+								  PgFdwConnState **state);
 extern void ReleaseConnection(PGconn *conn);
 extern unsigned int GetCursorNumber(PGconn *conn);
 extern unsigned int GetPrepStmtNumber(PGconn *conn);
