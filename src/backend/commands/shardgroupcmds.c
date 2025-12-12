@@ -34,6 +34,7 @@
 #include "catalog/pg_shardmembers.h"
 #include "catalog/partition.h"
 #include "commands/dbcommands.h"
+#include <unistd.h>
 #include "common/hashfn.h"
 #include "commands/defrem.h"
 #include "commands/shardgroupcmds.h"
@@ -1550,6 +1551,8 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 	extern char *cluster_name;
 	PartitionBoundSpec * partbound;
 	char	   *partition_bounds;
+	char	   *csv_path;
+	char	   *stage_name;
 	
 	/* Open the partition relation */
 	rel = table_open(partitionOid, AccessShareLock);
@@ -1608,9 +1611,44 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 	
 	/* Get the partition constraint definition */
 	partition_bounds = PartitionBoundsSpecToString(partbound);
+	csv_path = psprintf("/tmp/%s_migration_%u.csv", relname, MyProcPid);
+	stage_name = psprintf("%s_stage", relname);
+
+	/* Export data from the source partition to a CSV file */
+	resetStringInfo(&ddl);
+	appendStringInfo(&ddl,
+					 "COPY %s.%s TO '%s' WITH (FORMAT CSV, HEADER);",
+					 quote_identifier(nspname),
+					 quote_identifier(relname),
+					 csv_path);
+
+	if (fromServer != InvalidOid)
+		ExecuteDDLOnRemoteServer(fromServer, ddl.data);
+	else
+	{
+		SPI_connect();
+		SPI_execute(ddl.data, false, 0);
+		SPI_finish();
+	}
 	
 	if (toServer != InvalidOid)
 	{
+		/* Stage data on destination using deprecated GLOBAL/LOCAL temp grammar */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl,
+						"CREATE GLOBAL TEMP TABLE IF NOT EXISTS pg_temp.%s (LIKE %s.%s INCLUDING ALL);",
+						quote_identifier(stage_name),
+						quote_identifier(parentnspname),
+						quote_identifier(parentname));
+		ExecuteDDLOnRemoteServer(toServer, ddl.data);
+
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl,
+						"COPY pg_temp.%s FROM '%s' WITH (FORMAT CSV, HEADER);",
+						quote_identifier(stage_name),
+						csv_path);
+		ExecuteDDLOnRemoteServer(toServer, ddl.data);
+
 		/* Detach partition from parent to allow creating real table */
 		resetStringInfo(&ddl);
 		appendStringInfo(&ddl,
@@ -1635,12 +1673,17 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 		/* Copy data */
 		resetStringInfo(&ddl);
 		appendStringInfo(&ddl, 
-						"INSERT INTO %s.%s_temp SELECT * FROM %s.%s;",
+						"INSERT INTO %s.%s_temp SELECT * FROM pg_temp.%s;",
 						quote_identifier(nspname),
 						quote_identifier(relname),
-						quote_identifier(nspname),
-						quote_identifier(relname));
+						quote_identifier(stage_name));
 		
+		ExecuteDDLOnRemoteServer(toServer, ddl.data);
+
+		/* Drop staging table */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, "DROP TABLE IF EXISTS pg_temp.%s;",
+						quote_identifier(stage_name));
 		ExecuteDDLOnRemoteServer(toServer, ddl.data);
 		
 		/* Drop temporary foreign table */
@@ -1666,6 +1709,22 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 		/* use SPI */
 		SPI_connect();
 		
+		/* Stage data locally using GLOBAL TEMP syntax */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl,
+						"CREATE GLOBAL TEMP TABLE IF NOT EXISTS pg_temp.%s (LIKE %s.%s INCLUDING ALL);",
+						quote_identifier(stage_name),
+						quote_identifier(parentnspname),
+						quote_identifier(parentname));
+		SPI_execute(ddl.data, false, 0);
+
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl,
+						"COPY pg_temp.%s FROM '%s' WITH (FORMAT CSV, HEADER);",
+						quote_identifier(stage_name),
+						csv_path);
+		SPI_execute(ddl.data, false, 0);
+
 		/* Detach partition from parent to allow creating real table */
 		resetStringInfo(&ddl);
 		appendStringInfo(&ddl,
@@ -1686,16 +1745,21 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 						quote_identifier(parentname),
 						partition_bounds);
 		SPI_execute(ddl.data, false, 0);
-			
+		
 		/* Copy data */
 		resetStringInfo(&ddl);
 		appendStringInfo(&ddl, 
-						"INSERT INTO %s.%s_temp SELECT * FROM %s.%s;",
+						"INSERT INTO %s.%s_temp SELECT * FROM pg_temp.%s;",
 						quote_identifier(nspname),
 						quote_identifier(relname),
-						quote_identifier(nspname),
-						quote_identifier(relname));
+						quote_identifier(stage_name));
 		
+		SPI_execute(ddl.data, false, 0);
+
+		/* Drop staging table */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, "DROP TABLE IF EXISTS pg_temp.%s;",
+						quote_identifier(stage_name));
 		SPI_execute(ddl.data, false, 0);
 		
 		/* Drop temporary foreign table */
@@ -1814,6 +1878,9 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 	pfree(parentname);
 	pfree(partition_bounds);
 	pfree(parentnspname);
+	pfree(stage_name);
+	(void) unlink(csv_path);
+	pfree(csv_path);
 	
 	ereport(DEBUG1,
 			(errmsg("successfully migrated partition \"%s.%s\" to \"%s\"",
