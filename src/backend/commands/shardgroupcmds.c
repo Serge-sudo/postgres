@@ -12,7 +12,6 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include <unistd.h>
 
 #include "executor/spi.h"
 #include "access/genam.h"
@@ -35,6 +34,8 @@
 #include "catalog/pg_shardmembers.h"
 #include "catalog/partition.h"
 #include "commands/dbcommands.h"
+#include "libpq-fe.h"
+#include "storage/fd.h"
 #include "common/hashfn.h"
 #include "commands/defrem.h"
 #include "commands/shardgroupcmds.h"
@@ -74,6 +75,8 @@ static void MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toSer
 static Oid FindPartitionHostMember(Oid partitionOid, Oid sgid);
 static List *GetShardGroupPartitions(Oid sgid);
 static char *PartitionBoundsSpecToString(PartitionBoundSpec *partbound);
+static PGconn *OpenServerConnection(Oid serverid);
+static void CopyFileToRemote(PGconn *conn, const char *nspname, const char *relname, const char *filepath);
 
 /* Number of virtual nodes per shard member for consistent hashing */
 #define VIRTUAL_NODES_PER_MEMBER 150
@@ -762,6 +765,112 @@ PartitionBoundsSpecToString(PartitionBoundSpec *partbound)
 }
 
 /*
+ * Open a libpq connection using foreign server + user mapping options.
+ */
+static PGconn *
+OpenServerConnection(Oid serverid)
+{
+	ForeignServer *srv = GetForeignServer(serverid);
+	UserMapping *um = GetUserMapping(GetUserId(), serverid);
+	ListCell   *lc;
+	StringInfoData conninfo;
+
+	initStringInfo(&conninfo);
+
+	foreach(lc, srv->options)
+	{
+		DefElem *opt = lfirst_node(DefElem, lc);
+
+		if (strcmp(opt->defname, "host") == 0 ||
+			strcmp(opt->defname, "port") == 0 ||
+			strcmp(opt->defname, "dbname") == 0)
+			appendStringInfo(&conninfo, "%s=%s ", opt->defname, (char *) opt->arg);
+	}
+
+	foreach(lc, um->options)
+	{
+		DefElem *opt = lfirst_node(DefElem, lc);
+
+		if (strcmp(opt->defname, "user") == 0 ||
+			strcmp(opt->defname, "password") == 0)
+			appendStringInfo(&conninfo, "%s=%s ", opt->defname, (char *) opt->arg);
+	}
+
+	PGconn *conn = PQconnectdb(conninfo.data);
+	pfree(conninfo.data);
+
+	if (PQstatus(conn) != CONNECTION_OK)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("could not connect to foreign server \"%s\": %s",
+						srv->servername, PQerrorMessage(conn))));
+
+	return conn;
+}
+
+/*
+ * Stream a local CSV file into a remote table using COPY FROM STDIN.
+ */
+static void
+CopyFileToRemote(PGconn *conn, const char *nspname, const char *relname, const char *filepath)
+{
+	StringInfoData copycmd;
+	FILE	   *fp;
+	char		buf[8192];
+
+	initStringInfo(&copycmd);
+	appendStringInfo(&copycmd,
+					 "COPY %s.%s FROM STDIN WITH (FORMAT CSV, HEADER);",
+					 quote_identifier(nspname),
+					 quote_identifier(relname));
+
+	PGresult   *res = PQexec(conn, copycmd.data);
+	if (res == NULL || PQresultStatus(res) != PGRES_COPY_IN)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("could not start COPY on remote server: %s",
+						PQerrorMessage(conn))));
+	PQclear(res);
+
+	fp = AllocateFile(filepath, "r");
+	if (fp == NULL)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open temporary file \"%s\" for reading", filepath)));
+
+	while (fgets(buf, sizeof(buf), fp) != NULL)
+	{
+		if (PQputCopyData(conn, buf, strlen(buf)) != 1)
+		{
+			FreeFile(fp);
+			ereport(ERROR,
+					(errcode(ERRCODE_CONNECTION_FAILURE),
+					 errmsg("could not send COPY data: %s",
+							PQerrorMessage(conn))));
+		}
+	}
+
+	FreeFile(fp);
+
+	if (PQputCopyEnd(conn, NULL) != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("could not finish COPY: %s",
+						PQerrorMessage(conn))));
+
+	res = PQgetResult(conn);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	{
+		PQclear(res);
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("COPY failed: %s", PQerrorMessage(conn))));
+	}
+	PQclear(res);
+	pfree(copycmd.data);
+}
+
+/*
  * SyncTablesOnNewShardMember
  *		Create tables on a newly added shard member
  *
@@ -906,10 +1015,10 @@ SyncTablesOnNewShardMember(Oid sgid, Oid newsrvoid)
 						
 			partbound = RelationGetPartitionBoundSpec(parentRel, relid);
 			{
-				char *bounds_str = PartitionBoundsSpecToString(partbound);
+				char *partition_bounds = PartitionBoundsSpecToString(partbound);
 
-				appendStringInfo(&ddl, "%s ", bounds_str);
-				pfree(bounds_str);
+				appendStringInfo(&ddl, "%s ", partition_bounds);
+				pfree(partition_bounds);
 			}
 			
 			table_close(parentRel, AccessShareLock);
@@ -1546,14 +1655,14 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 	Relation	parent;
 	char	   *parentname;
 	char	   *parentnspname;
-	List	   *members = NIL;
+	List	   *members;
 	ListCell   *lc;
 	extern char *cluster_name;
 	PartitionBoundSpec * partbound;
 	char	   *partition_bounds;
-	char	   *csv_path;
-	char	   *stage_name;
-	bool		csv_removed = false;
+	char		tmpfile[MAXPGPATH];
+	int			tmpfd;
+	PGconn	   *dest_conn = NULL;
 	
 	/* Open the partition relation */
 	rel = table_open(partitionOid, AccessShareLock);
@@ -1607,295 +1716,367 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 					nspname, relname, fromServerName, toServerName)));
 	
 	/*
-	 * Step 1: Create real table on destination with data from source
+	 * Step 1: Create real table on destination and stream data
 	 */
 	
 	/* Get the partition constraint definition */
 	partition_bounds = PartitionBoundsSpecToString(partbound);
-	{
-		char		csv_path_template[MAXPGPATH];
-		int			csv_fd;
+	snprintf(tmpfile, sizeof(tmpfile), "/tmp/pg_migrate_%s_%u.csv", relname, MyProcPid);
+	tmpfd = OpenTransientFile(tmpfile, O_CREAT | O_EXCL | O_WRONLY);
+	if (tmpfd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create temporary file \"%s\"", tmpfile)));
+	CloseTransientFile(tmpfd);
 
-		snprintf(csv_path_template, sizeof(csv_path_template), "/tmp/%s_migration_XXXXXX", relname);
-		csv_fd = mkstemp(csv_path_template);
-		if (csv_fd < 0)
+	/* Export data from source into local CSV */
+	if (fromServer != InvalidOid)
+	{
+		ForeignServer *srcsrv = GetForeignServer(fromServer);
+		UserMapping *um = GetUserMapping(GetUserId(), fromServer);
+		PGconn	   *src_conn;
+		StringInfoData src_conninfo;
+		StringInfoData copycmd;
+		PGresult   *res;
+		FILE	   *fp;
+		char	   *row = NULL;
+		int			rowlen;
+
+		initStringInfo(&src_conninfo);
+		initStringInfo(&copycmd);
+
+		/* Build connection string from server/user mapping */
+		foreach(lc, srcsrv->options)
+		{
+			DefElem *opt = lfirst_node(DefElem, lc);
+
+			if (strcmp(opt->defname, "host") == 0 ||
+				strcmp(opt->defname, "port") == 0 ||
+				strcmp(opt->defname, "dbname") == 0)
+				appendStringInfo(&src_conninfo, "%s=%s ", opt->defname, (char *) opt->arg);
+		}
+
+		foreach(lc, um->options)
+		{
+			DefElem *opt = lfirst_node(DefElem, lc);
+
+			if (strcmp(opt->defname, "user") == 0 ||
+				strcmp(opt->defname, "password") == 0)
+				appendStringInfo(&src_conninfo, "%s=%s ", opt->defname, (char *) opt->arg);
+		}
+
+		src_conn = PQconnectdb(src_conninfo.data);
+		if (PQstatus(src_conn) != CONNECTION_OK)
+			ereport(ERROR,
+					(errcode(ERRCODE_CONNECTION_FAILURE),
+					 errmsg("could not connect to source server \"%s\": %s",
+							srcsrv->servername, PQerrorMessage(src_conn))));
+
+		appendStringInfo(&copycmd,
+						 "COPY %s.%s TO STDOUT WITH (FORMAT CSV, HEADER);",
+						 quote_identifier(nspname),
+						 quote_identifier(relname));
+
+		res = PQexec(src_conn, copycmd.data);
+		if (PQresultStatus(res) != PGRES_COPY_OUT)
+		{
+			PQclear(res);
+			PQfinish(src_conn);
+			ereport(ERROR,
+					(errcode(ERRCODE_CONNECTION_FAILURE),
+					 errmsg("could not start COPY on source: %s",
+							PQerrorMessage(src_conn))));
+		}
+		PQclear(res);
+
+		fp = AllocateFile(tmpfile, "w");
+		if (!fp)
+		{
+			PQfinish(src_conn);
 			ereport(ERROR,
 					(errcode_for_file_access(),
-					 errmsg("could not create temporary file for partition migration")));
-		close(csv_fd);
-		csv_path = pstrdup(csv_path_template);
+					 errmsg("could not open temporary file \"%s\" for writing", tmpfile)));
+		}
+
+		while ((rowlen = PQgetCopyData(src_conn, &row, 0)) > 0)
+		{
+			if (fwrite(row, 1, rowlen, fp) != rowlen)
+			{
+				PQfreemem(row);
+				FreeFile(fp);
+				PQfinish(src_conn);
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not write to temporary file \"%s\"", tmpfile)));
+			}
+			PQfreemem(row);
+		}
+
+		if (rowlen == -2)
+		{
+			FreeFile(fp);
+			PQfinish(src_conn);
+			ereport(ERROR,
+					(errcode(ERRCODE_CONNECTION_FAILURE),
+					 errmsg("error reading COPY data from source: %s",
+							PQerrorMessage(src_conn))));
+		}
+
+		FreeFile(fp);
+	res = PQgetResult(src_conn);
+	PQclear(res);
+	PQfinish(src_conn);
+	pfree(src_conninfo.data);
+	pfree(copycmd.data);
 	}
-	stage_name = psprintf("%s_stage", relname);
-
-	/* Export data from the source partition to a CSV file */
-	resetStringInfo(&ddl);
-	appendStringInfo(&ddl,
-					 "COPY %s.%s TO '%s' WITH (FORMAT CSV, HEADER);",
-					 quote_identifier(nspname),
-					 quote_identifier(relname),
-					 csv_path);
-
-	if (fromServer != InvalidOid)
-		ExecuteDDLOnRemoteServer(fromServer, ddl.data);
 	else
 	{
 		SPI_connect();
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl,
+						 "COPY %s.%s TO '%s' WITH (FORMAT CSV, HEADER);",
+						 quote_identifier(nspname),
+						 quote_identifier(relname),
+						 tmpfile);
+		SPI_execute(ddl.data, false, 0);
+		SPI_finish();
+	}
+
+	/* Ensure destination has real table */
+	if (toServer != InvalidOid)
+	{
+		dest_conn = OpenServerConnection(toServer);
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl,
+						 "CREATE TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s;",
+						 quote_identifier(nspname),
+						 quote_identifier(relname),
+						 quote_identifier(parentnspname),
+						 quote_identifier(parentname),
+						 partition_bounds);
+		ExecuteDDLOnRemoteServer(toServer, ddl.data);
+		CopyFileToRemote(dest_conn, nspname, relname, tmpfile);
+		PQfinish(dest_conn);
+	}
+	else
+	{
+		SPI_connect();
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl,
+						 "CREATE TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s;",
+						 quote_identifier(nspname),
+						 quote_identifier(relname),
+						 quote_identifier(parentnspname),
+						 quote_identifier(parentname),
+						 partition_bounds);
+		SPI_execute(ddl.data, false, 0);
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl,
+						 "COPY %s.%s FROM '%s' WITH (FORMAT CSV, HEADER);",
+						 quote_identifier(nspname),
+						 quote_identifier(relname),
+						 tmpfile);
 		SPI_execute(ddl.data, false, 0);
 		SPI_finish();
 	}
 	
-	PG_TRY();
+	if (toServer != InvalidOid)
 	{
-		if (toServer != InvalidOid)
-		{
-			/*
-			 * Use deprecated GLOBAL/LOCAL temp syntax intentionally to match
-			 * existing compatibility expectations.
-			 */
-			resetStringInfo(&ddl);
-			appendStringInfo(&ddl,
-							"CREATE GLOBAL TEMP TABLE IF NOT EXISTS pg_temp.%s (LIKE %s.%s INCLUDING ALL);",
-							quote_identifier(stage_name),
-							quote_identifier(parentnspname),
-							quote_identifier(parentname));
-			ExecuteDDLOnRemoteServer(toServer, ddl.data);
-
-			resetStringInfo(&ddl);
-			appendStringInfo(&ddl,
-							"COPY pg_temp.%s FROM '%s' WITH (FORMAT CSV, HEADER);",
-							quote_identifier(stage_name),
-							csv_path);
-			ExecuteDDLOnRemoteServer(toServer, ddl.data);
-
-			/* Detach partition from parent to allow creating real table */
-			resetStringInfo(&ddl);
-			appendStringInfo(&ddl,
-							"ALTER TABLE %s.%s DETACH PARTITION %s.%s;",
-							quote_identifier(parentnspname),
-							quote_identifier(parentname),
-							quote_identifier(nspname),
-							quote_identifier(relname));
-			ExecuteDDLOnRemoteServer(toServer, ddl.data);
-			
-			/* Create the partition structure on destination */
-			resetStringInfo(&ddl);
-			appendStringInfo(&ddl, 
-							"CREATE TABLE IF NOT EXISTS %s.%s_temp PARTITION OF %s.%s %s;",
-							quote_identifier(nspname),
-							quote_identifier(relname),
-							quote_identifier(parentnspname),
-							quote_identifier(parentname),
-							partition_bounds);
-			ExecuteDDLOnRemoteServer(toServer, ddl.data);
-				
-			/* Copy data */
-			resetStringInfo(&ddl);
-			appendStringInfo(&ddl, 
-							"INSERT INTO %s.%s_temp SELECT * FROM pg_temp.%s;",
-							quote_identifier(nspname),
-							quote_identifier(relname),
-							quote_identifier(stage_name));
-			
-			ExecuteDDLOnRemoteServer(toServer, ddl.data);
-
-			/* Drop staging table */
-			resetStringInfo(&ddl);
-			appendStringInfo(&ddl, "DROP TABLE IF EXISTS pg_temp.%s;",
-							quote_identifier(stage_name));
-			ExecuteDDLOnRemoteServer(toServer, ddl.data);
-			
-			/* Drop temporary foreign table */
-			resetStringInfo(&ddl);
-			appendStringInfo(&ddl, "DROP FOREIGN TABLE %s.%s;",
-							quote_identifier(nspname),
-							quote_identifier(relname));
-			
-			ExecuteDDLOnRemoteServer(toServer, ddl.data);
-			
-			/* Rename temp table to actual partition name */
-			resetStringInfo(&ddl);
-			appendStringInfo(&ddl,
-							"ALTER TABLE %s.%s_temp RENAME TO %s;",
-							quote_identifier(nspname),
-							quote_identifier(relname),
-							quote_identifier(relname));
-			
-			ExecuteDDLOnRemoteServer(toServer, ddl.data);	
-		}
-		else
-		{
-			/* use SPI */
-			SPI_connect();
-			
-			/* Stage data locally using GLOBAL TEMP syntax */
-			resetStringInfo(&ddl);
-			appendStringInfo(&ddl,
-							"CREATE GLOBAL TEMP TABLE IF NOT EXISTS pg_temp.%s (LIKE %s.%s INCLUDING ALL);",
-							quote_identifier(stage_name),
-							quote_identifier(parentnspname),
-							quote_identifier(parentname));
-			SPI_execute(ddl.data, false, 0);
-
-			resetStringInfo(&ddl);
-			appendStringInfo(&ddl,
-							"COPY pg_temp.%s FROM '%s' WITH (FORMAT CSV, HEADER);",
-							quote_identifier(stage_name),
-							csv_path);
-			SPI_execute(ddl.data, false, 0);
-
-			/* Detach partition from parent to allow creating real table */
-			resetStringInfo(&ddl);
-			appendStringInfo(&ddl,
-							"ALTER TABLE %s.%s DETACH PARTITION %s.%s;",
-							quote_identifier(parentnspname),
-							quote_identifier(parentname),
-							quote_identifier(nspname),
-							quote_identifier(relname));
-			SPI_execute(ddl.data, false, 0);
-			
-			/* Create the partition structure on destination */
-			resetStringInfo(&ddl);
-			appendStringInfo(&ddl, 
-							"CREATE TABLE IF NOT EXISTS %s.%s_temp PARTITION OF %s.%s %s;",
-							quote_identifier(nspname),
-							quote_identifier(relname),
-							quote_identifier(parentnspname),
-							quote_identifier(parentname),
-							partition_bounds);
-			SPI_execute(ddl.data, false, 0);
-				
-			/* Copy data */
-			resetStringInfo(&ddl);
-			appendStringInfo(&ddl, 
-							"INSERT INTO %s.%s_temp SELECT * FROM pg_temp.%s;",
-							quote_identifier(nspname),
-							quote_identifier(relname),
-							quote_identifier(stage_name));
-			
-			SPI_execute(ddl.data, false, 0);
-
-			/* Drop staging table */
-			resetStringInfo(&ddl);
-			appendStringInfo(&ddl, "DROP TABLE IF EXISTS pg_temp.%s;",
-							quote_identifier(stage_name));
-			SPI_execute(ddl.data, false, 0);
-			
-			/* Drop temporary foreign table */
-			resetStringInfo(&ddl);
-			appendStringInfo(&ddl, "DROP FOREIGN TABLE %s.%s;",
-							quote_identifier(nspname),
-							quote_identifier(relname));
-			
-			SPI_execute(ddl.data, false, 0);
-			
-			/* Rename temp table to actual partition name */
-			resetStringInfo(&ddl);
-			appendStringInfo(&ddl,
-							"ALTER TABLE %s.%s_temp RENAME TO %s;",
-							quote_identifier(nspname),
-							quote_identifier(relname),
-							quote_identifier(relname));
-			
-			SPI_execute(ddl.data, false, 0);
-			
-			SPI_finish();
-		}
+		/* Detach partition from parent to allow creating real table */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl,
+						"ALTER TABLE %s.%s DETACH PARTITION %s.%s;",
+						quote_identifier(parentnspname),
+						quote_identifier(parentname),
+						quote_identifier(nspname),
+						quote_identifier(relname));
+		ExecuteDDLOnRemoteServer(toServer, ddl.data);
 		
-		/*
-		 * Step 2: Drop real table on source and create foreign table
-		 */
-		if (fromServer != InvalidOid)
-		{
-			resetStringInfo(&ddl);
-			appendStringInfo(&ddl, "DROP TABLE IF EXISTS %s.%s CASCADE;",
-							quote_identifier(nspname),
-							quote_identifier(relname));
+		/* Create the partition structure on destination */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, 
+						"CREATE TABLE IF NOT EXISTS %s.%s_temp PARTITION OF %s.%s %s;",
+						quote_identifier(nspname),
+						quote_identifier(relname),
+						quote_identifier(parentnspname),
+						quote_identifier(parentname),
+						partition_bounds);
+		ExecuteDDLOnRemoteServer(toServer, ddl.data);
 			
-			ExecuteDDLOnRemoteServer(fromServer, ddl.data);
-			
-			/* Create foreign table on source pointing to destination */
-			resetStringInfo(&ddl);
-			appendStringInfo(&ddl, 
-							"CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s SERVER %s;",
-							quote_identifier(nspname),
-							quote_identifier(relname),
-							quote_identifier(parentnspname),
-							quote_identifier(parentname),
-							partition_bounds,
-							quote_identifier(toServerName));
-			
-			ExecuteDDLOnRemoteServer(fromServer, ddl.data);
-		}
-		else
-		{
-			/* use SPI */
-			SPI_connect();
-			
-			resetStringInfo(&ddl);
-			appendStringInfo(&ddl, "DROP TABLE IF EXISTS %s.%s CASCADE;",
-							quote_identifier(nspname),
-							quote_identifier(relname));
-			
-			SPI_execute(ddl.data, false, 0);
-			resetStringInfo(&ddl);
-			appendStringInfo(&ddl, 
-							"CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s SERVER %s;",
-							quote_identifier(nspname),
-							quote_identifier(relname),
-							quote_identifier(parentnspname),
-							quote_identifier(parentname),
-							partition_bounds,
-							quote_identifier(toServerName));
-							
-			SPI_execute(ddl.data, false, 0);
-			
-			SPI_finish();	
-		}
-
-		/*
-		 * Step 3: Update foreign tables on all other members
-		 */
-		members = get_shardgroup_members(sgid);
-		foreach(lc, members)
-		{
-			Oid serveroid = lfirst_oid(lc);
-			
-			/* Skip source and destination */
-			if (serveroid == fromServer || serveroid == toServer)
-				continue;
-			
-			/* Drop and recreate foreign table pointing to destination */
-			resetStringInfo(&ddl);
-			appendStringInfo(&ddl, "DROP FOREIGN TABLE IF EXISTS %s.%s CASCADE;",
-							 quote_identifier(nspname),
-							 quote_identifier(relname));
-			
-			ExecuteDDLOnRemoteServer(serveroid, ddl.data);
-			
-			resetStringInfo(&ddl);
-			appendStringInfo(&ddl, 
-							 "CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s SERVER %s;",
-							 quote_identifier(nspname),
-							 quote_identifier(relname),
-							 quote_identifier(parentnspname),
-							 quote_identifier(parentname),
-							 partition_bounds,
-							 quote_identifier(toServerName));
+		/* Copy data */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, 
+						"INSERT INTO %s.%s_temp SELECT * FROM %s.%s;",
+						quote_identifier(nspname),
+						quote_identifier(relname),
+						quote_identifier(nspname),
+						quote_identifier(relname));
 		
-			
-			ExecuteDDLOnRemoteServer(serveroid, ddl.data);
-		}
+		ExecuteDDLOnRemoteServer(toServer, ddl.data);
+		
+		/* Drop temporary foreign table */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, "DROP FOREIGN TABLE %s.%s;",
+						quote_identifier(nspname),
+						quote_identifier(relname));
+		
+		ExecuteDDLOnRemoteServer(toServer, ddl.data);
+		
+		/* Rename temp table to actual partition name */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl,
+						"ALTER TABLE %s.%s_temp RENAME TO %s;",
+						quote_identifier(nspname),
+						quote_identifier(relname),
+						quote_identifier(relname));
+		
+		ExecuteDDLOnRemoteServer(toServer, ddl.data);	
 	}
-	PG_CATCH();
+	else
 	{
-		if (!csv_removed && csv_path)
-		{
-			if (unlink(csv_path) == 0)
-				csv_removed = true;
-		}
-		PG_RE_THROW();
+		/* use SPI */
+		SPI_connect();
+		
+		/* Detach partition from parent to allow creating real table */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl,
+						"ALTER TABLE %s.%s DETACH PARTITION %s.%s;",
+						quote_identifier(parentnspname),
+						quote_identifier(parentname),
+						quote_identifier(nspname),
+						quote_identifier(relname));
+		SPI_execute(ddl.data, false, 0);
+		
+		/* Create the partition structure on destination */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, 
+						"CREATE TABLE IF NOT EXISTS %s.%s_temp PARTITION OF %s.%s %s;",
+						quote_identifier(nspname),
+						quote_identifier(relname),
+						quote_identifier(parentnspname),
+						quote_identifier(parentname),
+						partition_bounds);
+		SPI_execute(ddl.data, false, 0);
+			
+		/* Copy data */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, 
+						"INSERT INTO %s.%s_temp SELECT * FROM %s.%s;",
+						quote_identifier(nspname),
+						quote_identifier(relname),
+						quote_identifier(nspname),
+						quote_identifier(relname));
+		
+		SPI_execute(ddl.data, false, 0);
+		
+		/* Drop temporary foreign table */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, "DROP FOREIGN TABLE %s.%s;",
+						quote_identifier(nspname),
+						quote_identifier(relname));
+		
+		SPI_execute(ddl.data, false, 0);
+		
+		/* Rename temp table to actual partition name */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl,
+						"ALTER TABLE %s.%s_temp RENAME TO %s;",
+						quote_identifier(nspname),
+						quote_identifier(relname),
+						quote_identifier(relname));
+		
+		SPI_execute(ddl.data, false, 0);
+		
+		SPI_finish();
 	}
-	PG_END_TRY();
+	
+	/*
+	 * Step 2: Drop real table on source and create foreign table
+	 */
+	if (fromServer != InvalidOid)
+	{
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, "DROP TABLE IF EXISTS %s.%s CASCADE;",
+						quote_identifier(nspname),
+						quote_identifier(relname));
+		
+		ExecuteDDLOnRemoteServer(fromServer, ddl.data);
+		
+		/* Create foreign table on source pointing to destination */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, 
+						"CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s SERVER %s;",
+						quote_identifier(nspname),
+						quote_identifier(relname),
+						quote_identifier(parentnspname),
+						quote_identifier(parentname),
+						partition_bounds,
+						quote_identifier(toServerName));
+		
+		ExecuteDDLOnRemoteServer(fromServer, ddl.data);
+	}
+	else
+	{
+		elog(WARNING, "second part 2");
+		/* use SPI */
+		SPI_connect();
+		
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, "DROP TABLE IF EXISTS %s.%s CASCADE;",
+						quote_identifier(nspname),
+						quote_identifier(relname));
+		
+		SPI_execute(ddl.data, false, 0);
+		elog(WARNING, "second part 3");
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, 
+						"CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s SERVER %s;",
+						quote_identifier(nspname),
+						quote_identifier(relname),
+						quote_identifier(parentnspname),
+						quote_identifier(parentname),
+						partition_bounds,
+						quote_identifier(toServerName));
+						
+		SPI_execute(ddl.data, false, 0);
+		elog(WARNING, "second part 4");
+		
+		SPI_finish();	
+	}
+
+	/*
+	 * Step 3: Update foreign tables on all other members
+	 */
+	members = get_shardgroup_members(sgid);
+	foreach(lc, members)
+	{
+		Oid serveroid = lfirst_oid(lc);
+		
+		/* Skip source and destination */
+		if (serveroid == fromServer || serveroid == toServer)
+			continue;
+		
+		/* Drop and recreate foreign table pointing to destination */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, "DROP FOREIGN TABLE IF EXISTS %s.%s CASCADE;",
+						 quote_identifier(nspname),
+						 quote_identifier(relname));
+		
+		ExecuteDDLOnRemoteServer(serveroid, ddl.data);
+		
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, 
+						 "CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s SERVER %s;",
+						 quote_identifier(nspname),
+						 quote_identifier(relname),
+						 quote_identifier(parentnspname),
+						 quote_identifier(parentname),
+						 partition_bounds,
+						 quote_identifier(toServerName));
+	
+		
+		ExecuteDDLOnRemoteServer(serveroid, ddl.data);
+	}
 	
 	list_free(members);
 	pfree(ddl.data);
@@ -1904,14 +2085,10 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 	pfree(parentname);
 	pfree(partition_bounds);
 	pfree(parentnspname);
-	pfree(stage_name);
-	if (!csv_removed && unlink(csv_path) != 0)
+	if (unlink(tmpfile) != 0)
 		ereport(WARNING,
 				(errmsg("could not remove temporary migration file \"%s\"",
-						csv_path)));
-	else
-		csv_removed = true;
-	pfree(csv_path);
+						tmpfile)));
 	
 	ereport(DEBUG1,
 			(errmsg("successfully migrated partition \"%s.%s\" to \"%s\"",
