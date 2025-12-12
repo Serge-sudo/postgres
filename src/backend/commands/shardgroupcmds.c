@@ -30,6 +30,7 @@
 #include "catalog/pg_partitioned_table.h"
 #include "catalog/pg_shdepend.h"
 #include "catalog/pg_shardgroups.h"
+#include "catalog/pg_inherits.h"
 #include "catalog/pg_shardmembers.h"
 #include "catalog/partition.h"
 #include "commands/dbcommands.h"
@@ -73,9 +74,9 @@ static Oid FindPartitionHostMember(Oid partitionOid, Oid sgid);
 static List *GetShardGroupPartitions(Oid sgid);
 
 /* Number of virtual nodes per shard member for consistent hashing */
-#define VIRTUAL_NODES_PER_MEMBER 1
+#define VIRTUAL_NODES_PER_MEMBER 150
 /* Maximum length for virtual node key strings */
-#define VNODE_KEY_MAX_LEN 256
+#define VNODE_KEY_MAX_LEN 512
 
 
 /*
@@ -745,9 +746,8 @@ SyncTablesOnNewShardMember(Oid sgid, Oid newsrvoid)
 
 		if (is_partition)
 		{
-			char * cluster_;
+			char * cluster_ = NULL;
 			StringInfoData partition_bounds;
-			Oid			parentRelid;
 			Relation	parentRel;
 
 			/* partition of distributed table on foreign server */
@@ -835,7 +835,7 @@ SyncTablesOnNewShardMember(Oid sgid, Oid newsrvoid)
 									switch (nodeTag(&aconst->val.node))
 									{
 										case T_Integer:
-											appendStringInfo(&partition_bounds, "%ld", 
+											appendStringInfo(&partition_bounds, "%d", 
 															castNode(Integer, &aconst->val.node)->ival);
 											break;
 										case T_Float:
@@ -966,7 +966,7 @@ SyncTablesOnNewShardMember(Oid sgid, Oid newsrvoid)
 			HeapTuple	fttuple;
 			Form_pg_foreign_table ftform;
 			ForeignServer *target_server;
-			char * cluster_;
+			char * cluster_ = NULL;
 			
 			Assert(!is_partition && !is_partitioned);
 			
@@ -1294,7 +1294,7 @@ NotifyExistingMembersAboutNewMember(Oid sgid, Oid newsrvoid)
 static uint32
 hash_string_to_uint32(const char *str)
 {	
-	return string_hash(str, strlen(str));
+	return string_hash(str, strlen(str) + 1);
 }
 
 /*
@@ -1523,8 +1523,6 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 	Relation	rel;
 	char	   *relname;
 	char	   *nspname;
-	ForeignServer *toServerInfo;
-	ForeignServer *fromServerInfo;
 	char*			toServerName;
 	char*			fromServerName;
 	StringInfoData ddl;
@@ -1534,7 +1532,8 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 	List	   *members;
 	ListCell   *lc;
 	extern char *cluster_name;
-	char *partconstrdef;
+	PartitionBoundSpec * partbound;
+	StringInfoData partition_bounds;
 	
 	/* Open the partition relation */
 	rel = table_open(partitionOid, AccessShareLock);
@@ -1548,6 +1547,7 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 		parent = table_open(parentOid, AccessShareLock);
 		parentname = pstrdup(RelationGetRelationName(parent));
 		parentnspname = get_namespace_name(RelationGetNamespace(parent));
+		partbound = RelationGetPartitionBoundSpec(parent, partitionOid);
 		table_close(parent, AccessShareLock);
 	}
 	else
@@ -1590,51 +1590,211 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 	 * Step 1: Create real table on destination with data from source
 	 */
 	
-	 elog(WARNING, "ger");
 	/* Get the partition constraint definition */
-	partconstrdef = pg_get_partconstrdef_string(partitionOid, "xos");
+	initStringInfo(&partition_bounds);
 	
-	elog(WARNING, "Partition constraint definition: %s",
-		 partconstrdef ? partconstrdef : "<none>");
+	/* Build partition bounds specification */
+	if (partbound->is_default)
+	{
+		appendStringInfoString(&partition_bounds, "DEFAULT");
+	}
+	else
+	{
+		switch (partbound->strategy)
+		{
+			case PARTITION_STRATEGY_HASH:
+				appendStringInfo(&partition_bounds, "FOR VALUES WITH (modulus %d, remainder %d)",
+								partbound->modulus, partbound->remainder);
+				break;
+				
+			case PARTITION_STRATEGY_LIST:
+				{
+					ListCell   *cell;
+					const char *sep = "";
+					
+					appendStringInfoString(&partition_bounds, "FOR VALUES IN (");
+					foreach(cell, partbound->listdatums)
+					{
+						A_Const	   *aconst = lfirst(cell);
+						
+						appendStringInfoString(&partition_bounds, sep);
+						
+						/* Format the constant value based on its type */
+						if (aconst->isnull)
+						{
+							appendStringInfoString(&partition_bounds, "NULL");
+						}
+						else
+						{
+							switch (nodeTag(&aconst->val.node))
+							{
+								case T_Integer:
+									appendStringInfo(&partition_bounds, "%d", 
+													castNode(Integer, &aconst->val.node)->ival);
+									break;
+								case T_Float:
+									appendStringInfoString(&partition_bounds,
+														castNode(Float, &aconst->val.node)->fval);
+									break;
+								case T_Boolean:
+									appendStringInfoString(&partition_bounds,
+														castNode(Boolean, &aconst->val.node)->boolval ? "true" : "false");
+									break;
+								case T_String:
+									/* Quote string literals */
+									appendStringInfo(&partition_bounds, "'%s'",
+													castNode(String, &aconst->val.node)->sval);
+									break;
+								case T_BitString:
+									appendStringInfo(&partition_bounds, "B'%s'",
+													castNode(BitString, &aconst->val.node)->bsval);
+									break;
+								default:
+									elog(ERROR, "unrecognized node type in partition bound: %d",
+										(int) nodeTag(&aconst->val.node));
+									break;
+							}
+						}
+						
+						sep = ", ";
+					}
+					appendStringInfoChar(&partition_bounds, ')');
+				}
+				break;
+				
+			case PARTITION_STRATEGY_RANGE:
+				{
+					char	   *lower_str;
+					char	   *upper_str;
+					/* Deparse lower and upper bounds lists */
+					lower_str = deparse_expression((Node *) partbound->lowerdatums,
+												NIL, false, false);
+					upper_str = deparse_expression((Node *) partbound->upperdatums,
+												NIL, false, false);
+					appendStringInfo(&partition_bounds, "FOR VALUES FROM (%s) TO (%s)",
+									lower_str, upper_str);
+
+					pfree(lower_str);
+					pfree(upper_str);
+				}
+				break;
+				
+			default:
+				elog(ERROR, "unrecognized partition strategy: %d",
+					(int) partbound->strategy);
+				break;
+		}
+	}
 	
-	/* Create the partition structure on destination */
-	appendStringInfo(&ddl, 
-					 "CREATE TABLE IF NOT EXISTS %s.%s_temp (LIKE %s.%s INCLUDING ALL);",
-					 quote_identifier(nspname),
-					 quote_identifier(relname),
-					 quote_identifier(nspname),
-					 quote_identifier(relname));
-	
-	ExecuteDDLOnRemoteServer(toServer, ddl.data);
+	if (toServer != InvalidOid)
+	{
+		/* Detach partition from parent to allow creating real table */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl,
+						"ALTER TABLE %s.%s DETACH PARTITION %s.%s;",
+						quote_identifier(parentnspname),
+						quote_identifier(parentname),
+						quote_identifier(nspname),
+						quote_identifier(relname));
+		ExecuteDDLOnRemoteServer(toServer, ddl.data);
 		
-	/* Copy data */
-	resetStringInfo(&ddl);
-	appendStringInfo(&ddl, 
-					 "INSERT INTO %s.%s SELECT * FROM %s.%s_temp;",
-					 quote_identifier(nspname),
-					 quote_identifier(relname),
-					  quote_identifier(nspname),
-					 quote_identifier(relname));
-	
-	ExecuteDDLOnRemoteServer(toServer, ddl.data);
-	
-	/* Drop temporary foreign table */
-	resetStringInfo(&ddl);
-	appendStringInfo(&ddl, "DROP FOREIGN TABLE %s.%s;",
-		 			quote_identifier(nspname),
-					 quote_identifier(relname));
-	
-	ExecuteDDLOnRemoteServer(toServer, ddl.data);
-	
-	/* Rename temp table to actual partition name */
-	resetStringInfo(&ddl);
-	appendStringInfo(&ddl,
-					 "ALTER TABLE %s.%s_temp RENAME TO %s;",
-					 quote_identifier(nspname),
-					 quote_identifier(relname),
-					 quote_identifier(relname));
-	
-	ExecuteDDLOnRemoteServer(toServer, ddl.data);
+		/* Create the partition structure on destination */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, 
+						"CREATE TABLE IF NOT EXISTS %s.%s_temp PARTITION OF %s.%s %s WITH (no_rel_sync = true);",
+						quote_identifier(nspname),
+						quote_identifier(relname),
+						quote_identifier(parentnspname),
+						quote_identifier(parentname),
+						partition_bounds.data);
+		ExecuteDDLOnRemoteServer(toServer, ddl.data);
+			
+		/* Copy data */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, 
+						"INSERT INTO %s.%s_temp SELECT * FROM %s.%s;",
+						quote_identifier(nspname),
+						quote_identifier(relname),
+						quote_identifier(nspname),
+						quote_identifier(relname));
+		
+		ExecuteDDLOnRemoteServer(toServer, ddl.data);
+		
+		/* Drop temporary foreign table */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, "DROP FOREIGN TABLE %s.%s;",
+						quote_identifier(nspname),
+						quote_identifier(relname));
+		
+		ExecuteDDLOnRemoteServer(toServer, ddl.data);
+		
+		/* Rename temp table to actual partition name */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl,
+						"ALTER TABLE %s.%s_temp RENAME TO %s;",
+						quote_identifier(nspname),
+						quote_identifier(relname),
+						quote_identifier(relname));
+		
+		ExecuteDDLOnRemoteServer(toServer, ddl.data);	
+	}
+	else
+	{
+		/* use SPI */
+		SPI_connect();
+		
+		/* Detach partition from parent to allow creating real table */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl,
+						"ALTER TABLE %s.%s DETACH PARTITION %s.%s;",
+						quote_identifier(parentnspname),
+						quote_identifier(parentname),
+						quote_identifier(nspname),
+						quote_identifier(relname));
+		SPI_execute(ddl.data, false, 0);
+		
+		/* Create the partition structure on destination */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, 
+						"CREATE TABLE IF NOT EXISTS %s.%s_temp PARTITION OF %s.%s %s WITH (no_rel_sync = true);",
+						quote_identifier(nspname),
+						quote_identifier(relname),
+						quote_identifier(parentnspname),
+						quote_identifier(parentname),
+						partition_bounds.data);
+		SPI_execute(ddl.data, false, 0);
+			
+		/* Copy data */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, 
+						"INSERT INTO %s.%s_temp SELECT * FROM %s.%s;",
+						quote_identifier(nspname),
+						quote_identifier(relname),
+						quote_identifier(nspname),
+						quote_identifier(relname));
+		
+		SPI_execute(ddl.data, false, 0);
+		
+		/* Drop temporary foreign table */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, "DROP FOREIGN TABLE %s.%s;",
+						quote_identifier(nspname),
+						quote_identifier(relname));
+		
+		SPI_execute(ddl.data, false, 0);
+		
+		/* Rename temp table to actual partition name */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl,
+						"ALTER TABLE %s.%s_temp RENAME TO %s;",
+						quote_identifier(nspname),
+						quote_identifier(relname),
+						quote_identifier(relname));
+		
+		SPI_execute(ddl.data, false, 0);
+		
+		SPI_finish();
+	}
 	
 	/*
 	 * Step 2: Drop real table on source and create foreign table
@@ -1651,18 +1811,19 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 		/* Create foreign table on source pointing to destination */
 		resetStringInfo(&ddl);
 		appendStringInfo(&ddl, 
-						"CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s SERVER %s;",
+						"CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s SERVER %s WITH (no_rel_sync = true);",
 						quote_identifier(nspname),
 						quote_identifier(relname),
 						quote_identifier(parentnspname),
 						quote_identifier(parentname),
-						partconstrdef ? partconstrdef : "",
+						partition_bounds.data,
 						quote_identifier(toServerName));
 		
 		ExecuteDDLOnRemoteServer(fromServer, ddl.data);
 	}
 	else
 	{
+		elog(WARNING, "second part 2");
 		/* use SPI */
 		SPI_connect();
 		
@@ -1672,16 +1833,19 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 						quote_identifier(relname));
 		
 		SPI_execute(ddl.data, false, 0);
+		elog(WARNING, "second part 3");
 		resetStringInfo(&ddl);
 		appendStringInfo(&ddl, 
-						"CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s SERVER %s;",
+						"CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s WITH (no_rel_sync = true) SERVER %s;",
 						quote_identifier(nspname),
 						quote_identifier(relname),
 						quote_identifier(parentnspname),
 						quote_identifier(parentname),
-						partconstrdef ? partconstrdef : "",
+						partition_bounds.data,
 						quote_identifier(toServerName));
+						
 		SPI_execute(ddl.data, false, 0);
+		elog(WARNING, "second part 4");
 		
 		SPI_finish();	
 	}
@@ -1713,8 +1877,9 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 						 quote_identifier(relname),
 						 quote_identifier(parentnspname),
 						 quote_identifier(parentname),
-						 partconstrdef ? partconstrdef : "",
+						 partition_bounds.data,
 						 quote_identifier(toServerName));
+	
 		
 		ExecuteDDLOnRemoteServer(serveroid, ddl.data);
 	}
@@ -1724,9 +1889,8 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 	pfree(relname);
 	pfree(nspname);
 	pfree(parentname);
+	pfree(partition_bounds.data);
 	pfree(parentnspname);
-	if (partconstrdef)
-		pfree(partconstrdef);
 	
 	ereport(DEBUG1,
 			(errmsg("successfully migrated partition \"%s.%s\" to \"%s\"",
