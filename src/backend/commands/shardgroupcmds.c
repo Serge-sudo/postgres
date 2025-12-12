@@ -1828,7 +1828,6 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 		}
 		else
 		{
-			elog(WARNING, "second part 2");
 			/* use SPI */
 			SPI_connect();
 			
@@ -1838,7 +1837,6 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 							quote_identifier(relname));
 			
 			SPI_execute(ddl.data, false, 0);
-			elog(WARNING, "second part 3");
 			resetStringInfo(&ddl);
 			appendStringInfo(&ddl, 
 							"CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s SERVER %s;",
@@ -1850,7 +1848,6 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 							quote_identifier(toServerName));
 							
 			SPI_execute(ddl.data, false, 0);
-			elog(WARNING, "second part 4");
 			
 			SPI_finish();	
 		}
@@ -1893,8 +1890,8 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 	{
 		if (!csv_removed && csv_path)
 		{
-			(void) unlink(csv_path);
-			csv_removed = true;
+			if (unlink(csv_path) == 0)
+				csv_removed = true;
 		}
 		PG_RE_THROW();
 	}
