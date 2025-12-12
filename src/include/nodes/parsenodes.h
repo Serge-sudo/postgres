@@ -2666,6 +2666,7 @@ typedef struct CreateStmt
 	bool		is_distributed;	/* true for DISTRIBUTED BY (partspec contains distribution spec) */
 	bool		is_worldwide;	/* true for WORLDWIDE TABLE */
 	char	   *shardgroup;		/* SHARD GROUP name, or NULL for default */
+	bool		temp_sync;		/* for TEMP: true if GLOBAL (sync), false if LOCAL (no sync) */
 } CreateStmt;
 
 /* ----------

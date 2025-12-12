@@ -342,7 +342,6 @@ typedef struct StdRdOptions
 	bool		user_catalog_table; /* use as an additional catalog relation */
 	int			parallel_workers;	/* max number of parallel workers */
 	StdRdOptIndexCleanup vacuum_index_cleanup;	/* controls index vacuuming */
-	bool		noRelSync;
 	bool		vacuum_truncate;	/* enables vacuum to truncate a relation */
 } StdRdOptions;
 

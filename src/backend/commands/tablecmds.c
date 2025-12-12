@@ -1287,7 +1287,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	 * Handle sharding-related features: distributed tables, worldwide tables,
 	 * and shard group assignment.
 	 */
-	if (( !rel->rd_options || !((StdRdOptions *) rel->rd_options)->noRelSync) && stmt->is_distributed || stmt->is_worldwide)
+	if (stmt->temp_sync && (stmt->is_distributed || stmt->is_worldwide))
 	{
 		Oid			sgid = InvalidOid;
 		

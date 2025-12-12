@@ -65,6 +65,9 @@
 #include "utils/numeric.h"
 #include "utils/xml.h"
 
+/* Track TEMP keyword flavor for syncing decisions */
+static bool last_temp_is_local = false;
+
 
 /*
  * Location tracking support --- simpler than bison's default, since we only
@@ -3589,6 +3592,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->partspec = ($14 != NULL) ? $14 : n->partspec;  /* DISTRIBUTED BY overrides PARTITION BY */
 					n->is_worldwide = false;
 					n->shardgroup = $15;
+					n->temp_sync = !last_temp_is_local;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE IF_P NOT EXISTS qualified_name '('
@@ -3613,6 +3617,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->partspec = ($17 != NULL) ? $17 : n->partspec;  /* DISTRIBUTED BY overrides PARTITION BY */
 					n->is_worldwide = false;
 					n->shardgroup = $18;
+					n->temp_sync = !last_temp_is_local;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE qualified_name OF any_name
@@ -3637,6 +3642,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->is_distributed = false;
 					n->is_worldwide = false;
 					n->shardgroup = NULL;
+					n->temp_sync = !last_temp_is_local;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE IF_P NOT EXISTS qualified_name OF any_name
@@ -3661,6 +3667,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->is_distributed = false;
 					n->is_worldwide = false;
 					n->shardgroup = NULL;
+					n->temp_sync = !last_temp_is_local;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE qualified_name PARTITION OF qualified_name
@@ -3685,6 +3692,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->is_distributed = false;
 					n->is_worldwide = false;
 					n->shardgroup = NULL;
+					n->temp_sync = !last_temp_is_local;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE IF_P NOT EXISTS qualified_name PARTITION OF
@@ -3709,6 +3717,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->is_distributed = false;
 					n->is_worldwide = false;
 					n->shardgroup = NULL;
+					n->temp_sync = !last_temp_is_local;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp WORLDWIDE TABLE qualified_name '(' OptTableElementList ')'
@@ -3731,6 +3740,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->is_distributed = false;
 					n->is_worldwide = true;
 					n->shardgroup = $14;
+					n->temp_sync = !last_temp_is_local;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp WORLDWIDE TABLE IF_P NOT EXISTS qualified_name '('
@@ -3754,6 +3764,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->is_distributed = false;
 					n->is_worldwide = true;
 					n->shardgroup = $17;
+					n->temp_sync = !last_temp_is_local;
 					$$ = (Node *) n;
 				}
 		;
@@ -3769,16 +3780,17 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
  * implement LOCAL as meaning the same as our default temp table behavior,
  * so we'll probably continue to treat LOCAL as a noise word.
  */
-OptTemp:	TEMPORARY					{ $$ = RELPERSISTENCE_TEMP; }
-			| TEMP						{ $$ = RELPERSISTENCE_TEMP; }
-			| LOCAL TEMPORARY			{ $$ = RELPERSISTENCE_TEMP; }
-			| LOCAL TEMP				{ $$ = RELPERSISTENCE_TEMP; }
+OptTemp:	TEMPORARY					{ $$ = RELPERSISTENCE_TEMP; last_temp_is_local = false; }
+			| TEMP						{ $$ = RELPERSISTENCE_TEMP; last_temp_is_local = false; }
+			| LOCAL TEMPORARY			{ $$ = RELPERSISTENCE_TEMP; last_temp_is_local = true; }
+			| LOCAL TEMP				{ $$ = RELPERSISTENCE_TEMP; last_temp_is_local = true; }
 			| GLOBAL TEMPORARY
 				{
 					ereport(WARNING,
 							(errmsg("GLOBAL is deprecated in temporary table creation"),
 							 parser_errposition(@1)));
 					$$ = RELPERSISTENCE_TEMP;
+					last_temp_is_local = false;
 				}
 			| GLOBAL TEMP
 				{
@@ -3786,9 +3798,10 @@ OptTemp:	TEMPORARY					{ $$ = RELPERSISTENCE_TEMP; }
 							(errmsg("GLOBAL is deprecated in temporary table creation"),
 							 parser_errposition(@1)));
 					$$ = RELPERSISTENCE_TEMP;
+					last_temp_is_local = false;
 				}
-			| UNLOGGED					{ $$ = RELPERSISTENCE_UNLOGGED; }
-			| /*EMPTY*/					{ $$ = RELPERSISTENCE_PERMANENT; }
+			| UNLOGGED					{ $$ = RELPERSISTENCE_UNLOGGED; last_temp_is_local = false; }
+			| /*EMPTY*/					{ $$ = RELPERSISTENCE_PERMANENT; last_temp_is_local = false; }
 		;
 
 OptTableElementList:
