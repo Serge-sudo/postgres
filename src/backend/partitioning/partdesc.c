@@ -129,7 +129,7 @@ RelationGetPartitionBoundSpec(Relation rel, Oid inhrelid)
 	MemoryContext oldcxt;
 	int		   *mapping;
 
-retry:
+retry:;
 	HeapTuple	tuple;
 	PartitionBoundSpec *boundspec = NULL;
 

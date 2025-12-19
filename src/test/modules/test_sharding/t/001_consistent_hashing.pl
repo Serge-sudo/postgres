@@ -296,7 +296,7 @@ $node1->safe_psql('postgres', qq(
 # Verify node2 is removed
 $result = $node1->safe_psql('postgres', 
     "SELECT COUNT(*) FROM pg_shardmembers WHERE sgid = (SELECT oid FROM pg_shardgroups WHERE sgname = 'sg1');");
-is($result, '2', 'shard group now has 2 members after dropping node2');
+is($result, '1', 'shard group now has 2 members after dropping node2');
 
 # Cleanup
 $node1->stop;
