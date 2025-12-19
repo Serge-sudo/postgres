@@ -36,7 +36,12 @@
 #include "commands/dbcommands.h"
 #include "libpq-fe.h"
 #include "storage/fd.h"
-#include "contrib/postgres_fdw/postgres_fdw.h"
+#include "foreign/foreign.h"
+
+/* Borrow postgres_fdw copy helper without including extension headers */
+extern void pgfdw_copy_from_local(UserMapping *user, const char *nspname,
+								  const char *relname, const char *filepath,
+								  void **state);
 #include "common/hashfn.h"
 #include "commands/defrem.h"
 #include "commands/shardgroupcmds.h"
@@ -1845,7 +1850,7 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 	if (toServer != InvalidOid)
 	{
 		UserMapping *um = GetUserMapping(GetUserId(), toServer);
-		PgFdwConnState *fdwstate = NULL;
+		void	   *fdwstate = NULL;
 
 		resetStringInfo(&ddl);
 		appendStringInfo(&ddl,
