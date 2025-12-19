@@ -3169,17 +3169,21 @@ postgresExecForeignCopyFromLocal(Oid serverid,
 		ereport(ERROR,
 				(errcode(ERRCODE_CONNECTION_FAILURE),
 				 errmsg("could not finish COPY: %s",
-						PQerrorMessage(conn))));
+					 PQerrorMessage(conn))));
 
-	res = PQgetResult(conn);
-	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	while ((res = PQgetResult(conn)) != NULL)
 	{
+		if (PQresultStatus(res) != PGRES_COMMAND_OK &&
+			PQresultStatus(res) != PGRES_COPY_OUT &&
+			PQresultStatus(res) != PGRES_COPY_IN)
+		{
+			PQclear(res);
+			ereport(ERROR,
+					(errcode(ERRCODE_CONNECTION_FAILURE),
+					 errmsg("COPY failed: %s", PQerrorMessage(conn))));
+		}
 		PQclear(res);
-		ereport(ERROR,
-				(errcode(ERRCODE_CONNECTION_FAILURE),
-				 errmsg("COPY failed: %s", PQerrorMessage(conn))));
 	}
-	PQclear(res);
 	pfree(copycmd.data);
 }
 
