@@ -78,6 +78,7 @@ static List *GetShardGroupPartitions(Oid sgid);
 static char *PartitionBoundsSpecToString(PartitionBoundSpec *partbound);
 static PGconn *OpenServerConnection(Oid serverid);
 static void CopyFileToRemote(PGconn *conn, const char *nspname, const char *relname, const char *filepath);
+static void CopyFileToRemoteFDW(Oid serverid, const char *nspname, const char *relname, const char *filepath);
 
 /* Number of virtual nodes per shard member for consistent hashing */
 #define VIRTUAL_NODES_PER_MEMBER 150
@@ -869,6 +870,28 @@ CopyFileToRemote(PGconn *conn, const char *nspname, const char *relname, const c
 	}
 	PQclear(res);
 	pfree(copycmd.data);
+}
+
+/*
+ * CopyFileToRemoteFDW
+ *		Use FDW routine hook if available; otherwise fallback to direct libpq copy
+ */
+static void
+CopyFileToRemoteFDW(Oid serverid, const char *nspname, const char *relname, const char *filepath)
+{
+	FdwRoutine *fdwroutine = GetFdwRoutineByServerId(serverid);
+
+	if (fdwroutine != NULL && fdwroutine->ExecForeignCopyFromLocal != NULL)
+	{
+		fdwroutine->ExecForeignCopyFromLocal(serverid, nspname, relname, filepath);
+		return;
+	}
+
+	/* Fallback to manual connection */
+	PGconn *conn = OpenServerConnection(serverid);
+
+	CopyFileToRemote(conn, nspname, relname, filepath);
+	PQfinish(conn);
 }
 
 /*
@@ -1846,8 +1869,6 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 	/* Ensure destination has real table and stream data via existing FDW conn */
 	if (toServer != InvalidOid)
 	{
-		dest_conn = OpenServerConnection(toServer);
-
 		resetStringInfo(&ddl);
 		appendStringInfo(&ddl,
 						 "CREATE TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s;",
@@ -1857,8 +1878,7 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 						 quote_identifier(parentname),
 						 partition_bounds);
 		ExecuteDDLOnRemoteServer(toServer, ddl.data);
-		CopyFileToRemote(dest_conn, nspname, relname, tmpfile);
-		PQfinish(dest_conn);
+		CopyFileToRemoteFDW(toServer, nspname, relname, tmpfile);
 	}
 	else
 	{

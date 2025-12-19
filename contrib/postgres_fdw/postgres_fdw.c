@@ -402,6 +402,10 @@ static void postgresExecForeignTruncate(List *rels,
 										bool restart_seqs);
 static void postgresExecForeignDDL(Oid serverid,
 								   const char *sql);
+static void postgresExecForeignCopyFromLocal(Oid serverid,
+											 const char *nspname,
+											 const char *relname,
+											 const char *filepath);
 static bool postgresAnalyzeForeignTable(Relation relation,
 										AcquireSampleRowsFunc *func,
 										BlockNumber *totalpages);
@@ -596,6 +600,7 @@ postgres_fdw_handler(PG_FUNCTION_ARGS)
 
 	/* Support function for DDL execution */
 	routine->ExecForeignDDL = postgresExecForeignDDL;
+	routine->ExecForeignCopyFromLocal = postgresExecForeignCopyFromLocal;
 
 	/* Support functions for ANALYZE */
 	routine->AnalyzeForeignTable = postgresAnalyzeForeignTable;
@@ -3104,6 +3109,78 @@ postgresExecForeignDDL(Oid serverid, const char *sql)
 	 * The connection manager will handle it and will use 2PC
 	 * if there are multiple foreign servers in the transaction.
 	 */
+}
+
+/*
+ * postgresExecForeignCopyFromLocal
+ *		Stream a local CSV file into a remote table using existing FDW connection
+ */
+static void
+postgresExecForeignCopyFromLocal(Oid serverid,
+								 const char *nspname,
+								 const char *relname,
+								 const char *filepath)
+{
+	UserMapping *user;
+	PGconn	   *conn;
+	StringInfoData copycmd;
+	FILE	   *fp;
+	char		buf[8192];
+	PGresult   *res;
+
+	user = GetUserMapping(GetUserId(), serverid);
+	conn = GetConnection(user, false, NULL);
+
+	initStringInfo(&copycmd);
+	appendStringInfo(&copycmd,
+					 "COPY %s.%s FROM STDIN WITH (FORMAT CSV, HEADER);",
+					 quote_identifier(nspname),
+					 quote_identifier(relname));
+
+	res = PQexec(conn, copycmd.data);
+	if (res == NULL || PQresultStatus(res) != PGRES_COPY_IN)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("could not start COPY on remote server: %s",
+						PQerrorMessage(conn))));
+	PQclear(res);
+
+	fp = AllocateFile(filepath, "r");
+	if (fp == NULL)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open temporary file \"%s\" for reading", filepath)));
+
+	while (fgets(buf, sizeof(buf), fp) != NULL)
+	{
+		if (PQputCopyData(conn, buf, strlen(buf)) != 1)
+		{
+			FreeFile(fp);
+			ereport(ERROR,
+					(errcode(ERRCODE_CONNECTION_FAILURE),
+					 errmsg("could not send COPY data: %s",
+							PQerrorMessage(conn))));
+		}
+	}
+
+	FreeFile(fp);
+
+	if (PQputCopyEnd(conn, NULL) != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("could not finish COPY: %s",
+						PQerrorMessage(conn))));
+
+	res = PQgetResult(conn);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	{
+		PQclear(res);
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("COPY failed: %s", PQerrorMessage(conn))));
+	}
+	PQclear(res);
+	pfree(copycmd.data);
 }
 
 /*
