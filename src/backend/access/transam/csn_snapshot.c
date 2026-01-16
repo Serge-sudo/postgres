@@ -29,7 +29,7 @@
 #include "miscadmin.h"
 
 /* Raise a warning if imported snapshot_csn exceeds ours by this value. */
-#define SNAP_DESYNC_COMPLAIN (1*NSECS_PER_SEC) /* 1 second */
+#define SNAP_DESYNC_COMPLAIN (1 * HLC_TIME_UNITS_PER_SEC) /* 1 second */
 
 static TransactionId xmin_for_csn = InvalidTransactionId;
 
@@ -58,9 +58,9 @@ int csn_time_shift;
  *
  * On each snapshot acquisition CSNSnapshotMapXmin() is called and stores
  * correspondence between current snapshot_csn and oldestXmin in a sparse way:
- * snapshot_csn is rounded to seconds (and here we use the fact that snapshot_csn
- * is just a timestamp) and oldestXmin is stored in the circular buffer where
- * rounded snapshot_csn acts as an offset from current circular buffer head.
+ * snapshot_csn is rounded to seconds (using the physical component of the HLC)
+ * and oldestXmin is stored in the circular buffer where rounded snapshot_csn
+ * acts as an offset from current circular buffer head.
  * Size of the circular buffer is controlled by csn_snapshot_defer_time GUC.
  *
  * When csn snapshot arrives we check that its
@@ -212,7 +212,7 @@ CSNSnapshotMapXmin(SnapshotCSN snapshot_csn)
 	/*
 	 * Round up snapshot_csn to the next second -- pessimistically and safely.
 	 */
-	csn_seconds = (snapshot_csn / NSECS_PER_SEC + 1);
+	csn_seconds = (CSNGetPhysicalTime(snapshot_csn) / HLC_TIME_UNITS_PER_SEC + 1);
 
 	/*
 	 * Fast-path check. Avoid taking exclusive CSNSnapshotXidMapLock lock
@@ -317,7 +317,7 @@ CSNSnapshotToXmin(SnapshotCSN snapshot_csn)
 	Assert(csnXidMap != NULL);
 
 	/* Round down to get conservative estimates */
-	csn_seconds = (snapshot_csn / NSECS_PER_SEC);
+	csn_seconds = (CSNGetPhysicalTime(snapshot_csn) / HLC_TIME_UNITS_PER_SEC);
 
 	LWLockAcquire(CSNSnapshotXidMapLock, LW_SHARED);
 	last_csn_seconds = pg_atomic_read_u64(&csnXidMap->last_csn_seconds);
@@ -409,52 +409,41 @@ CSNSnapshotAssignCurrent(SnapshotCSN snapshot_csn)
  * CSNSnapshotSync
  *
  * Due to time desynchronization on different nodes we can receive snapshot_csn
- * which is greater than snapshot_csn on this node. To preserve proper isolation
- * this node needs to wait when such snapshot_csn comes on local clock.
+ * which is greater than snapshot_csn on this node. Use HLC receive semantics
+ * to advance the local clock, and optionally warn about a large physical skew.
  *
- * This should happend relatively rare if nodes have running NTP/PTP/etc.
- * Complain if wait time is more than SNAP_SYNC_COMPLAIN.
+ * This should happen relatively rare if nodes have running NTP/PTP/etc.
+ * Complain if skew is more than SNAP_DESYNC_COMPLAIN.
  */
 void
 CSNSnapshotSync(SnapshotCSN remote_csn)
 {
+	instr_time	current_time;
 	SnapshotCSN	local_csn;
 	SnapshotCSN	delta;
+	uint64		physical_time;
+	uint64		remote_time;
 
 	Assert(enable_csn_snapshot);
 
-	for(;;)
-	{
-		if (GetLastGeneratedCSN() > remote_csn)
-			return;
+	INSTR_TIME_SET_CURRENT(current_time);
+	physical_time = (uint64) INSTR_TIME_GET_NANOSEC(current_time) / NS_PER_MS;
+	physical_time += (int64) csn_time_shift * HLC_TIME_UNITS_PER_SEC;
+	remote_time = CSNGetPhysicalTime(remote_csn);
+	if (remote_time > physical_time)
+		delta = remote_time - physical_time;
+	else
+		delta = 0;
 
-		local_csn = GenerateCSN(true, InvalidCSN);
+	if (delta > SNAP_DESYNC_COMPLAIN)
+		ereport(WARNING,
+			(errmsg("remote global snapshot exceeds ours by more than a second"),
+			 errhint("Consider running NTPd on servers participating in global transaction")));
 
-		if (local_csn >= remote_csn)
-			/*
-			 * Everything is fine too, but last_max_csn wasn't updated for
-			 * some time.
-			 */
-			return;
-
-		/* Okay we need to sleep now */
-		delta = remote_csn - local_csn;
-		if (delta > SNAP_DESYNC_COMPLAIN)
-			ereport(WARNING,
-				(errmsg("remote global snapshot exceeds ours by more than a second"),
-				 errhint("Consider running NTPd on servers participating in global transaction")));
-
-		/* TODO: report this sleeptime somewhere? */
-		pg_usleep((long) (delta/NSECS_PER_USEC));
-
-		/*
-		 * Loop that checks to ensure that we actually slept for specified
-		 * amount of time.
-		 */
-	}
-
-	Assert(false); /* Should not happend */
-	return;
+	local_csn = GenerateCSN(false, remote_csn);
+	if (local_csn >= remote_csn)
+		/* Local clock has been advanced via HLC receive semantics. */
+		return;
 }
 
 /*

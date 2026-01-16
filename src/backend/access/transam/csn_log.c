@@ -686,33 +686,73 @@ csnsyncfiletag(const FileTag *ftag, char *path)
 /*
  * GenerateCSN
  *
- * Generate CSN which is actually a local time. Also we are forcing
- * this time to be always increasing. Since now it is not uncommon to have
- * millions of read transactions per second we are trying to use nanoseconds
- * if such time resolution is available.
+ * Generate CSN using a Hybrid Logical Clock (HLC). For local/send events,
+ * we advance based on local physical time. For receive events, we merge the
+ * incoming HLC with the local clock.
  */
 CSN
 GenerateCSN(bool locked, CSN assign)
 {
 	instr_time	current_time;
-	CSN	csn;
-	CSN log_csn = InvalidCSN;
+	CSN			csn;
+	CSN			log_csn = InvalidCSN;
+	uint64		physical_time;
+	uint64		local_time = 0;
+	uint64		local_counter = 0;
+	uint64		remote_time = 0;
+	uint64		remote_counter = 0;
+	uint64		next_time;
+	uint64		next_counter;
 
 	Assert(get_csnlog_status() || csn_snapshot_defer_time > 0);
 
 	/* TODO: create some macro that add small random shift to current time. */
 	INSTR_TIME_SET_CURRENT(current_time);
-	csn = (CSN) INSTR_TIME_GET_NANOSEC(current_time) + (int64) (csn_time_shift * 1E9);
-
-	if(assign != InvalidCSN && csn < assign)
-		csn = assign;
+	physical_time = (uint64) INSTR_TIME_GET_NANOSEC(current_time) / NS_PER_MS;
+	physical_time += (int64) csn_time_shift * HLC_TIME_UNITS_PER_SEC;
 
 	/* TODO: change to atomics? */
 	if (!locked)
 		SpinLockAcquire(&csnShared->lock);
 
-	if (csn <= csnShared->last_max_csn)
-		csn = csnShared->last_max_csn + 1;
+	if (CSNIsNormal(csnShared->last_max_csn))
+	{
+		local_time = CSNGetPhysicalTime(csnShared->last_max_csn);
+		local_counter = CSNGetLogicalCounter(csnShared->last_max_csn);
+	}
+
+	if (assign != InvalidCSN)
+	{
+		remote_time = CSNGetPhysicalTime(assign);
+		remote_counter = CSNGetLogicalCounter(assign);
+		next_time = Max(Max(local_time, remote_time), physical_time);
+		if (next_time == local_time && next_time == remote_time)
+			next_counter = Max(local_counter, remote_counter) + 1;
+		else if (next_time == local_time)
+			next_counter = local_counter + 1;
+		else if (next_time == remote_time)
+			next_counter = remote_counter + 1;
+		else
+			next_counter = 0;
+	}
+	else
+	{
+		next_time = Max(local_time, physical_time);
+		if (next_time == local_time)
+			next_counter = local_counter + 1;
+		else
+			next_counter = 0;
+	}
+
+	if (next_counter > HLC_COUNTER_MASK)
+	{
+		next_time++;
+		next_counter = 0;
+	}
+
+	csn = CSNMake(next_time, next_counter);
+	if (csn < FirstNormalCSN)
+		csn = FirstNormalCSN;
 	csnShared->last_max_csn = csn;
 
 	if (enable_csn_wal && csn > csnShared->last_csn_log_wal)
@@ -721,7 +761,7 @@ GenerateCSN(bool locked, CSN assign)
 		 * We log the CSN 5s greater than generated, you can see comments on
 		 * the CSN_ASSIGN_TIME_INTERVAL.
 		 */
-		log_csn = CSNAddByNanosec(csn, CSN_ASSIGN_TIME_INTERVAL);
+		log_csn = CSNAddBySeconds(csn, CSN_ASSIGN_TIME_INTERVAL);
 		csnShared->last_csn_log_wal = log_csn;
 	}
 

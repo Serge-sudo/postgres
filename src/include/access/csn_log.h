@@ -31,6 +31,21 @@
 #define CSNIsUnclear(csn)		((csn) == UnclearCSN)
 #define CSNIsNormal(csn)		((csn) >= FirstNormalCSN)
 
+/*
+ * Hybrid logical clock (HLC) layout for CSN.
+ * Physical time is tracked in milliseconds in the high bits, logical counter
+ * in the low bits.
+ */
+#define HLC_COUNTER_BITS			16
+#define HLC_COUNTER_MASK			((UINT64CONST(1) << HLC_COUNTER_BITS) - 1)
+#define HLC_TIME_SHIFT				HLC_COUNTER_BITS
+#define HLC_TIME_UNITS_PER_SEC		UINT64CONST(1000)
+
+#define CSNGetPhysicalTime(csn)		((uint64) (csn) >> HLC_TIME_SHIFT)
+#define CSNGetLogicalCounter(csn)	((uint64) (csn) & HLC_COUNTER_MASK)
+#define CSNMake(ptime, counter)		((CSN) (((uint64) (ptime) << HLC_TIME_SHIFT) | \
+										 ((uint64) (counter) & HLC_COUNTER_MASK)))
+
 /* XLOG stuff */
 #define XLOG_CSN_ASSIGNMENT			0x00
 #define XLOG_CSN_SETCSN				0x10
@@ -63,7 +78,8 @@ typedef struct xl_csn_set
 } xl_csn_set;
 
 #define MinSizeOfCSNSet offsetof(xl_csn_set, xsub)
-#define	CSNAddByNanosec(csn,second) (csn + second * 1000000000L)
+#define	CSNAddBySeconds(csn, seconds) \
+	(CSNMake(CSNGetPhysicalTime(csn) + (seconds) * HLC_TIME_UNITS_PER_SEC, 0))
 
 /* Main functions */
 extern void CSNLogSetCSN(TransactionId xid, int nsubxids,
