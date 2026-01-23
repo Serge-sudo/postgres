@@ -44,6 +44,9 @@
 int foreign_conn_multiplexer_workers = 0;
 bool enable_foreign_conn_multiplexer = false;
 
+/* Maximum number of workers supported */
+#define MAX_CONN_MULTIPLEXER_WORKERS 64
+
 /* Shared memory structures */
 typedef struct ConnMultiplexerShmemStruct
 {
@@ -52,7 +55,7 @@ typedef struct ConnMultiplexerShmemStruct
 	int			next_worker;		/* round-robin worker selection */
 	int			next_conn_id;		/* next connection ID to assign */
 	bool		initialized;		/* true when workers are running */
-	dsm_handle	worker_dsm_handles[64]; /* DSM handles for each worker */
+	dsm_handle	worker_dsm_handles[MAX_CONN_MULTIPLEXER_WORKERS]; /* DSM handles for each worker */
 } ConnMultiplexerShmemStruct;
 
 static ConnMultiplexerShmemStruct *ConnMultiplexerShmem = NULL;
@@ -350,7 +353,11 @@ process_worker_requests(WorkerConnection *connections, int worker_id)
 										worker_id, msg->conn_id)));
 					}
 
-					shm_mq_send(resp_mqh, resp->length, resp, false, true);
+					if (shm_mq_send(resp_mqh, resp->length, resp, false, true) != SHM_MQ_SUCCESS)
+					{
+						ereport(WARNING,
+								(errmsg("worker %d: failed to send CONNECT response", worker_id)));
+					}
 					pfree(resp);
 					break;
 				}
@@ -392,7 +399,11 @@ process_worker_requests(WorkerConnection *connections, int worker_id)
 										worker_id, msg->conn_id)));
 					}
 
-					shm_mq_send(resp_mqh, resp->length, resp, false, true);
+					if (shm_mq_send(resp_mqh, resp->length, resp, false, true) != SHM_MQ_SUCCESS)
+					{
+						ereport(WARNING,
+								(errmsg("worker %d: failed to send QUERY response", worker_id)));
+					}
 					pfree(resp);
 					break;
 				}
@@ -433,7 +444,11 @@ process_worker_requests(WorkerConnection *connections, int worker_id)
 						strcpy(resp->data, "Connection not found");
 					}
 
-					shm_mq_send(resp_mqh, resp->length, resp, false, true);
+					if (shm_mq_send(resp_mqh, resp->length, resp, false, true) != SHM_MQ_SUCCESS)
+					{
+						ereport(WARNING,
+								(errmsg("worker %d: failed to send CLOSE response", worker_id)));
+					}
 					pfree(resp);
 					break;
 				}
@@ -788,11 +803,9 @@ MultiplexerConnect(const char *conninfo, int *conn_id_out)
 	request_mq = shm_toc_lookup(toc, CONN_MUX_KEY_REQUEST_QUEUE, false);
 	response_mq = shm_toc_lookup(toc, CONN_MUX_KEY_RESPONSE_QUEUE, false);
 
-	/* Attach to queues - we send to request, receive from response */
+	/* Attach to queues - roles already set by worker */
 	req_mqh = shm_mq_attach(request_mq, seg, NULL);
-	shm_mq_set_sender(request_mq, MyProc);
 	resp_mqh = shm_mq_attach(response_mq, seg, NULL);
-	shm_mq_set_receiver(response_mq, MyProc);
 
 	/* Create CONNECT message */
 	msg_len = offsetof(ConnMuxMessage, data) + strlen(conninfo) + 1;
@@ -838,6 +851,13 @@ MultiplexerConnect(const char *conninfo, int *conn_id_out)
 			dsm_detach(seg);
 			return false;
 		}
+	}
+	else if (res == SHM_MQ_DETACHED)
+	{
+		ereport(WARNING,
+				(errmsg("multiplexer: worker %d queue detached", worker_id)));
+		dsm_detach(seg);
+		return false;
 	}
 	
 	ereport(WARNING,
@@ -935,11 +955,9 @@ MultiplexerQuery(int conn_id, const char *query, void **result_out)
 	request_mq = shm_toc_lookup(toc, CONN_MUX_KEY_REQUEST_QUEUE, false);
 	response_mq = shm_toc_lookup(toc, CONN_MUX_KEY_RESPONSE_QUEUE, false);
 
-	/* Attach to queues */
+	/* Attach to queues - roles already set by worker */
 	req_mqh = shm_mq_attach(request_mq, seg, NULL);
-	shm_mq_set_sender(request_mq, MyProc);
 	resp_mqh = shm_mq_attach(response_mq, seg, NULL);
-	shm_mq_set_receiver(response_mq, MyProc);
 
 	/* Create QUERY message */
 	msg_len = offsetof(ConnMuxMessage, data) + strlen(query) + 1;
@@ -984,6 +1002,13 @@ MultiplexerQuery(int conn_id, const char *query, void **result_out)
 			dsm_detach(seg);
 			return false;
 		}
+	}
+	else if (res == SHM_MQ_DETACHED)
+	{
+		ereport(WARNING,
+				(errmsg("multiplexer: worker %d queue detached", worker_id)));
+		dsm_detach(seg);
+		return false;
 	}
 	
 	ereport(WARNING,
@@ -1070,11 +1095,9 @@ MultiplexerClose(int conn_id)
 	request_mq = shm_toc_lookup(toc, CONN_MUX_KEY_REQUEST_QUEUE, false);
 	response_mq = shm_toc_lookup(toc, CONN_MUX_KEY_RESPONSE_QUEUE, false);
 
-	/* Attach to queues */
+	/* Attach to queues - roles already set by worker */
 	req_mqh = shm_mq_attach(request_mq, seg, NULL);
-	shm_mq_set_sender(request_mq, MyProc);
 	resp_mqh = shm_mq_attach(response_mq, seg, NULL);
-	shm_mq_set_receiver(response_mq, MyProc);
 
 	/* Create CLOSE message */
 	msg_len = sizeof(ConnMuxMessageHeader);
@@ -1111,6 +1134,11 @@ MultiplexerClose(int conn_id)
 			ereport(WARNING,
 					(errmsg("multiplexer: CLOSE failed: %s", resp_msg->data)));
 		}
+	}
+	else if (res == SHM_MQ_DETACHED)
+	{
+		ereport(WARNING,
+				(errmsg("multiplexer: worker %d queue detached during CLOSE", worker_id)));
 	}
 	
 	dsm_detach(seg);
