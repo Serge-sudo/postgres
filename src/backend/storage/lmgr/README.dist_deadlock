@@ -1,0 +1,219 @@
+# Distributed Deadlock Detection
+
+## Overview
+
+This module implements distributed deadlock detection for PostgreSQL shard groups. It allows detection of deadlocks that span multiple PostgreSQL nodes in a distributed system, **including deadlocks that span multiple shard groups**.
+
+**Integration with Local Deadlock Detection**: The distributed deadlock detector is automatically invoked by the existing PostgreSQL deadlock detection mechanism (`DeadLockCheck()`) when a process is waiting on a lock for a relation that belongs to a shard group.
+
+## Architecture
+
+The distributed deadlock detection system consists of several components:
+
+1. **Local Lock Graph Collection** - Collects wait-for relationships from the current node
+2. **Remote Query** - Queries all nodes across all shard groups for their lock graphs
+3. **Graph Merging** - Combines all graphs into a single global wait-for graph
+4. **Cycle Detection** - Uses depth-first search to find cycles in the merged graph
+5. **Integration** - Hooks into the existing deadlock detection system in `deadlock.c`
+
+## Integration with Existing Deadlock Detection
+
+The distributed deadlock detection is seamlessly integrated into PostgreSQL's existing deadlock detection system:
+
+### Automatic Invocation
+
+When a backend is waiting for a lock and the deadlock timeout expires, the system:
+
+1. **Local Check First**: `DeadLockCheck()` performs standard local deadlock detection
+2. **Check Shard Group**: If no local deadlock is found, it checks if the waited-on relation is part of a shard group (via `pg_class.relsgid`)
+3. **Global Distributed Check**: If the relation is in a shard group, it automatically calls `PerformGlobalDistributedDeadlockCheck()` which:
+   - Scans **all** shard groups in the system
+   - Collects members from all shard groups
+   - Queries all unique servers across all shard groups
+   - Merges all lock graphs into a single global graph
+   - Detects cycles that may span multiple shard groups
+4. **Action**: If a distributed deadlock is detected, returns `DS_HARD_DEADLOCK` to abort the transaction
+
+### Code Flow
+
+```
+ProcSleep() → deadlock_timeout expires
+    ↓
+CheckDeadLock() (in proc.c)
+    ↓
+DeadLockCheck() (in deadlock.c)
+    ↓
+    ├─→ Local deadlock check (existing code)
+    │   └─→ If found: return DS_HARD_DEADLOCK
+    │
+    └─→ If not found AND relation in shard group:
+        └─→ PerformGlobalDistributedDeadlockCheck()
+            ├─→ Scan all shard groups
+            ├─→ Collect all unique servers
+            ├─→ Query all servers for lock graphs
+            ├─→ Merge into global graph
+            └─→ Detect cycles (may span multiple shard groups)
+                └─→ If found: return DS_HARD_DEADLOCK
+```
+
+### Cross-Shard-Group Deadlock Detection
+
+The system can detect deadlocks that span multiple shard groups. For example:
+
+- Transaction T1 on Shard Group SG1 waits for Transaction T2 on Shard Group SG2
+- Transaction T2 on Shard Group SG2 waits for Transaction T1 on Shard Group SG1
+
+This forms a cycle across two different shard groups, which is detected by the global graph analysis.
+
+### Benefits of Integration
+
+- **Automatic**: No manual intervention required
+- **Transparent**: Works with existing applications
+- **Efficient**: Only runs when waiting on shard group relations
+- **Comprehensive**: Detects deadlocks within and across shard groups
+- **Consistent**: Uses same timeout and detection mechanisms as local deadlocks
+
+## How It Works
+
+### Wait-For Graph
+
+A wait-for graph is a directed graph where:
+- **Nodes** represent transactions/backends (identified by server OID + backend PID)
+- **Edges** represent "waits for" relationships (A → B means A is waiting for B)
+
+A deadlock exists when there is a cycle in this graph.
+
+### Distributed Detection Algorithm
+
+1. **Collect Local Graph**: The system examines the local `pg_locks` information to build a graph of lock waits on the current node.
+
+2. **Query Remote Nodes**: For each member of the shard group, the system connects to the remote server using **postgres_fdw** and queries the remote `pg_locks` via the `postgres_fdw_get_locks()` function. This function uses postgres_fdw's connection infrastructure to execute the query on the remote server.
+
+3. **Merge Graphs**: All local graphs are merged into a single global wait-for graph, where nodes are uniquely identified by (serverOid, backendPid).
+
+4. **Detect Cycles**: A depth-first search algorithm traverses the merged graph looking for cycles. If a cycle is found, it represents a distributed deadlock.
+
+## Prerequisites
+
+The distributed deadlock detection system requires:
+
+- **postgres_fdw extension** (version 1.2+): Used to execute queries on remote servers
+- **Foreign servers**: Each shard group member must be configured as a foreign server
+- **Proper authentication**: Remote servers must be accessible with appropriate credentials
+
+Install/upgrade postgres_fdw:
+```sql
+CREATE EXTENSION IF NOT EXISTS postgres_fdw;
+-- Or upgrade to version 1.2:
+ALTER EXTENSION postgres_fdw UPDATE TO '1.2';
+```
+
+## Usage
+
+### SQL Function
+
+The main interface is the SQL function `pg_check_distributed_deadlock()`:
+
+```sql
+-- Check for distributed deadlocks in shard group with OID 12345
+SELECT pg_check_distributed_deadlock(12345);
+```
+
+**Returns:**
+- `NULL` if no deadlock is detected
+- A text description of the deadlock if one is found, including:
+  - Number of nodes in the cycle
+  - Server OID, backend PID, and transaction ID for each node
+
+### Example Output
+
+```
+Distributed deadlock detected with 3 nodes in cycle:
+  Node 1: server=16384 pid=1234 xid=567
+  Node 2: server=16385 pid=5678 xid=890
+  Node 3: server=16384 pid=9012 xid=345
+```
+
+## Implementation Details
+
+### Data Structures
+
+**DistWaitNode**: Represents a node in the distributed graph
+```c
+typedef struct DistWaitNode {
+    Oid serverOid;      // Server identifier (InvalidOid for local)
+    int backendPid;     // Backend process ID
+    TransactionId xid;  // Transaction ID
+} DistWaitNode;
+```
+
+**DistWaitEdge**: Represents an edge (wait-for relationship)
+```c
+typedef struct DistWaitEdge {
+    DistWaitNode waiter;   // Process waiting
+    DistWaitNode blocker;  // Process being waited for
+    Oid lockOid;           // Object being locked
+    LOCKMODE lockMode;     // Type of lock
+} DistWaitEdge;
+```
+
+**DistLockGraph**: Contains the graph from a single node
+```c
+typedef struct DistLockGraph {
+    Oid serverOid;          // Source server
+    int numEdges;           // Number of edges
+    DistWaitEdge *edges;    // Array of edges
+} DistLockGraph;
+```
+
+### Key Functions
+
+- `CollectLocalLockGraph()` - Scans local lock manager structures
+- `QueryRemoteLockGraph(Oid serverOid)` - Queries remote node via SPI/FDW
+- `MergeLockGraphs()` - Combines multiple graphs
+- `DetectDistributedDeadlock()` - DFS-based cycle detection
+- `PerformDistributedDeadlockCheck()` - Main entry point
+
+## Limitations and Future Work
+
+1. **Performance**: The current implementation queries each node sequentially. This could be parallelized for better performance.
+
+2. **Network Failures**: The system needs better handling of connection failures and timeouts when querying remote nodes.
+
+3. **False Positives**: Due to the distributed nature, there's a small window where the system might detect a "false positive" if locks are released between when different nodes are queried.
+
+4. **Integration**: The system could be integrated with the automatic deadlock detector to periodically check for distributed deadlocks.
+
+5. **Resolution**: Currently the system only detects deadlocks. It does not automatically resolve them. Future work could add automatic victim selection and transaction abortion.
+
+## Files
+
+- `src/include/storage/dist_deadlock.h` - Header file with public API
+- `src/backend/storage/lmgr/dist_deadlock.c` - Implementation
+- `src/backend/utils/adt/lockfuncs.c` - SQL function interface
+
+## Dependencies
+
+- PostgreSQL shard groups feature
+- Foreign Data Wrapper (FDW) for remote connections
+- SPI (Server Programming Interface) for executing queries
+
+## Testing
+
+To test the distributed deadlock detection:
+
+1. Set up a shard group with multiple PostgreSQL nodes
+2. Create transactions that form a circular wait pattern across nodes
+3. Call `pg_check_distributed_deadlock()` to detect the deadlock
+
+Example scenario:
+- Node A: Transaction T1 holds lock on table X, waits for lock on table Y
+- Node B: Transaction T2 holds lock on table Y, waits for lock on table X
+
+This forms a deadlock cycle: T1 → T2 → T1
+
+## References
+
+- PostgreSQL Lock Manager: `src/backend/storage/lmgr/README`
+- Deadlock Detection: `src/backend/storage/lmgr/deadlock.c`
+- Distributed Systems: Classic distributed deadlock detection algorithms

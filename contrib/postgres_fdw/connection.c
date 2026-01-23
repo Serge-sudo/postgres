@@ -434,6 +434,17 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 
 	elog(DEBUG3, "new postgres_fdw connection %p for server \"%s\" (user mapping oid %u, userid %u)",
 		 entry->conn, server->servername, user->umid, user->userid);
+
+	/*
+	 * Register the connection in shared memory for distributed deadlock detection
+	 * Track the mapping: local_pid + server_oid -> remote_backend_pid
+	 */
+	if (entry->conn != NULL)
+	{
+		int remote_backend_pid = PQbackendPID(entry->conn);
+		if (remote_backend_pid > 0)
+			FdwConnShmemRegister(server->servername, remote_backend_pid);
+	}
 }
 
 /*
@@ -619,8 +630,19 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 static void
 disconnect_pg_server(ConnCacheEntry *entry)
 {
+	
+	elog(WARNING, "dis");
 	if (entry->conn != NULL)
 	{
+		ForeignServer *server;
+
+		/* Unregister from shared memory before disconnecting */
+		server = GetForeignServer(entry->serverid);
+		if (server != NULL)
+			FdwConnShmemUnregister(server->servername);
+		else
+			elog(WARNING, "failed to get foreign server for server OID %u during disconnect", entry->serverid);
+
 		libpqsrv_disconnect(entry->conn);
 		entry->conn = NULL;
 	}
@@ -2520,4 +2542,44 @@ disconnect_cached_connections(Oid serverid)
 	}
 
 	return result;
+}
+
+/*
+ * GetConnectionHashIterator
+ *		Initialize a hash sequence scan for the connection cache
+ *
+ * This function allows external callers (e.g., postgres_connections)
+ * to iterate over the connection cache. Returns true if the connection
+ * cache exists and the iterator was initialized, false otherwise.
+ *
+ * The caller should use hash_seq_search() to iterate through the entries.
+ */
+bool
+GetConnectionHashIterator(HASH_SEQ_STATUS *scan)
+{
+	if (!ConnectionHash)
+		return false;
+
+	hash_seq_init(scan, ConnectionHash);
+	return true;
+}
+
+/*
+ * GetConnCacheEntryInfo
+ *		Extract connection information from a ConnCacheEntry.
+ *
+ * Returns true if the entry has a valid connection, false otherwise.
+ * If true, fills in serverid and remote_backend_pid.
+ */
+bool
+GetConnCacheEntryInfo(void *entry_ptr, Oid *serverid, int *remote_backend_pid)
+{
+	ConnCacheEntry *entry = (ConnCacheEntry *) entry_ptr;
+
+	if (entry->conn == NULL)
+		return false;
+
+	*serverid = entry->serverid;
+	*remote_backend_pid = PQbackendPID(entry->conn);
+	return true;
 }
