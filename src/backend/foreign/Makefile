@@ -12,6 +12,8 @@ subdir = src/backend/foreign
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
+override CPPFLAGS := -I$(libpq_srcdir) $(CPPFLAGS)
+
 OBJS = \
 	conn_multiplexer.o \
 	foreign.o

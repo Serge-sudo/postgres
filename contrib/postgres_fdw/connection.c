@@ -154,6 +154,7 @@ static void configure_remote_session(PGconn *conn);
 static void do_sql_command_begin(PGconn *conn, const char *sql);
 static void do_sql_command_end(PGconn *conn, const char *sql,
 							   bool consume_input);
+static void do_sql_command_entry(ConnCacheEntry *entry, const char *sql);
 static void begin_remote_xact(ConnCacheEntry *entry);
 static void pgfdw_xact_callback(XactEvent event, void *arg);
 static void deallocate_prepared_stmts(ConnCacheEntry *entry);
@@ -846,6 +847,32 @@ do_sql_command(PGconn *conn, const char *sql)
 	do_sql_command_end(conn, sql, false);
 }
 
+/*
+ * Execute SQL command through multiplexer if enabled, otherwise directly
+ * This version takes ConnCacheEntry so it can route through the multiplexer
+ */
+static void
+do_sql_command_entry(ConnCacheEntry *entry, const char *sql)
+{
+	if (entry->use_multiplexer)
+	{
+		void *result = NULL;
+		
+		/* Route query through the multiplexer */
+		if (!MultiplexerQuery(entry->multiplexer_conn_id, sql, &result))
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_CONNECTION_FAILURE),
+					 errmsg("failed to execute command through multiplexer")));
+		}
+	}
+	else
+	{
+		/* Use direct connection */
+		do_sql_command(entry->conn, sql);
+	}
+}
+
 static void
 do_sql_command_begin(PGconn *conn, const char *sql)
 {
@@ -905,7 +932,7 @@ begin_remote_xact(ConnCacheEntry *entry)
 		else
 			sql = "START TRANSACTION ISOLATION LEVEL REPEATABLE READ";
 		entry->changing_xact_state = true;
-		do_sql_command(entry->conn, sql);
+		do_sql_command_entry(entry, sql);
 		entry->xact_depth = 1;
 		entry->changing_xact_state = false;
 
@@ -921,7 +948,7 @@ begin_remote_xact(ConnCacheEntry *entry)
 				"SELECT pg_csn_snapshot_import("UINT64_FORMAT")",
 				fdwTransState->csn);
 
-			do_sql_command(entry->conn, import_sql);
+			do_sql_command_entry(entry, import_sql);
 		}
 
 		fdwTransState->nparticipants += 1;
@@ -938,7 +965,7 @@ begin_remote_xact(ConnCacheEntry *entry)
 
 		snprintf(sql, sizeof(sql), "SAVEPOINT s%d", entry->xact_depth + 1);
 		entry->changing_xact_state = true;
-		do_sql_command(entry->conn, sql);
+		do_sql_command_entry(entry, sql);
 		entry->xact_depth++;
 		entry->changing_xact_state = false;
 	}
@@ -1328,7 +1355,7 @@ error:
 						pending_entries = lappend(pending_entries, entry);
 						continue;
 					}
-					do_sql_command(entry->conn, "COMMIT TRANSACTION");
+					do_sql_command_entry(entry, "COMMIT TRANSACTION");
 					entry->changing_xact_state = false;
 
 					if (UseCSNSnapshots)
@@ -1515,7 +1542,7 @@ pgfdw_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 				pending_entries = lappend(pending_entries, entry);
 				continue;
 			}
-			do_sql_command(entry->conn, sql);
+			do_sql_command_entry(entry, sql);
 			entry->changing_xact_state = false;
 		}
 		else

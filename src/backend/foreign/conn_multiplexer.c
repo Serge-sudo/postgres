@@ -40,9 +40,37 @@
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 
-/* GUC parameters */
-int foreign_conn_multiplexer_workers = 0;
-bool enable_foreign_conn_multiplexer = false;
+/* Forward declarations for libpq functions (to avoid including libpq-fe.h with BUILDING_DLL) */
+typedef struct pg_conn PGconn;
+typedef struct pg_result PGresult;
+
+typedef enum
+{
+	CONNECTION_OK,
+	CONNECTION_BAD
+} ConnStatusType;
+
+typedef enum
+{
+	PGRES_EMPTY_QUERY = 0,
+	PGRES_COMMAND_OK,
+	PGRES_TUPLES_OK
+} ExecStatusType;
+
+extern PGconn *PQconnectdb(const char *conninfo);
+extern void PQfinish(PGconn *conn);
+extern ConnStatusType PQstatus(const PGconn *conn);
+extern PGresult *PQexec(PGconn *conn, const char *command);
+extern ExecStatusType PQresultStatus(const PGresult *res);
+extern char *PQresultErrorMessage(const PGresult *res);
+extern char *PQerrorMessage(const PGconn *conn);
+extern void PQclear(PGresult *res);
+extern char *PQcmdStatus(PGresult *res);
+extern char *PQdb(const PGconn *conn);
+
+/* GUC parameters - defined in globals.c */
+extern int foreign_conn_multiplexer_workers;
+extern bool enable_foreign_conn_multiplexer;
 
 /* Maximum number of workers supported */
 #define MAX_CONN_MULTIPLEXER_WORKERS 64
@@ -320,22 +348,52 @@ process_worker_requests(WorkerConnection *connections, int worker_id)
 
 					if (conn != NULL)
 					{
+						PGconn *pgconn;
+						
 						conn->conn_id = msg->conn_id;
 						strncpy(conn->conninfo, msg->data, sizeof(conn->conninfo) - 1);
 						conn->conninfo[sizeof(conn->conninfo) - 1] = '\0';
 
-						/* Create success response */
-						resp_len = offsetof(ConnMuxMessage, data) + 8;
-						resp = palloc(resp_len);
-						resp->type = CONN_MUX_MSG_RESPONSE;
-						resp->length = resp_len;
-						resp->conn_id = msg->conn_id;
-						resp->request_id = msg->request_id;
-						strcpy(resp->data, "OK");
+						/* Actually establish the connection using libpq */
+						pgconn = PQconnectdb(conn->conninfo);
+						
+						if (PQstatus(pgconn) == CONNECTION_OK)
+						{
+							conn->pgconn = pgconn;
+							
+							/* Create success response */
+							resp_len = offsetof(ConnMuxMessage, data) + 8;
+							resp = palloc(resp_len);
+							resp->type = CONN_MUX_MSG_RESPONSE;
+							resp->length = resp_len;
+							resp->conn_id = msg->conn_id;
+							resp->request_id = msg->request_id;
+							strcpy(resp->data, "OK");
 
-						ereport(LOG,
-								(errmsg("worker %d: allocated connection %d",
-										worker_id, msg->conn_id)));
+							ereport(LOG,
+									(errmsg("worker %d: established connection %d to %s",
+											worker_id, msg->conn_id, PQdb(pgconn))));
+						}
+						else
+						{
+							/* Connection failed */
+							const char *err = PQerrorMessage(pgconn);
+							PQfinish(pgconn);
+							conn->in_use = false;
+							conn->pgconn = NULL;
+							
+							resp_len = offsetof(ConnMuxMessage, data) + strlen(err) + 1;
+							resp = palloc(resp_len);
+							resp->type = CONN_MUX_MSG_ERROR;
+							resp->length = resp_len;
+							resp->conn_id = msg->conn_id;
+							resp->request_id = msg->request_id;
+							strcpy(resp->data, err);
+
+							ereport(WARNING,
+									(errmsg("worker %d: connection %d failed: %s",
+											worker_id, msg->conn_id, err)));
+						}
 					}
 					else
 					{
@@ -368,20 +426,72 @@ process_worker_requests(WorkerConnection *connections, int worker_id)
 					ConnMuxMessage *resp;
 					Size resp_len;
 
-					if (conn != NULL)
+					if (conn != NULL && conn->pgconn != NULL)
 					{
-						/* Create success response */
-						resp_len = offsetof(ConnMuxMessage, data) + 64;
-						resp = palloc(resp_len);
-						resp->type = CONN_MUX_MSG_RESPONSE;
-						resp->length = resp_len;
-						resp->conn_id = msg->conn_id;
-						resp->request_id = msg->request_id;
-						snprintf(resp->data, 64, "Executed: %.40s", msg->data);
+						PGconn *pgconn = (PGconn *) conn->pgconn;
+						PGresult *result;
+						
+						/* Execute the query using libpq */
+						result = PQexec(pgconn, msg->data);
+						
+						if (result != NULL)
+						{
+							ExecStatusType status = PQresultStatus(result);
+							
+							if (status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK)
+							{
+								/* Query succeeded - for now return simple confirmation */
+								char result_str[256];
+								snprintf(result_str, sizeof(result_str), 
+										"OK: %s", PQcmdStatus(result));
+								
+								resp_len = offsetof(ConnMuxMessage, data) + strlen(result_str) + 1;
+								resp = palloc(resp_len);
+								resp->type = CONN_MUX_MSG_RESPONSE;
+								resp->length = resp_len;
+								resp->conn_id = msg->conn_id;
+								resp->request_id = msg->request_id;
+								strcpy(resp->data, result_str);
 
-						ereport(LOG,
-								(errmsg("worker %d: executed query on connection %d",
-										worker_id, msg->conn_id)));
+								ereport(LOG,
+										(errmsg("worker %d: executed query on connection %d: %.40s",
+												worker_id, msg->conn_id, msg->data)));
+							}
+							else
+							{
+								/* Query failed */
+								const char *err = PQresultErrorMessage(result);
+								resp_len = offsetof(ConnMuxMessage, data) + strlen(err) + 1;
+								resp = palloc(resp_len);
+								resp->type = CONN_MUX_MSG_ERROR;
+								resp->length = resp_len;
+								resp->conn_id = msg->conn_id;
+								resp->request_id = msg->request_id;
+								strcpy(resp->data, err);
+
+								ereport(WARNING,
+										(errmsg("worker %d: query failed on connection %d: %s",
+												worker_id, msg->conn_id, err)));
+							}
+							
+							PQclear(result);
+						}
+						else
+						{
+							/* PQexec returned NULL */
+							const char *err = PQerrorMessage(pgconn);
+							resp_len = offsetof(ConnMuxMessage, data) + strlen(err) + 1;
+							resp = palloc(resp_len);
+							resp->type = CONN_MUX_MSG_ERROR;
+							resp->length = resp_len;
+							resp->conn_id = msg->conn_id;
+							resp->request_id = msg->request_id;
+							strcpy(resp->data, err);
+
+							ereport(WARNING,
+									(errmsg("worker %d: PQexec failed on connection %d: %s",
+											worker_id, msg->conn_id, err)));
+						}
 					}
 					else
 					{
@@ -416,8 +526,14 @@ process_worker_requests(WorkerConnection *connections, int worker_id)
 
 					if (conn != NULL)
 					{
+						/* Close the libpq connection if it exists */
+						if (conn->pgconn != NULL)
+						{
+							PQfinish((PGconn *) conn->pgconn);
+							conn->pgconn = NULL;
+						}
+						
 						conn->in_use = false;
-						conn->pgconn = NULL;
 
 						/* Create success response */
 						resp_len = offsetof(ConnMuxMessage, data) + 8;
