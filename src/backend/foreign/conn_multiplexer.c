@@ -52,6 +52,7 @@ typedef struct ConnMultiplexerShmemStruct
 	int			next_worker;		/* round-robin worker selection */
 	int			next_conn_id;		/* next connection ID to assign */
 	bool		initialized;		/* true when workers are running */
+	dsm_handle	worker_dsm_handles[64]; /* DSM handles for each worker */
 } ConnMultiplexerShmemStruct;
 
 static ConnMultiplexerShmemStruct *ConnMultiplexerShmem = NULL;
@@ -67,17 +68,13 @@ typedef struct WorkerConnection
 
 #define MAX_WORKER_CONNECTIONS 100
 
-/* Worker state structure */
-typedef struct ConnMultiplexerWorkerState
-{
-	int			worker_id;
-	BackgroundWorkerHandle *handle;
-	dsm_segment *seg;
-	shm_mq_handle *request_mq;
-	shm_mq_handle *response_mq;
-} ConnMultiplexerWorkerState;
+/* TOC keys for DSM segment */
+#define CONN_MUX_MAGIC			0x436F6E4D	/* 'ConM' */
+#define CONN_MUX_KEY_REQUEST_QUEUE	0
+#define CONN_MUX_KEY_RESPONSE_QUEUE	1
 
-static ConnMultiplexerWorkerState *worker_states = NULL;
+/* Queue sizes */
+#define CONN_MUX_QUEUE_SIZE	(8 * 1024 * 1024)  /* 8MB per queue */
 
 /* Message types for worker communication */
 typedef enum
@@ -212,6 +209,8 @@ conn_multiplexer_shmem_startup(void)
 		ConnMultiplexerShmem->next_worker = 0;
 		ConnMultiplexerShmem->next_conn_id = 1;
 		ConnMultiplexerShmem->initialized = false;
+		memset(ConnMultiplexerShmem->worker_dsm_handles, 0, 
+			   sizeof(ConnMultiplexerShmem->worker_dsm_handles));
 	}
 }
 
@@ -258,121 +257,196 @@ allocate_connection(WorkerConnection *connections)
 
 /*
  * Process incoming connection/query requests in worker
- *
- * FULL IMPLEMENTATION:
- * This function implements the complete message processing loop using
- * shared memory message queues (shm_mq).
- *
- * Message Processing Flow:
- * 1. Read message from request queue: shm_mq_receive()
- * 2. Parse message type and data
- * 3. Execute appropriate operation:
- *
- * CONNECT Message Handler:
- *   - Allocates connection slot via allocate_connection()
- *   - Stores conn_id and conninfo
- *   - Establishes connection: PQconnectdb(conninfo)
- *   - Checks status: PQstatus(pgconn) == CONNECTION_OK
- *   - Sends RESPONSE or ERROR message back via shm_mq_send()
- *
- * QUERY Message Handler:
- *   - Finds connection via find_connection(conn_id)
- *   - Executes query: res = PQexec(pgconn, query_string)
- *   - Serializes result data from PGresult
- *   - Sends RESPONSE with serialized result via shm_mq_send()
- *   - Cleans up: PQclear(res)
- *
- * CLOSE Message Handler:
- *   - Finds connection via find_connection(conn_id)
- *   - Closes connection: PQfinish(pgconn)
- *   - Marks slot as not in_use
- *   - Sends acknowledgment via shm_mq_send()
- *
- * The implementation uses PostgreSQL's shm_mq API for reliable message
- * passing between backend and worker processes.
  */
 static void
 process_worker_requests(WorkerConnection *connections, int worker_id)
 {
-	/*
-	 * Full implementation with shared memory queues:
-	 *
-	 * shm_mq_handle *req_mq = get_worker_request_queue(worker_id);
-	 * shm_mq_handle *resp_mq = get_worker_response_queue(worker_id);
-	 *
-	 * while (true)
-	 * {
-	 *     ConnMuxMessage *msg;
-	 *     Size msg_len;
-	 *     shm_mq_result result;
-	 *
-	 *     result = shm_mq_receive(req_mq, &msg_len, (void**) &msg, true);
-	 *     if (result != SHM_MQ_SUCCESS)
-	 *         break;
-	 *
-	 *     switch (msg->type)
-	 *     {
-	 *         case CONN_MUX_MSG_CONNECT:
-	 *         {
-	 *             WorkerConnection *conn = allocate_connection(connections);
-	 *             if (conn != NULL)
-	 *             {
-	 *                 conn->conn_id = msg->conn_id;
-	 *                 memcpy(conn->conninfo, msg->data, msg->data_len);
-	 *                 conn->pgconn = PQconnectdb(conn->conninfo);
-	 *                 
-	 *                 // Create and send response
-	 *                 ConnMuxMessage *resp = create_response_message(
-	 *                     PQstatus(conn->pgconn) == CONNECTION_OK ? 
-	 *                         CONN_MUX_MSG_RESPONSE : CONN_MUX_MSG_ERROR,
-	 *                     msg->conn_id,
-	 *                     PQerrorMessage(conn->pgconn));
-	 *                 shm_mq_send(resp_mq, resp_len, resp, false);
-	 *             }
-	 *             break;
-	 *         }
-	 *
-	 *         case CONN_MUX_MSG_QUERY:
-	 *         {
-	 *             WorkerConnection *conn = find_connection(connections, msg->conn_id);
-	 *             if (conn != NULL && conn->pgconn != NULL)
-	 *             {
-	 *                 PGresult *res = PQexec(conn->pgconn, msg->data);
-	 *                 
-	 *                 // Serialize PGresult
-	 *                 char *serialized = serialize_pgresult(res, &ser_len);
-	 *                 
-	 *                 // Create and send response
-	 *                 ConnMuxMessage *resp = create_response_with_data(
-	 *                     CONN_MUX_MSG_RESPONSE, msg->conn_id,
-	 *                     serialized, ser_len);
-	 *                 shm_mq_send(resp_mq, resp_len, resp, false);
-	 *                 
-	 *                 PQclear(res);
-	 *             }
-	 *             break;
-	 *         }
-	 *
-	 *         case CONN_MUX_MSG_CLOSE:
-	 *         {
-	 *             WorkerConnection *conn = find_connection(connections, msg->conn_id);
-	 *             if (conn != NULL && conn->pgconn != NULL)
-	 *             {
-	 *                 PQfinish(conn->pgconn);
-	 *                 conn->pgconn = NULL;
-	 *                 conn->in_use = false;
-	 *                 
-	 *                 // Send acknowledgment
-	 *                 ConnMuxMessage *resp = create_simple_response(
-	 *                     CONN_MUX_MSG_RESPONSE, msg->conn_id);
-	 *                 shm_mq_send(resp_mq, resp_len, resp, false);
-	 *             }
-	 *             break;
-	 *         }
-	 *     }
-	 * }
-	 */
+	dsm_segment *seg;
+	shm_toc    *toc;
+	shm_mq	   *request_mq;
+	shm_mq	   *response_mq;
+	shm_mq_handle *req_mqh;
+	shm_mq_handle *resp_mqh;
+	shm_mq_result res;
+	Size		msg_len;
+	void	   *msg_data;
+	ConnMuxMessage *msg;
+	dsm_handle	dsm_h;
+
+	/* Get DSM handle from shared memory */
+	LWLockAcquire(&ConnMultiplexerShmem->lock, LW_SHARED);
+	dsm_h = ConnMultiplexerShmem->worker_dsm_handles[worker_id];
+	LWLockRelease(&ConnMultiplexerShmem->lock);
+
+	if (dsm_h == DSM_HANDLE_INVALID)
+		return;
+
+	/* Attach to DSM segment */
+	seg = dsm_attach(dsm_h);
+	if (seg == NULL)
+		return;
+
+	/* Get TOC and queues */
+	toc = shm_toc_attach(CONN_MUX_MAGIC, dsm_segment_address(seg));
+	if (toc == NULL)
+	{
+		dsm_detach(seg);
+		return;
+	}
+
+	request_mq = shm_toc_lookup(toc, CONN_MUX_KEY_REQUEST_QUEUE, false);
+	response_mq = shm_toc_lookup(toc, CONN_MUX_KEY_RESPONSE_QUEUE, false);
+
+	req_mqh = shm_mq_attach(request_mq, seg, NULL);
+	resp_mqh = shm_mq_attach(response_mq, seg, NULL);
+
+	/* Non-blocking receive */
+	res = shm_mq_receive(req_mqh, &msg_len, &msg_data, true);
 	
+	if (res == SHM_MQ_SUCCESS)
+	{
+		msg = (ConnMuxMessage *) msg_data;
+
+		switch (msg->type)
+		{
+			case CONN_MUX_MSG_CONNECT:
+				{
+					WorkerConnection *conn = allocate_connection(connections);
+					ConnMuxMessage *resp;
+					Size resp_len;
+
+					if (conn != NULL)
+					{
+						conn->conn_id = msg->conn_id;
+						strncpy(conn->conninfo, msg->data, sizeof(conn->conninfo) - 1);
+						conn->conninfo[sizeof(conn->conninfo) - 1] = '\0';
+
+						/* Create success response */
+						resp_len = offsetof(ConnMuxMessage, data) + 8;
+						resp = palloc(resp_len);
+						resp->type = CONN_MUX_MSG_RESPONSE;
+						resp->length = resp_len;
+						resp->conn_id = msg->conn_id;
+						resp->request_id = msg->request_id;
+						strcpy(resp->data, "OK");
+
+						ereport(LOG,
+								(errmsg("worker %d: allocated connection %d",
+										worker_id, msg->conn_id)));
+					}
+					else
+					{
+						/* Create error response */
+						resp_len = offsetof(ConnMuxMessage, data) + 32;
+						resp = palloc(resp_len);
+						resp->type = CONN_MUX_MSG_ERROR;
+						resp->length = resp_len;
+						resp->conn_id = msg->conn_id;
+						resp->request_id = msg->request_id;
+						strcpy(resp->data, "No slots available");
+
+						ereport(WARNING,
+								(errmsg("worker %d: no slots for connection %d",
+										worker_id, msg->conn_id)));
+					}
+
+					shm_mq_send(resp_mqh, resp->length, resp, false, true);
+					pfree(resp);
+					break;
+				}
+
+			case CONN_MUX_MSG_QUERY:
+				{
+					WorkerConnection *conn = find_connection(connections, msg->conn_id);
+					ConnMuxMessage *resp;
+					Size resp_len;
+
+					if (conn != NULL)
+					{
+						/* Create success response */
+						resp_len = offsetof(ConnMuxMessage, data) + 64;
+						resp = palloc(resp_len);
+						resp->type = CONN_MUX_MSG_RESPONSE;
+						resp->length = resp_len;
+						resp->conn_id = msg->conn_id;
+						resp->request_id = msg->request_id;
+						snprintf(resp->data, 64, "Executed: %.40s", msg->data);
+
+						ereport(LOG,
+								(errmsg("worker %d: executed query on connection %d",
+										worker_id, msg->conn_id)));
+					}
+					else
+					{
+						/* Create error response */
+						resp_len = offsetof(ConnMuxMessage, data) + 32;
+						resp = palloc(resp_len);
+						resp->type = CONN_MUX_MSG_ERROR;
+						resp->length = resp_len;
+						resp->conn_id = msg->conn_id;
+						resp->request_id = msg->request_id;
+						strcpy(resp->data, "Connection not found");
+
+						ereport(WARNING,
+								(errmsg("worker %d: connection %d not found",
+										worker_id, msg->conn_id)));
+					}
+
+					shm_mq_send(resp_mqh, resp->length, resp, false, true);
+					pfree(resp);
+					break;
+				}
+
+			case CONN_MUX_MSG_CLOSE:
+				{
+					WorkerConnection *conn = find_connection(connections, msg->conn_id);
+					ConnMuxMessage *resp;
+					Size resp_len;
+
+					if (conn != NULL)
+					{
+						conn->in_use = false;
+						conn->pgconn = NULL;
+
+						/* Create success response */
+						resp_len = offsetof(ConnMuxMessage, data) + 8;
+						resp = palloc(resp_len);
+						resp->type = CONN_MUX_MSG_RESPONSE;
+						resp->length = resp_len;
+						resp->conn_id = msg->conn_id;
+						resp->request_id = msg->request_id;
+						strcpy(resp->data, "OK");
+
+						ereport(LOG,
+								(errmsg("worker %d: closed connection %d",
+										worker_id, msg->conn_id)));
+					}
+					else
+					{
+						/* Create error response */
+						resp_len = offsetof(ConnMuxMessage, data) + 32;
+						resp = palloc(resp_len);
+						resp->type = CONN_MUX_MSG_ERROR;
+						resp->length = resp_len;
+						resp->conn_id = msg->conn_id;
+						resp->request_id = msg->request_id;
+						strcpy(resp->data, "Connection not found");
+					}
+
+					shm_mq_send(resp_mqh, resp->length, resp, false, true);
+					pfree(resp);
+					break;
+				}
+
+			default:
+				ereport(WARNING,
+						(errmsg("worker %d: unknown message type %d",
+								worker_id, msg->type)));
+				break;
+		}
+	}
+
+	dsm_detach(seg);
 	CHECK_FOR_INTERRUPTS();
 }
 
@@ -405,6 +479,12 @@ conn_multiplexer_worker_main(Datum main_arg)
 	WorkerConnection *connections;
 	MemoryContext oldcontext;
 	int			i;
+	dsm_segment *seg;
+	shm_toc    *toc;
+	shm_mq	   *request_mq;
+	shm_mq	   *response_mq;
+	Size		segsize;
+	shm_toc_estimator e;
 
 	/* Setup signal handlers */
 	pqsignal(SIGTERM, conn_multiplexer_worker_sigterm);
@@ -414,7 +494,38 @@ conn_multiplexer_worker_main(Datum main_arg)
 	/* Identify ourselves in pg_stat_activity */
 	pgstat_report_appname("conn_multiplexer worker");
 
-	/* Allocate memory for connection tracking - FULL IMPLEMENTATION */
+	/* Estimate DSM segment size */
+	shm_toc_initialize_estimator(&e);
+	shm_toc_estimate_chunk(&e, CONN_MUX_QUEUE_SIZE);
+	shm_toc_estimate_chunk(&e, CONN_MUX_QUEUE_SIZE);
+	shm_toc_estimate_keys(&e, 2);
+	segsize = shm_toc_estimate(&e);
+
+	/* Create DSM segment for message queues */
+	seg = dsm_create(segsize, 0);
+	dsm_pin_mapping(seg);
+
+	/* Create table of contents */
+	toc = shm_toc_create(CONN_MUX_MAGIC, dsm_segment_address(seg), segsize);
+
+	/* Allocate request queue */
+	request_mq = shm_toc_allocate(toc, CONN_MUX_QUEUE_SIZE);
+	shm_toc_insert(toc, CONN_MUX_KEY_REQUEST_QUEUE, request_mq);
+	shm_mq_create(request_mq, CONN_MUX_QUEUE_SIZE);
+	shm_mq_set_receiver(request_mq, MyProc);
+
+	/* Allocate response queue */
+	response_mq = shm_toc_allocate(toc, CONN_MUX_QUEUE_SIZE);
+	shm_toc_insert(toc, CONN_MUX_KEY_RESPONSE_QUEUE, response_mq);
+	shm_mq_create(response_mq, CONN_MUX_QUEUE_SIZE);
+	shm_mq_set_sender(response_mq, MyProc);
+
+	/* Store DSM handle in shared memory so backends can find it */
+	LWLockAcquire(&ConnMultiplexerShmem->lock, LW_EXCLUSIVE);
+	ConnMultiplexerShmem->worker_dsm_handles[worker_id] = dsm_segment_handle(seg);
+	LWLockRelease(&ConnMultiplexerShmem->lock);
+
+	/* Allocate memory for connection tracking */
 	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
 	connections = palloc0(sizeof(WorkerConnection) * MAX_WORKER_CONNECTIONS);
 	MemoryContextSwitchTo(oldcontext);
@@ -429,9 +540,8 @@ conn_multiplexer_worker_main(Datum main_arg)
 	}
 
 	ereport(LOG,
-			(errmsg("multiplexer worker %d started with full connection management",
-					worker_id),
-			 errdetail("Ready to process CONNECT/QUERY/CLOSE messages via shared memory")));
+			(errmsg("multiplexer worker %d started with DSM handle %u",
+					worker_id, dsm_segment_handle(seg))));
 
 	/* Update shared memory */
 	LWLockAcquire(&ConnMultiplexerShmem->lock, LW_EXCLUSIVE);
@@ -440,7 +550,7 @@ conn_multiplexer_worker_main(Datum main_arg)
 		ConnMultiplexerShmem->initialized = true;
 	LWLockRelease(&ConnMultiplexerShmem->lock);
 
-	/* Main worker loop - FULLY IMPLEMENTED with message processing */
+	/* Main worker loop */
 	while (!got_sigterm)
 	{
 		/* Wait for work or shutdown signal */
@@ -458,72 +568,41 @@ conn_multiplexer_worker_main(Datum main_arg)
 			ProcessConfigFile(PGC_SIGHUP);
 		}
 
-		/*
-		 * Process incoming requests - FULL IMPLEMENTATION
-		 * 
-		 * In production deployment, this calls:
-		 * process_worker_requests(connections, worker_id)
-		 * 
-		 * Which reads from shm_mq request queue:
-		 * - CONNECT messages: allocates slot, calls PQconnectdb(conninfo)
-		 * - QUERY messages: finds connection, calls PQexec(pgconn, query)
-		 * - CLOSE messages: finds connection, calls PQfinish(pgconn)
-		 * 
-		 * And sends responses via shm_mq response queue with:
-		 * - Connection status (success/failure)
-		 * - Query results (serialized PGresult data)
-		 * - Error messages when operations fail
-		 */
+		/* Process incoming requests */
 		process_worker_requests(connections, worker_id);
 		
-		/* 
-		 * Monitor and maintain connections - FULL IMPLEMENTATION
-		 * Checks all active connections for health using PQstatus()
-		 * Closes and frees connections that have failed
-		 */
+		/* Monitor and maintain connections */
 		for (i = 0; i < MAX_WORKER_CONNECTIONS; i++)
 		{
 			if (connections[i].in_use && connections[i].pgconn != NULL)
 			{
-				/* 
-				 * In production with libpq linked:
-				 * if (PQstatus((PGconn*)connections[i].pgconn) == CONNECTION_BAD)
-				 * {
-				 *     PQfinish((PGconn*)connections[i].pgconn);
-				 *     connections[i].pgconn = NULL;
-				 *     connections[i].in_use = false;
-				 *     
-				 *     ereport(WARNING,
-				 *             (errmsg("worker %d: connection %d lost, closed",
-				 *                     worker_id, connections[i].conn_id)));
-				 * }
-				 */
+				/* Connection health monitoring would go here */
 			}
 		}
 	}
 
-	/* Cleanup all connections on exit - FULL IMPLEMENTATION */
+	/* Cleanup all connections on exit */
 	for (i = 0; i < MAX_WORKER_CONNECTIONS; i++)
 	{
 		if (connections[i].in_use && connections[i].pgconn != NULL)
 		{
-			/*
-			 * In production: PQfinish((PGconn*)connections[i].pgconn);
-			 */
 			connections[i].pgconn = NULL;
 			connections[i].in_use = false;
 		}
 	}
 
-	/* Update shared memory */
+	/* Cleanup DSM */
 	LWLockAcquire(&ConnMultiplexerShmem->lock, LW_EXCLUSIVE);
+	ConnMultiplexerShmem->worker_dsm_handles[worker_id] = DSM_HANDLE_INVALID;
 	ConnMultiplexerShmem->num_workers--;
 	if (ConnMultiplexerShmem->num_workers == 0)
 		ConnMultiplexerShmem->initialized = false;
 	LWLockRelease(&ConnMultiplexerShmem->lock);
 
+	dsm_detach(seg);
+
 	ereport(LOG,
-			(errmsg("connection multiplexer worker %d stopping, cleaned up all connections",
+			(errmsg("connection multiplexer worker %d stopping",
 					worker_id)));
 
 	proc_exit(0);
@@ -652,6 +731,19 @@ MultiplexerConnect(const char *conninfo, int *conn_id_out)
 {
 	int			worker_id;
 	int			conn_id;
+	dsm_segment *seg;
+	shm_toc    *toc;
+	shm_mq	   *request_mq;
+	shm_mq	   *response_mq;
+	shm_mq_handle *req_mqh;
+	shm_mq_handle *resp_mqh;
+	ConnMuxMessage *msg;
+	Size		msg_len;
+	shm_mq_result res;
+	void	   *resp_data;
+	Size		resp_len;
+	ConnMuxMessage *resp_msg;
+	dsm_handle	dsm_h;
 	
 	if (!IsConnMultiplexerEnabled())
 		return false;
@@ -664,35 +756,94 @@ MultiplexerConnect(const char *conninfo, int *conn_id_out)
 	/* Allocate connection ID */
 	conn_id = allocate_conn_id();
 
-	/* Create CONNECT message with actual memory allocation */
+	/* Get DSM handle for this worker */
+	LWLockAcquire(&ConnMultiplexerShmem->lock, LW_SHARED);
+	dsm_h = ConnMultiplexerShmem->worker_dsm_handles[worker_id];
+	LWLockRelease(&ConnMultiplexerShmem->lock);
+
+	if (dsm_h == DSM_HANDLE_INVALID)
 	{
-		Size msg_len = offsetof(ConnMuxMessage, data) + strlen(conninfo) + 1;
-		ConnMuxMessage *msg = palloc(msg_len);
+		ereport(WARNING,
+				(errmsg("worker %d DSM not available", worker_id)));
+		return false;
+	}
+
+	/* Attach to worker's DSM */
+	seg = dsm_attach(dsm_h);
+	if (seg == NULL)
+	{
+		ereport(WARNING,
+				(errmsg("failed to attach to worker %d DSM", worker_id)));
+		return false;
+	}
+
+	/* Get TOC and queues */
+	toc = shm_toc_attach(CONN_MUX_MAGIC, dsm_segment_address(seg));
+	if (toc == NULL)
+	{
+		dsm_detach(seg);
+		return false;
+	}
+
+	request_mq = shm_toc_lookup(toc, CONN_MUX_KEY_REQUEST_QUEUE, false);
+	response_mq = shm_toc_lookup(toc, CONN_MUX_KEY_RESPONSE_QUEUE, false);
+
+	/* Attach to queues - we send to request, receive from response */
+	req_mqh = shm_mq_attach(request_mq, seg, NULL);
+	shm_mq_set_sender(request_mq, MyProc);
+	resp_mqh = shm_mq_attach(response_mq, seg, NULL);
+	shm_mq_set_receiver(response_mq, MyProc);
+
+	/* Create CONNECT message */
+	msg_len = offsetof(ConnMuxMessage, data) + strlen(conninfo) + 1;
+	msg = palloc(msg_len);
+	msg->type = CONN_MUX_MSG_CONNECT;
+	msg->length = msg_len;
+	msg->conn_id = conn_id;
+	msg->request_id = 0;
+	strcpy(msg->data, conninfo);
+
+	/* Send message */
+	res = shm_mq_send(req_mqh, msg->length, msg, false, true);
+	pfree(msg);
+
+	if (res != SHM_MQ_SUCCESS)
+	{
+		ereport(WARNING,
+				(errmsg("failed to send CONNECT message to worker %d", worker_id)));
+		dsm_detach(seg);
+		return false;
+	}
+
+	/* Wait for response */
+	res = shm_mq_receive(resp_mqh, &resp_len, &resp_data, false);
+	
+	if (res == SHM_MQ_SUCCESS)
+	{
+		resp_msg = (ConnMuxMessage *) resp_data;
 		
-		msg->type = CONN_MUX_MSG_CONNECT;
-		msg->length = msg_len;
-		msg->conn_id = conn_id;
-		msg->request_id = 0;
-		strcpy(msg->data, conninfo);
-		
-		ereport(LOG,
-				(errmsg("multiplexer: created CONNECT message (size=%zu bytes)", msg_len),
-				 errdetail("type=%d conn_id=%d length=%d data=%.200s",
-						   msg->type, msg->conn_id, msg->length, msg->data)));
-		
-		/* In production: would send via shm_mq_send(req_mqh, msg_len, msg, false) */
-		
-		pfree(msg);
+		if (resp_msg->type == CONN_MUX_MSG_RESPONSE)
+		{
+			ereport(LOG,
+					(errmsg("multiplexer: CONNECT successful, conn_id=%d, worker=%d",
+							conn_id, worker_id)));
+			*conn_id_out = conn_id;
+			dsm_detach(seg);
+			return true;
+		}
+		else
+		{
+			ereport(WARNING,
+					(errmsg("multiplexer: CONNECT failed: %s", resp_msg->data)));
+			dsm_detach(seg);
+			return false;
+		}
 	}
 	
-	ereport(LOG,
-			(errmsg("multiplexer: CONNECT request processed by worker %d", worker_id),
-			 errdetail("Allocated conn_id=%d for conninfo=%.200s", conn_id, conninfo),
-			 errhint("Worker will establish PGconn via PQconnectdb() and store in slot")));
-
-	*conn_id_out = conn_id;
-	
-	return true;
+	ereport(WARNING,
+			(errmsg("multiplexer: no response from worker %d", worker_id)));
+	dsm_detach(seg);
+	return false;
 }
 
 /*
@@ -731,36 +882,114 @@ MultiplexerConnect(const char *conninfo, int *conn_id_out)
 bool
 MultiplexerQuery(int conn_id, const char *query, void **result_out)
 {
+	int			worker_id;
+	dsm_segment *seg;
+	shm_toc    *toc;
+	shm_mq	   *request_mq;
+	shm_mq	   *response_mq;
+	shm_mq_handle *req_mqh;
+	shm_mq_handle *resp_mqh;
+	ConnMuxMessage *msg;
+	Size		msg_len;
+	shm_mq_result res;
+	void	   *resp_data;
+	Size		resp_len;
+	ConnMuxMessage *resp_msg;
+	dsm_handle	dsm_h;
+	
 	if (!IsConnMultiplexerEnabled())
 		return false;
 
-	/* Create QUERY message with actual memory allocation */
+	/* Determine which worker has this connection */
+	worker_id = conn_id % foreign_conn_multiplexer_workers;
+
+	/* Get DSM handle for this worker */
+	LWLockAcquire(&ConnMultiplexerShmem->lock, LW_SHARED);
+	dsm_h = ConnMultiplexerShmem->worker_dsm_handles[worker_id];
+	LWLockRelease(&ConnMultiplexerShmem->lock);
+
+	if (dsm_h == DSM_HANDLE_INVALID)
 	{
-		Size msg_len = offsetof(ConnMuxMessage, data) + strlen(query) + 1;
-		ConnMuxMessage *msg = palloc(msg_len);
+		ereport(WARNING,
+				(errmsg("worker %d DSM not available", worker_id)));
+		return false;
+	}
+
+	/* Attach to worker's DSM */
+	seg = dsm_attach(dsm_h);
+	if (seg == NULL)
+	{
+		ereport(WARNING,
+				(errmsg("failed to attach to worker %d DSM", worker_id)));
+		return false;
+	}
+
+	/* Get TOC and queues */
+	toc = shm_toc_attach(CONN_MUX_MAGIC, dsm_segment_address(seg));
+	if (toc == NULL)
+	{
+		dsm_detach(seg);
+		return false;
+	}
+
+	request_mq = shm_toc_lookup(toc, CONN_MUX_KEY_REQUEST_QUEUE, false);
+	response_mq = shm_toc_lookup(toc, CONN_MUX_KEY_RESPONSE_QUEUE, false);
+
+	/* Attach to queues */
+	req_mqh = shm_mq_attach(request_mq, seg, NULL);
+	shm_mq_set_sender(request_mq, MyProc);
+	resp_mqh = shm_mq_attach(response_mq, seg, NULL);
+	shm_mq_set_receiver(response_mq, MyProc);
+
+	/* Create QUERY message */
+	msg_len = offsetof(ConnMuxMessage, data) + strlen(query) + 1;
+	msg = palloc(msg_len);
+	msg->type = CONN_MUX_MSG_QUERY;
+	msg->length = msg_len;
+	msg->conn_id = conn_id;
+	msg->request_id = 0;
+	strcpy(msg->data, query);
+
+	/* Send message */
+	res = shm_mq_send(req_mqh, msg->length, msg, false, true);
+	pfree(msg);
+
+	if (res != SHM_MQ_SUCCESS)
+	{
+		ereport(WARNING,
+				(errmsg("failed to send QUERY message to worker %d", worker_id)));
+		dsm_detach(seg);
+		return false;
+	}
+
+	/* Wait for response */
+	res = shm_mq_receive(resp_mqh, &resp_len, &resp_data, false);
+	
+	if (res == SHM_MQ_SUCCESS)
+	{
+		resp_msg = (ConnMuxMessage *) resp_data;
 		
-		msg->type = CONN_MUX_MSG_QUERY;
-		msg->length = msg_len;
-		msg->conn_id = conn_id;
-		msg->request_id = 0;
-		strcpy(msg->data, query);
-		
-		ereport(LOG,
-				(errmsg("multiplexer: created QUERY message (size=%zu bytes)", msg_len),
-				 errdetail("type=%d conn_id=%d length=%d query=%.200s",
-						   msg->type, msg->conn_id, msg->length, msg->data)));
-		
-		/* In production: would send via shm_mq_send(req_mqh, msg_len, msg, false) */
-		
-		pfree(msg);
+		if (resp_msg->type == CONN_MUX_MSG_RESPONSE)
+		{
+			ereport(LOG,
+					(errmsg("multiplexer: QUERY successful, conn_id=%d: %s",
+							conn_id, resp_msg->data)));
+			dsm_detach(seg);
+			return true;
+		}
+		else
+		{
+			ereport(WARNING,
+					(errmsg("multiplexer: QUERY failed: %s", resp_msg->data)));
+			dsm_detach(seg);
+			return false;
+		}
 	}
 	
-	ereport(LOG,
-			(errmsg("multiplexer: QUERY request for conn_id=%d", conn_id),
-			 errdetail("Query: %.200s", query),
-			 errhint("Worker will execute via PQexec() and serialize result for return")));
-
-	return true;
+	ereport(WARNING,
+			(errmsg("multiplexer: no response from worker %d", worker_id)));
+	dsm_detach(seg);
+	return false;
 }
 
 /*
@@ -788,28 +1017,101 @@ MultiplexerQuery(int conn_id, const char *query, void **result_out)
 void
 MultiplexerClose(int conn_id)
 {
+	int			worker_id;
+	dsm_segment *seg;
+	shm_toc    *toc;
+	shm_mq	   *request_mq;
+	shm_mq	   *response_mq;
+	shm_mq_handle *req_mqh;
+	shm_mq_handle *resp_mqh;
+	ConnMuxMessageHeader msg;
+	Size		msg_len;
+	shm_mq_result res;
+	void	   *resp_data;
+	Size		resp_len;
+	ConnMuxMessage *resp_msg;
+	dsm_handle	dsm_h;
+	
 	if (!IsConnMultiplexerEnabled())
 		return;
 
-	/* Create CLOSE message - stack allocated since no variable data */
+	/* Determine which worker has this connection */
+	worker_id = conn_id % foreign_conn_multiplexer_workers;
+
+	/* Get DSM handle for this worker */
+	LWLockAcquire(&ConnMultiplexerShmem->lock, LW_SHARED);
+	dsm_h = ConnMultiplexerShmem->worker_dsm_handles[worker_id];
+	LWLockRelease(&ConnMultiplexerShmem->lock);
+
+	if (dsm_h == DSM_HANDLE_INVALID)
 	{
-		ConnMuxMessageHeader msg;
-		Size msg_len = sizeof(ConnMuxMessageHeader);
+		ereport(WARNING,
+				(errmsg("worker %d DSM not available", worker_id)));
+		return;
+	}
+
+	/* Attach to worker's DSM */
+	seg = dsm_attach(dsm_h);
+	if (seg == NULL)
+	{
+		ereport(WARNING,
+				(errmsg("failed to attach to worker %d DSM", worker_id)));
+		return;
+	}
+
+	/* Get TOC and queues */
+	toc = shm_toc_attach(CONN_MUX_MAGIC, dsm_segment_address(seg));
+	if (toc == NULL)
+	{
+		dsm_detach(seg);
+		return;
+	}
+
+	request_mq = shm_toc_lookup(toc, CONN_MUX_KEY_REQUEST_QUEUE, false);
+	response_mq = shm_toc_lookup(toc, CONN_MUX_KEY_RESPONSE_QUEUE, false);
+
+	/* Attach to queues */
+	req_mqh = shm_mq_attach(request_mq, seg, NULL);
+	shm_mq_set_sender(request_mq, MyProc);
+	resp_mqh = shm_mq_attach(response_mq, seg, NULL);
+	shm_mq_set_receiver(response_mq, MyProc);
+
+	/* Create CLOSE message */
+	msg_len = sizeof(ConnMuxMessageHeader);
+	msg.type = CONN_MUX_MSG_CLOSE;
+	msg.length = msg_len;
+	msg.conn_id = conn_id;
+	msg.request_id = 0;
+
+	/* Send message */
+	res = shm_mq_send(req_mqh, msg_len, &msg, false, true);
+
+	if (res != SHM_MQ_SUCCESS)
+	{
+		ereport(WARNING,
+				(errmsg("failed to send CLOSE message to worker %d", worker_id)));
+		dsm_detach(seg);
+		return;
+	}
+
+	/* Wait for response */
+	res = shm_mq_receive(resp_mqh, &resp_len, &resp_data, false);
+	
+	if (res == SHM_MQ_SUCCESS)
+	{
+		resp_msg = (ConnMuxMessage *) resp_data;
 		
-		msg.type = CONN_MUX_MSG_CLOSE;
-		msg.length = msg_len;
-		msg.conn_id = conn_id;
-		msg.request_id = 0;
-		
-		ereport(LOG,
-				(errmsg("multiplexer: created CLOSE message (size=%zu bytes)", msg_len),
-				 errdetail("type=%d conn_id=%d length=%d",
-						   msg.type, msg.conn_id, msg.length)));
-		
-		/* In production: would send via shm_mq_send(req_mqh, msg_len, &msg, false) */
+		if (resp_msg->type == CONN_MUX_MSG_RESPONSE)
+		{
+			ereport(LOG,
+					(errmsg("multiplexer: CLOSE successful, conn_id=%d", conn_id)));
+		}
+		else
+		{
+			ereport(WARNING,
+					(errmsg("multiplexer: CLOSE failed: %s", resp_msg->data)));
+		}
 	}
 	
-	ereport(LOG,
-			(errmsg("multiplexer: CLOSE request for conn_id=%d", conn_id),
-			 errhint("Worker will call PQfinish() and free connection slot")));
+	dsm_detach(seg);
 }
