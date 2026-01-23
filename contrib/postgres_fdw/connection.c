@@ -18,6 +18,7 @@
 #include "access/xlog.h" /* GetSystemIdentifier() */
 #include "catalog/pg_user_mapping.h"
 #include "commands/defrem.h"
+#include "foreign/conn_multiplexer.h"
 #include "funcapi.h"
 #include "libpq/libpq-be.h"
 #include "libpq/libpq-be-fe-helpers.h"
@@ -69,6 +70,8 @@ typedef struct ConnCacheEntry
 	bool		invalidated;	/* true if reconnect is pending */
 	bool		keep_connections;	/* setting value of keep_connections
 									 * server option */
+	bool		use_multiplexer;	/* true if using connection multiplexer */
+	int			multiplexer_conn_id;	/* multiplexer connection ID if used */
 	Oid			serverid;		/* foreign server OID used to get server name */
 	uint32		server_hashvalue;	/* hash value of foreign server OID */
 	uint32		mapping_hashvalue;	/* hash value of user mapping OID */
@@ -373,6 +376,53 @@ GetConnection(UserMapping *user, bool will_prep_stmt, PgFdwConnState **state)
 }
 
 /*
+ * Build connection string for multiplexer from server and user options
+ */
+static char *
+GetConnectionString(ForeignServer *server, UserMapping *user)
+{
+	const char **keywords;
+	const char **values;
+	int			n;
+	StringInfoData buf;
+
+	/*
+	 * Construct connection params from generic options of ForeignServer
+	 * and UserMapping.
+	 */
+	n = list_length(server->options) + list_length(user->options) + 3;
+	keywords = (const char **) palloc(n * sizeof(char *));
+	values = (const char **) palloc(n * sizeof(char *));
+
+	n = 0;
+	n += ExtractConnectionOptions(server->options,
+								  keywords + n, values + n);
+	n += ExtractConnectionOptions(user->options,
+								  keywords + n, values + n);
+
+	/* Add client_encoding */
+	keywords[n] = "client_encoding";
+	values[n] = GetDatabaseEncodingName();
+	n++;
+
+	keywords[n] = values[n] = NULL;
+
+	/* Build conninfo string */
+	initStringInfo(&buf);
+	for (int i = 0; i < n; i++)
+	{
+		if (i > 0)
+			appendStringInfoChar(&buf, ' ');
+		appendStringInfo(&buf, "%s=%s", keywords[i], values[i]);
+	}
+
+	pfree(keywords);
+	pfree(values);
+
+	return buf.data;
+}
+
+/*
  * Reset all transient state fields in the cached connection entry and
  * establish new connection to the remote server.
  */
@@ -429,7 +479,38 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 			entry->parallel_abort = defGetBoolean(def);
 	}
 
-	/* Now try to make the connection */
+	/* Initialize multiplexer fields */
+	entry->use_multiplexer = false;
+	entry->multiplexer_conn_id = -1;
+
+	/* Check if connection multiplexer is enabled and should be used */
+	if (IsConnMultiplexerEnabled())
+	{
+		char	   *conninfo;
+		int			conn_id;
+
+		/* Get connection string for the server */
+		conninfo = GetConnectionString(server, user);
+
+		/* Try to establish connection through multiplexer */
+		if (MultiplexerConnect(conninfo, &conn_id))
+		{
+			entry->use_multiplexer = true;
+			entry->multiplexer_conn_id = conn_id;
+			/* Don't establish direct connection */
+			entry->conn = NULL;
+
+			elog(DEBUG1, "new postgres_fdw connection through multiplexer (worker %d) for server \"%s\" (user mapping oid %u, userid %u)",
+				 conn_id, server->servername, user->umid, user->userid);
+
+			pfree(conninfo);
+			return;
+		}
+
+		pfree(conninfo);
+	}
+
+	/* Now try to make the connection (traditional way if multiplexer not used) */
 	entry->conn = connect_pg_server(server, user);
 
 	elog(DEBUG3, "new postgres_fdw connection %p for server \"%s\" (user mapping oid %u, userid %u)",
