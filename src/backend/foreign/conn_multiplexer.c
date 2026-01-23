@@ -87,7 +87,7 @@ typedef struct ConnMuxMessageHeader
 } ConnMuxMessageHeader;
 
 /* Forward declarations */
-static void conn_multiplexer_worker_main(Datum main_arg);
+void conn_multiplexer_worker_main(Datum main_arg);
 static void conn_multiplexer_shmem_startup(void);
 static Size conn_multiplexer_shmem_size(void);
 static void conn_multiplexer_worker_sigterm(SIGNAL_ARGS);
@@ -137,7 +137,7 @@ RegisterConnMultiplexerWorkers(void)
 			worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
 			worker.bgw_start_time = BgWorkerStart_PostmasterStart;
 			worker.bgw_restart_time = 10;	/* restart after 10 seconds */
-			worker.bgw_library_name[0] = '\0';	/* built-in worker */
+			sprintf(worker.bgw_library_name, "postgres");	/* built-in worker */
 			sprintf(worker.bgw_function_name, "conn_multiplexer_worker_main");
 			worker.bgw_main_arg = Int32GetDatum(i);
 			worker.bgw_notify_pid = 0;
@@ -190,7 +190,7 @@ conn_multiplexer_shmem_startup(void)
 /*
  * Background worker main function
  */
-static void
+void
 conn_multiplexer_worker_main(Datum main_arg)
 {
 	int			worker_id = DatumGetInt32(main_arg);
@@ -216,13 +216,11 @@ conn_multiplexer_worker_main(Datum main_arg)
 	/* Main worker loop */
 	while (!got_sigterm)
 	{
-		int			rc;
-
 		/* Wait for work or shutdown signal */
-		rc = WaitLatch(MyLatch,
-					   WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-					   1000L,
-					   PG_WAIT_EXTENSION);
+		(void) WaitLatch(MyLatch,
+						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 1000L,
+						 PG_WAIT_EXTENSION);
 
 		ResetLatch(MyLatch);
 
@@ -284,6 +282,8 @@ conn_multiplexer_worker_sighup(SIGNAL_ARGS)
 bool
 IsConnMultiplexerEnabled(void)
 {
+	bool		initialized;
+
 	if (!enable_foreign_conn_multiplexer)
 		return false;
 
@@ -292,7 +292,7 @@ IsConnMultiplexerEnabled(void)
 
 	/* Check if workers are initialized */
 	LWLockAcquire(&ConnMultiplexerShmem->lock, LW_SHARED);
-	bool initialized = ConnMultiplexerShmem->initialized;
+	initialized = ConnMultiplexerShmem->initialized;
 	LWLockRelease(&ConnMultiplexerShmem->lock);
 
 	return initialized;

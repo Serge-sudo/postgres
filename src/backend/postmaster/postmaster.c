@@ -95,6 +95,7 @@
 #include "common/file_utils.h"
 #include "common/ip.h"
 #include "common/pg_prng.h"
+#include "foreign/conn_multiplexer.h"
 #include "lib/ilist.h"
 #include "libpq/libpq.h"
 #include "libpq/pqsignal.h"
@@ -974,7 +975,13 @@ PostmasterMain(int argc, char *argv[])
 	 * normally choose the same IPC keys.  This helps ensure that we will
 	 * clean up dead IPC objects if the postmaster crashes and is restarted.
 	 */
+	InitConnMultiplexer();
 	CreateSharedMemoryAndSemaphores();
+
+	/*
+	 * Register connection multiplexer workers if enabled
+	 */
+	RegisterConnMultiplexerWorkers();
 
 	/*
 	 * Estimate number of openable files.  This must happen after setting up
