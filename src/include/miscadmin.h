@@ -178,6 +178,10 @@ extern PGDLLIMPORT int MaxConnections;
 extern PGDLLIMPORT int max_worker_processes;
 extern PGDLLIMPORT int max_parallel_workers;
 
+/* Foreign connection multiplexer */
+extern PGDLLIMPORT int foreign_conn_multiplexer_workers;
+extern PGDLLIMPORT bool enable_foreign_conn_multiplexer;
+
 extern PGDLLIMPORT int commit_timestamp_buffers;
 extern PGDLLIMPORT int multixact_member_buffers;
 extern PGDLLIMPORT int multixact_offset_buffers;

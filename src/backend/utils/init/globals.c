@@ -142,6 +142,10 @@ int			max_worker_processes = 8;
 int			max_parallel_workers = 8;
 int			MaxBackends = 0;
 
+/* GUC parameters for foreign connection multiplexer */
+int			foreign_conn_multiplexer_workers = 0;
+bool		enable_foreign_conn_multiplexer = false;
+
 /* GUC parameters for vacuum */
 int			VacuumBufferUsageLimit = 2048;
 

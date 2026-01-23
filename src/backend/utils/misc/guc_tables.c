@@ -1944,6 +1944,16 @@ struct config_bool ConfigureNamesBool[] =
 	},
 
 	{
+		{"foreign_conn_multiplexer.enabled", PGC_SIGHUP, RESOURCES_ASYNCHRONOUS,
+			gettext_noop("Enable connection multiplexer for foreign servers."),
+			gettext_noop("When enabled, foreign connections are routed through workers."),
+		},
+		&enable_foreign_conn_multiplexer,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"jit", PGC_USERSET, QUERY_TUNING_OTHER,
 			gettext_noop("Allow JIT compilation."),
 			NULL,
@@ -3203,6 +3213,19 @@ struct config_int ConfigureNamesInt[] =
 		},
 		&max_logical_replication_workers,
 		4, 0, MAX_BACKENDS,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"foreign_conn_multiplexer.workers",
+			PGC_POSTMASTER,
+			RESOURCES_ASYNCHRONOUS,
+			gettext_noop("Number of worker processes for foreign connection multiplexing."),
+			gettext_noop("Set to 0 to disable the multiplexer. "
+						 "Workers handle routing of foreign server connections."),
+		},
+		&foreign_conn_multiplexer_workers,
+		0, 0, MAX_BACKENDS,
 		NULL, NULL, NULL
 	},
 
