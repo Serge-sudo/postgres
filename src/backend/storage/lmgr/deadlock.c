@@ -25,12 +25,16 @@
  */
 #include "postgres.h"
 
+#include "catalog/pg_class.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
 #include "pgstat.h"
+#include "storage/dist_deadlock.h"
 #include "storage/lmgr.h"
 #include "storage/proc.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
+#include "utils/syscache.h"
 
 
 /*
@@ -195,6 +199,9 @@ InitDeadLockChecking(void)
 	possibleConstraints =
 		(EDGE *) palloc(maxPossibleConstraints * sizeof(EDGE));
 
+	/* Initialize distributed deadlock detection structures */
+	InitDistDeadlockDetection();
+
 	MemoryContextSwitchTo(oldcxt);
 }
 
@@ -212,6 +219,9 @@ InitDeadLockChecking(void)
  * subsequent printing by DeadLockReport().  That activity is separate
  * because (a) we don't want to do it while holding all those LWLocks,
  * and (b) we are typically invoked inside a signal handler.
+ *
+ * This function also performs distributed deadlock detection when the
+ * lock being waited on belongs to a relation that is part of a shard group.
  */
 DeadLockState
 DeadLockCheck(PGPROC *proc)
@@ -267,6 +277,75 @@ DeadLockCheck(PGPROC *proc)
 
 		/* See if any waiters for the lock can be woken up now */
 		ProcLockWakeup(GetLocksMethodTable(lock), lock);
+	}
+
+	/*
+	 * If no local deadlock was found, check if any relation locks are
+	 * involved and if any are part of a shard group. If so, perform
+	 * global distributed deadlock detection across all shard groups.
+	 *
+	 * Note: We perform global detection (checking all shard groups) rather
+	 * than just checking the specific shard group of the waited-on relation,
+	 * because deadlocks can span multiple shard groups.
+	 */
+	if (nWaitOrders == 0 && blocking_autovacuum_proc == NULL && proc->waitLock != NULL)
+	{
+		LOCK	   *lock = proc->waitLock;
+		LOCKTAG    *tag = &lock->tag;
+
+		/*
+		 * Check if this is a relation lock and if the relation is part of a
+		 * shard group
+		 */
+		if (tag->locktag_type == LOCKTAG_RELATION)
+		{
+			Oid			relid = tag->locktag_field2;
+			HeapTuple	tuple;
+			Form_pg_class classForm;
+			bool		hasShardGroup = false;
+
+			/* Look up the relation in pg_class to check if it has sgid set */
+			tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+			if (HeapTupleIsValid(tuple))
+			{
+				classForm = (Form_pg_class) GETSTRUCT(tuple);
+				hasShardGroup = OidIsValid(classForm->relsgid);
+				ReleaseSysCache(tuple);
+			}
+
+			/* Only perform distributed deadlock detection if relation has sgid */
+			if (hasShardGroup)
+			{
+				DistDeadlockInfo *distInfo;
+				bool		foundDistDeadlock = false;
+
+				elog(DEBUG2, "checking for distributed deadlock across all shard groups");
+
+				distInfo = PerformGlobalDistributedDeadlockCheck();
+
+				if (distInfo != NULL)
+				{
+					if (distInfo->deadlockFound)
+					{
+						elog(DEBUG2, "distributed deadlock detected with %d nodes in cycle",
+								distInfo->cycleLength);
+						foundDistDeadlock = true;
+					}
+
+					FreeDistDeadlockInfo(distInfo);
+
+					if (foundDistDeadlock)
+					{
+						/*
+						 * Return hard deadlock to trigger transaction abort.
+						 * The distributed deadlock cannot be resolved by
+						 * reordering local wait queues.
+						 */
+						return DS_HARD_DEADLOCK;
+					}
+				}
+			}
+		}
 	}
 
 	/* Return code tells caller if we had to escape a deadlock or not */
