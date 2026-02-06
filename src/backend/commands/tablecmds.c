@@ -47,6 +47,7 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_publication_rel.h"
 #include "catalog/pg_rewrite.h"
+#include "catalog/pg_shardgroups.h"
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_trigger.h"
@@ -751,7 +752,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	else
 		partitioned = false;
 
-	if (stmt->shardgroup && !(stmt->is_distributed || stmt->is_worldwide))
+	if (stmt->shardgroup && !(stmt->is_distributed || stmt->is_worldwide || relkind == RELKIND_FOREIGN_TABLE))
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
@@ -1321,10 +1322,10 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 			SetRelationShardGroup(relationId, sgid);
 			
 			/*
-			 * Create tables on shard members (foreign servers)
-			 * For partitions: create partitions on remote servers with PARTITION OF
-			 * For regular tables: create tables on remote servers
-			 */
+			* Create tables on shard members (foreign servers)
+			* For partitions: create partitions on remote servers with PARTITION OF
+			* For regular tables: create tables on remote servers
+			*/
 			if (stmt->partbound != NULL)
 			{
 				/* For partitions, pass parent OID and bound spec */
@@ -1337,6 +1338,12 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 				CreateTablesOnShardMembers(relationId, sgid, false, InvalidOid, NULL);
 			}
 		}
+	}
+	else if (rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE && stmt->shardgroup)
+	{
+		/* For foreign tables with SHARD GROUP, just set the shard group but don't create tables on members */
+		Oid			sgid = get_shardgroup_oid(stmt->shardgroup, false);
+		SetRelationShardGroup(relationId, sgid);
 	}
 	else if (stmt->partbound != NULL && OidIsValid(rel->rd_rel->relsgid) && rel->rd_rel->relkind != RELKIND_FOREIGN_TABLE &&
 	(!(rel->rd_options && ((StdRdOptions *) rel->rd_options)->noRelSync)))
@@ -1431,18 +1438,30 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 	StringInfo create_foreign_table_sql;
 	char	   *relname;
 	char	   *nspname;
+	char	   *sgname;
 	int			i;
 	int			first_col;
 	Oid			target_member = InvalidOid;
 	ForeignServer *target_server = NULL;
 	extern char *cluster_name;
 	char *target_server_name;
+	HeapTuple	sgtuple;
+	Form_pg_shardgroups sgform;
 	
 
 	/* Get list of shard members */
 	members = get_shardgroup_members(sgid);
 	if (members == NIL)
 		return;	/* No members, nothing to do */
+
+	/* Get the shard group name */
+	sgtuple = SearchSysCache1(SHARDGROUPOID, ObjectIdGetDatum(sgid));
+	if (!HeapTupleIsValid(sgtuple))
+		elog(ERROR, "cache lookup failed for shard group %u", sgid);
+	
+	sgform = (Form_pg_shardgroups) GETSTRUCT(sgtuple);
+	sgname = pstrdup(NameStr(sgform->sgname));
+	ReleaseSysCache(sgtuple);
 
 	/* Check if cluster_name is set - required for creating foreign tables on remote servers */
 	if (!cluster_name || cluster_name[0] == '\0')
@@ -1465,7 +1484,6 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 	 * For partitions: use consistent hashing to determine which member should host the partition.
 	 * For non-partitions: distribute to all members (existing behavior).
 	 */
-	if (is_partition && OidIsValid(parentOid) && partbound != NULL)
 	{
 		bool found;
 		/* Use consistent hashing to determine target member for this partition */
@@ -1608,6 +1626,7 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 		}
 
 		/* Build SQL for creating real partition table (for target member) */
+		/* Note: Partitions inherit relsgid from parent, so no SHARD GROUP clause needed */
 		appendStringInfo(create_table_sql, "CREATE TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s",
 						 quote_identifier(nspname),
 						 quote_identifier(relname),
@@ -1634,7 +1653,8 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 		 * For regular distributed/worldwide tables (including partitioned tables):
 		 * Create actual tables on foreign servers
 		 */
-		appendStringInfo(create_table_sql, "CREATE TABLE IF NOT EXISTS %s.%s (",
+		appendStringInfo(create_table_sql, "CREATE %s TABLE IF NOT EXISTS %s.%s (",
+						 rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ? "" : "FOREIGN",
 						 quote_identifier(nspname),
 						 quote_identifier(relname));
 		
@@ -1671,7 +1691,7 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 				/* Get the partition key definition */
 				partkey_str = pg_get_partkeydef_columns(relationId, false);
 				
-				appendStringInfo(create_table_sql, " PARTITION BY %s (%s)",
+				appendStringInfo(create_table_sql, " DISTRIBUTED BY %s (%s)",
 								 partkey->strategy == PARTITION_STRATEGY_HASH ? "HASH" :
 								 partkey->strategy == PARTITION_STRATEGY_LIST ? "LIST" :
 								 partkey->strategy == PARTITION_STRATEGY_RANGE ? "RANGE" : "UNKNOWN",
@@ -1679,6 +1699,12 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 				pfree(partkey_str);
 			}
 		}
+		else
+		{
+			appendStringInfo(create_table_sql, " SERVER %s", quote_identifier(target_server_name));
+		}
+		/* Add SHARD GROUP clause */
+		appendStringInfo(create_table_sql, " SHARD GROUP %s", quote_identifier(sgname));
 	}
 
 	/*
@@ -1732,6 +1758,7 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 	destroyStringInfo(create_table_sql);
 	destroyStringInfo(create_foreign_table_sql);
 	pfree(nspname);
+	pfree(sgname);
 	list_free(members);
 }
 
