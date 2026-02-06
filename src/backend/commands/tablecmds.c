@@ -2069,6 +2069,91 @@ RemoveRelations(DropStmt *drop)
 		obj.objectId = relOid;
 		obj.objectSubId = 0;
 
+		/* 
+		 * If this table belongs to a shard group, replicate DROP to shard members.
+		 * Skip replication if we're executing DDL from a remote server to prevent infinite recursion.
+		 */
+		if ((drop->removeType == OBJECT_TABLE || drop->removeType == OBJECT_FOREIGN_TABLE) && !executing_remote_ddl)
+		{
+			HeapTuple	tuple;
+			Form_pg_class classForm;
+			Oid			sgid;
+			
+			tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relOid));
+			if (HeapTupleIsValid(tuple))
+			{
+				classForm = (Form_pg_class) GETSTRUCT(tuple);
+				sgid = classForm->relsgid;
+				
+				/* If this table belongs to a shard group, replicate the DROP */
+				if (OidIsValid(sgid))
+				{
+					char	   *relname = NameStr(classForm->relname);
+					char	   *nspname = get_namespace_name(classForm->relnamespace);
+					List	   *members;
+					ListCell   *lc;
+					StringInfoData drop_sql;
+					
+					/* Null check for namespace name */
+					if (nspname == NULL)
+					{
+						ReleaseSysCache(tuple);
+						elog(ERROR, "cache lookup failed for namespace %u", classForm->relnamespace);
+					}
+					
+					members = get_shardgroup_members(sgid);
+					
+					initStringInfo(&drop_sql);
+					appendStringInfo(&drop_sql, "%s TABLE IF EXISTS %s.%s",
+									drop->removeType == OBJECT_TABLE ? "DROP FOREIGN" : "DROP",
+									 quote_identifier(nspname),
+									 quote_identifier(relname));
+					
+					/* Add CASCADE or RESTRICT based on drop behavior */
+					if (drop->behavior == DROP_CASCADE)
+						appendStringInfoString(&drop_sql, " CASCADE");
+					else
+						appendStringInfoString(&drop_sql, " RESTRICT");
+					
+					ereport(DEBUG1,
+							(errmsg("replicating DROP TABLE to shard members"),
+							 errdetail("Table: %s.%s, Shard Group: %u",
+									   nspname, relname, sgid)));
+					
+					/* Execute on all shard members */
+					foreach(lc, members)
+					{
+						Oid			serveroid = lfirst_oid(lc);
+						ForeignServer *server = GetForeignServer(serveroid);
+						ForeignDataWrapper *fdw = GetForeignDataWrapper(server->fdwid);
+						FdwRoutine *fdwroutine = GetFdwRoutine(fdw->fdwhandler);
+						
+						if (fdwroutine->ExecForeignDDL != NULL)
+						{
+							ereport(DEBUG1,
+									(errmsg("executing DROP TABLE on shard member \"%s\"",
+											server->servername)));
+							
+							fdwroutine->ExecForeignDDL(serveroid, drop_sql.data);
+						}
+						else
+						{
+							ereport(NOTICE,
+									(errmsg("table should be dropped on shard member \"%s\"",
+											server->servername),
+									 errdetail("Execute: %s", drop_sql.data),
+									 errhint("The FDW for this server does not support automatic DDL execution.")));
+						}
+					}
+					
+					pfree(drop_sql.data);
+					list_free(members);
+				}
+				
+				ReleaseSysCache(tuple);
+			}
+		}
+
 		add_exact_object_address(&obj, objects);
 	}
 
@@ -19192,6 +19277,91 @@ ATExecAttachPartition(List **wqueue, Relation rel, PartitionCmd *cmd,
 	ObjectAddressSet(address, RelationRelationId, RelationGetRelid(attachrel));
 
 	/*
+	 * If the parent table belongs to a shard group, replicate the ATTACH PARTITION
+	 * to all shard members. If the table being attached is a worldwide table,
+	 * it gets converted to a partition distributed across the shard group.
+	 * Skip replication if we're executing DDL from a remote server to prevent infinite recursion.
+	 */
+	if (!executing_remote_ddl)
+	{
+		Oid			parent_sgid = rel->rd_rel->relsgid;
+		
+		if (OidIsValid(parent_sgid))
+		{
+			char	   *parent_relname = RelationGetRelationName(rel);
+			char	   *parent_nspname = get_namespace_name(RelationGetNamespace(rel));
+			char	   *attach_relname = RelationGetRelationName(attachrel);
+			char	   *attach_nspname = get_namespace_name(RelationGetNamespace(attachrel));
+			List	   *members;
+			ListCell   *lc;
+			StringInfoData attach_sql;
+			
+			/* Null checks for namespace names */
+			if (parent_nspname == NULL)
+				elog(ERROR, "cache lookup failed for namespace %u", RelationGetNamespace(rel));
+			if (attach_nspname == NULL)
+				elog(ERROR, "cache lookup failed for namespace %u", RelationGetNamespace(attachrel));
+			
+			members = get_shardgroup_members(parent_sgid);
+			
+			/*
+			 * Generate ATTACH PARTITION DDL with partition bounds
+			 */
+			initStringInfo(&attach_sql);
+			appendStringInfo(&attach_sql,
+							 "ALTER TABLE %s.%s ATTACH PARTITION %s.%s",
+							 quote_identifier(parent_nspname),
+							 quote_identifier(parent_relname),
+							 quote_identifier(attach_nspname),
+							 quote_identifier(attach_relname));
+			
+			/* Add partition bounds if specified */
+			if (cmd->bound)
+			{
+				char *bounds_str = PartitionBoundsSpecToString(cmd->bound);
+				appendStringInfo(&attach_sql, " %s", bounds_str);
+				pfree(bounds_str);
+			}
+			
+			ereport(DEBUG1,
+					(errmsg("replicating ATTACH PARTITION to shard members"),
+					 errdetail("Parent: %s.%s, Partition: %s.%s, Shard Group: %u",
+							   parent_nspname, parent_relname,
+							   attach_nspname, attach_relname, parent_sgid)));
+			
+			/* Execute ATTACH PARTITION on all shard members */
+			foreach(lc, members)
+			{
+				Oid			serveroid = lfirst_oid(lc);
+				ForeignServer *server = GetForeignServer(serveroid);
+				ForeignDataWrapper *fdw = GetForeignDataWrapper(server->fdwid);
+				FdwRoutine *fdwroutine = GetFdwRoutine(fdw->fdwhandler);
+				
+				if (fdwroutine->ExecForeignDDL != NULL)
+				{
+					ereport(DEBUG1,
+							(errmsg("executing ATTACH PARTITION on shard member \"%s\"",
+									server->servername),
+							 errdetail("DDL: %s", attach_sql.data)));
+					
+					fdwroutine->ExecForeignDDL(serveroid, attach_sql.data);
+				}
+				else
+				{
+					ereport(NOTICE,
+							(errmsg("partition should be attached on shard member \"%s\"",
+									server->servername),
+							 errdetail("Execute: %s", attach_sql.data),
+							 errhint("The FDW for this server does not support automatic DDL execution.")));
+				}
+			}
+			
+			pfree(attach_sql.data);
+			list_free(members);
+		}
+	}
+
+	/*
 	 * If the partition we just attached is partitioned itself, invalidate
 	 * relcache for all descendent partitions too to ensure that their
 	 * rd_partcheck expression trees are rebuilt; partitions already locked at
@@ -19715,6 +19885,84 @@ ATExecDetachPartition(List **wqueue, AlteredTableInfo *tab, Relation rel,
 
 	/* Do the final part of detaching */
 	DetachPartitionFinalize(rel, partRel, concurrent, defaultPartOid);
+
+	/* 
+	 * If the parent table belongs to a shard group, replicate the DETACH PARTITION
+	 * to all shard members and convert the detached partition to a worldwide table.
+	 * Skip replication if we're executing DDL from a remote server to prevent infinite recursion.
+	 */
+	if(!executing_remote_ddl)
+	{
+		Oid			parent_sgid = rel->rd_rel->relsgid;
+		
+		if (OidIsValid(parent_sgid))
+		{
+			char	   *parent_relname = RelationGetRelationName(rel);
+			char	   *parent_nspname = get_namespace_name(RelationGetNamespace(rel));
+			char	   *part_relname = RelationGetRelationName(partRel);
+			char	   *part_nspname = get_namespace_name(RelationGetNamespace(partRel));
+			List	   *members;
+			ListCell   *lc;
+			StringInfoData detach_sql;
+			
+			/* Null checks for namespace names */
+			if (parent_nspname == NULL)
+				elog(ERROR, "cache lookup failed for namespace %u", RelationGetNamespace(rel));
+			if (part_nspname == NULL)
+				elog(ERROR, "cache lookup failed for namespace %u", RelationGetNamespace(partRel));
+			
+			members = get_shardgroup_members(parent_sgid);
+			
+			initStringInfo(&detach_sql);
+			appendStringInfo(&detach_sql,
+							 "ALTER TABLE %s.%s DETACH PARTITION %s.%s",
+							 quote_identifier(parent_nspname),
+							 quote_identifier(parent_relname),
+							 quote_identifier(part_nspname),
+							 quote_identifier(part_relname));
+			
+			if (concurrent)
+				appendStringInfoString(&detach_sql, " CONCURRENTLY");
+			
+			ereport(DEBUG1,
+					(errmsg("replicating DETACH PARTITION to shard members"),
+					 errdetail("Parent: %s.%s, Partition: %s.%s, Shard Group: %u",
+							   parent_nspname, parent_relname,
+							   part_nspname, part_relname, parent_sgid)));
+			
+			/* Execute DETACH PARTITION on all shard members */
+			foreach(lc, members)
+			{
+				Oid			serveroid = lfirst_oid(lc);
+				ForeignServer *server = GetForeignServer(serveroid);
+				ForeignDataWrapper *fdw = GetForeignDataWrapper(server->fdwid);
+				FdwRoutine *fdwroutine = GetFdwRoutine(fdw->fdwhandler);
+				
+				if (fdwroutine->ExecForeignDDL != NULL)
+				{
+					ereport(DEBUG1,
+							(errmsg("executing DETACH PARTITION on shard member \"%s\"",
+									server->servername)));
+					
+					fdwroutine->ExecForeignDDL(serveroid, detach_sql.data);
+				}
+				else
+				{
+					ereport(NOTICE,
+							(errmsg("partition should be detached on shard member \"%s\"",
+									server->servername),
+							 errdetail("Execute: %s", detach_sql.data),
+							 errhint("The FDW for this server does not support automatic DDL execution.")));
+				}
+			}
+			
+			pfree(detach_sql.data);
+			list_free(members);
+			ereport(NOTICE,
+					(errmsg("partition \"%s\" has been detached and converted to a worldwide table in shard group",
+							part_relname)));
+		}
+	}
 
 	ObjectAddressSet(address, RelationRelationId, RelationGetRelid(partRel));
 

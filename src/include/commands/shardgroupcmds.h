@@ -16,6 +16,7 @@
 
 #include "catalog/objectaddress.h"
 #include "nodes/parsenodes.h"
+#include "utils/guc.h"
 
 extern ObjectAddress CreateShardGroup(CreateShardGroupStmt *stmt);
 extern ObjectAddress AlterShardGroup(AlterShardGroupStmt *stmt);
@@ -29,5 +30,14 @@ extern List *get_shardgroup_members(Oid sgid);
 
 /* Consistent hashing for partition placement */
 extern Oid GetPartitionTargetMember(Oid sgid, const char *partition_name, Oid *exclude_member, bool *found);
+
+/* Partition bounds deparsing */
+extern char *PartitionBoundsSpecToString(PartitionBoundSpec *partbound);
+
+/* Flag to track if DDL is being executed from a remote server (to prevent infinite recursion) */
+extern bool executing_remote_ddl;
+
+/* GUC check hook for executing_remote_ddl */
+extern bool check_executing_remote_ddl(bool *newval, void **extra, GucSource source);
 
 #endif							/* SHARDGROUPCMDS_H */

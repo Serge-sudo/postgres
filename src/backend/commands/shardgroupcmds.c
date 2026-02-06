@@ -45,6 +45,7 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/partcache.h"
@@ -73,13 +74,74 @@ static void DetachShardMember(Oid sgid, Oid srvoid);
 static void MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgid);
 static Oid FindPartitionHostMember(Oid partitionOid, Oid sgid);
 static List *GetShardGroupPartitions(Oid sgid);
-static char *PartitionBoundsSpecToString(PartitionBoundSpec *partbound);
 static void CopyFileToRemoteFDW(Oid src_serverid, Oid dest_serverid, const char *src_nspname, const char *src_relname, const char *dest_nspname, const char *dest_relname);
 
 /* Number of virtual nodes per shard member for consistent hashing */
 #define VIRTUAL_NODES_PER_MEMBER 150
 /* Maximum length for virtual node key strings */
 #define VNODE_KEY_MAX_LEN 512
+
+/* 
+ * GUC variable to track if DDL is being executed from a remote server.
+ * This prevents infinite recursion when DDL operations are replicated.
+ * When postgres_fdw executes DDL on a remote server, it prefixes the DDL with
+ * "SET LOCAL shardgroup.executing_remote_ddl = true;" to set this flag on the remote server.
+ */
+bool executing_remote_ddl = false;
+
+/*
+ * check_executing_remote_ddl
+ *		GUC check hook for shardgroup.executing_remote_ddl
+ *
+ * This hook ensures that the GUC can only be set to true via SET LOCAL within
+ * a transaction, which is how postgres_fdw sets it during DDL replication.
+ * This prevents users from manually setting the flag through interactive sessions.
+ */
+bool
+check_executing_remote_ddl(bool *newval, void **extra, GucSource source)
+{
+	/*
+	 * Allow setting to false from any source (resetting is safe).
+	 */
+	if (*newval == false)
+		return true;
+	
+	/*
+	 * When setting to true, only allow it if:
+	 * 1. We're in a transaction block (postgres_fdw uses SET LOCAL)
+	 * 2. The source is from a session SET command (not from config file)
+	 * 
+	 * This combination means it's likely from postgres_fdw's remote DDL execution.
+	 * We reject attempts from:
+	 * - Configuration files (PGC_S_FILE, PGC_S_OVERRIDE)
+	 * - ALTER DATABASE/ROLE commands (PGC_S_DATABASE_USER, etc.)
+	 * - Command line options (PGC_S_ARGV)
+	 * 
+	 * We also reject if NOT in a transaction, which would be a user trying to
+	 * set it from psql or similar without using SET LOCAL in a transaction.
+	 */
+	if (source == PGC_S_SESSION)
+	{
+		/*
+		 * Check if we're in a transaction. postgres_fdw always uses SET LOCAL
+		 * which requires being in a transaction block.
+		 */
+		if (!IsTransactionState() || !IsTransactionBlock())
+		{
+			GUC_check_errdetail("shardgroup.executing_remote_ddl can only be set within a transaction block.");
+			return false;
+		}
+		
+		/* Allow if in transaction - this is the postgres_fdw case */
+		return true;
+	}
+	
+	/*
+	 * Reject all other sources when trying to set to true
+	 */
+	GUC_check_errdetail("shardgroup.executing_remote_ddl can only be set by postgres_fdw during DDL replication.");
+	return false;
+}
 
 /*
  * CopyFileToRemoteFDW
@@ -378,9 +440,23 @@ AlterShardGroup(AlterShardGroupStmt *stmt)
 		Relation	rel;
 		HeapTuple	tuple;
 		Oid			memberoid;
+		HeapTuple	sgtuple;
+		Form_pg_shardgroups sgform;
+		char	   *sgname;
+		List	   *all_members;
+		ListCell   *lc;
+		StringInfoData drop_ddl;
 		
 		/* Get the foreign server OID */
 		srvoid = get_foreign_server_oid(stmt->servername, false);
+		
+		/* Get shard group name for DDL generation */
+		sgtuple = SearchSysCache1(SHARDGROUPOID, ObjectIdGetDatum(sgoid));
+		if (!HeapTupleIsValid(sgtuple))
+			elog(ERROR, "cache lookup failed for shard group %u", sgoid);
+		sgform = (Form_pg_shardgroups) GETSTRUCT(sgtuple);
+		sgname = pstrdup(NameStr(sgform->sgname));
+		ReleaseSysCache(sgtuple);
 		
 		/* Check if any foreign tables in this shard group depend on this member */
 		{
@@ -491,12 +567,66 @@ AlterShardGroup(AlterShardGroupStmt *stmt)
 		
 		table_close(rel, RowExclusiveLock);
 		
+		/* Get all members before deletion to notify them */
+		all_members = get_shardgroup_members(sgoid);
+		
+		/* Build DDL to drop member from shard group on remote servers */
+		initStringInfo(&drop_ddl);
+		appendStringInfo(&drop_ddl,
+						 "ALTER SHARD GROUP %s DROP MEMBER %s",
+						 quote_identifier(sgname),
+						 quote_identifier(stmt->servername));
+		
+		/* Notify all OTHER members to delete this server from their metadata */
+		foreach(lc, all_members)
+		{
+			Oid			member_srvoid = lfirst_oid(lc);
+			
+			/* Skip the server being removed */
+			if (member_srvoid == srvoid)
+				continue;
+			
+			ereport(DEBUG1,
+					(errmsg("notifying shard member about DROP MEMBER"),
+					 errdetail("Executing on server %u: %s",
+							   member_srvoid, drop_ddl.data)));
+			
+			ExecuteDDLOnRemoteServer(member_srvoid, drop_ddl.data);
+		}
+		
+		/* Send message to the server being removed to clean up its metadata */
+		{
+			StringInfoData drop_sg_ddl;
+			
+			/* 
+			 * On the removed server, we should drop the shard group itself
+			 * (not just the membership). This will CASCADE and drop all 
+			 * tables associated with the shard group on that server.
+			 */
+			initStringInfo(&drop_sg_ddl);
+			appendStringInfo(&drop_sg_ddl,
+							 "DROP SHARD GROUP IF EXISTS %s CASCADE",
+							 quote_identifier(sgname));
+			
+			ereport(DEBUG1,
+					(errmsg("instructing removed server to drop shard group"),
+					 errdetail("Executing on server %u: %s",
+							   srvoid, drop_sg_ddl.data)));
+			
+			ExecuteDDLOnRemoteServer(srvoid, drop_sg_ddl.data);
+			
+			pfree(drop_sg_ddl.data);
+		}
+		
 		/* Perform deletion via dependency system */
 		{
 			ObjectAddress memberAddr;
 			ObjectAddressSet(memberAddr, ShardMemberRelationId, memberoid);
 			performDeletion(&memberAddr, DROP_RESTRICT, 0);
 		}
+		
+		pfree(sgname);
+		pfree(drop_ddl.data);
 		
 		ObjectAddressSet(address, ShardMemberRelationId, memberoid);
 	}
@@ -693,7 +823,7 @@ ExecuteDDLOnRemoteServer(Oid serveroid, const char *sql)
  *
  * Caller must pfree the returned string.
  */
-static char *
+char *
 PartitionBoundsSpecToString(PartitionBoundSpec *partbound)
 {
 	StringInfo partition_bounds;
@@ -823,6 +953,7 @@ SyncTablesOnNewShardMember(Oid sgid, Oid newsrvoid)
 	List	   *processed_tables = NIL;
 	ForeignServer *server;
 	extern char *cluster_name;
+	bool	first_scan = true;
 
 	/* Check if cluster_name is set */
 	if (!cluster_name || cluster_name[0] == '\0')
@@ -843,7 +974,7 @@ SyncTablesOnNewShardMember(Oid sgid, Oid newsrvoid)
 
 	/* Scan pg_class for all tables with this shard group */
 	classrel = table_open(RelationRelationId, AccessShareLock);
-
+scan_again:
 	ScanKeyInit(&key[0],
 				Anum_pg_class_relsgid,
 				BTEqualStrategyNumber, F_OIDEQ,
@@ -868,6 +999,15 @@ SyncTablesOnNewShardMember(Oid sgid, Oid newsrvoid)
 		PartitionBoundSpec *partbound = NULL;
 
 		/* Skip non-table relations */
+		if (first_scan)
+		{
+			/* On the first scan, we only want to process partitioned tables, 
+			  so that we create the parent tables before the partitions. 
+			  On the second scan, we process the partitions. */
+			if (classForm->relkind != RELKIND_PARTITIONED_TABLE)
+				continue;
+		}
+		
 		if (classForm->relkind != RELKIND_RELATION &&
 			classForm->relkind != RELKIND_PARTITIONED_TABLE &&
 			classForm->relkind != RELKIND_FOREIGN_TABLE)
@@ -1086,8 +1226,16 @@ SyncTablesOnNewShardMember(Oid sgid, Oid newsrvoid)
 	}
 
 	systable_endscan(scan);
+	
+	/* If we just processed partitioned tables, we need to scan again to process partitions */
+	if (first_scan)
+	{
+		first_scan = false;
+		goto scan_again;
+	}
+	
 	table_close(classrel, AccessShareLock);
-
+	
 	if (list_length(processed_tables) > 0)
 	{
 		ereport(DEBUG1,
@@ -1660,6 +1808,7 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 		
 		/* Create the partition structure on destination */
 		resetStringInfo(&ddl);
+
 		appendStringInfo(&ddl, 
 						"CREATE TABLE IF NOT EXISTS %s.%s_temp PARTITION OF %s.%s %s WITH (no_rel_sync = true);",
 						quote_identifier(nspname),
@@ -1709,6 +1858,8 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 		
 		/* Create the partition structure on destination */
 		resetStringInfo(&ddl);
+		
+		executing_remote_ddl = true; /* flag to indicate we're want it to execute only on local server and not propagate to others */
 		appendStringInfo(&ddl, 
 						"CREATE TABLE IF NOT EXISTS %s.%s_temp PARTITION OF %s.%s %s WITH (no_rel_sync = true);",
 						quote_identifier(nspname),
@@ -1729,6 +1880,8 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 						quote_identifier(relname));
 		
 		SPI_execute(ddl.data, false, 0);
+		
+		executing_remote_ddl = false; /* reset flag */
 		
 		/* Rename temp table to actual partition name */
 		resetStringInfo(&ddl);
@@ -1773,12 +1926,14 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 		/* use SPI */
 		SPI_connect();
 		
+		executing_remote_ddl = true; /* flag to indicate we're want it to execute only on local server and not propagate to others */
 		resetStringInfo(&ddl);
 		appendStringInfo(&ddl, "DROP TABLE IF EXISTS %s.%s CASCADE;",
 						quote_identifier(nspname),
 						quote_identifier(relname));
-		
+
 		SPI_execute(ddl.data, false, 0);
+		executing_remote_ddl = false; 
 
 		resetStringInfo(&ddl);
 		appendStringInfo(&ddl, 
@@ -1815,6 +1970,8 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 			
 			/* Drop and recreate foreign table pointing to destination */
 			resetStringInfo(&ddl);
+			
+			executing_remote_ddl = true; /* flag to indicate we're want it to execute only on local server and not propagate to others */
 			appendStringInfo(&ddl, "DROP FOREIGN TABLE IF EXISTS %s.%s CASCADE;",
 							 quote_identifier(nspname),
 							 quote_identifier(relname));
@@ -1832,6 +1989,8 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 							 quote_identifier(toServerName));
 		
 			SPI_execute(ddl.data, false, 0);
+			
+			executing_remote_ddl = false; /* reset flag */
 			
 			SPI_finish();
 		}
