@@ -106,11 +106,14 @@ static Oid	ReindexTable(const ReindexStmt *stmt, const ReindexParams *params,
 						 bool isTopLevel);
 static void ReindexMultipleTables(const ReindexStmt *stmt,
 								  const ReindexParams *params);
-static void reindex_error_callback(void *arg);
 static void ReindexPartitions(const ReindexStmt *stmt, Oid relid,
 							  const ReindexParams *params, bool isTopLevel);
 static void ReindexMultipleInternal(const ReindexStmt *stmt, const List *relids,
 									const ReindexParams *params);
+static void ReindexPartitionsSingleTransaction(const ReindexStmt *stmt,
+											   Oid relid,
+											   List *partitions,
+											   const ReindexParams *params);
 static bool ReindexRelationConcurrently(const ReindexStmt *stmt,
 										Oid relationOid,
 										const ReindexParams *params);
@@ -127,14 +130,13 @@ struct ReindexIndexCallbackState
 };
 
 /*
- * callback arguments for reindex_error_callback()
+ * Structure for holding table-index OID pairs for sorting
  */
-typedef struct ReindexErrorInfo
+typedef struct IndexTableOidPair
 {
-	char	   *relname;
-	char	   *relnamespace;
-	char		relkind;
-} ReindexErrorInfo;
+	Oid			tableOid;
+	Oid			indexOid;
+} IndexTableOidPair;
 
 /*
  * CheckIndexCompatible
@@ -3156,24 +3158,6 @@ ReindexMultipleTables(const ReindexStmt *stmt, const ReindexParams *params)
 }
 
 /*
- * Error callback specific to ReindexPartitions().
- */
-static void
-reindex_error_callback(void *arg)
-{
-	ReindexErrorInfo *errinfo = (ReindexErrorInfo *) arg;
-
-	Assert(RELKIND_HAS_PARTITIONS(errinfo->relkind));
-
-	if (errinfo->relkind == RELKIND_PARTITIONED_TABLE)
-		errcontext("while reindexing partitioned table \"%s.%s\"",
-				   errinfo->relnamespace, errinfo->relname);
-	else if (errinfo->relkind == RELKIND_PARTITIONED_INDEX)
-		errcontext("while reindexing partitioned index \"%s.%s\"",
-				   errinfo->relnamespace, errinfo->relname);
-}
-
-/*
  * ReindexPartitions
  *
  * Reindex a set of partitions, per the partitioned index or table given
@@ -3184,44 +3168,10 @@ ReindexPartitions(const ReindexStmt *stmt, Oid relid, const ReindexParams *param
 {
 	List	   *partitions = NIL;
 	char		relkind = get_rel_relkind(relid);
-	char	   *relname = get_rel_name(relid);
-	char	   *relnamespace = get_namespace_name(get_rel_namespace(relid));
-	MemoryContext reindex_context;
 	List	   *inhoids;
 	ListCell   *lc;
-	ErrorContextCallback errcallback;
-	ReindexErrorInfo errinfo;
 
 	Assert(RELKIND_HAS_PARTITIONS(relkind));
-
-	/*
-	 * Check if this runs in a transaction block, with an error callback to
-	 * provide more context under which a problem happens.
-	 */
-	errinfo.relname = pstrdup(relname);
-	errinfo.relnamespace = pstrdup(relnamespace);
-	errinfo.relkind = relkind;
-	errcallback.callback = reindex_error_callback;
-	errcallback.arg = (void *) &errinfo;
-	errcallback.previous = error_context_stack;
-	error_context_stack = &errcallback;
-
-	PreventInTransactionBlock(isTopLevel,
-							  relkind == RELKIND_PARTITIONED_TABLE ?
-							  "REINDEX TABLE" : "REINDEX INDEX");
-
-	/* Pop the error context stack */
-	error_context_stack = errcallback.previous;
-
-	/*
-	 * Create special memory context for cross-transaction storage.
-	 *
-	 * Since it is a child of PortalContext, it will go away eventually even
-	 * if we suffer an error so there is no need for special abort cleanup
-	 * logic.
-	 */
-	reindex_context = AllocSetContextCreate(PortalContext, "Reindex",
-											ALLOCSET_DEFAULT_SIZES);
 
 	/* ShareLock is enough to prevent schema modifications */
 	inhoids = find_all_inheritors(relid, ShareLock, NULL);
@@ -3234,7 +3184,6 @@ ReindexPartitions(const ReindexStmt *stmt, Oid relid, const ReindexParams *param
 	{
 		Oid			partoid = lfirst_oid(lc);
 		char		partkind = get_rel_relkind(partoid);
-		MemoryContext old_context;
 
 		/*
 		 * This discards partitioned tables, partitioned indexes and foreign
@@ -3247,23 +3196,16 @@ ReindexPartitions(const ReindexStmt *stmt, Oid relid, const ReindexParams *param
 			   partkind == RELKIND_RELATION);
 
 		/* Save partition OID */
-		old_context = MemoryContextSwitchTo(reindex_context);
 		partitions = lappend_oid(partitions, partoid);
-		MemoryContextSwitchTo(old_context);
 	}
 
 	/*
-	 * Process each partition listed in a separate transaction.  Note that
-	 * this commits and then starts a new transaction immediately.
+	 * Process all partitions in the current transaction, sorting them to
+	 * avoid deadlocks.
 	 */
-	ReindexMultipleInternal(stmt, partitions, params);
+	ReindexPartitionsSingleTransaction(stmt, relid, partitions, params);
 
-	/*
-	 * Clean up working storage --- note we must do this after
-	 * StartTransactionCommand, else we might be trying to delete the active
-	 * context!
-	 */
-	MemoryContextDelete(reindex_context);
+	list_free(partitions);
 }
 
 /*
@@ -3373,6 +3315,126 @@ ReindexMultipleInternal(const ReindexStmt *stmt, const List *relids, const Reind
 	}
 
 	StartTransactionCommand();
+}
+
+/*
+ * Comparator for list_sort to sort IndexTableOidPair by table OID first, then index OID.
+ */
+static int
+index_table_oid_pair_cmp(const ListCell *a, const ListCell *b)
+{
+	const IndexTableOidPair *pair1 = (const IndexTableOidPair *) lfirst(a);
+	const IndexTableOidPair *pair2 = (const IndexTableOidPair *) lfirst(b);
+
+	if (pair1->tableOid < pair2->tableOid)
+		return -1;
+	if (pair1->tableOid > pair2->tableOid)
+		return 1;
+	if (pair1->indexOid < pair2->indexOid)
+		return -1;
+	if (pair1->indexOid > pair2->indexOid)
+		return 1;
+	return 0;
+}
+
+/*
+ * ReindexPartitionsSingleTransaction
+ *
+ * Process reindexing of partitions within a single transaction.
+ * For partitioned tables, we sort partition OIDs and call reindex_relation.
+ * For partitioned indexes, we sort (tableoid, indexoid) pairs and call reindex_index.
+ * This allows the command to run within a transaction block.
+ */
+static void
+ReindexPartitionsSingleTransaction(const ReindexStmt *stmt,
+									Oid relid,
+									List *partitions,
+									const ReindexParams *params)
+{
+	char		relkind = get_rel_relkind(relid);
+	ListCell   *lc;
+
+	Assert(RELKIND_HAS_PARTITIONS(relkind));
+
+	if (relkind == RELKIND_PARTITIONED_TABLE)
+	{
+		/*
+		 * For partitioned tables, sort partition OIDs and reindex each table.
+		 */
+		/* Sort the list by OID to avoid deadlocks */
+		list_sort(partitions, list_oid_cmp);
+
+		foreach(lc, partitions)
+		{
+			Oid			partoid = lfirst_oid(lc);
+			ReindexParams newparams = *params;
+
+			newparams.options |= REINDEXOPT_REPORT_PROGRESS;
+
+			/* Check if relation still exists */
+			if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(partoid)))
+				continue;
+
+			/* Reindex the partition table */
+			(void) reindex_relation(stmt, partoid,
+									REINDEX_REL_PROCESS_TOAST |
+									REINDEX_REL_CHECK_CONSTRAINTS,
+									&newparams);
+		}
+	}
+	else if (relkind == RELKIND_PARTITIONED_INDEX)
+	{
+		/*
+		 * For partitioned indexes, sort by (tableoid, indexoid) pairs to avoid
+		 * deadlocks. We need to lock tables before their indexes.
+		 */
+		List	   *index_pairs = NIL;
+
+		/* Build a list of table-index OID pairs */
+		foreach(lc, partitions)
+		{
+			Oid			indexoid = lfirst_oid(lc);
+			Oid			tableoid;
+			IndexTableOidPair *pair;
+
+			/* Get the table OID for this index */
+			tableoid = IndexGetRelation(indexoid, true);
+
+			if (!OidIsValid(tableoid))
+				continue;
+
+			pair = (IndexTableOidPair *) palloc(sizeof(IndexTableOidPair));
+			pair->tableOid = tableoid;
+			pair->indexOid = indexoid;
+			index_pairs = lappend(index_pairs, pair);
+		}
+
+		/* Sort by table OID first, then by index OID */
+		list_sort(index_pairs, index_table_oid_pair_cmp);
+
+		/* Reindex each partition index in sorted order */
+		foreach(lc, index_pairs)
+		{
+			IndexTableOidPair *pair = (IndexTableOidPair *) lfirst(lc);
+			Oid			indexoid = pair->indexOid;
+			char		persistence;
+			ReindexParams newparams = *params;
+
+			newparams.options |= REINDEXOPT_REPORT_PROGRESS;
+
+			/* Check if index still exists */
+			if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(indexoid)))
+				continue;
+
+			persistence = get_rel_persistence(indexoid);
+
+			/* Reindex the partition index */
+			reindex_index(stmt, indexoid, false, persistence, &newparams);
+		}
+
+		/* Free the allocated pairs */
+		list_free_deep(index_pairs);
+	}
 }
 
 
