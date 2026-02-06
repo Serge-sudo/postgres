@@ -953,6 +953,9 @@ SyncTablesOnNewShardMember(Oid sgid, Oid newsrvoid)
 	List	   *processed_tables = NIL;
 	ForeignServer *server;
 	extern char *cluster_name;
+	char	   *sgname;
+	HeapTuple	sgtuple;
+	Form_pg_shardgroups sgform;
 	bool	first_scan = true;
 
 	/* Check if cluster_name is set */
@@ -964,6 +967,15 @@ SyncTablesOnNewShardMember(Oid sgid, Oid newsrvoid)
 				 errhint("Set cluster_name in postgresql.conf to enable automatic table synchronization.")));
 		return;
 	}
+	
+	/* Get the shard group name */
+	sgtuple = SearchSysCache1(SHARDGROUPOID, ObjectIdGetDatum(sgid));
+	if (!HeapTupleIsValid(sgtuple))
+		elog(ERROR, "cache lookup failed for shard group %u", sgid);
+	
+	sgform = (Form_pg_shardgroups) GETSTRUCT(sgtuple);
+	sgname = pstrdup(NameStr(sgform->sgname));
+	ReleaseSysCache(sgtuple);
 
 	/* Get the foreign server name for logging */
 	server = GetForeignServer(newsrvoid);
@@ -1138,13 +1150,16 @@ scan_again:
 			{
 				char *partkey_str = pg_get_partkeydef_columns(relid, false);
 				
-				appendStringInfo(&ddl, " PARTITION BY %s (%s)",
+				appendStringInfo(&ddl, " DISTRIBUTED BY %s (%s)",
 									partkey->strategy == PARTITION_STRATEGY_HASH ? "HASH" :
 									partkey->strategy == PARTITION_STRATEGY_LIST ? "LIST" :
 									partkey->strategy == PARTITION_STRATEGY_RANGE ? "RANGE" : "UNKNOWN",
 									partkey_str);
 				pfree(partkey_str);
 			}
+			
+			/* Add SHARD GROUP clause */
+			appendStringInfo(&ddl, " SHARD GROUP %s", quote_identifier(sgname));
 
 			ereport(DEBUG1,
 					(errmsg("creating partitioned table \"%s.%s\" on shard member \"%s\"",
@@ -1207,6 +1222,8 @@ scan_again:
 
 			appendStringInfo(&ddl, ") SERVER %s",
 							 quote_identifier(cluster_));
+							 
+			appendStringInfo(&ddl, " SHARD GROUP %s", quote_identifier(sgname));
 
 			ereport(DEBUG1,
 					(errmsg("creating foreign table \"%s.%s\" on shard member \"%s\" pointing to server \"%s\"",
@@ -1250,6 +1267,7 @@ scan_again:
 	}
 
 	list_free(processed_tables);
+	pfree(sgname);
 }
 
 /*
@@ -1724,6 +1742,7 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 	Relation	rel;
 	char	   *relname;
 	char	   *nspname;
+	char	   *sgname;
 	char*			toServerName;
 	char*			fromServerName;
 	StringInfoData ddl;
@@ -1735,6 +1754,17 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 	extern char *cluster_name;
 	PartitionBoundSpec * partbound;
 	char	   *partition_bounds;
+	HeapTuple	sgtuple;
+	Form_pg_shardgroups sgform;
+	
+	/* Get the shard group name */
+	sgtuple = SearchSysCache1(SHARDGROUPOID, ObjectIdGetDatum(sgid));
+	if (!HeapTupleIsValid(sgtuple))
+		elog(ERROR, "cache lookup failed for shard group %u", sgid);
+	
+	sgform = (Form_pg_shardgroups) GETSTRUCT(sgtuple);
+	sgname = pstrdup(NameStr(sgform->sgname));
+	ReleaseSysCache(sgtuple);
 	
 	/* Open the partition relation */
 	rel = table_open(partitionOid, AccessShareLock);
@@ -1807,6 +1837,7 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 		ExecuteDDLOnRemoteServer(toServer, ddl.data);
 		
 		/* Create the partition structure on destination */
+		/* Note: Partitions inherit relsgid from parent, so no SHARD GROUP clause needed */
 		resetStringInfo(&ddl);
 
 		appendStringInfo(&ddl, 
@@ -1857,6 +1888,7 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 		SPI_execute(ddl.data, false, 0);
 		
 		/* Create the partition structure on destination */
+		/* Note: Partitions inherit relsgid from parent, so no SHARD GROUP clause needed */
 		resetStringInfo(&ddl);
 		
 		executing_remote_ddl = true; /* flag to indicate we're want it to execute only on local server and not propagate to others */
@@ -1867,7 +1899,8 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 						quote_identifier(parentnspname),
 						quote_identifier(parentname),
 						partition_bounds);
-		SPI_execute(ddl.data, false, 0);
+		if (SPI_execute(ddl.data, false, 0) < 0)
+			elog(ERROR, "SPI_execute failed: %s", ddl.data);
 
 		/* Copy data */
 		copy_relname = psprintf("%s_temp", quote_identifier(relname));
@@ -2026,6 +2059,7 @@ MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgi
 	pfree(parentname);
 	pfree(partition_bounds);
 	pfree(parentnspname);
+	pfree(sgname);
 	
 	ereport(DEBUG1,
 			(errmsg("successfully migrated partition \"%s.%s\" to \"%s\"",
