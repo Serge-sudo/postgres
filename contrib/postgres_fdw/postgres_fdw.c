@@ -55,6 +55,7 @@
 #include "utils/syscache.h"
 #include "executor/spi.h"
 
+
 PG_MODULE_MAGIC;
 
 /* Default CPU cost to start up a foreign query. */
@@ -3093,12 +3094,17 @@ postgresExecForeignTruncate(List *rels,
  * This function is called to execute DDL statements on a foreign server.
  * It uses the existing postgres_fdw connection infrastructure and participates
  * in 2PC transactions if enabled.
+ * 
+ * To prevent infinite recursion in DDL replication, we set the 
+ * shardgroup.executing_remote_ddl GUC on the remote server before executing
+ * the DDL. This tells the remote server not to replicate the DDL further.
  */
 static void
 postgresExecForeignDDL(Oid serverid, const char *sql)
 {
 	UserMapping *user;
 	PGconn	   *conn;
+	StringInfoData full_sql;
 
 	/*
 	 * Get user mapping and connection to the foreign server.
@@ -3108,8 +3114,20 @@ postgresExecForeignDDL(Oid serverid, const char *sql)
 	user = GetUserMapping(GetUserId(), serverid);
 	conn = GetConnection(user, false, NULL);
 
+	/* 
+	 * Prefix the DDL with SET LOCAL to set the executing_remote_ddl flag
+	 * on the REMOTE server. This prevents infinite recursion by telling
+	 * the remote server not to replicate this DDL further.
+	 */
+	initStringInfo(&full_sql);
+	appendStringInfo(&full_sql, 
+					 "SET LOCAL shardgroup.executing_remote_ddl = true; %s",
+					 sql);
+
 	/* Execute the DDL command on the remote server */
-	do_sql_command(conn, sql);
+	do_sql_command(conn, full_sql.data);
+
+	pfree(full_sql.data);
 
 	/*
 	 * Note: Connection is not explicitly released here.
