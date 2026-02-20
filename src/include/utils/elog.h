@@ -312,7 +312,7 @@ typedef struct ErrorContextCallback
 	void	   *arg;
 } ErrorContextCallback;
 
-extern PGDLLIMPORT ErrorContextCallback *error_context_stack;
+extern PGDLLIMPORT __thread ErrorContextCallback *error_context_stack;
 
 
 /*----------
@@ -427,7 +427,7 @@ extern PGDLLIMPORT ErrorContextCallback *error_context_stack;
 	(pg_re_throw(), pg_unreachable())
 #endif
 
-extern PGDLLIMPORT sigjmp_buf *PG_exception_stack;
+extern PGDLLIMPORT __thread sigjmp_buf *PG_exception_stack;
 
 
 /* Stuff that error handlers might want to use */

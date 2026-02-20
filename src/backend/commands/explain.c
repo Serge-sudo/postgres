@@ -13,11 +13,13 @@
  */
 #include "postgres.h"
 
+#include "access/parallelthread.h"
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "commands/createas.h"
 #include "commands/defrem.h"
 #include "commands/prepare.h"
+#include "executor/nodeSeqscan.h"
 #include "foreign/fdwapi.h"
 #include "jit/jit.h"
 #include "libpq/pqformat.h"
@@ -1445,7 +1447,18 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			sname = "Hash Join";
 			break;
 		case T_SeqScan:
-			pname = sname = "Seq Scan";
+			/*
+			 * When thread-based parallel workers are planned (ptworkers_planned
+			 * > 0), use "Local Parallel Seq Scan" to make the parallelism
+			 * visible to the user.  ptworkers_planned is set during
+			 * ExecInitSeqScan for temp table scans with
+			 * enable_parallel_temp_table on.
+			 */
+			if (planstate != NULL &&
+				castNode(SeqScanState, planstate)->ptworkers_planned > 0)
+				pname = sname = "Local Parallel Seq Scan";
+			else
+				pname = sname = "Seq Scan";
 			break;
 		case T_SampleScan:
 			pname = sname = "Sample Scan";
@@ -2016,6 +2029,28 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			/* fall through to print additional fields the same as SeqScan */
 			/* FALLTHROUGH */
 		case T_SeqScan:
+			show_scan_qual(plan->qual, "Filter", planstate, ancestors, es);
+			if (plan->qual)
+				show_instrumentation_count("Rows Removed by Filter", 1,
+										   planstate, es);
+			/*
+			 * For thread-parallel temp table scans (T_SeqScan only, not the
+			 * SampleScan fall-through), show worker counts analogous to how
+			 * Gather shows them.
+			 */
+			if (nodeTag(plan) == T_SeqScan &&
+				castNode(SeqScanState, planstate)->ptworkers_planned > 0)
+			{
+				ExplainPropertyInteger("Workers Planned", NULL,
+									   castNode(SeqScanState, planstate)->ptworkers_planned,
+									   es);
+				if (es->analyze &&
+					castNode(SeqScanState, planstate)->ptcxt != NULL)
+					ExplainPropertyInteger("Workers Launched", NULL,
+										   castNode(SeqScanState, planstate)->ptcxt->nworkers_launched,
+										   es);
+			}
+			break;
 		case T_ValuesScan:
 		case T_CteScan:
 		case T_NamedTuplestoreScan:

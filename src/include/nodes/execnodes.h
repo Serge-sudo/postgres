@@ -1579,6 +1579,10 @@ typedef struct SeqScanState
 {
 	ScanState	ss;				/* its first field is NodeTag */
 	Size		pscan_len;		/* size of parallel heap scan descriptor */
+	/* Thread-based parallel scan context for temporary tables (may be NULL) */
+	struct ParallelThreadContext *ptcxt;
+	/* planned thread worker count (set even for plain EXPLAIN) */
+	int			ptworkers_planned;
 } SeqScanState;
 
 /* ----------------

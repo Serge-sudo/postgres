@@ -152,6 +152,7 @@ bool		enable_parallel_hash = true;
 bool		enable_partition_pruning = true;
 bool		enable_presorted_aggregate = true;
 bool		enable_async_append = true;
+bool		enable_parallel_temp_table = false;
 
 typedef struct
 {
@@ -345,6 +346,75 @@ cost_seqscan(Path *path, PlannerInfo *root,
 		 */
 		path->rows = clamp_row_est(path->rows / parallel_divisor);
 	}
+
+	path->startup_cost = startup_cost;
+	path->total_cost = startup_cost + cpu_run_cost + disk_run_cost;
+}
+
+/*
+ * cost_localparallel_seqscan
+ *	  Determines and returns the cost of scanning a temp relation using
+ *	  thread-based local parallel workers.
+ *
+ * This is identical to cost_seqscan for the partial-plan case (CPU cost
+ * divided by the parallel divisor), except that path->rows is NOT divided.
+ * Unlike background-worker parallel paths (which are partial and get wrapped
+ * in a Gather node), a local-parallel path is a *complete* path that emits
+ * all rows by itself; the leader collects tuples from thread workers and
+ * returns the full result set.
+ */
+void
+cost_localparallel_seqscan(Path *path, PlannerInfo *root,
+						   RelOptInfo *baserel, ParamPathInfo *param_info)
+{
+	Cost		startup_cost = 0;
+	Cost		cpu_run_cost;
+	Cost		disk_run_cost;
+	double		spc_seq_page_cost;
+	QualCost	qpqual_cost;
+	Cost		cpu_per_tuple;
+	double		parallel_divisor;
+
+	Assert(baserel->relid > 0);
+	Assert(baserel->rtekind == RTE_RELATION);
+	Assert(path->parallel_workers > 0);
+
+	/* Full row estimate — this path returns all rows, not a fraction */
+	if (param_info)
+		path->rows = param_info->ppi_rows;
+	else
+		path->rows = baserel->rows;
+
+	if (!enable_seqscan)
+		startup_cost += disable_cost;
+
+	get_tablespace_page_costs(baserel->reltablespace, NULL, &spc_seq_page_cost);
+
+	disk_run_cost = spc_seq_page_cost * baserel->pages;
+
+	get_restriction_qual_cost(root, baserel, param_info, &qpqual_cost);
+
+	startup_cost += qpqual_cost.startup;
+	cpu_per_tuple = cpu_tuple_cost + qpqual_cost.per_tuple;
+	cpu_run_cost = cpu_per_tuple * baserel->tuples;
+	startup_cost += path->pathtarget->cost.startup;
+	cpu_run_cost += path->pathtarget->cost.per_tuple * path->rows;
+
+	/*
+	 * Divide the CPU work among all workers (including the leader).  The
+	 * disk cost is not amortized: each worker reads its own share of blocks,
+	 * but the total I/O bandwidth is still the same.
+	 * leader_contribution is inverse to worker count, as if we have many workers
+	 * than the leader does not have time to do work on its own.
+	 */
+	parallel_divisor = path->parallel_workers;
+	if (parallel_leader_participation)
+	{
+		double		leader_contribution = 1.0 / path->parallel_workers;
+
+		parallel_divisor += leader_contribution;
+	}
+	cpu_run_cost /= parallel_divisor;
 
 	path->startup_cost = startup_cost;
 	path->total_cost = startup_cost + cpu_run_cost + disk_run_cost;

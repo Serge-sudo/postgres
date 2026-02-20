@@ -27,13 +27,18 @@
  */
 #include "postgres.h"
 
+#include "access/parallelthread.h"
 #include "access/relscan.h"
 #include "access/tableam.h"
 #include "executor/executor.h"
 #include "executor/nodeSeqscan.h"
+#include "miscadmin.h"
+#include "optimizer/cost.h"
+#include "storage/bufmgr.h"
 #include "utils/rel.h"
 
 static TupleTableSlot *SeqNext(SeqScanState *node);
+static void SeqScanLaunchThreadWorkers(SeqScanState *node, Snapshot snapshot);
 
 /* ----------------------------------------------------------------
  *						Scan Support
@@ -61,6 +66,28 @@ SeqNext(SeqScanState *node)
 	estate = node->ss.ps.state;
 	direction = estate->es_direction;
 	slot = node->ss.ss_ScanTupleSlot;
+
+	/*
+	 * If thread-based parallel workers are active for this temp table scan,
+	 * retrieve the next tuple from the inter-thread result queue instead of
+	 * doing a regular heap scan.  Only forward-direction scans are supported
+	 * with thread workers; a backward scan falls through to the normal path.
+	 */
+	if (node->ptcxt != NULL && ScanDirectionIsForward(direction))
+	{
+		HeapTuple	tuple = ParallelThreadGetNextTuple(node->ptcxt);
+
+		if (tuple == NULL)
+			return ExecClearTuple(slot);
+
+		/*
+		 * ExecForceStoreHeapTuple handles any slot type, including the
+		 * TTSOpsBufferHeapTuple slots that SeqScan normally uses.
+		 * shouldFree = true lets the slot own the palloc'd tuple.
+		 */
+		ExecForceStoreHeapTuple(tuple, slot, true);
+		return slot;
+	}
 
 	if (scandesc == NULL)
 	{
@@ -112,6 +139,56 @@ ExecSeqScan(PlanState *pstate)
 	return ExecScan(&node->ss,
 					(ExecScanAccessMtd) SeqNext,
 					(ExecScanRecheckMtd) SeqRecheck);
+}
+
+
+/*
+ * SeqScanLaunchThreadWorkers
+ *
+ * Launch thread-based parallel workers for a temporary table sequential scan.
+ * Stores the resulting ParallelThreadContext in node->ptcxt, or leaves it NULL
+ * if no workers could be started.  Used by both ExecInitSeqScan (initial
+ * launch) and ExecReScanSeqScan (restart after a rescan).
+ */
+static void
+SeqScanLaunchThreadWorkers(SeqScanState *node, Snapshot snapshot)
+{
+	BlockNumber			nblocks;
+	int					nworkers;
+	ParallelThreadContext *ptcxt;
+	List			   *qual;
+
+	Assert(node->ptcxt == NULL);
+
+	nblocks = RelationGetNumberOfBlocks(node->ss.ss_currentRelation);
+	if (nblocks == 0)
+		return;
+
+	/*
+	 * Derive the worker count from the actual block count, mirroring the
+	 * planner's create_localparallel_seqscan logic.  We cannot call
+	 * compute_parallel_worker() here because it requires a RelOptInfo; we
+	 * instead replicate the min-cap, which is also what the planner path
+	 * does when rel->rel_parallel_workers is unset and the table is large
+	 * enough for the maximum worker count.
+	 */
+	nworkers = node->ptworkers_planned;
+	ptcxt = CreateParallelThreadContext(nworkers);
+
+	/* Raw qual list from the plan node, for per-worker ExprState compilation. */
+	qual = node->ss.ps.plan->qual;
+
+	LaunchParallelThreadWorkers(ptcxt,
+								node->ss.ss_currentRelation,
+								snapshot,
+								nblocks,
+								qual,
+								node->ss.ps.ps_ExprContext);
+
+	if (ptcxt->nworkers_launched > 0)
+		node->ptcxt = ptcxt;
+	else
+		DestroyParallelThreadContext(ptcxt);
 }
 
 
@@ -171,6 +248,49 @@ ExecInitSeqScan(SeqScan *node, EState *estate, int eflags)
 	scanstate->ss.ps.qual =
 		ExecInitQual(node->scan.plan.qual, (PlanState *) scanstate);
 
+	/*
+	 * If this is a scan of a temporary table, enable_parallel_temp_table is
+	 * on, and we have a worker budget, launch thread-based parallel workers
+	 * now.  Thread workers run inside this process and can directly access
+	 * the session's local buffer pool.  We do not launch workers when:
+	 *   - We are already inside a parallel worker (avoid nesting).
+	 *   - The relation has no blocks (nothing to scan in parallel).
+	 *   - An EXPLAIN-only plan run (EXEC_FLAG_EXPLAIN_ONLY).
+	 *
+	 * We compute ptworkers_planned regardless of EXEC_FLAG_EXPLAIN_ONLY so
+	 * that plain EXPLAIN can display "Workers Planned: N".
+	 */
+	scanstate->ptcxt = NULL;
+	scanstate->ptworkers_planned = 0;
+
+	if (enable_parallel_temp_table &&
+		RelationUsesLocalBuffers(scanstate->ss.ss_currentRelation) &&
+		max_parallel_workers_per_gather > 0 &&
+		!IsParallelWorker() && !IsParallelThreadWorker())
+	{
+		int			rel_parallel_workers;
+
+		/*
+		 * Determine the worker count the same way the planner does:
+		 * honour the parallel_workers reloption first; otherwise cap at
+		 * max_parallel_workers_per_gather and MAX_PARALLEL_THREAD_WORKERS.
+		 * The planner's cost_localparallel_seqscan uses compute_parallel_worker()
+		 * which also reads the reloption first, so this stays consistent.
+		 */
+		rel_parallel_workers =
+			RelationGetParallelWorkers(scanstate->ss.ss_currentRelation, -1);
+
+		if (rel_parallel_workers != -1)
+			scanstate->ptworkers_planned = Min(rel_parallel_workers,
+											   MAX_PARALLEL_THREAD_WORKERS);
+		else
+			scanstate->ptworkers_planned = Min(max_parallel_workers_per_gather,
+											   MAX_PARALLEL_THREAD_WORKERS);
+
+		if (scanstate->ptworkers_planned > 0 && !(eflags & EXEC_FLAG_EXPLAIN_ONLY))
+			SeqScanLaunchThreadWorkers(scanstate, estate->es_snapshot);
+	}
+
 	return scanstate;
 }
 
@@ -184,6 +304,18 @@ void
 ExecEndSeqScan(SeqScanState *node)
 {
 	TableScanDesc scanDesc;
+
+	/*
+	 * If thread-based parallel workers are running, wait for them to finish
+	 * and clean up the thread context.  WaitForParallelThreadWorkers() also
+	 * re-raises any error reported by a worker.
+	 */
+	if (node->ptcxt != NULL)
+	{
+		WaitForParallelThreadWorkers(node->ptcxt);
+		DestroyParallelThreadContext(node->ptcxt);
+		node->ptcxt = NULL;
+	}
 
 	/*
 	 * get information from node
@@ -211,7 +343,29 @@ ExecEndSeqScan(SeqScanState *node)
 void
 ExecReScanSeqScan(SeqScanState *node)
 {
+	EState	   *estate = node->ss.ps.state;
 	TableScanDesc scan;
+
+	/*
+	 * If thread-based parallel workers are active, drain the result queue and
+	 * wait for all threads to finish, then restart them so the rescan reads
+	 * from the beginning of the relation again.
+	 */
+	if (node->ptcxt != NULL)
+	{
+		HeapTuple	tup;
+
+		/* Drain the queue so workers don't block trying to enqueue. */
+		while ((tup = ParallelThreadGetNextTuple(node->ptcxt)) != NULL)
+			pfree(tup);
+
+		WaitForParallelThreadWorkers(node->ptcxt);
+		DestroyParallelThreadContext(node->ptcxt);
+		node->ptcxt = NULL;
+
+		/* Re-launch workers from the start of the relation. */
+		SeqScanLaunchThreadWorkers(node, estate->es_snapshot);
+	}
 
 	scan = node->ss.ss_currentScanDesc;
 

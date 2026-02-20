@@ -137,17 +137,24 @@ static const MemoryContextMethods mcxt_methods[] = {
 #undef BOGUS_MCTX
 
 /*
- * CurrentMemoryContext
- *		Default memory context for allocations.
+ * CurrentMemoryContext is declared __thread so that parallel thread workers
+ * (which share the process address space with the leader) each have their
+ * own independent current allocation context.  In a single-threaded backend
+ * the behaviour is identical to a plain global.
  */
-MemoryContext CurrentMemoryContext = NULL;
+__thread MemoryContext CurrentMemoryContext = NULL;
 
 /*
  * Standard top-level contexts. For a description of the purpose of each
  * of these contexts, refer to src/backend/utils/mmgr/README
  */
 MemoryContext TopMemoryContext = NULL;
-MemoryContext ErrorContext = NULL;
+/*
+ * ErrorContext is declared __thread so that each parallel thread worker has
+ * its own error reporting context, preventing concurrent error handling from
+ * corrupting each other's state.
+ */
+__thread MemoryContext ErrorContext = NULL;
 MemoryContext PostmasterContext = NULL;
 MemoryContext CacheMemoryContext = NULL;
 MemoryContext MessageContext = NULL;

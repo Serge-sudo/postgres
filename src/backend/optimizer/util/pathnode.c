@@ -945,6 +945,40 @@ create_seqscan_path(PlannerInfo *root, RelOptInfo *rel,
 }
 
 /*
+ * create_localparallel_seqscan_path
+ *	  Creates a path for a thread-based local parallel sequential scan of a
+ *	  temporary table.
+ *
+ * Unlike a standard parallel path (parallel_aware = true), this path is
+ * complete — it returns all tuples, not a fraction — and must NOT be placed
+ * under a Gather node.  Thread workers run inside the backend process and
+ * share its local buffer pool.
+ *
+ * The path uses T_SeqScan as the executor node; the executor detects that
+ * thread workers should be used because the relation is a temp table and
+ * enable_parallel_temp_table is on.
+ */
+Path *
+create_localparallel_seqscan_path(PlannerInfo *root, RelOptInfo *rel,
+								  Relids required_outer, int parallel_workers)
+{
+	Path	   *pathnode = makeNode(Path);
+
+	pathnode->pathtype = T_SeqScan;
+	pathnode->parent = rel;
+	pathnode->pathtarget = rel->reltarget;
+	pathnode->param_info = get_baserel_parampathinfo(root, rel, required_outer);
+	pathnode->parallel_aware = false;	/* complete path, not partial */
+	pathnode->parallel_safe = rel->consider_parallel;
+	pathnode->parallel_workers = parallel_workers;
+	pathnode->pathkeys = NIL;	/* unordered result */
+
+	cost_localparallel_seqscan(pathnode, root, rel, pathnode->param_info);
+
+	return pathnode;
+}
+
+/*
  * create_samplescan_path
  *	  Creates a path node for a sampled table scan.
  */

@@ -90,10 +90,17 @@
 #define _(x) err_gettext(x)
 
 
-/* Global variables */
-ErrorContextCallback *error_context_stack = NULL;
+/*
+ * Global variables for error handling.
+ *
+ * These are declared with __thread so that each thread (including parallel
+ * thread workers for temporary table scans) has its own independent error
+ * handling state.  In a single-threaded backend the behaviour is identical
+ * to a plain global variable.
+ */
+__thread ErrorContextCallback *error_context_stack = NULL;
 
-sigjmp_buf *PG_exception_stack = NULL;
+__thread sigjmp_buf *PG_exception_stack = NULL;
 
 extern bool redirection_done;
 
@@ -146,11 +153,11 @@ static void write_eventlog(int level, const char *line, int len);
 /* We provide a small stack of ErrorData records for re-entrant cases */
 #define ERRORDATA_STACK_SIZE  5
 
-static ErrorData errordata[ERRORDATA_STACK_SIZE];
+static __thread ErrorData errordata[ERRORDATA_STACK_SIZE];
 
-static int	errordata_stack_depth = -1; /* index of topmost active frame */
+static __thread int errordata_stack_depth = -1; /* index of topmost active frame */
 
-static int	recursion_depth = 0;	/* to detect actual recursion */
+static __thread int recursion_depth = 0;	/* to detect actual recursion */
 
 /*
  * Saved timeval and buffers for formatted timestamps that might be used by

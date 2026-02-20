@@ -56,7 +56,7 @@
  * MemoryContextInit() itself.
  */
 extern PGDLLIMPORT MemoryContext TopMemoryContext;
-extern PGDLLIMPORT MemoryContext ErrorContext;
+extern PGDLLIMPORT __thread MemoryContext ErrorContext;
 extern PGDLLIMPORT MemoryContext PostmasterContext;
 extern PGDLLIMPORT MemoryContext CacheMemoryContext;
 extern PGDLLIMPORT MemoryContext MessageContext;

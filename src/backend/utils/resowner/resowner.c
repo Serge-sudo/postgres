@@ -162,7 +162,12 @@ struct ResourceOwnerData
  *	  GLOBAL MEMORY															 *
  *****************************************************************************/
 
-ResourceOwner CurrentResourceOwner = NULL;
+/*
+ * CurrentResourceOwner is declared __thread so each parallel thread worker
+ * tracks its own set of pinned buffers and other resources independently.
+ * In a single-threaded backend the behaviour is identical to a plain global.
+ */
+__thread ResourceOwner CurrentResourceOwner = NULL;
 ResourceOwner CurTransactionResourceOwner = NULL;
 ResourceOwner TopTransactionResourceOwner = NULL;
 ResourceOwner AuxProcessResourceOwner = NULL;

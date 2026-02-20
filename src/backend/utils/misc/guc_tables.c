@@ -951,6 +951,19 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"enable_parallel_temp_table", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enables parallel query execution on temporary tables using thread workers."),
+			gettext_noop("When enabled, SELECT queries on temporary tables may use "
+						 "thread-based parallel workers that can access the session's "
+						 "local buffers directly.  Disabled by default because the "
+						 "feature is experimental."),
+			GUC_EXPLAIN
+		},
+		&enable_parallel_temp_table,
+		false,
+		NULL, NULL, NULL
+	},
+	{
 		{"enable_partition_pruning", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables plan-time and execution-time partition pruning."),
 			gettext_noop("Allows the query planner and executor to compare partition "

@@ -70,12 +70,17 @@ extern PGDLLIMPORT bool enable_parallel_hash;
 extern PGDLLIMPORT bool enable_partition_pruning;
 extern PGDLLIMPORT bool enable_presorted_aggregate;
 extern PGDLLIMPORT bool enable_async_append;
+/* enable parallel query on temporary tables via thread workers */
+extern PGDLLIMPORT bool enable_parallel_temp_table;
 extern PGDLLIMPORT int constraint_exclusion;
 
 extern double index_pages_fetched(double tuples_fetched, BlockNumber pages,
 								  double index_pages, PlannerInfo *root);
 extern void cost_seqscan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
 						 ParamPathInfo *param_info);
+extern void cost_localparallel_seqscan(Path *path, PlannerInfo *root,
+									   RelOptInfo *baserel,
+									   ParamPathInfo *param_info);
 extern void cost_samplescan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
 							ParamPathInfo *param_info);
 extern void cost_index(IndexPath *path, PlannerInfo *root,

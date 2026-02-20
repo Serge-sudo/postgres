@@ -15,7 +15,10 @@
  */
 #include "postgres.h"
 
+#include <pthread.h>
+
 #include "access/parallel.h"
+#include "access/parallelthread.h"
 #include "executor/instrument.h"
 #include "pgstat.h"
 #include "storage/buf_internals.h"
@@ -51,6 +54,7 @@ static HTAB *LocalBufHash = NULL;
 
 /* number of local buffers pinned at least once */
 static int	NLocalPinnedBuffers = 0;
+
 
 
 static void InitLocalBuffers(void);
@@ -108,9 +112,10 @@ PrefetchLocalBuffer(SMgrRelation smgr, ForkNumber forkNum,
  * LocalBufferAlloc -
  *	  Find or create a local buffer for the given page of the given relation.
  *
- * API is similar to bufmgr.c's BufferAlloc, except that we do not need to do
- * any locking since this is all local.  We support only default access
- * strategy (hence, usage_count is always advanced).
+ * API is similar to bufmgr.c's BufferAlloc.  When parallel thread workers are
+ * active, callers are responsible for serialising access to local buffer
+ * bookkeeping by holding mvcc_mutex (or equivalent) around ReadBuffer and
+ * ReleaseBuffer calls; see parallelthread.c.
  */
 BufferDesc *
 LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
@@ -154,7 +159,9 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 		hresult = (LocalBufferLookupEnt *)
 			hash_search(LocalBufHash, &newTag, HASH_ENTER, &found);
 		if (found)				/* shouldn't happen */
+		{
 			elog(ERROR, "local buffer hash table corrupted");
+		}
 		hresult->id = bufid;
 
 		/*
@@ -584,14 +591,18 @@ InitLocalBuffers(void)
 	int			i;
 
 	/*
-	 * Parallel workers can't access data in temporary tables, because they
-	 * have no visibility into the local buffers of their leader.  This is a
-	 * convenient, low-cost place to provide a backstop check for that.  Note
-	 * that we don't wish to prevent a parallel worker from accessing catalog
-	 * metadata about a temp table, so checks at higher levels would be
-	 * inappropriate.
+	 * Process-based parallel workers can't access data in temporary tables,
+	 * because they have no visibility into the local buffers of their leader.
+	 * Thread-based parallel workers (IsParallelThreadWorker()) share the
+	 * process address space with the leader and therefore CAN access local
+	 * buffers; they are explicitly permitted here.
+	 *
+	 * This is a convenient, low-cost place to provide a backstop check for
+	 * the process-based case.  Note that we don't wish to prevent a parallel
+	 * worker from accessing catalog metadata about a temp table, so checks at
+	 * higher levels would be inappropriate.
 	 */
-	if (IsParallelWorker())
+	if (IsParallelWorker() && !IsParallelThreadWorker())
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
 				 errmsg("cannot access temporary tables during a parallel operation")));

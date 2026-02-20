@@ -18,6 +18,7 @@
 #include <limits.h>
 #include <math.h>
 
+#include "access/parallelthread.h"
 #include "access/sysattr.h"
 #include "access/tsmapi.h"
 #include "catalog/pg_class.h"
@@ -774,6 +775,33 @@ set_plain_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 
 	/* Consider sequential scan */
 	add_path(rel, create_seqscan_path(root, rel, required_outer, 0));
+
+	/*
+	 * Consider local parallel sequential scan for temporary tables.
+	 *
+	 * Thread-based parallel workers run inside the backend process and can
+	 * directly access the session's local buffer pool, making parallel scans
+	 * on temp tables feasible.  We use the same compute_parallel_worker()
+	 * logic as for normal-table parallel scans to derive the worker count,
+	 * then add a complete (non-partial) path whose CPU cost is divided by the
+	 * worker + leader contribution.  add_path() compares it against the plain
+	 * seqscan on cost and keeps the cheaper one (or both if neither dominates).
+	 */
+	if (enable_parallel_temp_table && required_outer == NULL &&
+		max_parallel_workers_per_gather > 0 &&
+		get_rel_persistence(rte->relid) == RELPERSISTENCE_TEMP)
+	{
+		int			nworkers;
+
+		nworkers = compute_parallel_worker(rel, rel->pages, -1,
+										   max_parallel_workers_per_gather);
+		nworkers = Min(nworkers, MAX_PARALLEL_THREAD_WORKERS);
+		if (nworkers > 0)
+			add_path(rel,
+					 create_localparallel_seqscan_path(root, rel,
+													   required_outer,
+													   nworkers));
+	}
 
 	/* If appropriate, consider parallel sequential scan */
 	if (rel->consider_parallel && required_outer == NULL)

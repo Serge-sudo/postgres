@@ -1351,3 +1351,54 @@ CREATE UNIQUE INDEX parallel_hang_idx
 SET debug_parallel_query = on;
 DELETE FROM parallel_hang WHERE 380 <= i AND i <= 420;
 ROLLBACK;
+-- Tests for parallel query on temporary tables via enable_parallel_temp_table
+-- (Thread-based workers run inside the leader process and share local buffers.)
+-- Verify the GUC exists and defaults to off
+SHOW enable_parallel_temp_table;
+ enable_parallel_temp_table 
+----------------------------
+ off
+(1 row)
+
+SET max_parallel_workers_per_gather = 2;
+CREATE TEMP TABLE parallel_temp_tbl (id int, val text);
+INSERT INTO parallel_temp_tbl SELECT i, 'v'||i FROM generate_series(1,500) i;
+-- Without the flag, shows regular Seq Scan
+SET enable_parallel_temp_table = off;
+EXPLAIN (costs off) SELECT count(*) FROM parallel_temp_tbl;
+             QUERY PLAN              
+-------------------------------------
+ Aggregate
+   ->  Seq Scan on parallel_temp_tbl
+(2 rows)
+
+-- With the flag, shows Local Parallel Seq Scan to indicate thread workers
+SET enable_parallel_temp_table = on;
+EXPLAIN (costs off) SELECT count(*) FROM parallel_temp_tbl;
+                     QUERY PLAN                     
+----------------------------------------------------
+ Aggregate
+   ->  Local Parallel Seq Scan on parallel_temp_tbl
+         Workers Planned: 2
+(3 rows)
+
+-- Verify the result is correct when thread workers are active
+SELECT count(*) FROM parallel_temp_tbl;
+ count 
+-------
+   500
+(1 row)
+
+-- Rescan test: verify thread workers are restarted on rescan
+SELECT t.n, (SELECT count(*) FROM parallel_temp_tbl WHERE id <= t.n * 250) AS cnt
+FROM (VALUES (1),(2)) t(n) ORDER BY t.n;
+ n | cnt 
+---+-----
+ 1 | 250
+ 2 | 500
+(2 rows)
+
+DROP TABLE parallel_temp_tbl;
+-- Reset GUC settings
+RESET enable_parallel_temp_table;
+RESET max_parallel_workers_per_gather;
