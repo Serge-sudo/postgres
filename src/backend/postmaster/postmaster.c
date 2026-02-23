@@ -95,7 +95,7 @@
 #include "common/file_utils.h"
 #include "common/ip.h"
 #include "common/pg_prng.h"
-#include "foreign/conn_multiplexer.h"
+
 #include "lib/ilist.h"
 #include "libpq/libpq.h"
 #include "libpq/pqsignal.h"
@@ -907,6 +907,11 @@ PostmasterMain(int argc, char *argv[])
 	 * before any modules had a chance to take the background worker slots.
 	 */
 	ApplyLauncherRegister();
+	
+	/*
+	 * Register connection multiplexer workers if enabled
+	 */
+	RegisterConnMultiplexerWorkers();
 
 	/*
 	 * process any libraries that should be preloaded at postmaster start
@@ -975,13 +980,7 @@ PostmasterMain(int argc, char *argv[])
 	 * normally choose the same IPC keys.  This helps ensure that we will
 	 * clean up dead IPC objects if the postmaster crashes and is restarted.
 	 */
-	InitConnMultiplexer();
 	CreateSharedMemoryAndSemaphores();
-
-	/*
-	 * Register connection multiplexer workers if enabled
-	 */
-	RegisterConnMultiplexerWorkers();
 
 	/*
 	 * Estimate number of openable files.  This must happen after setting up

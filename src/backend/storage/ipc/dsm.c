@@ -689,7 +689,7 @@ dsm_attach(dsm_handle h)
 	{
 		seg = dlist_container(dsm_segment, node, iter.cur);
 		if (seg->handle == h)
-			elog(ERROR, "can't attach the same segment more than once");
+			return seg;
 	}
 
 	/* Create a new segment descriptor. */

@@ -78,7 +78,7 @@ extern bool enable_foreign_conn_multiplexer;
 /* Shared memory structures */
 typedef struct ConnMultiplexerShmemStruct
 {
-	LWLock		lock;				/* protects worker pool state */
+	LWLock		lock;
 	int			num_workers;		/* number of active workers */
 	int			next_worker;		/* round-robin worker selection */
 	int			next_conn_id;		/* next connection ID to assign */
@@ -87,6 +87,7 @@ typedef struct ConnMultiplexerShmemStruct
 } ConnMultiplexerShmemStruct;
 
 static ConnMultiplexerShmemStruct *ConnMultiplexerShmem = NULL;
+static LWLock *ConnMultiplexerLock = NULL;
 
 /* Worker connection state - stores actual libpq connections */
 typedef struct WorkerConnection
@@ -150,22 +151,13 @@ static WorkerConnection *allocate_connection(WorkerConnection *connections);
 static volatile sig_atomic_t got_sigterm = false;
 static volatile sig_atomic_t got_sighup = false;
 
-/* Shared memory startup hook */
-static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
-
 /*
  * Module initialization - called during postmaster startup
  */
 void
 InitConnMultiplexer(void)
 {
-	/* Request shared memory */
-	RequestAddinShmemSpace(conn_multiplexer_shmem_size());
-	RequestNamedLWLockTranche("conn_multiplexer", 1);
-
-	/* Set up shared memory startup hook */
-	prev_shmem_startup_hook = shmem_startup_hook;
-	shmem_startup_hook = conn_multiplexer_shmem_startup;
+	conn_multiplexer_shmem_startup();
 }
 
 /*
@@ -222,9 +214,6 @@ conn_multiplexer_shmem_startup(void)
 	bool		found;
 	LWLock	   *lock;
 
-	if (prev_shmem_startup_hook)
-		prev_shmem_startup_hook();
-
 	/* Allocate shared memory */
 	ConnMultiplexerShmem = ShmemInitStruct("conn_multiplexer",
 										   sizeof(ConnMultiplexerShmemStruct),
@@ -234,8 +223,8 @@ conn_multiplexer_shmem_startup(void)
 	{
 		/* Initialize shared memory on first time */
 		/* Get the LWLock from the named tranche we requested */
-		lock = &(GetNamedLWLockTranche("conn_multiplexer"))->lock;
-		memcpy(&ConnMultiplexerShmem->lock, lock, sizeof(LWLock));
+		ConnMultiplexerLock = &ConnMultiplexerShmem->lock;
+		LWLockInitialize(ConnMultiplexerLock, LWTRANCHE_MULTIPLEXER);
 		ConnMultiplexerShmem->num_workers = 0;
 		ConnMultiplexerShmem->next_worker = 0;
 		ConnMultiplexerShmem->next_conn_id = 1;
@@ -305,9 +294,9 @@ process_worker_requests(WorkerConnection *connections, int worker_id)
 	dsm_handle	dsm_h;
 
 	/* Get DSM handle from shared memory */
-	LWLockAcquire(&ConnMultiplexerShmem->lock, LW_SHARED);
+	LWLockAcquire(ConnMultiplexerLock, LW_SHARED);
 	dsm_h = ConnMultiplexerShmem->worker_dsm_handles[worker_id];
-	LWLockRelease(&ConnMultiplexerShmem->lock);
+	LWLockRelease(ConnMultiplexerLock);
 
 	if (dsm_h == DSM_HANDLE_INVALID)
 		return;
@@ -652,9 +641,9 @@ conn_multiplexer_worker_main(Datum main_arg)
 	shm_mq_set_sender(response_mq, MyProc);
 
 	/* Store DSM handle in shared memory so backends can find it */
-	LWLockAcquire(&ConnMultiplexerShmem->lock, LW_EXCLUSIVE);
+	LWLockAcquire(ConnMultiplexerLock, LW_EXCLUSIVE);
 	ConnMultiplexerShmem->worker_dsm_handles[worker_id] = dsm_segment_handle(seg);
-	LWLockRelease(&ConnMultiplexerShmem->lock);
+	LWLockRelease(ConnMultiplexerLock);
 
 	/* Allocate memory for connection tracking */
 	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
@@ -675,11 +664,11 @@ conn_multiplexer_worker_main(Datum main_arg)
 					worker_id, dsm_segment_handle(seg))));
 
 	/* Update shared memory */
-	LWLockAcquire(&ConnMultiplexerShmem->lock, LW_EXCLUSIVE);
+	LWLockAcquire(ConnMultiplexerLock, LW_EXCLUSIVE);
 	ConnMultiplexerShmem->num_workers++;
 	if (ConnMultiplexerShmem->num_workers == foreign_conn_multiplexer_workers)
 		ConnMultiplexerShmem->initialized = true;
-	LWLockRelease(&ConnMultiplexerShmem->lock);
+	LWLockRelease(ConnMultiplexerLock);
 
 	/* Main worker loop */
 	while (!got_sigterm)
@@ -723,12 +712,12 @@ conn_multiplexer_worker_main(Datum main_arg)
 	}
 
 	/* Cleanup DSM */
-	LWLockAcquire(&ConnMultiplexerShmem->lock, LW_EXCLUSIVE);
+	LWLockAcquire(ConnMultiplexerLock, LW_EXCLUSIVE);
 	ConnMultiplexerShmem->worker_dsm_handles[worker_id] = DSM_HANDLE_INVALID;
 	ConnMultiplexerShmem->num_workers--;
 	if (ConnMultiplexerShmem->num_workers == 0)
 		ConnMultiplexerShmem->initialized = false;
-	LWLockRelease(&ConnMultiplexerShmem->lock);
+	LWLockRelease(ConnMultiplexerLock);
 
 	dsm_detach(seg);
 
@@ -782,9 +771,9 @@ IsConnMultiplexerEnabled(void)
 		return false;
 
 	/* Check if workers are initialized */
-	LWLockAcquire(&ConnMultiplexerShmem->lock, LW_SHARED);
+	LWLockAcquire(ConnMultiplexerLock, LW_SHARED);
 	initialized = ConnMultiplexerShmem->initialized;
-	LWLockRelease(&ConnMultiplexerShmem->lock);
+	LWLockRelease(ConnMultiplexerLock);
 
 	return initialized;
 }
@@ -800,11 +789,11 @@ GetNextMultiplexerWorker(void)
 	if (!IsConnMultiplexerEnabled())
 		return -1;
 
-	LWLockAcquire(&ConnMultiplexerShmem->lock, LW_EXCLUSIVE);
+	LWLockAcquire(ConnMultiplexerLock, LW_EXCLUSIVE);
 	worker_id = ConnMultiplexerShmem->next_worker;
 	ConnMultiplexerShmem->next_worker = 
 		(ConnMultiplexerShmem->next_worker + 1) % foreign_conn_multiplexer_workers;
-	LWLockRelease(&ConnMultiplexerShmem->lock);
+	LWLockRelease(ConnMultiplexerLock);
 
 	return worker_id;
 }
@@ -820,9 +809,9 @@ allocate_conn_id(void)
 {
 	int conn_id;
 	
-	LWLockAcquire(&ConnMultiplexerShmem->lock, LW_EXCLUSIVE);
+	LWLockAcquire(ConnMultiplexerLock, LW_EXCLUSIVE);
 	conn_id = ConnMultiplexerShmem->next_conn_id++;
-	LWLockRelease(&ConnMultiplexerShmem->lock);
+	LWLockRelease(ConnMultiplexerLock);
 	
 	return conn_id;
 }
@@ -888,9 +877,9 @@ MultiplexerConnect(const char *conninfo, int *conn_id_out)
 	conn_id = allocate_conn_id();
 
 	/* Get DSM handle for this worker */
-	LWLockAcquire(&ConnMultiplexerShmem->lock, LW_SHARED);
+	LWLockAcquire(ConnMultiplexerLock, LW_SHARED);
 	dsm_h = ConnMultiplexerShmem->worker_dsm_handles[worker_id];
-	LWLockRelease(&ConnMultiplexerShmem->lock);
+	LWLockRelease(ConnMultiplexerLock);
 
 	if (dsm_h == DSM_HANDLE_INVALID)
 	{
@@ -1040,9 +1029,9 @@ MultiplexerQuery(int conn_id, const char *query, void **result_out)
 	worker_id = conn_id % foreign_conn_multiplexer_workers;
 
 	/* Get DSM handle for this worker */
-	LWLockAcquire(&ConnMultiplexerShmem->lock, LW_SHARED);
+	LWLockAcquire(ConnMultiplexerLock, LW_SHARED);
 	dsm_h = ConnMultiplexerShmem->worker_dsm_handles[worker_id];
-	LWLockRelease(&ConnMultiplexerShmem->lock);
+	LWLockRelease(ConnMultiplexerLock);
 
 	if (dsm_h == DSM_HANDLE_INVALID)
 	{
@@ -1180,9 +1169,9 @@ MultiplexerClose(int conn_id)
 	worker_id = conn_id % foreign_conn_multiplexer_workers;
 
 	/* Get DSM handle for this worker */
-	LWLockAcquire(&ConnMultiplexerShmem->lock, LW_SHARED);
+	LWLockAcquire(ConnMultiplexerLock, LW_SHARED);
 	dsm_h = ConnMultiplexerShmem->worker_dsm_handles[worker_id];
-	LWLockRelease(&ConnMultiplexerShmem->lock);
+	LWLockRelease(ConnMultiplexerLock);
 
 	if (dsm_h == DSM_HANDLE_INVALID)
 	{

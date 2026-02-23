@@ -24,6 +24,7 @@
 #include "access/subtrans.h"
 #include "access/syncscan.h"
 #include "access/transam.h"
+#include "foreign/conn_multiplexer.h"
 #include "access/csn_log.h"
 #include "access/csn_snapshot.h"
 #include "access/twophase.h"
@@ -316,6 +317,7 @@ CreateOrAttachShmemStructs(void)
 	SUBTRANSShmemInit();
 	MultiXactShmemInit();
 	InitBufferPool();
+	InitConnMultiplexer();
 
 	/*
 	 * Set up lock manager
