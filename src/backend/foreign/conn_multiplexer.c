@@ -110,10 +110,14 @@ typedef struct WorkerState
 
 #define MAX_WORKER_CONNECTIONS 100
 
-/* TOC keys for DSM segment */
+/* TOC keys for DSM segment - these are indices, not the actual keys */
 #define CONN_MUX_MAGIC			0x436F6E4D	/* 'ConM' */
 #define CONN_MUX_KEY_REQUEST_QUEUE	0
 #define CONN_MUX_KEY_RESPONSE_QUEUE	1
+
+/* Helper macros to create unique keys per worker */
+#define WORKER_REQUEST_QUEUE_KEY(worker_id)	((worker_id) * 2 + CONN_MUX_KEY_REQUEST_QUEUE)
+#define WORKER_RESPONSE_QUEUE_KEY(worker_id)	((worker_id) * 2 + CONN_MUX_KEY_RESPONSE_QUEUE)
 
 /* Queue sizes - reduced to 512KB per queue to avoid exhausting /dev/shm */
 #define CONN_MUX_QUEUE_SIZE	(512 * 1024)  /* 512KB per queue */
@@ -604,15 +608,15 @@ conn_multiplexer_worker_main(Datum main_arg)
 	/* Create table of contents */
 	toc = shm_toc_create(CONN_MUX_MAGIC, dsm_segment_address(seg), segsize);
 
-	/* Allocate request queue */
+	/* Allocate request queue with unique key for this worker */
 	request_mq = shm_toc_allocate(toc, CONN_MUX_QUEUE_SIZE);
-	shm_toc_insert(toc, CONN_MUX_KEY_REQUEST_QUEUE, request_mq);
+	shm_toc_insert(toc, WORKER_REQUEST_QUEUE_KEY(worker_id), request_mq);
 	shm_mq_create(request_mq, CONN_MUX_QUEUE_SIZE);
 	shm_mq_set_receiver(request_mq, MyProc);
 
-	/* Allocate response queue */
+	/* Allocate response queue with unique key for this worker */
 	response_mq = shm_toc_allocate(toc, CONN_MUX_QUEUE_SIZE);
-	shm_toc_insert(toc, CONN_MUX_KEY_RESPONSE_QUEUE, response_mq);
+	shm_toc_insert(toc, WORKER_RESPONSE_QUEUE_KEY(worker_id), response_mq);
 	shm_mq_create(response_mq, CONN_MUX_QUEUE_SIZE);
 	shm_mq_set_sender(response_mq, MyProc);
 
@@ -887,8 +891,8 @@ MultiplexerConnect(const char *conninfo, int *conn_id_out)
 		return false;
 	}
 
-	request_mq = shm_toc_lookup(toc, CONN_MUX_KEY_REQUEST_QUEUE, false);
-	response_mq = shm_toc_lookup(toc, CONN_MUX_KEY_RESPONSE_QUEUE, false);
+	request_mq = shm_toc_lookup(toc, WORKER_REQUEST_QUEUE_KEY(worker_id), false);
+	response_mq = shm_toc_lookup(toc, WORKER_RESPONSE_QUEUE_KEY(worker_id), false);
 
 	/* 
 	 * Do NOT set sender/receiver roles here!
@@ -1047,8 +1051,8 @@ MultiplexerQuery(int conn_id, const char *query, void **result_out)
 		return false;
 	}
 
-	request_mq = shm_toc_lookup(toc, CONN_MUX_KEY_REQUEST_QUEUE, false);
-	response_mq = shm_toc_lookup(toc, CONN_MUX_KEY_RESPONSE_QUEUE, false);
+	request_mq = shm_toc_lookup(toc, WORKER_REQUEST_QUEUE_KEY(worker_id), false);
+	response_mq = shm_toc_lookup(toc, WORKER_RESPONSE_QUEUE_KEY(worker_id), false);
 
 	/* Do NOT set sender/receiver roles - worker already set them at startup */
 	req_mqh = shm_mq_attach(request_mq, seg, NULL);
@@ -1187,8 +1191,8 @@ MultiplexerClose(int conn_id)
 		return;
 	}
 
-	request_mq = shm_toc_lookup(toc, CONN_MUX_KEY_REQUEST_QUEUE, false);
-	response_mq = shm_toc_lookup(toc, CONN_MUX_KEY_RESPONSE_QUEUE, false);
+	request_mq = shm_toc_lookup(toc, WORKER_REQUEST_QUEUE_KEY(worker_id), false);
+	response_mq = shm_toc_lookup(toc, WORKER_RESPONSE_QUEUE_KEY(worker_id), false);
 
 	/* Do NOT set sender/receiver roles - worker already set them at startup */
 	req_mqh = shm_mq_attach(request_mq, seg, NULL);
