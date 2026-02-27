@@ -76,6 +76,14 @@ extern bool enable_foreign_conn_multiplexer;
 #define MAX_CONN_MULTIPLEXER_WORKERS 64
 
 /* Shared memory structures */
+typedef struct ConnMultiplexerWorkerQueues
+{
+	shm_mq	   *request_queue;		/* Queue for requests to worker */
+	shm_mq	   *response_queue;		/* Queue for responses from worker */
+	char		request_queue_data[CONN_MUX_QUEUE_SIZE];	/* Request queue storage */
+	char		response_queue_data[CONN_MUX_QUEUE_SIZE];	/* Response queue storage */
+} ConnMultiplexerWorkerQueues;
+
 typedef struct ConnMultiplexerShmemStruct
 {
 	LWLock		lock;
@@ -83,7 +91,7 @@ typedef struct ConnMultiplexerShmemStruct
 	int			next_worker;		/* round-robin worker selection */
 	int			next_conn_id;		/* next connection ID to assign */
 	bool		initialized;		/* true when workers are running */
-	dsm_handle	worker_dsm_handles[MAX_CONN_MULTIPLEXER_WORKERS]; /* DSM handles for each worker */
+	ConnMultiplexerWorkerQueues worker_queues[MAX_CONN_MULTIPLEXER_WORKERS]; /* Queue storage for each worker */
 } ConnMultiplexerShmemStruct;
 
 static ConnMultiplexerShmemStruct *ConnMultiplexerShmem = NULL;
@@ -102,7 +110,6 @@ typedef struct WorkerConnection
 typedef struct WorkerState
 {
 	int				worker_id;
-	dsm_segment	   *seg;
 	shm_mq_handle  *req_mqh;
 	shm_mq_handle  *resp_mqh;
 	WorkerConnection *connections;
@@ -110,15 +117,7 @@ typedef struct WorkerState
 
 #define MAX_WORKER_CONNECTIONS 100
 
-/* TOC keys for DSM segment
- * Since each worker has its own DSM segment (and therefore its own TOC),
- * we can use simple keys 0 and 1 for request and response queues.
- */
-#define CONN_MUX_MAGIC			0x436F6E4D	/* 'ConM' */
-#define CONN_MUX_KEY_REQUEST_QUEUE	0
-#define CONN_MUX_KEY_RESPONSE_QUEUE	1
-
-/* Queue sizes - reduced to 512KB per queue to avoid exhausting /dev/shm */
+/* Queue sizes - 512KB per queue fits within typical /dev/shm limits */
 #define CONN_MUX_QUEUE_SIZE	(512 * 1024)  /* 512KB per queue */
 
 /* Message types for worker communication */
@@ -168,69 +167,25 @@ static volatile sig_atomic_t got_sighup = false;
  * Module initialization - called during postmaster startup
  * This is called AFTER shared memory is initialized.
  * 
- * We create all worker DSM segments here in the postmaster context
- * and store their handles in shared memory. Workers will attach to
- * these pre-created segments rather than creating their own.
- *
- * This approach follows PostgreSQL's pattern where DSM segments are
- * created by a coordinating process and workers attach to them using
- * handles passed via shared memory or bgw_main_arg.
+ * Queues are now pre-allocated in shared memory (not DSM).
+ * This avoids the issue with dsm_create() assertion in postmaster context.
  */
 void
 InitConnMultiplexer(void)
 {
-	int i;
-	
 	conn_multiplexer_shmem_startup();
 	
-	/* Create DSM segments for all workers if multiplexer is enabled */
+	/* Set the number of workers if multiplexer is enabled */
 	if (foreign_conn_multiplexer_workers > 0 && ConnMultiplexerShmem != NULL)
 	{
-		for (i = 0; i < foreign_conn_multiplexer_workers; i++)
-		{
-			dsm_segment *seg;
-			shm_toc    *toc;
-			shm_mq	   *request_mq;
-			shm_mq	   *response_mq;
-			Size		segsize;
-			shm_toc_estimator e;
-			
-			/* Estimate DSM segment size */
-			shm_toc_initialize_estimator(&e);
-			shm_toc_estimate_chunk(&e, CONN_MUX_QUEUE_SIZE);  /* request queue */
-			shm_toc_estimate_chunk(&e, CONN_MUX_QUEUE_SIZE);  /* response queue */
-			shm_toc_estimate_keys(&e, 2);
-			segsize = shm_toc_estimate(&e);
-			
-			/* Create DSM segment */
-			seg = dsm_create(segsize, 0);
-			dsm_pin_mapping(seg);
-			
-			/* Create table of contents */
-			toc = shm_toc_create(CONN_MUX_MAGIC, dsm_segment_address(seg), segsize);
-			
-			/* Allocate and initialize request queue */
-			request_mq = shm_toc_allocate(toc, CONN_MUX_QUEUE_SIZE);
-			shm_toc_insert(toc, CONN_MUX_KEY_REQUEST_QUEUE, request_mq);
-			shm_mq_create(request_mq, CONN_MUX_QUEUE_SIZE);
-			
-			/* Allocate and initialize response queue */
-			response_mq = shm_toc_allocate(toc, CONN_MUX_QUEUE_SIZE);
-			shm_toc_insert(toc, CONN_MUX_KEY_RESPONSE_QUEUE, response_mq);
-			shm_mq_create(response_mq, CONN_MUX_QUEUE_SIZE);
-			
-			/* Store DSM handle in shared memory for worker to find */
-			LWLockAcquire(ConnMultiplexerLock, LW_EXCLUSIVE);
-			ConnMultiplexerShmem->worker_dsm_handles[i] = dsm_segment_handle(seg);
-			LWLockRelease(ConnMultiplexerLock);
-			
-			/* Keep segment pinned - workers will attach to it */
-			/* Note: We don't detach here because we want segment to persist */
-			
-			ereport(LOG,
-					(errmsg("created DSM segment for multiplexer worker %d, handle %u",
-							i, dsm_segment_handle(seg))));
-		}
+		LWLockAcquire(ConnMultiplexerLock, LW_EXCLUSIVE);
+		ConnMultiplexerShmem->num_workers = foreign_conn_multiplexer_workers;
+		ConnMultiplexerShmem->initialized = true;
+		LWLockRelease(ConnMultiplexerLock);
+
+		ereport(LOG,
+				(errmsg("connection multiplexer initialized with %d workers",
+						foreign_conn_multiplexer_workers)));
 	}
 }
 
@@ -274,6 +229,7 @@ conn_multiplexer_shmem_size(void)
 {
 	Size		size = 0;
 
+	/* Base structure size includes all queue storage */
 	size = add_size(size, sizeof(ConnMultiplexerShmemStruct));
 
 	return size;
@@ -286,7 +242,7 @@ static void
 conn_multiplexer_shmem_startup(void)
 {
 	bool		found;
-	LWLock	   *lock;
+	int			i;
 
 	/* Allocate shared memory */
 	ConnMultiplexerShmem = ShmemInitStruct("conn_multiplexer",
@@ -303,8 +259,18 @@ conn_multiplexer_shmem_startup(void)
 		ConnMultiplexerShmem->next_worker = 0;
 		ConnMultiplexerShmem->next_conn_id = 1;
 		ConnMultiplexerShmem->initialized = false;
-		memset(ConnMultiplexerShmem->worker_dsm_handles, 0, 
-			   sizeof(ConnMultiplexerShmem->worker_dsm_handles));
+		
+		/* Initialize message queues for each worker in preallocated shared memory */
+		for (i = 0; i < MAX_CONN_MULTIPLEXER_WORKERS; i++)
+		{
+			ConnMultiplexerWorkerQueues *wq = &ConnMultiplexerShmem->worker_queues[i];
+			
+			/* Create request queue in preallocated storage */
+			wq->request_queue = shm_mq_create(wq->request_queue_data, CONN_MUX_QUEUE_SIZE);
+			
+			/* Create response queue in preallocated storage */
+			wq->response_queue = shm_mq_create(wq->response_queue_data, CONN_MUX_QUEUE_SIZE);
+		}
 	}
 }
 
@@ -645,9 +611,6 @@ conn_multiplexer_worker_main(Datum main_arg)
 	WorkerState *state;
 	MemoryContext oldcontext;
 	int			i;
-	dsm_segment *seg;
-	dsm_handle	seg_handle;
-	shm_toc    *toc;
 	shm_mq	   *request_mq;
 	shm_mq	   *response_mq;
 
@@ -659,38 +622,11 @@ conn_multiplexer_worker_main(Datum main_arg)
 	/* Identify ourselves in pg_stat_activity */
 	pgstat_report_appname("conn_multiplexer worker");
 
-	/* Get DSM handle from shared memory - it was created by postmaster */
+	/* Get queues from shared memory - they were pre-created during shmem init */
 	LWLockAcquire(ConnMultiplexerLock, LW_SHARED);
-	seg_handle = ConnMultiplexerShmem->worker_dsm_handles[worker_id];
+	request_mq = ConnMultiplexerShmem->worker_queues[worker_id].request_queue;
+	response_mq = ConnMultiplexerShmem->worker_queues[worker_id].response_queue;
 	LWLockRelease(ConnMultiplexerLock);
-
-	/* Attach to the pre-created DSM segment */
-	if (seg_handle == DSM_HANDLE_INVALID)
-	{
-		ereport(ERROR,
-				(errmsg("worker %d: DSM segment not created by postmaster", worker_id)));
-	}
-	
-	seg = dsm_attach(seg_handle);
-	if (seg == NULL)
-	{
-		ereport(ERROR,
-				(errmsg("worker %d: failed to attach to DSM segment handle %u",
-						worker_id, seg_handle)));
-	}
-	dsm_pin_mapping(seg);
-
-	/* Find the table of contents in the DSM segment */
-	toc = shm_toc_attach(CONN_MUX_MAGIC, dsm_segment_address(seg));
-	if (toc == NULL)
-	{
-		ereport(ERROR,
-				(errmsg("worker %d: bad magic number in TOC", worker_id)));
-	}
-
-	/* Lookup the pre-created queues (each worker has its own TOC) */
-	request_mq = shm_toc_lookup(toc, CONN_MUX_KEY_REQUEST_QUEUE, false);
-	response_mq = shm_toc_lookup(toc, CONN_MUX_KEY_RESPONSE_QUEUE, false);
 
 	/* Set our roles on the queues */
 	shm_mq_set_receiver(request_mq, MyProc);
@@ -700,12 +636,12 @@ conn_multiplexer_worker_main(Datum main_arg)
 	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
 	state = palloc0(sizeof(WorkerState));
 	state->worker_id = worker_id;
-	state->seg = seg;
+	state->seg = NULL;  /* No DSM segment needed anymore */
 	state->connections = palloc0(sizeof(WorkerConnection) * MAX_WORKER_CONNECTIONS);
 	
-	/* Attach to the queues */
-	state->req_mqh = shm_mq_attach(request_mq, seg, NULL);
-	state->resp_mqh = shm_mq_attach(response_mq, seg, NULL);
+	/* Attach to the queues - no DSM segment needed, pass NULL */
+	state->req_mqh = shm_mq_attach(request_mq, NULL, NULL);
+	state->resp_mqh = shm_mq_attach(response_mq, NULL, NULL);
 	MemoryContextSwitchTo(oldcontext);
 
 	/* Initialize all connection slots */
@@ -718,8 +654,8 @@ conn_multiplexer_worker_main(Datum main_arg)
 	}
 
 	ereport(LOG,
-			(errmsg("multiplexer worker %d attached to DSM handle %u",
-					worker_id, seg_handle)));
+			(errmsg("multiplexer worker %d started using preallocated queues",
+					worker_id)));
 
 	/* Update shared memory */
 	LWLockAcquire(ConnMultiplexerLock, LW_EXCLUSIVE);
@@ -910,8 +846,6 @@ MultiplexerConnect(const char *conninfo, int *conn_id_out)
 {
 	int			worker_id;
 	int			conn_id;
-	dsm_segment *seg;
-	shm_toc    *toc;
 	shm_mq	   *request_mq;
 	shm_mq	   *response_mq;
 	shm_mq_handle *req_mqh;
@@ -922,7 +856,6 @@ MultiplexerConnect(const char *conninfo, int *conn_id_out)
 	void	   *resp_data;
 	Size		resp_len;
 	ConnMuxMessage *resp_msg;
-	dsm_handle	dsm_h;
 	
 	if (!IsConnMultiplexerEnabled())
 		return false;
@@ -933,37 +866,18 @@ MultiplexerConnect(const char *conninfo, int *conn_id_out)
 	/* Determine worker using same algorithm as MultiplexerQuery for consistency */
 	worker_id = conn_id % foreign_conn_multiplexer_workers;
 
-	/* Get DSM handle for this worker */
+	/* Get queues from shared memory - no DSM needed */
 	LWLockAcquire(ConnMultiplexerLock, LW_SHARED);
-	dsm_h = ConnMultiplexerShmem->worker_dsm_handles[worker_id];
+	request_mq = ConnMultiplexerShmem->worker_queues[worker_id].request_queue;
+	response_mq = ConnMultiplexerShmem->worker_queues[worker_id].response_queue;
 	LWLockRelease(ConnMultiplexerLock);
 
-	if (dsm_h == DSM_HANDLE_INVALID)
+	if (request_mq == NULL || response_mq == NULL)
 	{
 		ereport(WARNING,
-				(errmsg("worker %d DSM not available", worker_id)));
+				(errmsg("worker %d queues not available", worker_id)));
 		return false;
 	}
-
-	/* Attach to worker's DSM */
-	seg = dsm_attach(dsm_h);
-	if (seg == NULL)
-	{
-		ereport(WARNING,
-				(errmsg("failed to attach to worker %d DSM", worker_id)));
-		return false;
-	}
-
-	/* Get TOC and queues */
-	toc = shm_toc_attach(CONN_MUX_MAGIC, dsm_segment_address(seg));
-	if (toc == NULL)
-	{
-		dsm_detach(seg);
-		return false;
-	}
-
-	request_mq = shm_toc_lookup(toc, CONN_MUX_KEY_REQUEST_QUEUE, false);
-	response_mq = shm_toc_lookup(toc, CONN_MUX_KEY_RESPONSE_QUEUE, false);
 
 	/* 
 	 * Do NOT set sender/receiver roles here!
@@ -974,8 +888,8 @@ MultiplexerConnect(const char *conninfo, int *conn_id_out)
 	 * Setting roles again would overwrite the worker's attachment and cause
 	 * SHM_MQ_DETACHED errors. Just attach and the queues will work.
 	 */
-	req_mqh = shm_mq_attach(request_mq, seg, NULL);
-	resp_mqh = shm_mq_attach(response_mq, seg, NULL);
+	req_mqh = shm_mq_attach(request_mq, NULL, NULL);
+	resp_mqh = shm_mq_attach(response_mq, NULL, NULL);
 
 	/* Create CONNECT message */
 	msg_len = offsetof(ConnMuxMessage, data) + strlen(conninfo) + 1;
@@ -994,7 +908,8 @@ MultiplexerConnect(const char *conninfo, int *conn_id_out)
 	{
 		ereport(WARNING,
 				(errmsg("failed to send CONNECT message to worker %d", worker_id)));
-		dsm_detach(seg);
+		shm_mq_detach(req_mqh);
+		shm_mq_detach(resp_mqh);
 		return false;
 	}
 
@@ -1011,14 +926,16 @@ MultiplexerConnect(const char *conninfo, int *conn_id_out)
 					(errmsg("multiplexer: CONNECT successful, conn_id=%d, worker=%d",
 							conn_id, worker_id)));
 			*conn_id_out = conn_id;
-			dsm_detach(seg);
+			shm_mq_detach(req_mqh);
+			shm_mq_detach(resp_mqh);
 			return true;
 		}
 		else
 		{
 			ereport(WARNING,
 					(errmsg("multiplexer: CONNECT failed: %s", resp_msg->data)));
-			dsm_detach(seg);
+			shm_mq_detach(req_mqh);
+			shm_mq_detach(resp_mqh);
 			return false;
 		}
 	}
@@ -1026,13 +943,15 @@ MultiplexerConnect(const char *conninfo, int *conn_id_out)
 	{
 		ereport(WARNING,
 				(errmsg("multiplexer: worker %d queue detached", worker_id)));
-		dsm_detach(seg);
+		shm_mq_detach(req_mqh);
+		shm_mq_detach(resp_mqh);
 		return false;
 	}
 	
 	ereport(WARNING,
 			(errmsg("multiplexer: no response from worker %d", worker_id)));
-	dsm_detach(seg);
+	shm_mq_detach(req_mqh);
+	shm_mq_detach(resp_mqh);
 	return false;
 }
 
@@ -1073,8 +992,6 @@ bool
 MultiplexerQuery(int conn_id, const char *query, void **result_out)
 {
 	int			worker_id;
-	dsm_segment *seg;
-	shm_toc    *toc;
 	shm_mq	   *request_mq;
 	shm_mq	   *response_mq;
 	shm_mq_handle *req_mqh;
@@ -1085,7 +1002,6 @@ MultiplexerQuery(int conn_id, const char *query, void **result_out)
 	void	   *resp_data;
 	Size		resp_len;
 	ConnMuxMessage *resp_msg;
-	dsm_handle	dsm_h;
 	
 	if (!IsConnMultiplexerEnabled())
 		return false;
@@ -1093,41 +1009,22 @@ MultiplexerQuery(int conn_id, const char *query, void **result_out)
 	/* Determine which worker has this connection */
 	worker_id = conn_id % foreign_conn_multiplexer_workers;
 
-	/* Get DSM handle for this worker */
+	/* Get queues from shared memory */
 	LWLockAcquire(ConnMultiplexerLock, LW_SHARED);
-	dsm_h = ConnMultiplexerShmem->worker_dsm_handles[worker_id];
+	request_mq = ConnMultiplexerShmem->worker_queues[worker_id].request_queue;
+	response_mq = ConnMultiplexerShmem->worker_queues[worker_id].response_queue;
 	LWLockRelease(ConnMultiplexerLock);
 
-	if (dsm_h == DSM_HANDLE_INVALID)
+	if (request_mq == NULL || response_mq == NULL)
 	{
 		ereport(WARNING,
-				(errmsg("worker %d DSM not available", worker_id)));
+				(errmsg("worker %d queues not available", worker_id)));
 		return false;
 	}
-
-	/* Attach to worker's DSM */
-	seg = dsm_attach(dsm_h);
-	if (seg == NULL)
-	{
-		ereport(WARNING,
-				(errmsg("failed to attach to worker %d DSM", worker_id)));
-		return false;
-	}
-
-	/* Get TOC and queues */
-	toc = shm_toc_attach(CONN_MUX_MAGIC, dsm_segment_address(seg));
-	if (toc == NULL)
-	{
-		dsm_detach(seg);
-		return false;
-	}
-
-	request_mq = shm_toc_lookup(toc, CONN_MUX_KEY_REQUEST_QUEUE, false);
-	response_mq = shm_toc_lookup(toc, CONN_MUX_KEY_RESPONSE_QUEUE, false);
 
 	/* Do NOT set sender/receiver roles - worker already set them at startup */
-	req_mqh = shm_mq_attach(request_mq, seg, NULL);
-	resp_mqh = shm_mq_attach(response_mq, seg, NULL);
+	req_mqh = shm_mq_attach(request_mq, NULL, NULL);
+	resp_mqh = shm_mq_attach(response_mq, NULL, NULL);
 
 	/* Create QUERY message */
 	msg_len = offsetof(ConnMuxMessage, data) + strlen(query) + 1;
@@ -1146,7 +1043,8 @@ MultiplexerQuery(int conn_id, const char *query, void **result_out)
 	{
 		ereport(WARNING,
 				(errmsg("failed to send QUERY message to worker %d", worker_id)));
-		dsm_detach(seg);
+		shm_mq_detach(req_mqh);
+		shm_mq_detach(resp_mqh);
 		return false;
 	}
 
@@ -1162,14 +1060,16 @@ MultiplexerQuery(int conn_id, const char *query, void **result_out)
 			ereport(LOG,
 					(errmsg("multiplexer: QUERY successful, conn_id=%d: %s",
 							conn_id, resp_msg->data)));
-			dsm_detach(seg);
+			shm_mq_detach(req_mqh);
+			shm_mq_detach(resp_mqh);
 			return true;
 		}
 		else
 		{
 			ereport(WARNING,
 					(errmsg("multiplexer: QUERY failed: %s", resp_msg->data)));
-			dsm_detach(seg);
+			shm_mq_detach(req_mqh);
+			shm_mq_detach(resp_mqh);
 			return false;
 		}
 	}
@@ -1177,13 +1077,15 @@ MultiplexerQuery(int conn_id, const char *query, void **result_out)
 	{
 		ereport(WARNING,
 				(errmsg("multiplexer: worker %d queue detached", worker_id)));
-		dsm_detach(seg);
+		shm_mq_detach(req_mqh);
+		shm_mq_detach(resp_mqh);
 		return false;
 	}
 	
 	ereport(WARNING,
 			(errmsg("multiplexer: no response from worker %d", worker_id)));
-	dsm_detach(seg);
+	shm_mq_detach(req_mqh);
+	shm_mq_detach(resp_mqh);
 	return false;
 }
 
@@ -1213,8 +1115,6 @@ void
 MultiplexerClose(int conn_id)
 {
 	int			worker_id;
-	dsm_segment *seg;
-	shm_toc    *toc;
 	shm_mq	   *request_mq;
 	shm_mq	   *response_mq;
 	shm_mq_handle *req_mqh;
@@ -1225,7 +1125,6 @@ MultiplexerClose(int conn_id)
 	void	   *resp_data;
 	Size		resp_len;
 	ConnMuxMessage *resp_msg;
-	dsm_handle	dsm_h;
 	
 	if (!IsConnMultiplexerEnabled())
 		return;
@@ -1233,41 +1132,22 @@ MultiplexerClose(int conn_id)
 	/* Determine which worker has this connection */
 	worker_id = conn_id % foreign_conn_multiplexer_workers;
 
-	/* Get DSM handle for this worker */
+	/* Get queues from shared memory */
 	LWLockAcquire(ConnMultiplexerLock, LW_SHARED);
-	dsm_h = ConnMultiplexerShmem->worker_dsm_handles[worker_id];
+	request_mq = ConnMultiplexerShmem->worker_queues[worker_id].request_queue;
+	response_mq = ConnMultiplexerShmem->worker_queues[worker_id].response_queue;
 	LWLockRelease(ConnMultiplexerLock);
 
-	if (dsm_h == DSM_HANDLE_INVALID)
+	if (request_mq == NULL || response_mq == NULL)
 	{
 		ereport(WARNING,
-				(errmsg("worker %d DSM not available", worker_id)));
+				(errmsg("worker %d queues not available", worker_id)));
 		return;
 	}
-
-	/* Attach to worker's DSM */
-	seg = dsm_attach(dsm_h);
-	if (seg == NULL)
-	{
-		ereport(WARNING,
-				(errmsg("failed to attach to worker %d DSM", worker_id)));
-		return;
-	}
-
-	/* Get TOC and queues */
-	toc = shm_toc_attach(CONN_MUX_MAGIC, dsm_segment_address(seg));
-	if (toc == NULL)
-	{
-		dsm_detach(seg);
-		return;
-	}
-
-	request_mq = shm_toc_lookup(toc, CONN_MUX_KEY_REQUEST_QUEUE, false);
-	response_mq = shm_toc_lookup(toc, CONN_MUX_KEY_RESPONSE_QUEUE, false);
 
 	/* Do NOT set sender/receiver roles - worker already set them at startup */
-	req_mqh = shm_mq_attach(request_mq, seg, NULL);
-	resp_mqh = shm_mq_attach(response_mq, seg, NULL);
+	req_mqh = shm_mq_attach(request_mq, NULL, NULL);
+	resp_mqh = shm_mq_attach(response_mq, NULL, NULL);
 
 	/* Create CLOSE message */
 	msg_len = sizeof(ConnMuxMessageHeader);
@@ -1283,7 +1163,8 @@ MultiplexerClose(int conn_id)
 	{
 		ereport(WARNING,
 				(errmsg("failed to send CLOSE message to worker %d", worker_id)));
-		dsm_detach(seg);
+		shm_mq_detach(req_mqh);
+		shm_mq_detach(resp_mqh);
 		return;
 	}
 
@@ -1311,5 +1192,6 @@ MultiplexerClose(int conn_id)
 				(errmsg("multiplexer: worker %d queue detached during CLOSE", worker_id)));
 	}
 	
-	dsm_detach(seg);
+	shm_mq_detach(req_mqh);
+	shm_mq_detach(resp_mqh);
 }
