@@ -890,11 +890,15 @@ MultiplexerConnect(const char *conninfo, int *conn_id_out)
 	request_mq = shm_toc_lookup(toc, CONN_MUX_KEY_REQUEST_QUEUE, false);
 	response_mq = shm_toc_lookup(toc, CONN_MUX_KEY_RESPONSE_QUEUE, false);
 
-	/* Set our roles: we are sender for request queue, receiver for response queue */
-	shm_mq_set_sender(request_mq, MyProc);
-	shm_mq_set_receiver(response_mq, MyProc);
-	
-	/* Now attach to the queues */
+	/* 
+	 * Do NOT set sender/receiver roles here!
+	 * The worker already set its roles at startup:
+	 * - Worker is receiver for request_mq (we send to it)
+	 * - Worker is sender for response_mq (we receive from it)
+	 * 
+	 * Setting roles again would overwrite the worker's attachment and cause
+	 * SHM_MQ_DETACHED errors. Just attach and the queues will work.
+	 */
 	req_mqh = shm_mq_attach(request_mq, seg, NULL);
 	resp_mqh = shm_mq_attach(response_mq, seg, NULL);
 
@@ -1046,11 +1050,7 @@ MultiplexerQuery(int conn_id, const char *query, void **result_out)
 	request_mq = shm_toc_lookup(toc, CONN_MUX_KEY_REQUEST_QUEUE, false);
 	response_mq = shm_toc_lookup(toc, CONN_MUX_KEY_RESPONSE_QUEUE, false);
 
-	/* Set our roles: we are sender for request queue, receiver for response queue */
-	shm_mq_set_sender(request_mq, MyProc);
-	shm_mq_set_receiver(response_mq, MyProc);
-	
-	/* Now attach to the queues */
+	/* Do NOT set sender/receiver roles - worker already set them at startup */
 	req_mqh = shm_mq_attach(request_mq, seg, NULL);
 	resp_mqh = shm_mq_attach(response_mq, seg, NULL);
 
@@ -1190,11 +1190,7 @@ MultiplexerClose(int conn_id)
 	request_mq = shm_toc_lookup(toc, CONN_MUX_KEY_REQUEST_QUEUE, false);
 	response_mq = shm_toc_lookup(toc, CONN_MUX_KEY_RESPONSE_QUEUE, false);
 
-	/* Set our roles: we are sender for request queue, receiver for response queue */
-	shm_mq_set_sender(request_mq, MyProc);
-	shm_mq_set_receiver(response_mq, MyProc);
-	
-	/* Now attach to the queues */
+	/* Do NOT set sender/receiver roles - worker already set them at startup */
 	req_mqh = shm_mq_attach(request_mq, seg, NULL);
 	resp_mqh = shm_mq_attach(response_mq, seg, NULL);
 
