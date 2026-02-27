@@ -852,13 +852,11 @@ MultiplexerConnect(const char *conninfo, int *conn_id_out)
 	if (!IsConnMultiplexerEnabled())
 		return false;
 
-	/* Get worker to handle this connection */
-	worker_id = GetNextMultiplexerWorker();
-	if (worker_id < 0)
-		return false;
-
-	/* Allocate connection ID */
+	/* Allocate connection ID first */
 	conn_id = allocate_conn_id();
+
+	/* Determine worker using same algorithm as MultiplexerQuery for consistency */
+	worker_id = conn_id % foreign_conn_multiplexer_workers;
 
 	/* Get DSM handle for this worker */
 	LWLockAcquire(ConnMultiplexerLock, LW_SHARED);
