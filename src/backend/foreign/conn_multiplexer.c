@@ -167,11 +167,72 @@ static volatile sig_atomic_t got_sighup = false;
 
 /*
  * Module initialization - called during postmaster startup
+ * This is called AFTER shared memory is initialized.
+ * 
+ * We create all worker DSM segments here in the postmaster context
+ * and store their handles in shared memory. Workers will attach to
+ * these pre-created segments rather than creating their own.
+ *
+ * This approach follows PostgreSQL's pattern where DSM segments are
+ * created by a coordinating process and workers attach to them using
+ * handles passed via shared memory or bgw_main_arg.
  */
 void
 InitConnMultiplexer(void)
 {
+	int i;
+	
 	conn_multiplexer_shmem_startup();
+	
+	/* Create DSM segments for all workers if multiplexer is enabled */
+	if (foreign_conn_multiplexer_workers > 0 && ConnMultiplexerShmem != NULL)
+	{
+		for (i = 0; i < foreign_conn_multiplexer_workers; i++)
+		{
+			dsm_segment *seg;
+			shm_toc    *toc;
+			shm_mq	   *request_mq;
+			shm_mq	   *response_mq;
+			Size		segsize;
+			shm_toc_estimator e;
+			
+			/* Estimate DSM segment size */
+			shm_toc_initialize_estimator(&e);
+			shm_toc_estimate_chunk(&e, CONN_MUX_QUEUE_SIZE);  /* request queue */
+			shm_toc_estimate_chunk(&e, CONN_MUX_QUEUE_SIZE);  /* response queue */
+			shm_toc_estimate_keys(&e, 2);
+			segsize = shm_toc_estimate(&e);
+			
+			/* Create DSM segment */
+			seg = dsm_create(segsize, 0);
+			dsm_pin_mapping(seg);
+			
+			/* Create table of contents */
+			toc = shm_toc_create(CONN_MUX_MAGIC, dsm_segment_address(seg), segsize);
+			
+			/* Allocate and initialize request queue with unique key for this worker */
+			request_mq = shm_toc_allocate(toc, CONN_MUX_QUEUE_SIZE);
+			shm_toc_insert(toc, WORKER_REQUEST_QUEUE_KEY(i), request_mq);
+			shm_mq_create(request_mq, CONN_MUX_QUEUE_SIZE);
+			
+			/* Allocate and initialize response queue with unique key for this worker */
+			response_mq = shm_toc_allocate(toc, CONN_MUX_QUEUE_SIZE);
+			shm_toc_insert(toc, WORKER_RESPONSE_QUEUE_KEY(i), response_mq);
+			shm_mq_create(response_mq, CONN_MUX_QUEUE_SIZE);
+			
+			/* Store DSM handle in shared memory for worker to find */
+			LWLockAcquire(ConnMultiplexerLock, LW_EXCLUSIVE);
+			ConnMultiplexerShmem->worker_dsm_handles[i] = dsm_segment_handle(seg);
+			LWLockRelease(ConnMultiplexerLock);
+			
+			/* Keep segment pinned - workers will attach to it */
+			/* Note: We don't detach here because we want segment to persist */
+			
+			ereport(LOG,
+					(errmsg("created DSM segment for multiplexer worker %d, handle %u",
+							i, dsm_segment_handle(seg))));
+		}
+	}
 }
 
 /*
@@ -558,12 +619,13 @@ process_worker_requests(WorkerState *state)
  * and processes requests from backends through shared memory message queues.
  * 
  * The worker:
- * 1. Maintains an array of WorkerConnection slots (max 100)
- * 2. Processes CONNECT messages - establishes PGconn via PQconnectdb()
- * 3. Processes QUERY messages - executes queries via PQexec()
- * 4. Processes CLOSE messages - closes connections via PQfinish()
- * 5. Monitors connection health and handles reconnection
- * 6. Uses shared memory queues for bi-directional communication
+ * 1. Attaches to pre-created DSM segment (created by postmaster in InitConnMultiplexer)
+ * 2. Maintains an array of WorkerConnection slots (max 100)
+ * 3. Processes CONNECT messages - establishes PGconn via PQconnectdb()
+ * 4. Processes QUERY messages - executes queries via PQexec()
+ * 5. Processes CLOSE messages - closes connections via PQfinish()
+ * 6. Monitors connection health and handles reconnection
+ * 7. Uses shared memory queues for bi-directional communication
  * 
  * Full message passing protocol:
  * - Backend creates ConnMuxMessage with conninfo/query data
@@ -571,6 +633,11 @@ process_worker_requests(WorkerState *state)
  * - Worker processes request using libpq functions
  * - Worker sends ConnMuxMessage response via shm_mq response queue
  * - Backend receives and processes response
+ * 
+ * DSM Architecture:
+ * - DSM segments are created by postmaster in InitConnMultiplexer()
+ * - Workers attach to pre-created segments using handles from shared memory
+ * - This ensures consistent virtual address mappings across processes
  */
 void
 conn_multiplexer_worker_main(Datum main_arg)
@@ -580,11 +647,10 @@ conn_multiplexer_worker_main(Datum main_arg)
 	MemoryContext oldcontext;
 	int			i;
 	dsm_segment *seg;
+	dsm_handle	seg_handle;
 	shm_toc    *toc;
 	shm_mq	   *request_mq;
 	shm_mq	   *response_mq;
-	Size		segsize;
-	shm_toc_estimator e;
 
 	/* Setup signal handlers */
 	pqsignal(SIGTERM, conn_multiplexer_worker_sigterm);
@@ -594,36 +660,42 @@ conn_multiplexer_worker_main(Datum main_arg)
 	/* Identify ourselves in pg_stat_activity */
 	pgstat_report_appname("conn_multiplexer worker");
 
-	/* Estimate DSM segment size */
-	shm_toc_initialize_estimator(&e);
-	shm_toc_estimate_chunk(&e, CONN_MUX_QUEUE_SIZE);
-	shm_toc_estimate_chunk(&e, CONN_MUX_QUEUE_SIZE);
-	shm_toc_estimate_keys(&e, 2);
-	segsize = shm_toc_estimate(&e);
+	/* Get DSM handle from shared memory - it was created by postmaster */
+	LWLockAcquire(ConnMultiplexerLock, LW_SHARED);
+	seg_handle = ConnMultiplexerShmem->worker_dsm_handles[worker_id];
+	LWLockRelease(ConnMultiplexerLock);
 
-	/* Create DSM segment for message queues */
-	seg = dsm_create(segsize, 0);
+	/* Attach to the pre-created DSM segment */
+	if (seg_handle == DSM_HANDLE_INVALID)
+	{
+		ereport(ERROR,
+				(errmsg("worker %d: DSM segment not created by postmaster", worker_id)));
+	}
+	
+	seg = dsm_attach(seg_handle);
+	if (seg == NULL)
+	{
+		ereport(ERROR,
+				(errmsg("worker %d: failed to attach to DSM segment handle %u",
+						worker_id, seg_handle)));
+	}
 	dsm_pin_mapping(seg);
 
-	/* Create table of contents */
-	toc = shm_toc_create(CONN_MUX_MAGIC, dsm_segment_address(seg), segsize);
+	/* Find the table of contents in the DSM segment */
+	toc = shm_toc_attach(CONN_MUX_MAGIC, dsm_segment_address(seg));
+	if (toc == NULL)
+	{
+		ereport(ERROR,
+				(errmsg("worker %d: bad magic number in TOC", worker_id)));
+	}
 
-	/* Allocate request queue with unique key for this worker */
-	request_mq = shm_toc_allocate(toc, CONN_MUX_QUEUE_SIZE);
-	shm_toc_insert(toc, WORKER_REQUEST_QUEUE_KEY(worker_id), request_mq);
-	shm_mq_create(request_mq, CONN_MUX_QUEUE_SIZE);
+	/* Lookup the pre-created queues using this worker's unique keys */
+	request_mq = shm_toc_lookup(toc, WORKER_REQUEST_QUEUE_KEY(worker_id), false);
+	response_mq = shm_toc_lookup(toc, WORKER_RESPONSE_QUEUE_KEY(worker_id), false);
+
+	/* Set our roles on the queues */
 	shm_mq_set_receiver(request_mq, MyProc);
-
-	/* Allocate response queue with unique key for this worker */
-	response_mq = shm_toc_allocate(toc, CONN_MUX_QUEUE_SIZE);
-	shm_toc_insert(toc, WORKER_RESPONSE_QUEUE_KEY(worker_id), response_mq);
-	shm_mq_create(response_mq, CONN_MUX_QUEUE_SIZE);
 	shm_mq_set_sender(response_mq, MyProc);
-
-	/* Store DSM handle in shared memory so backends can find it */
-	LWLockAcquire(ConnMultiplexerLock, LW_EXCLUSIVE);
-	ConnMultiplexerShmem->worker_dsm_handles[worker_id] = dsm_segment_handle(seg);
-	LWLockRelease(ConnMultiplexerLock);
 
 	/* Allocate worker state in TopMemoryContext so it persists */
 	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
@@ -632,7 +704,7 @@ conn_multiplexer_worker_main(Datum main_arg)
 	state->seg = seg;
 	state->connections = palloc0(sizeof(WorkerConnection) * MAX_WORKER_CONNECTIONS);
 	
-	/* Attach to the queues we just created */
+	/* Attach to the queues */
 	state->req_mqh = shm_mq_attach(request_mq, seg, NULL);
 	state->resp_mqh = shm_mq_attach(response_mq, seg, NULL);
 	MemoryContextSwitchTo(oldcontext);
@@ -647,8 +719,8 @@ conn_multiplexer_worker_main(Datum main_arg)
 	}
 
 	ereport(LOG,
-			(errmsg("multiplexer worker %d started with DSM handle %u",
-					worker_id, dsm_segment_handle(seg))));
+			(errmsg("multiplexer worker %d attached to DSM handle %u",
+					worker_id, seg_handle)));
 
 	/* Update shared memory */
 	LWLockAcquire(ConnMultiplexerLock, LW_EXCLUSIVE);
@@ -699,14 +771,14 @@ conn_multiplexer_worker_main(Datum main_arg)
 		}
 	}
 
-	/* Cleanup DSM */
+	/* Update worker count in shared memory */
 	LWLockAcquire(ConnMultiplexerLock, LW_EXCLUSIVE);
-	ConnMultiplexerShmem->worker_dsm_handles[worker_id] = DSM_HANDLE_INVALID;
 	ConnMultiplexerShmem->num_workers--;
 	if (ConnMultiplexerShmem->num_workers == 0)
 		ConnMultiplexerShmem->initialized = false;
 	LWLockRelease(ConnMultiplexerLock);
 
+	/* Detach from DSM (but don't destroy - it's owned by postmaster) */
 	dsm_detach(state->seg);
 
 	ereport(LOG,
