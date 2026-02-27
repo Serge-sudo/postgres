@@ -115,8 +115,8 @@ typedef struct WorkerState
 #define CONN_MUX_KEY_REQUEST_QUEUE	0
 #define CONN_MUX_KEY_RESPONSE_QUEUE	1
 
-/* Queue sizes */
-#define CONN_MUX_QUEUE_SIZE	(8 * 1024 * 1024)  /* 8MB per queue */
+/* Queue sizes - reduced to 512KB per queue to avoid exhausting /dev/shm */
+#define CONN_MUX_QUEUE_SIZE	(512 * 1024)  /* 512KB per queue */
 
 /* Message types for worker communication */
 typedef enum
