@@ -290,8 +290,9 @@ GetConnection(UserMapping *user, bool will_prep_stmt, PgFdwConnState **state)
 	 * If cache entry doesn't have a connection, we have to establish a new
 	 * connection.  (If connect_pg_server throws an error, the cache entry
 	 * will remain in a valid empty state, ie conn == NULL.)
+	 * For multiplexer connections, conn is NULL but we have multiplexer_conn_id.
 	 */
-	if (entry->conn == NULL)
+	if (entry->conn == NULL && !entry->use_multiplexer)
 		make_new_connection(entry, user);
 
 	/*
@@ -313,20 +314,11 @@ GetConnection(UserMapping *user, bool will_prep_stmt, PgFdwConnState **state)
 		ErrorData  *errdata = CopyErrorData();
 
 		/*
-		 * Determine whether to try to reestablish the connection.
-		 *
-		 * After a broken connection is detected in libpq, any error other
-		 * than connection failure (e.g., out-of-memory) can be thrown
-		 * somewhere between return from libpq and the expected ereport() call
-		 * in pgfdw_report_error(). In this case, since PQstatus() indicates
-		 * CONNECTION_BAD, checking only PQstatus() causes the false detection
-		 * of connection failure. To avoid this, we also verify that the
-		 * error's sqlstate is ERRCODE_CONNECTION_FAILURE. Note that also
-		 * checking only the sqlstate can cause another false detection
-		 * because pgfdw_report_error() may report ERRCODE_CONNECTION_FAILURE
-		 * for any libpq-originated error condition.
+		 * For multiplexer connections, we can't check PQstatus since there's
+		 * no direct PGconn. Re-throw the error.
 		 */
-		if (errdata->sqlerrcode != ERRCODE_CONNECTION_FAILURE ||
+		if (entry->use_multiplexer ||
+			errdata->sqlerrcode != ERRCODE_CONNECTION_FAILURE ||
 			PQstatus(entry->conn) != CONNECTION_BAD ||
 			entry->xact_depth > 0)
 		{
@@ -496,12 +488,21 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 		/* Try to establish connection through multiplexer */
 		if (MultiplexerConnect(conninfo, &conn_id))
 		{
+			void *result = NULL;
+
 			entry->use_multiplexer = true;
 			entry->multiplexer_conn_id = conn_id;
 			/* Don't establish direct connection */
 			entry->conn = NULL;
 
-			elog(DEBUG1, "new postgres_fdw connection through multiplexer (worker %d) for server \"%s\" (user mapping oid %u, userid %u)",
+			/* Configure remote session via multiplexer */
+			MultiplexerQuery(conn_id, "SET search_path = pg_catalog", &result);
+			MultiplexerQuery(conn_id, "SET timezone = 'GMT'", &result);
+			MultiplexerQuery(conn_id, "SET datestyle = ISO", &result);
+			MultiplexerQuery(conn_id, "SET intervalstyle = postgres", &result);
+			MultiplexerQuery(conn_id, "SET extra_float_digits = 3", &result);
+
+			elog(DEBUG1, "new postgres_fdw connection through multiplexer (conn_id %d) for server \"%s\" (user mapping oid %u, userid %u)",
 				 conn_id, server->servername, user->umid, user->userid);
 
 			pfree(conninfo);
@@ -712,6 +713,14 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 static void
 disconnect_pg_server(ConnCacheEntry *entry)
 {
+	/* Handle multiplexer connections */
+	if (entry->use_multiplexer)
+	{
+		MultiplexerClose(entry->multiplexer_conn_id);
+		entry->use_multiplexer = false;
+		entry->multiplexer_conn_id = -1;
+	}
+
 	if (entry->conn != NULL)
 	{
 		ForeignServer *server;
@@ -869,6 +878,32 @@ do_sql_command_entry(ConnCacheEntry *entry, const char *sql)
 		/* Use direct connection */
 		do_sql_command(entry->conn, sql);
 	}
+}
+
+/*
+ * Execute SQL command on a foreign server, routing through multiplexer if active.
+ *
+ * This is the public interface for code that has a UserMapping but doesn't
+ * have direct access to the ConnCacheEntry (e.g. postgresExecForeignDDL).
+ */
+void
+do_sql_command_or_multiplexer(UserMapping *user, const char *sql)
+{
+	ConnCacheEntry *entry;
+	ConnCacheKey key;
+	bool		found;
+
+	key = user->umid;
+	entry = hash_search(ConnectionHash, &key, HASH_FIND, &found);
+
+	if (!found || (!entry->conn && !entry->use_multiplexer))
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_DOES_NOT_EXIST),
+				 errmsg("no active connection for user mapping %u", user->umid)));
+	}
+
+	do_sql_command_entry(entry, sql);
 }
 
 static void
@@ -1324,7 +1359,7 @@ error:
 	while ((entry = (ConnCacheEntry *) hash_seq_search(&scan)))
 	{
 		/* Ignore cache entry if no open connection right now */
-		if (entry->conn == NULL)
+		if (entry->conn == NULL && !entry->use_multiplexer)
 			continue;
 
 		/* If it has an open remote transaction, try to close it */
@@ -1359,15 +1394,30 @@ error:
 					if (UseCSNSnapshots)
 					{
 						CSN			csn = InvalidCSN;
-						PGresult	*res;
 
-						res = pgfdw_exec_query(entry->conn, "SELECT pg_current_csn()", NULL);
-						if (PQresultStatus(res) == PGRES_TUPLES_OK)
+						if (entry->use_multiplexer)
 						{
-							sscanf(PQgetvalue(res, 0, 0), "%lu", &csn);
+							/* For multiplexer, use MultiplexerQuery */
+							void *result = NULL;
+							if (MultiplexerQuery(entry->multiplexer_conn_id,
+												 "SELECT pg_current_csn()", &result))
+							{
+								/* Result parsing not yet available via multiplexer;
+								 * CSN sync skipped for multiplexer connections */
+							}
+						}
+						else
+						{
+							PGresult	*res;
 
-							if (csn != InvalidCSN)
-								GenerateCSN(false, csn);
+							res = pgfdw_exec_query(entry->conn, "SELECT pg_current_csn()", NULL);
+							if (PQresultStatus(res) == PGRES_TUPLES_OK)
+							{
+								sscanf(PQgetvalue(res, 0, 0), "%lu", &csn);
+
+								if (csn != InvalidCSN)
+									GenerateCSN(false, csn);
+							}
 						}
 					}
 					
@@ -1469,12 +1519,19 @@ error:
 static void
 deallocate_prepared_stmts(ConnCacheEntry *entry)
 {
-	PGresult   *res;
-
 	if (entry->have_prep_stmt && entry->have_error)
 	{
-		res = PQexec(entry->conn, "DEALLOCATE ALL");
-		PQclear(res);
+		if (entry->use_multiplexer)
+		{
+			void *result = NULL;
+			MultiplexerQuery(entry->multiplexer_conn_id, "DEALLOCATE ALL", &result);
+		}
+		else if (entry->conn != NULL)
+		{
+			PGresult   *res;
+			res = PQexec(entry->conn, "DEALLOCATE ALL");
+			PQclear(res);
+		}
 	}
 	entry->have_prep_stmt = false;
 	entry->have_error = false;
@@ -1516,7 +1573,7 @@ pgfdw_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 		 * We only care about connections with open remote subtransactions of
 		 * the current level.
 		 */
-		if (entry->conn == NULL || entry->xact_depth < curlevel)
+		if ((entry->conn == NULL && !entry->use_multiplexer) || entry->xact_depth < curlevel)
 			continue;
 
 		if (entry->xact_depth > curlevel)
@@ -1609,7 +1666,7 @@ pgfdw_inval_callback(Datum arg, int cacheid, uint32 hashvalue)
 	while ((entry = (ConnCacheEntry *) hash_seq_search(&scan)))
 	{
 		/* Ignore invalid entries */
-		if (entry->conn == NULL)
+		if (entry->conn == NULL && !entry->use_multiplexer)
 			continue;
 
 		/* hashvalue == 0 means a cache reset, must clear all state */
@@ -2056,6 +2113,31 @@ pgfdw_abort_cleanup(ConnCacheEntry *entry, bool toplevel)
 
 	/* Assume we might have lost track of prepared statements */
 	entry->have_error = true;
+
+	/*
+	 * For multiplexer connections, send abort via multiplexer.
+	 */
+	if (entry->use_multiplexer)
+	{
+		void *result = NULL;
+
+		CONSTRUCT_ABORT_COMMAND(sql, entry, toplevel);
+		MultiplexerQuery(entry->multiplexer_conn_id, sql, &result);
+
+		if (toplevel)
+		{
+			if (entry->have_prep_stmt && entry->have_error)
+				MultiplexerQuery(entry->multiplexer_conn_id, "DEALLOCATE ALL", &result);
+			entry->have_prep_stmt = false;
+			entry->have_error = false;
+		}
+
+		if (entry->state.pendingAreq)
+			memset(&entry->state, 0, sizeof(entry->state));
+
+		entry->changing_xact_state = false;
+		return;
+	}
 
 	/*
 	 * If a command has been submitted to the remote server by using an
@@ -2604,7 +2686,7 @@ disconnect_cached_connections(Oid serverid)
 	while ((entry = (ConnCacheEntry *) hash_seq_search(&scan)))
 	{
 		/* Ignore cache entry if no open connection right now. */
-		if (!entry->conn)
+		if (!entry->conn && !entry->use_multiplexer)
 			continue;
 
 		if (all || entry->serverid == serverid)

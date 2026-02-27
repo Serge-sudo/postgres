@@ -52,6 +52,7 @@ extern void shm_mq_set_receiver(shm_mq *mq, PGPROC *);
 extern void shm_mq_set_sender(shm_mq *mq, PGPROC *);
 extern void shm_mq_reset_sender(shm_mq *mq);
 extern void shm_mq_reset_receiver(shm_mq *mq);
+extern void shm_mq_reinit(shm_mq *mq);
 /* Accessor methods for sender and receiver. */
 extern PGPROC *shm_mq_get_receiver(shm_mq *);
 extern PGPROC *shm_mq_get_sender(shm_mq *);
@@ -65,6 +66,9 @@ extern void shm_mq_set_handle(shm_mq_handle *, BackgroundWorkerHandle *);
 
 /* Break connection, release handle resources. */
 extern void shm_mq_detach(shm_mq_handle *mqh);
+
+/* Release handle resources without marking queue as detached. */
+extern void shm_mq_release_handle(shm_mq_handle *mqh);
 
 /* Get the shm_mq from handle. */
 extern shm_mq *shm_mq_get_queue(shm_mq_handle *mqh);

@@ -3082,7 +3082,10 @@ postgresExecForeignTruncate(List *rels,
 	deparseTruncateSql(&sql, rels, behavior, restart_seqs);
 
 	/* Issue the TRUNCATE command to remote server */
-	do_sql_command(conn, sql.data);
+	if (conn != NULL)
+		do_sql_command(conn, sql.data);
+	else
+		do_sql_command_or_multiplexer(user, sql.data);
 
 	pfree(sql.data);
 }
@@ -3124,16 +3127,17 @@ postgresExecForeignDDL(Oid serverid, const char *sql)
 					 "SET LOCAL shardgroup.executing_remote_ddl = true; %s",
 					 sql);
 
-	/* Execute the DDL command on the remote server */
-	do_sql_command(conn, full_sql.data);
+	/*
+	 * Route through multiplexer if available, otherwise use direct connection.
+	 * do_sql_command_or_multiplexer looks up the ConnCacheEntry and routes
+	 * accordingly.
+	 */
+	if (conn != NULL)
+		do_sql_command(conn, full_sql.data);
+	else
+		do_sql_command_or_multiplexer(user, full_sql.data);
 
 	pfree(full_sql.data);
-
-	/*
-	 * Note: Connection is not explicitly released here.
-	 * The connection manager will handle it and will use 2PC
-	 * if there are multiple foreign servers in the transaction.
-	 */
 }
 
 /*

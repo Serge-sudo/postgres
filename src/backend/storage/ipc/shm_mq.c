@@ -264,6 +264,25 @@ shm_mq_reset_sender(shm_mq *mq)
 }
 
 /*
+ * Reinitialize a shared message queue for reuse.
+ *
+ * This resets the queue's internal state (bytes read/written, detached flag,
+ * sender/receiver) so it can be reused by new sender/receiver pairs without
+ * recreating. The caller must ensure no other process is using the queue.
+ */
+void
+shm_mq_reinit(shm_mq *mq)
+{
+	SpinLockAcquire(&mq->mq_mutex);
+	mq->mq_receiver = NULL;
+	mq->mq_sender = NULL;
+	mq->mq_detached = false;
+	SpinLockRelease(&mq->mq_mutex);
+	pg_atomic_write_u64(&mq->mq_bytes_read, 0);
+	pg_atomic_write_u64(&mq->mq_bytes_written, 0);
+}
+
+/*
  * Get the configured receiver.
  */
 PGPROC *
@@ -879,6 +898,36 @@ shm_mq_detach(shm_mq_handle *mqh)
 
 	/* Notify counterparty that we're outta here. */
 	shm_mq_detach_internal(mqh->mqh_queue);
+
+	/* Cancel on_dsm_detach callback, if any. */
+	if (mqh->mqh_segment)
+		cancel_on_dsm_detach(mqh->mqh_segment,
+							 shm_mq_detach_callback,
+							 PointerGetDatum(mqh->mqh_queue));
+
+	/* Release local memory associated with handle. */
+	if (mqh->mqh_buffer != NULL)
+		pfree(mqh->mqh_buffer);
+	pfree(mqh);
+}
+
+/*
+ * Release handle resources without marking the queue as detached.
+ *
+ * Unlike shm_mq_detach(), this does NOT set mq_detached on the queue,
+ * so the counterparty won't see SHM_MQ_DETACHED. This is used when
+ * the queue will be reused by different senders/receivers (e.g., in a
+ * connection multiplexer scenario).
+ */
+void
+shm_mq_release_handle(shm_mq_handle *mqh)
+{
+	/* Flush any pending writes. */
+	if (mqh->mqh_send_pending > 0)
+	{
+		shm_mq_inc_bytes_written(mqh->mqh_queue, mqh->mqh_send_pending);
+		mqh->mqh_send_pending = 0;
+	}
 
 	/* Cancel on_dsm_detach callback, if any. */
 	if (mqh->mqh_segment)
