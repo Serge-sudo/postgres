@@ -851,19 +851,20 @@ multiplexer_send_receive(int worker_id, const void *msg, Size msg_len)
 
 	/*
 	 * Wait for the worker to be ready. The worker sets ready=true after
-	 * reiniting queues and setting its roles. We spin-wait with a sleep
-	 * since this should normally be very fast.
+	 * reiniting queues and setting its roles. We release the lock while
+	 * waiting so the worker can make progress.
 	 */
 	while (!wq->ready)
 	{
 		pg_read_barrier();
 		LWLockRelease(&wq->queue_lock);
 
-		if (++wait_count > 1000)		/* ~10 seconds */
+		if (wait_count >= 1000)		/* ~10 seconds */
 		{
 			ereport(ERROR,
 					(errmsg("multiplexer: worker %d not ready after timeout", worker_id)));
 		}
+		wait_count++;
 
 		pg_usleep(10000);				/* 10ms */
 		LWLockAcquire(&wq->queue_lock, LW_EXCLUSIVE);
@@ -963,10 +964,9 @@ MultiplexerConnect(const char *conninfo, int *conn_id_out)
 	}
 	else
 	{
-		char *errstr = pstrdup(resp->data);
-		pfree(resp);
 		ereport(ERROR,
-				(errmsg("multiplexer: CONNECT failed: %s", errstr)));
+				(errmsg("multiplexer: CONNECT failed: %s", resp->data)));
+		pfree(resp);	/* not reached, but for completeness */
 		return false;
 	}
 }
@@ -1008,10 +1008,9 @@ MultiplexerQuery(int conn_id, const char *query, void **result_out)
 	}
 	else
 	{
-		char *errstr = pstrdup(resp->data);
-		pfree(resp);
 		ereport(ERROR,
-				(errmsg("multiplexer: QUERY failed: %s", errstr)));
+				(errmsg("multiplexer: QUERY failed: %s", resp->data)));
+		pfree(resp);	/* not reached, but for completeness */
 		return false;
 	}
 }

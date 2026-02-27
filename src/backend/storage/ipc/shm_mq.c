@@ -277,9 +277,9 @@ shm_mq_reinit(shm_mq *mq)
 	mq->mq_receiver = NULL;
 	mq->mq_sender = NULL;
 	mq->mq_detached = false;
-	SpinLockRelease(&mq->mq_mutex);
 	pg_atomic_write_u64(&mq->mq_bytes_read, 0);
 	pg_atomic_write_u64(&mq->mq_bytes_written, 0);
+	SpinLockRelease(&mq->mq_mutex);
 }
 
 /*
