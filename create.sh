@@ -48,8 +48,7 @@ synchronous_commit = off
 full_page_writes = off
 logging_collector = on
 log_statement = 'all'
-foreign_conn_multiplexer.enabled = on
-foreign_conn_multiplexer.workers = 2
+foreign_conn_multiplexer.workers = 1
 log_directory = 'log'
 shared_preload_libraries = 'postgres_fdw'
 log_filename = '${name}.log'
@@ -67,7 +66,7 @@ EOF
 
 stop_node() {
   local dir="$1"
-  [[ -d "$dir" ]] && pg_ctl -D "$dir" -w stop -m fast >/dev/null || true
+  [[ -d "$dir" ]] && pg_ctl -D "$dir" -w stop -m immediate >/dev/null || true
 }
 
 psql_node() {

@@ -1944,16 +1944,6 @@ struct config_bool ConfigureNamesBool[] =
 	},
 
 	{
-		{"foreign_conn_multiplexer.enabled", PGC_SIGHUP, RESOURCES_ASYNCHRONOUS,
-			gettext_noop("Enable connection multiplexer for foreign servers."),
-			gettext_noop("When enabled, foreign connections are routed through workers."),
-		},
-		&enable_foreign_conn_multiplexer,
-		false,
-		NULL, NULL, NULL
-	},
-
-	{
 		{"jit", PGC_USERSET, QUERY_TUNING_OTHER,
 			gettext_noop("Allow JIT compilation."),
 			NULL,

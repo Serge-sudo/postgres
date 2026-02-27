@@ -170,6 +170,9 @@ CalculateShmemSize(int *num_semaphores)
 
 	/* might as well round it off to a multiple of a typical page size */
 	size = add_size(size, 8192 - (size % 8192));
+	
+	/* include shmem for connection multiplexer if enabled */
+	size = add_size(size, conn_multiplexer_shmem_size());
 
 	return size;
 }

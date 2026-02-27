@@ -16,6 +16,7 @@
 /* Function declarations */
 extern void InitConnMultiplexer(void);
 extern void RegisterConnMultiplexerWorkers(void);
+extern Size conn_multiplexer_shmem_size(void);
 extern bool IsConnMultiplexerEnabled(void);
 extern int GetNextMultiplexerWorker(void);
 extern bool MultiplexerConnect(const char *conninfo, int *conn_id_out);

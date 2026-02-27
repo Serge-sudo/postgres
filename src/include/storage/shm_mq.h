@@ -50,7 +50,8 @@ typedef enum
 extern shm_mq *shm_mq_create(void *address, Size size);
 extern void shm_mq_set_receiver(shm_mq *mq, PGPROC *);
 extern void shm_mq_set_sender(shm_mq *mq, PGPROC *);
-
+extern void shm_mq_reset_sender(shm_mq *mq);
+extern void shm_mq_reset_receiver(shm_mq *mq);
 /* Accessor methods for sender and receiver. */
 extern PGPROC *shm_mq_get_receiver(shm_mq *);
 extern PGPROC *shm_mq_get_sender(shm_mq *);

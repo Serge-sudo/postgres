@@ -712,8 +712,6 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 static void
 disconnect_pg_server(ConnCacheEntry *entry)
 {
-	
-	elog(WARNING, "dis");
 	if (entry->conn != NULL)
 	{
 		ForeignServer *server;

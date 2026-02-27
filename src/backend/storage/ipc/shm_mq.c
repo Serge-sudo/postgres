@@ -217,6 +217,20 @@ shm_mq_set_receiver(shm_mq *mq, PGPROC *proc)
 		SetLatch(&sender->procLatch);
 }
 
+void
+shm_mq_reset_receiver(shm_mq *mq)
+{
+	PGPROC	   *sender;
+
+	SpinLockAcquire(&mq->mq_mutex);
+	mq->mq_receiver = NULL;
+	sender = mq->mq_sender;
+	SpinLockRelease(&mq->mq_mutex);
+
+	if (sender != NULL)
+		SetLatch(&sender->procLatch);
+}
+
 /*
  * Set the identity of the process that will send to a shared message queue.
  */
@@ -228,6 +242,20 @@ shm_mq_set_sender(shm_mq *mq, PGPROC *proc)
 	SpinLockAcquire(&mq->mq_mutex);
 	Assert(mq->mq_sender == NULL);
 	mq->mq_sender = proc;
+	receiver = mq->mq_receiver;
+	SpinLockRelease(&mq->mq_mutex);
+
+	if (receiver != NULL)
+		SetLatch(&receiver->procLatch);
+}
+
+void
+shm_mq_reset_sender(shm_mq *mq)
+{
+	PGPROC	   *receiver;
+
+	SpinLockAcquire(&mq->mq_mutex);
+	mq->mq_sender = NULL;
 	receiver = mq->mq_receiver;
 	SpinLockRelease(&mq->mq_mutex);
 
