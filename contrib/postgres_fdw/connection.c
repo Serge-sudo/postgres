@@ -16,7 +16,9 @@
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "access/xlog.h" /* GetSystemIdentifier() */
+#include "catalog/pg_database.h"
 #include "catalog/pg_user_mapping.h"
+#include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "funcapi.h"
 #include "libpq/libpq-be.h"
@@ -24,6 +26,8 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "postmaster/bgworker.h"
+#include "postmaster/conn_multiplexer.h"
 #include "postgres_fdw.h"
 #include "storage/fd.h"
 #include "storage/latch.h"
@@ -323,6 +327,7 @@ GetConnection(UserMapping *user, bool will_prep_stmt, PgFdwConnState **state)
 		 * for any libpq-originated error condition.
 		 */
 		if (errdata->sqlerrcode != ERRCODE_CONNECTION_FAILURE ||
+			IS_MUX_CONN(entry->conn) ||
 			PQstatus(entry->conn) != CONNECTION_BAD ||
 			entry->xact_depth > 0)
 		{
@@ -351,7 +356,9 @@ GetConnection(UserMapping *user, bool will_prep_stmt, PgFdwConnState **state)
 		ereport(DEBUG3,
 				(errmsg_internal("could not start remote transaction on connection %p",
 								 entry->conn)),
-				errdetail_internal("%s", pchomp(PQerrorMessage(entry->conn))));
+				errdetail_internal("%s",
+								   IS_MUX_CONN(entry->conn) ? "(mux connection)" :
+								   pchomp(PQerrorMessage(entry->conn))));
 
 		elog(DEBUG3, "closing connection %p to reestablish a new one",
 			 entry->conn);
@@ -430,6 +437,121 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 	}
 
 	/* Now try to make the connection */
+
+	/*
+	 * If the connection multiplexer is running, route this foreign-server
+	 * connection through it.  We store a MuxConnSentinel cast to PGconn* in
+	 * entry->conn so that all subsequent callers can detect the mux path via
+	 * IS_MUX_CONN().  The multiplexer maintains the actual TCP connection to
+	 * the remote server and all SQL goes through shared-memory queues.
+	 */
+	if (ConnMuxIsAvailable(server->serverid))
+	{
+		StringInfoData sb;
+		ListCell   *lc2;
+		uint32		conn_id;
+		int			worker_slot;
+
+		/* Build a libpq-compatible connstr from the server's srvoptions */
+		initStringInfo(&sb);
+		foreach(lc2, server->options)
+		{
+			DefElem    *def = (DefElem *) lfirst(lc2);
+			const char *p;
+			char	   *val;
+
+			/* Skip FDW meta-options that aren't libpq options */
+			if (strcmp(def->defname, "keep_connections") == 0 ||
+				strcmp(def->defname, "parallel_commit") == 0 ||
+				strcmp(def->defname, "parallel_abort") == 0 ||
+				strcmp(def->defname, "fetch_size") == 0 ||
+				strcmp(def->defname, "batch_size") == 0 ||
+				strcmp(def->defname, "truncatable") == 0 ||
+				strcmp(def->defname, "extensions") == 0 ||
+				strcmp(def->defname, "updatable") == 0 ||
+				strcmp(def->defname, "async_capable") == 0)
+				continue;
+
+			val = defGetString(def);
+			appendStringInfo(&sb, "%s='", def->defname);
+			for (p = val; *p; p++)
+			{
+				if (*p == '\'' || *p == '\\')
+					appendStringInfoChar(&sb, '\\');
+				appendStringInfoChar(&sb, *p);
+			}
+			appendStringInfoChar(&sb, '\'');
+			appendStringInfoChar(&sb, ' ');
+		}
+		appendStringInfo(&sb, "application_name='pg_mux_%s'",
+						 server->servername);
+
+		/* Register the server in the multiplexer's remote_conns table */
+		conn_id = ConnMuxRegisterServer(server->serverid,
+										server->servername,
+										sb.data);
+
+		/*
+		 * Reserve a worker slot and spawn a dedicated extension background
+		 * worker (ConnMuxForeignWorkerMain) that will hold the actual libpq
+		 * connection to this foreign server.
+		 */
+		worker_slot = (conn_id != (uint32) -1) ?
+			ConnMuxReserveWorkerSlot(server->serverid, server->servername) : -1;
+
+		if (worker_slot >= 0)
+		{
+			BackgroundWorker bgw;
+			BackgroundWorkerHandle *handle;
+			MemoryContext old_ctx;
+			MuxConnSentinel *sentinel;
+
+			MemSet(&bgw, 0, sizeof(bgw));
+			bgw.bgw_flags =
+				BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+			bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
+			bgw.bgw_restart_time = BGW_NEVER_RESTART;
+			snprintf(bgw.bgw_library_name, MAXPGPATH, "postgres_fdw");
+			snprintf(bgw.bgw_function_name, BGW_MAXLEN,
+					 "ConnMuxForeignWorkerMain");
+			snprintf(bgw.bgw_name, BGW_MAXLEN,
+					 "mux foreign worker for \"%s\"", server->servername);
+			snprintf(bgw.bgw_type, BGW_MAXLEN, "mux foreign worker");
+			bgw.bgw_main_arg = Int32GetDatum(worker_slot);
+			bgw.bgw_notify_pid = 0;
+			/* Pass the database name in bgw_extra so the worker can connect */
+			strlcpy(bgw.bgw_extra, get_database_name(MyDatabaseId),
+					BGW_EXTRALEN);
+
+			if (RegisterDynamicBackgroundWorker(&bgw, &handle))
+			{
+				/* Wait briefly for the worker to start */
+				WaitForBackgroundWorkerStartup(handle, NULL);
+				pfree(handle);
+
+				old_ctx = MemoryContextSwitchTo(CacheMemoryContext);
+				sentinel = MuxConnSentinelCreate(server->serverid,
+												 server->servername);
+				MemoryContextSwitchTo(old_ctx);
+
+				entry->conn = (PGconn *) sentinel;
+
+				pfree(sb.data);
+				elog(DEBUG3,
+					 "postgres_fdw: routing connection to \"%s\" via multiplexer (slot %d)",
+					 server->servername, worker_slot);
+				return;
+			}
+		}
+
+		pfree(sb.data);
+
+		/* Worker registration failed; fall through to direct connect */
+		ereport(WARNING,
+				(errmsg("postgres_fdw: multiplexer worker for server \"%s\" could not be started, using direct connection",
+						server->servername)));
+	}
+
 	entry->conn = connect_pg_server(server, user);
 
 	elog(DEBUG3, "new postgres_fdw connection %p for server \"%s\" (user mapping oid %u, userid %u)",
@@ -439,7 +561,7 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 	 * Register the connection in shared memory for distributed deadlock detection
 	 * Track the mapping: local_pid + server_oid -> remote_backend_pid
 	 */
-	if (entry->conn != NULL)
+	if (entry->conn != NULL && !IS_MUX_CONN(entry->conn))
 	{
 		int remote_backend_pid = PQbackendPID(entry->conn);
 		if (remote_backend_pid > 0)
@@ -630,18 +752,31 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 static void
 disconnect_pg_server(ConnCacheEntry *entry)
 {
-	
-	elog(WARNING, "dis");
 	if (entry->conn != NULL)
 	{
-		ForeignServer *server;
+		if (IS_MUX_CONN(entry->conn))
+		{
+			/*
+			 * This is a multiplexer-routed connection.  The actual TCP
+			 * connection is managed by the multiplexer process; just free
+			 * the sentinel and clear the pointer.
+			 */
+			pfree(entry->conn);
+			entry->conn = NULL;
+			return;
+		}
 
-		/* Unregister from shared memory before disconnecting */
-		server = GetForeignServer(entry->serverid);
-		if (server != NULL)
-			FdwConnShmemUnregister(server->servername);
-		else
-			elog(WARNING, "failed to get foreign server for server OID %u during disconnect", entry->serverid);
+		/* Normal direct connection */
+		{
+			ForeignServer *server;
+
+			/* Unregister from shared memory before disconnecting */
+			server = GetForeignServer(entry->serverid);
+			if (server != NULL)
+				FdwConnShmemUnregister(server->servername);
+			else
+				elog(WARNING, "failed to get foreign server for server OID %u during disconnect", entry->serverid);
+		}
 
 		libpqsrv_disconnect(entry->conn);
 		entry->conn = NULL;
@@ -765,6 +900,29 @@ do_sql_command(PGconn *conn, const char *sql)
 	do_sql_command_end(conn, sql, false);
 }
 
+/*
+ * do_sql_command_entry
+ *		Like do_sql_command() but mux-aware: when the connection cache entry
+ *		uses the multiplexer, routes the command through it instead of calling
+ *		direct libpq functions.
+ */
+static void
+do_sql_command_entry(ConnCacheEntry *entry, const char *sql)
+{
+	if (IS_MUX_CONN(entry->conn))
+	{
+		char		mux_errmsg[512];
+
+		if (!ConnMuxSendCommand(MUX_CONN_SRVOID(entry->conn), sql,
+								mux_errmsg, sizeof(mux_errmsg)))
+			ereport(ERROR,
+					(errmsg("could not send command to foreign server via multiplexer: %s",
+							mux_errmsg)));
+		return;
+	}
+	do_sql_command(entry->conn, sql);
+}
+
 static void
 do_sql_command_begin(PGconn *conn, const char *sql)
 {
@@ -824,7 +982,7 @@ begin_remote_xact(ConnCacheEntry *entry)
 		else
 			sql = "START TRANSACTION ISOLATION LEVEL REPEATABLE READ";
 		entry->changing_xact_state = true;
-		do_sql_command(entry->conn, sql);
+		do_sql_command_entry(entry, sql);
 		entry->xact_depth = 1;
 		entry->changing_xact_state = false;
 
@@ -840,7 +998,7 @@ begin_remote_xact(ConnCacheEntry *entry)
 				"SELECT pg_csn_snapshot_import("UINT64_FORMAT")",
 				fdwTransState->csn);
 
-			do_sql_command(entry->conn, import_sql);
+			do_sql_command_entry(entry, import_sql);
 		}
 
 		fdwTransState->nparticipants += 1;
@@ -857,7 +1015,7 @@ begin_remote_xact(ConnCacheEntry *entry)
 
 		snprintf(sql, sizeof(sql), "SAVEPOINT s%d", entry->xact_depth + 1);
 		entry->changing_xact_state = true;
-		do_sql_command(entry->conn, sql);
+		do_sql_command_entry(entry, sql);
 		entry->xact_depth++;
 		entry->changing_xact_state = false;
 	}
@@ -908,6 +1066,118 @@ GetPrepStmtNumber(PGconn *conn)
 }
 
 /*
+ * pgfdw_build_result_from_mux
+ *		Deserialise the compact binary result produced by the multiplexer
+ *		into a heap-allocated structure usable by the rest of postgres_fdw.
+ *
+ * The result format (see mux_serialize_result in conn_multiplexer.c):
+ *   int32 nfields
+ *   int32 ntuples
+ *   for each field: NUL-terminated name + int32 type OID
+ *   for each tuple, for each field: int32 value_len (-1 = NULL) + bytes
+ *
+ * We return a plain C struct that exposes the same interface that
+ * postgres_fdw uses from PGresult (ntuples, nfields, getvalue, getisnull,
+ * ftype), so callers can check IS_MUX_RESULT and branch accordingly.
+ */
+typedef struct MuxPGresult
+{
+	uint32		magic;			/* MUX_RESULT_MAGIC – distinguishes from PGresult */
+	int			nfields;
+	int			ntuples;
+	char	  **field_names;
+	Oid		   *field_types;
+	char	 ***values;			/* [tuple][field], NULL entry means SQL NULL */
+	int		  **value_lens;		/* [tuple][field] */
+} MuxPGresult;
+
+static MuxPGresult *
+pgfdw_build_result_from_mux(const char *data, int data_len,
+							int nfields, int ntuples)
+{
+	MuxPGresult *mr;
+	const char *p = data;
+	const char *end = data + data_len;
+	MemoryContext old_ctx;
+
+	old_ctx = MemoryContextSwitchTo(CurrentMemoryContext);
+
+	mr = palloc0(sizeof(MuxPGresult));
+	mr->magic = MUX_RESULT_MAGIC;
+	mr->nfields = nfields;
+	mr->ntuples = ntuples;
+
+	if (nfields > 0)
+	{
+		mr->field_names = (char **) palloc(nfields * sizeof(char *));
+		mr->field_types = (Oid *) palloc(nfields * sizeof(Oid));
+	}
+
+	/* Skip header ints (already parsed by caller) */
+	p += 4;					/* nfields */
+	p += 4;					/* ntuples */
+
+	/* Field descriptors */
+	for (int f = 0; f < nfields && p < end; f++)
+	{
+		size_t		nlen = strnlen(p, end - p);
+
+		mr->field_names[f] = pstrdup(p);
+		p += nlen + 1;			/* name + NUL */
+		if (p + 4 > end)
+			break;
+		memcpy(&mr->field_types[f], p, 4);
+		p += 4;
+	}
+
+	/* Row data */
+	if (ntuples > 0 && nfields > 0)
+	{
+		mr->values = (char ***) palloc(ntuples * sizeof(char **));
+		mr->value_lens = (int **) palloc(ntuples * sizeof(int *));
+
+		for (int t = 0; t < ntuples; t++)
+		{
+			mr->values[t] = (char **) palloc(nfields * sizeof(char *));
+			mr->value_lens[t] = (int *) palloc(nfields * sizeof(int));
+
+			for (int f = 0; f < nfields; f++)
+			{
+				int32		vlen;
+
+				if (p + 4 > end)
+				{
+					mr->values[t][f] = NULL;
+					mr->value_lens[t][f] = -1;
+					continue;
+				}
+				memcpy(&vlen, p, 4);
+				p += 4;
+
+				if (vlen < 0)
+				{
+					/* SQL NULL */
+					mr->values[t][f] = NULL;
+					mr->value_lens[t][f] = -1;
+				}
+				else
+				{
+					mr->values[t][f] = palloc(vlen + 1);
+					if (p + vlen <= end)
+						memcpy(mr->values[t][f], p, vlen);
+					mr->values[t][f][vlen] = '\0';
+					mr->value_lens[t][f] = vlen;
+					p += vlen;
+				}
+			}
+		}
+	}
+
+	MemoryContextSwitchTo(old_ctx);
+	return mr;
+}
+
+/*
  * Submit a query and wait for the result.
  *
  * Since we don't use non-blocking mode, this can't process interrupts while
@@ -915,6 +1185,13 @@ GetPrepStmtNumber(PGconn *conn)
  * ignore that for now.
  *
  * Caller is responsible for the error handling on the result.
+ *
+ * When conn is a MuxConnSentinel (IS_MUX_CONN(conn)), the query is sent to
+ * the foreign server via the connection multiplexer instead of the direct
+ * libpq path.  The returned PGresult* is actually a MuxPGresult* in that
+ * case; callers must use the mux-aware accessor macros
+ * (PGFDW_RESULT_NTUPLES, PGFDW_RESULT_GETVALUE, etc.) rather than PQntuples
+ * etc. directly when the result might come from the mux path.
  */
 PGresult *
 pgfdw_exec_query(PGconn *conn, const char *query, PgFdwConnState *state)
@@ -922,6 +1199,38 @@ pgfdw_exec_query(PGconn *conn, const char *query, PgFdwConnState *state)
 	/* First, process a pending asynchronous request, if any. */
 	if (state && state->pendingAreq)
 		process_pending_request(state->pendingAreq);
+
+	/* Multiplexer-routed connection: submit via shm_mq */
+	if (IS_MUX_CONN(conn))
+	{
+		Oid			server_oid = MUX_CONN_SRVOID(conn);
+		char	   *result_buf = palloc(MUX_RESULT_MAXLEN);
+		char		mux_errmsg[512];
+		int			nfields,
+					ntuples;
+		bool		truncated;
+		bool		ok;
+
+		ok = ConnMuxSubmitQuery(server_oid, query,
+								result_buf, MUX_RESULT_MAXLEN,
+								&nfields, &ntuples, &truncated,
+								mux_errmsg, sizeof(mux_errmsg));
+		if (!ok)
+		{
+			pfree(result_buf);
+			/*
+			 * Return NULL so callers can report the error via the
+			 * standard pgfdw_report_error path (which checks for NULL res).
+			 */
+			ereport(ERROR,
+					(errmsg("multiplexer error from foreign server: %s",
+							mux_errmsg)));
+		}
+
+		return (PGresult *)
+			pgfdw_build_result_from_mux(result_buf, MUX_RESULT_MAXLEN,
+										nfields, ntuples);
+	}
 
 	if (!PQsendQuery(conn, query))
 		return NULL;
@@ -956,6 +1265,17 @@ void
 pgfdw_report_error(int elevel, PGresult *res, PGconn *conn,
 				   bool clear, const char *sql)
 {
+	/*
+	 * For mux-routed connections, the error was already raised in
+	 * pgfdw_exec_query; nothing more to report here.
+	 */
+	if (IS_MUX_CONN(conn))
+	{
+		if (clear && res && IS_MUX_RESULT(res))
+			pfree(res);
+		return;
+	}
+
 	/* If requested, PGresult must be released before leaving this function. */
 	PG_TRY();
 	{
@@ -1241,13 +1561,13 @@ error:
 
 					/* Commit all remote transactions during pre-commit */
 					entry->changing_xact_state = true;
-					if (entry->parallel_commit)
+					if (entry->parallel_commit && !IS_MUX_CONN(entry->conn))
 					{
 						do_sql_command_begin(entry->conn, "COMMIT TRANSACTION");
 						pending_entries = lappend(pending_entries, entry);
 						continue;
 					}
-					do_sql_command(entry->conn, "COMMIT TRANSACTION");
+					do_sql_command_entry(entry, "COMMIT TRANSACTION");
 					entry->changing_xact_state = false;
 
 					if (UseCSNSnapshots)
@@ -1256,15 +1576,25 @@ error:
 						PGresult	*res;
 
 						res = pgfdw_exec_query(entry->conn, "SELECT pg_current_csn()", NULL);
-						if (PQresultStatus(res) == PGRES_TUPLES_OK)
+						if (IS_MUX_RESULT(res))
+						{
+							MuxPGresult *mr = (MuxPGresult *) res;
+
+							if (mr->ntuples > 0 && mr->nfields > 0 &&
+								mr->values[0][0] != NULL)
+								sscanf(mr->values[0][0], "%lu", &csn);
+							pfree(mr);
+						}
+						else if (res && PQresultStatus(res) == PGRES_TUPLES_OK)
 						{
 							sscanf(PQgetvalue(res, 0, 0), "%lu", &csn);
-
-							if (csn != InvalidCSN)
-								GenerateCSN(false, csn);
+							pgfdw_PQclear(res);
 						}
+
+						if (csn != InvalidCSN)
+							GenerateCSN(false, csn);
 					}
-					
+
 					deallocate_prepared_stmts(entry);
 					break;
 				case XACT_EVENT_PRE_PREPARE:
@@ -1367,8 +1697,19 @@ deallocate_prepared_stmts(ConnCacheEntry *entry)
 
 	if (entry->have_prep_stmt && entry->have_error)
 	{
-		res = PQexec(entry->conn, "DEALLOCATE ALL");
-		PQclear(res);
+		if (IS_MUX_CONN(entry->conn))
+		{
+			char	errmsg[512];
+
+			ConnMuxSendCommand(MUX_CONN_SRVOID(entry->conn),
+							   "DEALLOCATE ALL",
+							   errmsg, sizeof(errmsg));
+		}
+		else
+		{
+			res = PQexec(entry->conn, "DEALLOCATE ALL");
+			PQclear(res);
+		}
 	}
 	entry->have_prep_stmt = false;
 	entry->have_error = false;
@@ -1950,6 +2291,26 @@ pgfdw_abort_cleanup(ConnCacheEntry *entry, bool toplevel)
 
 	/* Assume we might have lost track of prepared statements */
 	entry->have_error = true;
+
+	/*
+	 * For mux-routed connections, send ROLLBACK directly via the mux.
+	 * We can't call PQtransactionStatus on a sentinel, so skip the cancel
+	 * logic and go straight to the abort SQL.
+	 */
+	if (IS_MUX_CONN(entry->conn))
+	{
+		char		sql[100];
+		char		errmsg[512];
+
+		CONSTRUCT_ABORT_COMMAND(sql, entry, toplevel);
+		ConnMuxSendCommand(MUX_CONN_SRVOID(entry->conn), sql,
+						   errmsg, sizeof(errmsg));
+		/* Ignore errors during cleanup */
+		entry->have_prep_stmt = false;
+		entry->have_error = false;
+		entry->changing_xact_state = false;
+		return;
+	}
 
 	/*
 	 * If a command has been submitted to the remote server by using an
@@ -2582,4 +2943,307 @@ GetConnCacheEntryInfo(void *entry_ptr, Oid *serverid, int *remote_backend_pid)
 	*serverid = entry->serverid;
 	*remote_backend_pid = PQbackendPID(entry->conn);
 	return true;
+}
+/* ----------------------------------------------------------------
+ * Connection multiplexer -- foreign worker
+ *
+ * ConnMuxForeignWorkerMain is an extension background worker registered
+ * by postgres_fdw via RegisterDynamicBackgroundWorker when the connection
+ * multiplexer is running.  It holds a persistent libpq connection to a
+ * single foreign server and services MuxQuerySlot requests posted by
+ * backends via ConnMuxSubmitQuery / ConnMuxSendCommand.
+ *
+ * The slot index (and thus the target server OID) is passed in bgw_main_arg.
+ * ---------------------------------------------------------------- */
+
+/*
+ * mux_serialize_result_fdw
+ *		Serialise a PGresult into slot->result_data (same format as described
+ *		in conn_multiplexer.h).  Lives here because PGresult is available
+ *		only in extension code.
+ */
+static void
+mux_serialize_result_fdw(MuxQuerySlot *slot, PGresult *res)
+{
+	int			nf = PQnfields(res);
+	int			nt = PQntuples(res);
+	char	   *buf = slot->result_data;
+	char	   *end = buf + MUX_RESULT_MAXLEN;
+	char	   *p = buf;
+	int32		tmp;
+
+#define WI32(v) do { \
+	if (p + 4 > end) { slot->result_truncated = true; return; } \
+	tmp = (int32)(v); memcpy(p, &tmp, 4); p += 4; } while (0)
+
+#define WBYTES(s, n) do { \
+	if (p + (n) > end) { slot->result_truncated = true; return; } \
+	memcpy(p, (s), (n)); p += (n); } while (0)
+
+	WI32(nf);
+	WI32(nt);
+
+	for (int f = 0; f < nf; f++)
+	{
+		const char *fname = PQfname(res, f);
+		size_t		fnlen = strlen(fname) + 1;
+		Oid			ftype = PQftype(res, f);
+
+		WBYTES(fname, fnlen);
+		WI32((int32) ftype);
+	}
+
+	for (int t = 0; t < nt; t++)
+	{
+		for (int f = 0; f < nf; f++)
+		{
+			if (PQgetisnull(res, t, f))
+			{
+				int32		null_marker = -1;
+
+				WI32(null_marker);
+			}
+			else
+			{
+				int32		vlen = PQgetlength(res, t, f);
+				const char *val = PQgetvalue(res, t, f);
+
+				WI32(vlen);
+				WBYTES(val, vlen);
+			}
+		}
+	}
+
+#undef WI32
+#undef WBYTES
+
+	slot->result_len = (int) (p - buf);
+	slot->result_nfields = nf;
+	slot->result_ntuples = nt;
+}
+
+/*
+ * ConnMuxForeignWorkerMain
+ *		Entry point for the extension background worker that handles a
+ *		single foreign server's persistent libpq connection.
+ *
+ *		bgw_main_arg = slot index in MuxState->workers[].
+ */
+PGDLLEXPORT void
+ConnMuxForeignWorkerMain(Datum main_arg)
+{
+	int			slot_idx = DatumGetInt32(main_arg);
+	MuxSharedState *mux_state;
+	MuxWorkerSlot *my_slot;
+	PGconn	   *pgconn = NULL;
+	char		connstr[MUX_CONNSTR_MAXLEN];
+	sigjmp_buf	local_sigjmp_buf;
+
+	/*
+	 * Connect to the database specified in bgw_extra so we can use catalog
+	 * access (needed for BackgroundWorkerInitializeConnection semantics).
+	 */
+	if (MyBgworkerEntry->bgw_extra[0] != '\0')
+		BackgroundWorkerInitializeConnection(MyBgworkerEntry->bgw_extra, NULL, 0);
+
+	/* Attach to the multiplexer shared-memory segment */
+	ConnMuxShmemInit();
+	mux_state = ConnMuxGetSharedState();
+	Assert(mux_state != NULL);
+	Assert(slot_idx >= 0 && slot_idx < MUX_MAX_WORKERS);
+
+	my_slot = &mux_state->workers[slot_idx];
+
+	/* Register our PID and latch in the slot */
+	SpinLockAcquire(&my_slot->mutex);
+	my_slot->pid = MyProcPid;
+	my_slot->worker_latch = &MyProc->procLatch;
+	my_slot->phase = MUX_WORKER_IDLE;
+	SpinLockRelease(&my_slot->mutex);
+
+	/* Copy the connection string out of the shared remote_conns entry */
+	{
+		Oid			server_oid = my_slot->server_oid;
+		bool		found = false;
+
+		for (int i = 0; i < MUX_MAX_REMOTE_CONNS; i++)
+		{
+			MuxRemoteConn *rc = &mux_state->remote_conns[i];
+
+			if (rc->server_oid == server_oid)
+			{
+				strlcpy(connstr, rc->connstr, MUX_CONNSTR_MAXLEN);
+				found = true;
+				break;
+			}
+		}
+
+		if (!found)
+		{
+			ereport(LOG,
+					(errmsg("mux foreign worker: no connstr for server OID %u",
+							server_oid)));
+			goto shutdown;
+		}
+	}
+
+	/* Establish the persistent connection to the remote server */
+	pgconn = libpqsrv_connect(connstr, PG_WAIT_CLIENT);
+	if (pgconn == NULL || PQstatus(pgconn) != CONNECTION_OK)
+	{
+		ereport(WARNING,
+				(errmsg("mux foreign worker: could not connect to foreign server: %s",
+						pgconn ? PQerrorMessage(pgconn) : "out of memory")));
+		if (pgconn)
+		{
+			libpqsrv_disconnect(pgconn);
+			pgconn = NULL;
+		}
+		SpinLockAcquire(&my_slot->mutex);
+		my_slot->phase = MUX_WORKER_DEAD;
+		SpinLockRelease(&my_slot->mutex);
+		return;
+	}
+
+	ereport(LOG,
+			(errmsg("mux foreign worker: connected to foreign server \"%s\"",
+					my_slot->server_name)));
+
+	SpinLockAcquire(&my_slot->mutex);
+	my_slot->phase = MUX_WORKER_IDLE;
+	SpinLockRelease(&my_slot->mutex);
+
+	/* Set up error-recovery jump point */
+	if (sigsetjmp(local_sigjmp_buf, 1) != 0)
+	{
+		EmitErrorReport();
+		FlushErrorState();
+		if (pgconn && PQstatus(pgconn) != CONNECTION_OK)
+		{
+			libpqsrv_disconnect(pgconn);
+			pgconn = libpqsrv_connect(connstr, PG_WAIT_CLIENT);
+		}
+	}
+	PG_exception_stack = &local_sigjmp_buf;
+
+	/*
+	 * Main service loop: poll MuxQuerySlot for requests that target our
+	 * server_oid, execute them, and signal the waiting backend.
+	 */
+	for (;;)
+	{
+		bool		did_work = false;
+
+		if (QueryCancelPending || ProcDiePending)
+			break;
+
+		for (int i = 0; i < MUX_MAX_QUERY_SLOTS; i++)
+		{
+			MuxQuerySlot *slot = &mux_state->query_slots[i];
+			PGresult   *res;
+
+			SpinLockAcquire(&slot->mutex);
+			if (!slot->in_use || slot->completed ||
+				slot->server_oid != my_slot->server_oid)
+			{
+				SpinLockRelease(&slot->mutex);
+				continue;
+			}
+			SpinLockRelease(&slot->mutex);
+
+			/* This slot is ours to process */
+			SpinLockAcquire(&my_slot->mutex);
+			my_slot->phase = MUX_WORKER_BUSY;
+			SpinLockRelease(&my_slot->mutex);
+
+			/* Reconnect if needed */
+			if (pgconn == NULL || PQstatus(pgconn) != CONNECTION_OK)
+			{
+				if (pgconn)
+					libpqsrv_disconnect(pgconn);
+				pgconn = libpqsrv_connect(connstr, PG_WAIT_CLIENT);
+				if (pgconn == NULL || PQstatus(pgconn) != CONNECTION_OK)
+				{
+					SpinLockAcquire(&slot->mutex);
+					slot->is_error = true;
+					strlcpy(slot->error_msg,
+							"mux foreign worker: lost connection to remote server",
+							sizeof(slot->error_msg));
+					slot->completed = true;
+					SpinLockRelease(&slot->mutex);
+					if (slot->requester_latch)
+						SetLatch(slot->requester_latch);
+					continue;
+				}
+			}
+
+			/* Execute the query */
+			res = libpqsrv_exec(pgconn, slot->sql, PG_WAIT_CLIENT);
+
+			SpinLockAcquire(&slot->mutex);
+			slot->result_truncated = false;
+			slot->result_len = 0;
+
+			if (res == NULL)
+			{
+				slot->is_error = true;
+				strlcpy(slot->error_msg, PQerrorMessage(pgconn),
+						sizeof(slot->error_msg));
+			}
+			else if (PQresultStatus(res) == PGRES_TUPLES_OK)
+			{
+				slot->is_error = false;
+				mux_serialize_result_fdw(slot, res);
+			}
+			else if (PQresultStatus(res) == PGRES_COMMAND_OK)
+			{
+				slot->is_error = false;
+				slot->result_nfields = 0;
+				slot->result_ntuples = 0;
+			}
+			else
+			{
+				slot->is_error = true;
+				strlcpy(slot->error_msg, PQresultErrorMessage(res),
+						sizeof(slot->error_msg));
+			}
+
+			if (res)
+				PQclear(res);
+
+			slot->completed = true;
+			SpinLockRelease(&slot->mutex);
+
+			if (slot->requester_latch)
+				SetLatch(slot->requester_latch);
+
+			SpinLockAcquire(&my_slot->mutex);
+			my_slot->phase = MUX_WORKER_IDLE;
+			my_slot->requests_completed++;
+			my_slot->count_queries++;
+			SpinLockRelease(&my_slot->mutex);
+
+			did_work = true;
+		}
+
+		if (!did_work)
+		{
+			WaitLatch(MyLatch,
+					  WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+					  100,	/* 100 ms */
+					  PG_WAIT_IPC);
+			ResetLatch(MyLatch);
+		}
+	}
+
+shutdown:
+	if (pgconn)
+		libpqsrv_disconnect(pgconn);
+
+	SpinLockAcquire(&my_slot->mutex);
+	my_slot->phase = MUX_WORKER_DEAD;
+	my_slot->pid = 0;
+	my_slot->worker_latch = NULL;
+	my_slot->is_foreign = false;
+	SpinLockRelease(&my_slot->mutex);
 }

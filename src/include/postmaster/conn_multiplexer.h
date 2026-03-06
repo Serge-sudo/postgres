@@ -8,7 +8,7 @@
  *  - Connects to peer multiplexers via a single connection per remote node
  *  - Maintains a pool of workers that execute sub-statement level queries
  *  - Communicates with workers and backends via shared-memory queues
- *  - Discovers remote nodes from pg_foreign_server / pg_shardmembers catalog *
+ *
  * This dramatically reduces the total number of connections and processes
  * in a cluster compared to the traditional per-connection model.
  *
@@ -18,24 +18,7 @@
  *
  * The multiplexer event loop moves data between:
  *   - Local backends ↔ local workers (via shm_mq)
- *   - Local workers  ↔ remote nodes  (via single persistent connection per
- *                                      foreign server)
- *
- * Foreign-server integration
- * --------------------------
- * When remote nodes are declared as foreign servers (e.g., via
- * ADD MEMBER to a shard group), the multiplexer discovers them from the
- * pg_foreign_server catalog at startup.  For each such server it allocates
- * a MuxRemoteConn slot that stores the server OID, name, and a libpq-style
- * connection string built from the server's srvoptions.
- *
- * Remote workers
- * --------------
- * For each registered foreign server, the multiplexer spawns a dedicated
- * "remote worker" background process.  A remote worker has database access
- * and executes sub-statements on the foreign server using SPI and the
- * postgres_fdw connection infrastructure, then returns results back to the
- * multiplexer via its worker_to_mux shm_mq queue.
+ *   - Local workers  ↔ remote nodes  (via single TCP connection per node)
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
@@ -67,6 +50,15 @@
 /* Maximum length of a connection string stored in shared memory */
 #define MUX_CONNSTR_MAXLEN		256
 
+/*
+ * Query request/response slot sizing for backend→multiplexer routing.
+ * A backend that wants to execute a query on a foreign server via the
+ * multiplexer posts a request into one of these fixed-size slots.
+ */
+#define MUX_MAX_QUERY_SLOTS		64		/* max concurrent foreign queries */
+#define MUX_SQL_MAXLEN			4096	/* max SQL text length per request */
+#define MUX_RESULT_MAXLEN		(64 * 1024) /* max serialised result (64 kB) */
+
 /* ----------------------------------------------------------------
  * Message types exchanged through the shared-memory queues
  * ---------------------------------------------------------------- */
@@ -77,7 +69,7 @@ typedef enum MuxMessageType
 	MUX_MSG_CLOSE,				/* either direction: close/cancel request */
 	MUX_MSG_TXSTATE,			/* coordinator → worker: transaction state */
 	MUX_MSG_ERROR,				/* worker  → backend: error report */
-	MUX_MSG_REMOTE_QUERY,		/* mux → remote worker: forward query to a foreign server */
+	MUX_MSG_FOREIGN_QUERY,		/* backend → mux: execute on a foreign server */
 } MuxMessageType;
 
 /*
@@ -104,20 +96,15 @@ typedef enum MuxWorkerPhase
 } MuxWorkerPhase;
 
 /*
- * Worker type: local workers execute queries locally; remote workers proxy
- * requests through a specific foreign server via postgres_fdw / SPI.
- */
-typedef enum MuxWorkerType
-{
-	MUX_WORKER_LOCAL = 0,		/* executes queries on the local node */
-	MUX_WORKER_REMOTE,			/* proxies queries to a foreign server */
-} MuxWorkerType;
-
-/*
  * One slot in the worker pool, stored in shared memory.
  *
  * The two shm_mq queues are embedded directly in this struct so that no
  * DSM segment is needed for basic multiplexer ↔ worker communication.
+ *
+ * Local workers (is_foreign = false) execute queries via SPI on the local
+ * database.  Foreign workers (is_foreign = true) are extension background
+ * workers (registered by postgres_fdw) that hold a persistent libpq
+ * connection to a remote server and execute queries there.
  */
 typedef struct MuxWorkerSlot
 {
@@ -128,13 +115,17 @@ typedef struct MuxWorkerSlot
 	int			worker_id;		/* 0-based index in the pool */
 	pid_t		pid;			/* worker OS PID; 0 if not running */
 
-	/* Worker type and associated foreign server (for remote workers) */
-	MuxWorkerType worker_type;
-	Oid			remote_server_oid;	/* OID of the ForeignServer (0 = local) */
-	char		remote_server_name[NAMEDATALEN]; /* server name for display */
-
 	/* State */
 	MuxWorkerPhase phase;
+
+	/*
+	 * Foreign-worker fields.  When is_foreign is true this slot belongs to
+	 * an extension background worker (postgres_fdw) that holds the actual
+	 * PGconn* to the remote server.
+	 */
+	bool		is_foreign;		/* true = postgres_fdw foreign worker */
+	Oid			server_oid;		/* foreign server OID (InvalidOid for local) */
+	char		server_name[NAMEDATALEN];	/* foreign server name */
 
 	/* Current request being processed */
 	MuxMessageType current_request_type;
@@ -182,12 +173,10 @@ typedef struct MuxRemoteConn
 	MuxConnPhase phase;
 	uint32		conn_id;		/* identifier used in MuxMsgHeader */
 
-	/* Foreign server identity */
-	Oid			server_oid;		/* OID of pg_foreign_server (0 if unknown) */
-	char		server_name[NAMEDATALEN]; /* server name for display */
-
-	/* libpq-style connection string built from foreign server options */
-	char		connstr[MUX_CONNSTR_MAXLEN];
+	/* Foreign server identity (set when the server is registered) */
+	Oid			server_oid;		/* pg_foreign_server.oid */
+	char		server_name[NAMEDATALEN];	/* pg_foreign_server.srvname */
+	char		connstr[MUX_CONNSTR_MAXLEN]; /* libpq connection string */
 
 	/* Statistics */
 	uint64		bytes_sent;
@@ -196,6 +185,101 @@ typedef struct MuxRemoteConn
 	uint64		msgs_recv;
 	TimestampTz connect_time;
 } MuxRemoteConn;
+
+/* ----------------------------------------------------------------
+ * Query routing slot (backend → multiplexer → foreign server)
+ *
+ * When a backend wants to execute a query on a foreign server through the
+ * multiplexer (rather than making its own TCP connection), it fills one of
+ * these slots and waits for the multiplexer to complete the request.
+ * ---------------------------------------------------------------- */
+typedef struct MuxQuerySlot
+{
+	slock_t		mutex;
+	bool		in_use;			/* slot is taken by a backend */
+
+	/* ------ Request (filled by backend) ------ */
+	Oid			server_oid;		/* which foreign server to query */
+	char		sql[MUX_SQL_MAXLEN];	/* query text */
+	pid_t		requester_pid;
+	Latch	   *requester_latch; /* backend's MyProc->procLatch */
+
+	/* ------ Result (filled by multiplexer) ------ */
+	volatile bool completed;	/* set to true when result is ready */
+	bool		is_error;		/* query failed */
+	char		error_msg[512];	/* error text when is_error */
+
+	/*
+	 * Serialised result rows.
+	 *
+	 * Format: nfields int32, ntuples int32, then for each field: name as
+	 * NUL-terminated string + type OID int32; then for each tuple, for each
+	 * field: value_len int32 (-1 for NULL) + value bytes (not NUL-terminated).
+	 */
+	int			result_nfields;
+	int			result_ntuples;
+	bool		result_truncated; /* true if result exceeded MUX_RESULT_MAXLEN */
+	char		result_data[MUX_RESULT_MAXLEN];
+	int			result_len;
+} MuxQuerySlot;
+
+/* ----------------------------------------------------------------
+ * Sentinel PGconn* for multiplexer-routed postgres_fdw connections.
+ *
+ * When the multiplexer is active for a foreign server, postgres_fdw stores
+ * a pointer to a MuxConnSentinel cast to PGconn* in the connection cache
+ * entry instead of a real libpq connection.  Code that needs to distinguish
+ * the two cases uses IS_MUX_CONN().
+ * ---------------------------------------------------------------- */
+#define MUX_CONN_MAGIC		0x4D555803U	/* 'M','U','X','\3' */
+
+typedef struct MuxConnSentinel
+{
+	uint32		magic;			/* always MUX_CONN_MAGIC */
+	Oid			server_oid;		/* foreign server this represents */
+	char		server_name[NAMEDATALEN];
+} MuxConnSentinel;
+
+/*
+ * Allocate a new sentinel for the given server.  The sentinel is
+ * palloc'd in the current memory context.
+ */
+static inline MuxConnSentinel *
+MuxConnSentinelCreate(Oid serverOid, const char *serverName)
+{
+	MuxConnSentinel *s = (MuxConnSentinel *) palloc(sizeof(MuxConnSentinel));
+
+	s->magic = MUX_CONN_MAGIC;
+	s->server_oid = serverOid;
+	strlcpy(s->server_name, serverName, NAMEDATALEN);
+	return s;
+}
+
+/* Test whether a PGconn* is actually a MuxConnSentinel */
+#define IS_MUX_CONN(conn) \
+	((conn) != NULL && \
+	 ((const MuxConnSentinel *)(conn))->magic == MUX_CONN_MAGIC)
+
+/* Extract the foreign server OID from a sentinel */
+#define MUX_CONN_SRVOID(conn) \
+	(((const MuxConnSentinel *)(conn))->server_oid)
+
+/*
+ * Magic value for MuxPGresult – a palloc'd result struct returned by
+ * pgfdw_exec_query() when a query was executed via the multiplexer.
+ * Having this constant in the shared header lets both connection.c and
+ * postgres_fdw.h use IS_MUX_RESULT without a forward declaration.
+ */
+#define MUX_RESULT_MAGIC	0x4D555852U		/* 'M','U','X','R' */
+
+/*
+ * IS_MUX_RESULT – test whether a PGresult* is actually a MuxPGresult*
+ * returned by pgfdw_exec_query.  Uses a raw uint32 cast so no MuxPGresult
+ * type definition is needed at the call site.
+ */
+#define IS_MUX_RESULT(res) \
+	((res) != NULL && \
+	 *((const uint32 *)(res)) == MUX_RESULT_MAGIC)
 
 /* ----------------------------------------------------------------
  * Global multiplexer shared-memory state
@@ -213,11 +297,13 @@ typedef struct MuxSharedState
 
 	/* Worker pool */
 	int			num_workers;		/* configured pool size (GUC) */
-	int			num_remote_workers; /* count of remote-worker slots */
 	MuxWorkerSlot workers[MUX_MAX_WORKERS];
 
-	/* Remote connections (one per foreign server) */
+	/* Remote connections (metadata; actual PGconn* lives in mux process) */
 	MuxRemoteConn remote_conns[MUX_MAX_REMOTE_CONNS];
+
+	/* Query routing slots for backend→mux foreign-server queries */
+	MuxQuerySlot query_slots[MUX_MAX_QUERY_SLOTS];
 
 	/* Global counters */
 	uint64		total_requests;
@@ -243,24 +329,11 @@ extern void ConnMuxRegister(void);
 /* Entry point for the multiplexer background worker */
 extern PGDLLIMPORT void ConnMuxMain(Datum main_arg);
 
-/* Entry point for each local pool worker background worker */
+/* Entry point for each pool worker background worker */
 extern PGDLLIMPORT void ConnMuxWorkerMain(Datum main_arg);
-
-/* Entry point for each remote worker background worker */
-extern PGDLLIMPORT void ConnMuxRemoteWorkerMain(Datum main_arg);
 
 /* Wake the multiplexer from a backend or worker */
 extern void ConnMuxWakeup(void);
-
-/*
- * Register a foreign server with the multiplexer so that a persistent
- * remote worker will be spawned for it.  Safe to call from any backend
- * that has database access.  Returns the conn_id assigned to this server,
- * or (uint32) -1 if the server is already registered or no slot is free.
- *
- * The caller is responsible for ensuring the server exists in the catalog.
- */
-extern uint32 ConnMuxRegisterForeignServer(Oid serverOid);
 
 /*
  * Statistics accessor – fills a caller-allocated array of MuxWorkerSlot
@@ -269,9 +342,78 @@ extern uint32 ConnMuxRegisterForeignServer(Oid serverOid);
 extern int	ConnMuxGetWorkerStats(MuxWorkerSlot *slots, int max_slots);
 
 /*
- * Remote-connection statistics accessor – fills a caller-allocated array
- * of MuxRemoteConn copies.  Returns the number of slots filled.
+ * Foreign server connection routing – called from postgres_fdw and any
+ * other code that wants to route through the multiplexer instead of
+ * making a direct TCP connection.
  */
-extern int	ConnMuxGetRemoteConnStats(MuxRemoteConn *conns, int max_conns);
+
+/*
+ * Check whether the multiplexer is running and has registered (or can
+ * register) a connection for the given foreign server OID.  If true, the
+ * caller should use ConnMuxSubmitQuery / ConnMuxSendCommand instead of
+ * direct libpq calls.
+ */
+extern bool ConnMuxIsAvailable(Oid serverOid);
+
+/*
+ * Register a foreign server with the multiplexer.  This causes the
+ * multiplexer to establish (or reuse) a persistent PGconn* to the server.
+ * connstr must be a libpq-compatible connection string.
+ * Returns the conn_id on success, or (uint32) -1 on failure.
+ * Safe to call from any backend.
+ */
+extern uint32 ConnMuxRegisterServer(Oid serverOid, const char *serverName,
+									const char *connstr);
+
+/*
+ * Reserve a worker slot in the pool for an extension background worker that
+ * will hold a libpq connection to serverOid's foreign server.
+ *
+ * Call this from make_new_connection() (postgres_fdw) before registering
+ * the dynamic background worker.  Pass the returned slot index as the
+ * background worker's bgw_main_arg.
+ *
+ * Returns the slot index (>= 0) on success, or -1 if the pool is full.
+ */
+extern int	ConnMuxReserveWorkerSlot(Oid serverOid, const char *serverName);
+
+/*
+ * Return a pointer to the MuxSharedState segment.  Call ConnMuxShmemInit()
+ * first (which is a no-op if already initialised).  Intended for use by
+ * the foreign worker (ConnMuxForeignWorkerMain) running inside the
+ * postgres_fdw extension.
+ */
+extern MuxSharedState *ConnMuxGetSharedState(void);
+
+/*
+ * Submit a query for execution on a foreign server via the multiplexer.
+ *
+ * The multiplexer executes the query on its persistent PGconn* for
+ * serverOid and returns the result in caller-supplied buffers.
+ *
+ * result_data receives a compact binary stream (nfields, ntuples, field
+ * descriptors, then row values).  The caller must supply a buffer of at
+ * least MUX_RESULT_MAXLEN bytes.
+ *
+ * Returns true on success, false on error (error_msg is then filled with
+ * a NUL-terminated message string).
+ *
+ * Blocks until the multiplexer completes the request (or timeout occurs).
+ */
+extern bool ConnMuxSubmitQuery(Oid serverOid, const char *sql,
+							   char *result_data, int result_data_size,
+							   int *nfields_out, int *ntuples_out,
+							   bool *truncated_out,
+							   char *error_msg, int error_msg_size);
+
+/*
+ * Send a command (no result expected beyond success/failure) to a foreign
+ * server via the multiplexer.  Used for BEGIN, COMMIT, ROLLBACK, SAVEPOINT,
+ * and similar control statements.
+ *
+ * Returns true on success, false on error (error_msg is filled).
+ */
+extern bool ConnMuxSendCommand(Oid serverOid, const char *sql,
+							   char *error_msg, int error_msg_size);
 
 #endif							/* CONN_MULTIPLEXER_H */

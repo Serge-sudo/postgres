@@ -2037,8 +2037,7 @@ pg_stat_have_stats(PG_FUNCTION_ARGS)
  * pg_stat_get_conn_mux_workers
  *
  * Returns a set of records describing the status and statistics of each
- * worker in the connection multiplexer pool.  Includes both local workers
- * and remote workers (which proxy queries to foreign servers).
+ * worker in the connection multiplexer pool.
  * ----------------------------------------------------------------
  */
 #include "postmaster/conn_multiplexer.h"
@@ -2046,7 +2045,7 @@ pg_stat_have_stats(PG_FUNCTION_ARGS)
 Datum
 pg_stat_get_conn_mux_workers(PG_FUNCTION_ARGS)
 {
-#define CONN_MUX_WORKER_COLS 13
+#define CONN_MUX_WORKER_COLS 12
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	TupleDesc	tupdesc;
 	Tuplestorestate *tupstore;
@@ -2080,27 +2079,25 @@ pg_stat_get_conn_mux_workers(PG_FUNCTION_ARGS)
 					   INT4OID, -1, 0);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 2,  "pid",
 					   INT4OID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 3,  "worker_type",
+	TupleDescInitEntry(tupdesc, (AttrNumber) 3,  "phase",
 					   TEXTOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 4,  "phase",
+	TupleDescInitEntry(tupdesc, (AttrNumber) 4,  "current_request_type",
 					   TEXTOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 5,  "current_request_type",
-					   TEXTOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 6,  "current_conn_id",
+	TupleDescInitEntry(tupdesc, (AttrNumber) 5,  "current_conn_id",
 					   INT4OID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 7,  "requester_pid",
+	TupleDescInitEntry(tupdesc, (AttrNumber) 6,  "requester_pid",
 					   INT4OID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 8,  "requests_completed",
+	TupleDescInitEntry(tupdesc, (AttrNumber) 7,  "requests_completed",
 					   INT8OID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 9,  "count_queries",
+	TupleDescInitEntry(tupdesc, (AttrNumber) 8,  "count_queries",
 					   INT8OID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 10, "count_connects",
+	TupleDescInitEntry(tupdesc, (AttrNumber) 9,  "count_connects",
 					   INT8OID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 11, "count_closes",
+	TupleDescInitEntry(tupdesc, (AttrNumber) 10, "count_closes",
 					   INT8OID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 12, "count_errors",
+	TupleDescInitEntry(tupdesc, (AttrNumber) 11, "count_errors",
 					   INT8OID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 13, "last_active",
+	TupleDescInitEntry(tupdesc, (AttrNumber) 12, "last_active",
 					   TIMESTAMPTZOID, -1, 0);
 
 	tupstore = tuplestore_begin_heap(true, false, work_mem);
@@ -2111,15 +2108,14 @@ pg_stat_get_conn_mux_workers(PG_FUNCTION_ARGS)
 	MemoryContextSwitchTo(oldcontext);
 
 	/* Collect a snapshot of the worker stats */
-	slots = (MuxWorkerSlot *) palloc(sizeof(MuxWorkerSlot) * MUX_MAX_WORKERS);
-	nslots = ConnMuxGetWorkerStats(slots, MUX_MAX_WORKERS);
+	slots = (MuxWorkerSlot *) palloc(sizeof(MuxWorkerSlot) * mux_worker_count);
+	nslots = ConnMuxGetWorkerStats(slots, mux_worker_count);
 
 	for (i = 0; i < nslots; i++)
 	{
 		MuxWorkerSlot *slot = &slots[i];
 		Datum		values[CONN_MUX_WORKER_COLS];
 		bool		nulls[CONN_MUX_WORKER_COLS];
-		const char *worker_type_str;
 		const char *phase_str;
 		const char *req_type_str;
 
@@ -2132,12 +2128,6 @@ pg_stat_get_conn_mux_workers(PG_FUNCTION_ARGS)
 		else
 			values[1] = Int32GetDatum((int32) slot->pid);
 
-		/* worker_type */
-		worker_type_str = (slot->worker_type == MUX_WORKER_REMOTE) ?
-			"remote" : "local";
-		values[2] = CStringGetTextDatum(worker_type_str);
-
-		/* phase */
 		switch (slot->phase)
 		{
 			case MUX_WORKER_DEAD:
@@ -2156,12 +2146,12 @@ pg_stat_get_conn_mux_workers(PG_FUNCTION_ARGS)
 				phase_str = "unknown";
 				break;
 		}
-		values[3] = CStringGetTextDatum(phase_str);
+		values[2] = CStringGetTextDatum(phase_str);
 
 		if (slot->phase != MUX_WORKER_BUSY)
 		{
+			nulls[3] = true;
 			nulls[4] = true;
-			nulls[5] = true;
 		}
 		else
 		{
@@ -2182,170 +2172,33 @@ pg_stat_get_conn_mux_workers(PG_FUNCTION_ARGS)
 				case MUX_MSG_ERROR:
 					req_type_str = "error";
 					break;
-				case MUX_MSG_REMOTE_QUERY:
-					req_type_str = "remote_query";
-					break;
 				default:
 					req_type_str = "unknown";
 					break;
 			}
-			values[4] = CStringGetTextDatum(req_type_str);
-			values[5] = Int32GetDatum((int32) slot->current_conn_id);
+			values[3] = CStringGetTextDatum(req_type_str);
+			values[4] = Int32GetDatum((int32) slot->current_conn_id);
 		}
 
 		if (slot->requester_pid == 0)
-			nulls[6] = true;
+			nulls[5] = true;
 		else
-			values[6] = Int32GetDatum(slot->requester_pid);
+			values[5] = Int32GetDatum(slot->requester_pid);
 
-		values[7]  = Int64GetDatum((int64) slot->requests_completed);
-		values[8]  = Int64GetDatum((int64) slot->count_queries);
-		values[9]  = Int64GetDatum((int64) slot->count_connects);
-		values[10] = Int64GetDatum((int64) slot->count_closes);
-		values[11] = Int64GetDatum((int64) slot->count_errors);
+		values[6] = Int64GetDatum((int64) slot->requests_completed);
+		values[7] = Int64GetDatum((int64) slot->count_queries);
+		values[8] = Int64GetDatum((int64) slot->count_connects);
+		values[9] = Int64GetDatum((int64) slot->count_closes);
+		values[10] = Int64GetDatum((int64) slot->count_errors);
 
 		if (slot->last_active == 0)
-			nulls[12] = true;
+			nulls[11] = true;
 		else
-			values[12] = TimestampTzGetDatum(slot->last_active);
+			values[11] = TimestampTzGetDatum(slot->last_active);
 
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 	}
 
 	pfree(slots);
-	return (Datum) 0;
-}
-
-/* ----------------------------------------------------------------
- * pg_stat_get_conn_mux_remotes
- *
- * Returns a set of records describing each registered foreign-server
- * connection managed by the connection multiplexer.
- * ----------------------------------------------------------------
- */
-Datum
-pg_stat_get_conn_mux_remotes(PG_FUNCTION_ARGS)
-{
-#define CONN_MUX_REMOTE_COLS 10
-	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	TupleDesc	tupdesc;
-	Tuplestorestate *tupstore;
-	MemoryContext per_query_ctx;
-	MemoryContext oldcontext;
-	MuxRemoteConn *conns;
-	int			nconns;
-	int			i;
-
-	/* Require pg_monitor membership */
-	if (!has_privs_of_role(GetUserId(), ROLE_PG_MONITOR))
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("permission denied for view \"pg_stat_conn_multiplexer_remotes\""),
-				 errhint("Must be member of role \"pg_monitor\".")));
-
-	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("set-valued function called in context that cannot accept a set")));
-	if (!(rsinfo->allowedModes & SFRM_Materialize))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("materialize mode required, but it is not allowed in this context")));
-
-	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
-	oldcontext = MemoryContextSwitchTo(per_query_ctx);
-
-	tupdesc = CreateTemplateTupleDesc(CONN_MUX_REMOTE_COLS);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 1,  "conn_id",
-					   INT4OID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 2,  "phase",
-					   TEXTOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 3,  "server_oid",
-					   OIDOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 4,  "server_name",
-					   TEXTOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 5,  "connstr",
-					   TEXTOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 6,  "bytes_sent",
-					   INT8OID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 7,  "bytes_recv",
-					   INT8OID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 8,  "msgs_sent",
-					   INT8OID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 9,  "msgs_recv",
-					   INT8OID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 10, "connect_time",
-					   TIMESTAMPTZOID, -1, 0);
-
-	tupstore = tuplestore_begin_heap(true, false, work_mem);
-	rsinfo->returnMode = SFRM_Materialize;
-	rsinfo->setResult = tupstore;
-	rsinfo->setDesc = tupdesc;
-
-	MemoryContextSwitchTo(oldcontext);
-
-	conns = (MuxRemoteConn *) palloc(sizeof(MuxRemoteConn) * MUX_MAX_REMOTE_CONNS);
-	nconns = ConnMuxGetRemoteConnStats(conns, MUX_MAX_REMOTE_CONNS);
-
-	for (i = 0; i < nconns; i++)
-	{
-		MuxRemoteConn *rc = &conns[i];
-		Datum		values[CONN_MUX_REMOTE_COLS];
-		bool		nulls[CONN_MUX_REMOTE_COLS];
-		const char *phase_str;
-
-		MemSet(nulls, 0, sizeof(nulls));
-
-		values[0] = Int32GetDatum((int32) rc->conn_id);
-
-		switch (rc->phase)
-		{
-			case MUX_CONN_UNUSED:
-				phase_str = "unused";
-				break;
-			case MUX_CONN_CONNECTING:
-				phase_str = "connecting";
-				break;
-			case MUX_CONN_ACTIVE:
-				phase_str = "active";
-				break;
-			case MUX_CONN_ERROR:
-				phase_str = "error";
-				break;
-			default:
-				phase_str = "unknown";
-				break;
-		}
-		values[1] = CStringGetTextDatum(phase_str);
-
-		if (!OidIsValid(rc->server_oid))
-			nulls[2] = true;
-		else
-			values[2] = ObjectIdGetDatum(rc->server_oid);
-
-		if (rc->server_name[0] == '\0')
-			nulls[3] = true;
-		else
-			values[3] = CStringGetTextDatum(rc->server_name);
-
-		if (rc->connstr[0] == '\0')
-			nulls[4] = true;
-		else
-			values[4] = CStringGetTextDatum(rc->connstr);
-
-		values[5] = Int64GetDatum((int64) rc->bytes_sent);
-		values[6] = Int64GetDatum((int64) rc->bytes_recv);
-		values[7] = Int64GetDatum((int64) rc->msgs_sent);
-		values[8] = Int64GetDatum((int64) rc->msgs_recv);
-
-		if (rc->connect_time == 0)
-			nulls[9] = true;
-		else
-			values[9] = TimestampTzGetDatum(rc->connect_time);
-
-		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
-	}
-
-	pfree(conns);
 	return (Datum) 0;
 }

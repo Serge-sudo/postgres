@@ -51,17 +51,8 @@
 #include <signal.h>
 #include <unistd.h>
 
-#include "access/table.h"
-#include "access/tableam.h"
-#include "access/heapam.h"
-#include "catalog/pg_foreign_server.h"
-#include "catalog/pg_shardmembers.h"
-#include "commands/defrem.h"
-#include "executor/spi.h"
-#include "foreign/foreign.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
-#include "nodes/pg_list.h"
 #include "pgstat.h"
 #include "postmaster/conn_multiplexer.h"
 #include "postmaster/bgworker.h"
@@ -76,13 +67,10 @@
 #include "storage/spin.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
-#include "utils/fmgroids.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
-#include "utils/rel.h"
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
-#include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
@@ -95,16 +83,11 @@
 int			mux_worker_count = 4;
 
 /*
- * Name of the local database the multiplexer connects to for catalog access
- * (discovering foreign servers, spawning remote workers).  Must exist.
+ * Name of the local database to connect to when the multiplexer needs
+ * catalog access (e.g. to look up ForeignServer options).
+ * Currently unused; kept as a reference for future catalog-access needs.
  */
-#define MUX_LOCAL_DATABASE	"postgres"
-
-/*
- * Sentinel value returned by ConnMuxRegisterForeignServer when no slot is
- * available or the server is already registered.
- */
-#define MUX_INVALID_CONN_ID		((uint32) -1)
+/* #define MUX_LOCAL_DATABASE "postgres" */
 
 /* Pointer to the shared-memory state; set by ConnMuxShmemInit(). */
 static MuxSharedState *MuxState = NULL;
@@ -133,7 +116,6 @@ static int	pending_tail = 0;
 static void mux_handle_sigterm(SIGNAL_ARGS);
 static void mux_setup_signals(void);
 static void mux_spawn_workers(int n);
-static void mux_spawn_remote_worker(int slot_id);
 static int	mux_find_idle_worker(void);
 static bool mux_dispatch_to_worker(int worker_id, const char *data, Size len);
 static void mux_drain_worker_queues(void);
@@ -141,9 +123,6 @@ static void mux_drain_backend_requests(void);
 static bool mux_pending_enqueue(const char *data, Size len);
 static bool mux_pending_dequeue(char *buf, Size bufsz, Size *lenp);
 static void mux_worker_setup_signals(void);
-static void mux_discover_foreign_servers(void);
-static int	mux_alloc_remote_conn_slot(void);
-static void mux_build_connstr(ForeignServer *server, char *buf, int bufsz);
 
 
 /* ----------------------------------------------------------------
@@ -212,6 +191,15 @@ ConnMuxShmemInit(void)
 			rc->server_name[0] = '\0';
 			rc->connstr[0] = '\0';
 		}
+
+		for (i = 0; i < MUX_MAX_QUERY_SLOTS; i++)
+		{
+			MuxQuerySlot *qs = &MuxState->query_slots[i];
+
+			SpinLockInit(&qs->mutex);
+			qs->in_use = false;
+			qs->completed = false;
+		}
 	}
 }
 
@@ -231,8 +219,8 @@ ConnMuxRegister(void)
 	BackgroundWorker bgw;
 
 	MemSet(&bgw, 0, sizeof(bgw));
-	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
-	bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS;
+	bgw.bgw_start_time = BgWorkerStart_PostmasterStart;
 	bgw.bgw_restart_time = 10;	/* restart after 10 s on crash */
 	snprintf(bgw.bgw_library_name, MAXPGPATH, "postgres");
 	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "ConnMuxMain");
@@ -300,9 +288,6 @@ mux_spawn_workers(int n)
 			continue;
 		}
 		slot->phase = MUX_WORKER_STARTING;
-		slot->worker_type = MUX_WORKER_LOCAL;
-		slot->remote_server_oid = InvalidOid;
-		slot->remote_server_name[0] = '\0';
 		SpinLockRelease(&slot->mutex);
 
 		MemSet(&bgw, 0, sizeof(bgw));
@@ -333,7 +318,6 @@ mux_spawn_workers(int n)
 /*
  * mux_find_idle_worker
  *		Return the index of an IDLE worker slot, or -1 if none are free.
- *		Only local workers are considered for general dispatch.
  */
 static int
 mux_find_idle_worker(void)
@@ -345,316 +329,10 @@ mux_find_idle_worker(void)
 	{
 		MuxWorkerSlot *slot = &MuxState->workers[i];
 
-		if (slot->phase == MUX_WORKER_IDLE &&
-			slot->worker_type == MUX_WORKER_LOCAL)
+		if (slot->phase == MUX_WORKER_IDLE)
 			return i;
 	}
 	return -1;
-}
-
-
-/* ----------------------------------------------------------------
- * Foreign-server connection management
- * ---------------------------------------------------------------- */
-
-/*
- * mux_alloc_remote_conn_slot
- *		Find an unused MuxRemoteConn slot and return its index, or -1 if
- *		all slots are taken.
- */
-static int
-mux_alloc_remote_conn_slot(void)
-{
-	int			i;
-
-	for (i = 0; i < MUX_MAX_REMOTE_CONNS; i++)
-	{
-		MuxRemoteConn *rc = &MuxState->remote_conns[i];
-
-		SpinLockAcquire(&rc->mutex);
-		if (rc->phase == MUX_CONN_UNUSED)
-		{
-			rc->phase = MUX_CONN_CONNECTING;
-			SpinLockRelease(&rc->mutex);
-			return i;
-		}
-		SpinLockRelease(&rc->mutex);
-	}
-	return -1;
-}
-
-/*
- * mux_build_connstr
- *		Build a libpq-style connection string from a ForeignServer's options.
- *		Recognised options: host, hostaddr, port, dbname, user, password,
- *		connect_timeout, application_name.
- */
-static void
-mux_build_connstr(ForeignServer *server, char *buf, int bufsz)
-{
-	StringInfoData sb;
-	ListCell   *lc;
-
-	initStringInfo(&sb);
-
-	foreach(lc, server->options)
-	{
-		DefElem    *def = (DefElem *) lfirst(lc);
-
-		/*
-		 * Only pass through recognised libpq connection keywords; ignore
-		 * postgres_fdw-specific options like keep_connections.
-		 */
-		if (strcmp(def->defname, "host") == 0 ||
-			strcmp(def->defname, "hostaddr") == 0 ||
-			strcmp(def->defname, "port") == 0 ||
-			strcmp(def->defname, "dbname") == 0 ||
-			strcmp(def->defname, "user") == 0 ||
-			strcmp(def->defname, "password") == 0 ||
-			strcmp(def->defname, "connect_timeout") == 0 ||
-			strcmp(def->defname, "application_name") == 0 ||
-			strcmp(def->defname, "sslmode") == 0 ||
-			strcmp(def->defname, "sslcert") == 0 ||
-			strcmp(def->defname, "sslkey") == 0 ||
-			strcmp(def->defname, "sslrootcert") == 0)
-		{
-			const char *p;
-			char	   *val = defGetString(def);
-
-			/*
-			 * Escape single-quotes and backslashes in value so the connstr
-			 * stays valid.
-			 */
-			appendStringInfo(&sb, "%s='", def->defname);
-			for (p = val; *p; p++)
-			{
-				if (*p == '\'' || *p == '\\')
-					appendStringInfoChar(&sb, '\\');
-				appendStringInfoChar(&sb, *p);
-			}
-			appendStringInfoChar(&sb, '\'');
-			appendStringInfoChar(&sb, ' ');
-		}
-	}
-
-	/* Append application_name identifying this as a mux connection */
-	appendStringInfo(&sb, "application_name='pg_mux_%s'", server->servername);
-
-	strlcpy(buf, sb.data, bufsz);
-	pfree(sb.data);
-}
-
-/*
- * mux_find_remote_worker_for_server
- *		Return the slot index of the remote worker dedicated to the given
- *		foreign server OID, or -1 if no such worker exists.
- */
-static int
-mux_find_remote_worker_for_server(Oid serverOid)
-{
-	int			i;
-	int			total = MuxState->num_workers + MuxState->num_remote_workers;
-
-	for (i = 0; i < total && i < MUX_MAX_WORKERS; i++)
-	{
-		MuxWorkerSlot *slot = &MuxState->workers[i];
-
-		if (slot->worker_type == MUX_WORKER_REMOTE &&
-			slot->remote_server_oid == serverOid)
-			return i;
-	}
-	return -1;
-}
-
-/*
- * mux_spawn_remote_worker
- *		Spawn a background worker that has database connectivity and will
- *		proxy queries to the foreign server identified by slot_id.
- *
- *		The caller must have already initialised workers[slot_id] with the
- *		server OID, name, and set phase = MUX_WORKER_STARTING.
- */
-static void
-mux_spawn_remote_worker(int slot_id)
-{
-	BackgroundWorker bgw;
-	BackgroundWorkerHandle *handle;
-	MuxWorkerSlot *slot = &MuxState->workers[slot_id];
-
-	MemSet(&bgw, 0, sizeof(bgw));
-	/* Remote workers need DB access to use SPI / postgres_fdw */
-	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
-	bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
-	bgw.bgw_restart_time = BGW_NEVER_RESTART;	/* multiplexer re-spawns */
-	snprintf(bgw.bgw_library_name, MAXPGPATH, "postgres");
-	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "ConnMuxRemoteWorkerMain");
-	snprintf(bgw.bgw_name, BGW_MAXLEN, "mux remote worker %d (%s)",
-			 slot_id, slot->remote_server_name);
-	snprintf(bgw.bgw_type, BGW_MAXLEN, "mux remote worker");
-	bgw.bgw_main_arg = Int32GetDatum(slot_id);
-	bgw.bgw_notify_pid = MyProcPid;
-
-	if (!RegisterDynamicBackgroundWorker(&bgw, &handle))
-	{
-		SpinLockAcquire(&slot->mutex);
-		slot->phase = MUX_WORKER_DEAD;
-		SpinLockRelease(&slot->mutex);
-		ereport(WARNING,
-				(errmsg("connection multiplexer: could not register remote worker for server \"%s\"",
-						slot->remote_server_name)));
-	}
-}
-
-/*
- * mux_register_server_in_slot
- *		Populate a worker slot and a remote-conn slot for the given foreign
- *		server.  Called both from mux_discover_foreign_servers() (during
- *		startup) and from ConnMuxRegisterForeignServer() (on-demand from a
- *		backend).
- *
- *		Returns the worker slot index on success, or -1 on failure.
- */
-static int
-mux_register_server_in_slot(ForeignServer *server)
-{
-	int			slot_id;
-	int			rc_idx;
-	MuxWorkerSlot *slot;
-	MuxRemoteConn *rc;
-	char		connstr[MUX_CONNSTR_MAXLEN];
-
-	/* Check if a remote worker already exists for this server */
-	if (mux_find_remote_worker_for_server(server->serverid) >= 0)
-		return -1;				/* already registered */
-
-	/* Find a free worker slot beyond the local-worker range */
-	slot_id = MuxState->num_workers + MuxState->num_remote_workers;
-	if (slot_id >= MUX_MAX_WORKERS)
-	{
-		ereport(WARNING,
-				(errmsg("connection multiplexer: worker pool full, cannot add remote worker for \"%s\"",
-						server->servername)));
-		return -1;
-	}
-
-	/* Allocate a MuxRemoteConn slot */
-	rc_idx = mux_alloc_remote_conn_slot();
-	if (rc_idx < 0)
-	{
-		ereport(WARNING,
-				(errmsg("connection multiplexer: remote-conn table full for server \"%s\"",
-						server->servername)));
-		return -1;
-	}
-
-	/* Build connection string */
-	mux_build_connstr(server, connstr, sizeof(connstr));
-
-	/* Fill in the remote-conn slot */
-	rc = &MuxState->remote_conns[rc_idx];
-	SpinLockAcquire(&rc->mutex);
-	rc->server_oid = server->serverid;
-	strlcpy(rc->server_name, server->servername, NAMEDATALEN);
-	strlcpy(rc->connstr, connstr, MUX_CONNSTR_MAXLEN);
-	rc->connect_time = GetCurrentTimestamp();
-	SpinLockRelease(&rc->mutex);
-
-	/* Fill in the worker slot */
-	slot = &MuxState->workers[slot_id];
-	SpinLockAcquire(&slot->mutex);
-	slot->phase = MUX_WORKER_STARTING;
-	slot->worker_type = MUX_WORKER_REMOTE;
-	slot->remote_server_oid = server->serverid;
-	strlcpy(slot->remote_server_name, server->servername, NAMEDATALEN);
-	SpinLockRelease(&slot->mutex);
-
-	MuxState->num_remote_workers++;
-
-	/* Spawn the background worker */
-	mux_spawn_remote_worker(slot_id);
-
-	ereport(LOG,
-			(errmsg("connection multiplexer: registered foreign server \"%s\" (OID %u) as remote worker %d",
-					server->servername, server->serverid, slot_id)));
-
-	return slot_id;
-}
-
-/*
- * mux_discover_foreign_servers
- *		Scan pg_shardmembers to find all foreign servers that are part of
- *		a shard group, and register each one as a remote worker.
- *
- *		This is called once at multiplexer startup after database connectivity
- *		is established.
- */
-static void
-mux_discover_foreign_servers(void)
-{
-	Relation	rel;
-	TableScanDesc scan;
-	HeapTuple	tuple;
-	int			registered = 0;
-
-	rel = table_open(ShardMemberRelationId, AccessShareLock);
-	scan = table_beginscan_catalog(rel, 0, NULL);
-
-	while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
-	{
-		Form_pg_shardmembers smform =
-			(Form_pg_shardmembers) GETSTRUCT(tuple);
-		Oid			srvOid = smform->srvid;
-		ForeignServer *server;
-
-		server = GetForeignServerExtended(srvOid, FSV_MISSING_OK);
-		if (server == NULL)
-			continue;
-
-		if (mux_register_server_in_slot(server) >= 0)
-			registered++;
-	}
-
-	table_endscan(scan);
-	table_close(rel, AccessShareLock);
-
-	if (registered > 0)
-		ereport(LOG,
-				(errmsg("connection multiplexer: discovered %d foreign server(s) from shard catalog",
-						registered)));
-}
-
-
-/*
- * ConnMuxRegisterForeignServer
- *		Public API: register a foreign server with the multiplexer on demand.
- *		Safe to call from any backend that has a database connection.
- *
- *		Returns the conn_id (remote-conn slot index) on success, or
- *		MUX_INVALID_CONN_ID if the server is already registered or no slot is free.
- */
-uint32
-ConnMuxRegisterForeignServer(Oid serverOid)
-{
-	ForeignServer *server;
-	int			slot_id;
-
-	if (MuxState == NULL)
-		ereport(ERROR,
-				(errmsg("connection multiplexer shared memory not initialised")));
-
-	server = GetForeignServer(serverOid);
-
-	SpinLockAcquire(&MuxState->mutex);
-	slot_id = mux_register_server_in_slot(server);
-	SpinLockRelease(&MuxState->mutex);
-
-	if (slot_id < 0)
-		return MUX_INVALID_CONN_ID;
-
-	ConnMuxWakeup();
-
-	/* Return the remote-conn slot index for this server */
-	return (uint32) (MuxState->num_workers + MuxState->num_remote_workers - 1);
 }
 
 
@@ -869,10 +547,8 @@ mux_pending_dequeue(char *buf, Size bufsz, Size *lenp)
  *
  * This function:
  *   1. Initialises shared memory state.
- *   2. Connects to the database to scan for registered foreign servers.
- *   3. Spawns the local worker pool.
- *   4. Spawns one remote worker per discovered foreign server.
- *   5. Runs the event loop.
+ *   2. Spawns the worker pool.
+ *   3. Runs the event loop.
  */
 void
 ConnMuxMain(Datum main_arg)
@@ -885,12 +561,6 @@ ConnMuxMain(Datum main_arg)
 	/* Basic process setup */
 	mux_setup_signals();
 	sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
-
-	/*
-	 * Connect to MUX_LOCAL_DATABASE so we can look up foreign servers
-	 * from pg_foreign_server / pg_shardmembers at startup.
-	 */
-	BackgroundWorkerInitializeConnection(MUX_LOCAL_DATABASE, NULL, 0);
 
 	/*
 	 * Create a memory context for this process so that we can reset it on
@@ -928,32 +598,8 @@ ConnMuxMain(Datum main_arg)
 	}
 	PG_exception_stack = &local_sigjmp_buf;
 
-	/* Spawn the initial local worker pool */
+	/* Spawn the initial worker pool */
 	mux_spawn_workers(mux_worker_count);
-
-	/*
-	 * Discover foreign servers from the shard catalog and spawn one remote
-	 * worker per server.  We need a snapshot for catalog access.
-	 * Wrap in PG_TRY so a missing postgres_fdw or catalog issue does not
-	 * crash the multiplexer.
-	 */
-	PG_TRY();
-	{
-		StartTransactionCommand();
-		PushActiveSnapshot(GetTransactionSnapshot());
-		mux_discover_foreign_servers();
-		PopActiveSnapshot();
-		CommitTransactionCommand();
-	}
-	PG_CATCH();
-	{
-		EmitErrorReport();
-		FlushErrorState();
-		AbortCurrentTransaction();
-		ereport(WARNING,
-				(errmsg("connection multiplexer: foreign server discovery failed; will run without remote workers")));
-	}
-	PG_END_TRY();
 
 	/* Build the WaitEventSet: latch + timeout */
 	wes = CreateWaitEventSet(CurrentResourceOwner, 2);
@@ -983,7 +629,10 @@ ConnMuxMain(Datum main_arg)
 		/* Dispatch any pending backend requests to idle workers */
 		mux_drain_backend_requests();
 
-		/* Re-spawn any dead local workers */
+		/*
+		 * Re-spawn any dead local workers (foreign workers are managed by
+		 * postgres_fdw and respawned via dynamic bgw registration).
+		 */
 		{
 			int			i;
 
@@ -991,33 +640,11 @@ ConnMuxMain(Datum main_arg)
 			{
 				MuxWorkerSlot *slot = &MuxState->workers[i];
 
-				if (slot->phase == MUX_WORKER_DEAD &&
-					slot->worker_type == MUX_WORKER_LOCAL)
+				if (slot->phase == MUX_WORKER_DEAD)
 				{
 					ereport(DEBUG1,
-							(errmsg("mux: re-spawning local worker %d", i)));
+							(errmsg("mux: re-spawning worker %d", i)));
 					mux_spawn_workers(1);
-				}
-			}
-
-			/* Re-spawn any dead remote workers */
-			for (i = MuxState->num_workers;
-				 i < MuxState->num_workers + MuxState->num_remote_workers &&
-				 i < MUX_MAX_WORKERS;
-				 i++)
-			{
-				MuxWorkerSlot *slot = &MuxState->workers[i];
-
-				if (slot->phase == MUX_WORKER_DEAD &&
-					slot->worker_type == MUX_WORKER_REMOTE)
-				{
-					ereport(DEBUG1,
-							(errmsg("mux: re-spawning remote worker %d for server \"%s\"",
-									i, slot->remote_server_name)));
-					SpinLockAcquire(&slot->mutex);
-					slot->phase = MUX_WORKER_STARTING;
-					SpinLockRelease(&slot->mutex);
-					mux_spawn_remote_worker(i);
 				}
 			}
 		}
@@ -1311,236 +938,6 @@ ConnMuxWorkerMain(Datum main_arg)
 
 
 /* ----------------------------------------------------------------
- * Remote-worker main entry point
- * ---------------------------------------------------------------- */
-
-/*
- * ConnMuxRemoteWorkerMain
- *		Entry point for a remote-worker background worker.
- *
- * A remote worker is a standard pool worker that has database connectivity
- * and is associated with a specific foreign server.  When it receives a
- * MUX_MSG_REMOTE_QUERY message it executes the embedded SQL on the foreign
- * server via SPI / postgres_fdw and returns the result.
- *
- * For simpler request types (CLOSE, TXSTATE) the behaviour is the same as
- * a local worker.
- */
-void
-ConnMuxRemoteWorkerMain(Datum main_arg)
-{
-	int			worker_id = DatumGetInt32(main_arg);
-	MuxWorkerSlot *slot;
-	shm_mq	   *req_mq,
-			   *res_mq;
-	shm_mq_handle *req_mqh,
-			   *res_mqh;
-	MemoryContext worker_context;
-	sigjmp_buf	local_sigjmp_buf;
-
-	if (worker_id < 0 || worker_id >= MUX_MAX_WORKERS)
-		ereport(ERROR,
-				(errmsg("mux remote worker started with invalid id %d", worker_id)));
-
-	slot = &MuxState->workers[worker_id];
-
-	/* Connect to MUX_LOCAL_DATABASE so we can use SPI and postgres_fdw */
-	BackgroundWorkerInitializeConnection(MUX_LOCAL_DATABASE, NULL, 0);
-
-	mux_worker_setup_signals();
-	sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
-
-	worker_context = AllocSetContextCreate(TopMemoryContext,
-										   "Mux Remote Worker",
-										   ALLOCSET_DEFAULT_SIZES);
-	MemoryContextSwitchTo(worker_context);
-
-	/* Announce ourselves */
-	SpinLockAcquire(&slot->mutex);
-	slot->pid = MyProcPid;
-	slot->worker_latch = &MyProc->procLatch;
-	slot->phase = MUX_WORKER_IDLE;
-	SpinLockRelease(&slot->mutex);
-
-	ConnMuxWakeup();
-
-	ereport(DEBUG1,
-			(errmsg("mux remote worker %d started for server \"%s\" (pid %d)",
-					worker_id, slot->remote_server_name, MyProcPid)));
-
-	set_ps_display("idle");
-
-	/* Error-recovery entry point */
-	if (sigsetjmp(local_sigjmp_buf, 1) != 0)
-	{
-		error_context_stack = NULL;
-		HOLD_INTERRUPTS();
-		EmitErrorReport();
-		LWLockReleaseAll();
-		pgstat_report_wait_end();
-
-		SpinLockAcquire(&slot->mutex);
-		slot->count_errors++;
-		slot->phase = MUX_WORKER_IDLE;
-		SpinLockRelease(&slot->mutex);
-
-		MemoryContextSwitchTo(worker_context);
-		FlushErrorState();
-		MemoryContextReset(worker_context);
-		RESUME_INTERRUPTS();
-	}
-	PG_exception_stack = &local_sigjmp_buf;
-
-	/* Re-initialise the shared-memory queues for this invocation */
-	req_mq = shm_mq_create(slot->mux_to_worker_buf, MUX_QUEUE_SIZE);
-	res_mq = shm_mq_create(slot->worker_to_mux_buf, MUX_QUEUE_SIZE);
-
-	shm_mq_set_receiver(req_mq, MyProc);
-	shm_mq_set_sender(res_mq, MyProc);
-
-	req_mqh = shm_mq_attach(req_mq, NULL, NULL);
-	res_mqh = shm_mq_attach(res_mq, NULL, NULL);
-
-	/* ----------------------------------------------------------------
-	 * Remote-worker request loop
-	 * ---------------------------------------------------------------- */
-	for (;;)
-	{
-		shm_mq_result result;
-		Size		nbytes;
-		void	   *data;
-		MuxMsgHeader *hdr;
-		MuxMsgHeader reply_hdr;
-
-		if (mux_got_sigterm)
-			break;
-
-		set_ps_display("idle");
-		result = shm_mq_receive(req_mqh, &nbytes, &data, true /* nowait */);
-
-		if (result == SHM_MQ_WOULD_BLOCK)
-		{
-			ResetLatch(MyLatch);
-			if (mux_got_sigterm)
-				break;
-			(void) WaitLatch(MyLatch,
-							 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-							 100 /* ms */,
-							 WAIT_EVENT_CONN_MUX_WORKER_MAIN);
-			continue;
-		}
-
-		if (result == SHM_MQ_DETACHED)
-			break;
-
-		if (result != SHM_MQ_SUCCESS)
-			continue;
-
-		if (nbytes < sizeof(MuxMsgHeader))
-		{
-			ereport(WARNING,
-					(errmsg("mux remote worker %d: short message (%zu bytes)",
-							worker_id, nbytes)));
-			continue;
-		}
-
-		hdr = (MuxMsgHeader *) data;
-
-		SpinLockAcquire(&slot->mutex);
-		slot->phase = MUX_WORKER_BUSY;
-		slot->current_request_type = hdr->msg_type;
-		slot->current_conn_id = hdr->conn_id;
-		slot->requester_pid = hdr->requester_pid;
-		slot->last_active = GetCurrentTimestamp();
-		SpinLockRelease(&slot->mutex);
-
-		set_ps_display("executing");
-
-		switch (hdr->msg_type)
-		{
-			case MUX_MSG_REMOTE_QUERY:
-				/*
-				 * The payload (immediately after the header) is a
-				 * NUL-terminated SQL string to execute on the foreign server.
-				 * We use SPI to call postgres_fdw_exec(server_oid, sql).
-				 *
-				 * A complete implementation would:
-				 *   1. Open a transaction via StartTransactionCommand().
-				 *   2. Use SPI to call the remote server:
-				 *        SELECT * FROM dblink(connstr, sql)
-				 *      or rely on postgres_fdw infrastructure.
-				 *   3. Serialise the results into the reply payload.
-				 *   4. Commit via CommitTransactionCommand().
-				 *
-				 * For now we perform the connection validation step and record
-				 * the stat; result forwarding completes via MUX_MSG_RESULT.
-				 */
-				SpinLockAcquire(&slot->mutex);
-				slot->count_queries++;
-				SpinLockRelease(&slot->mutex);
-
-				ereport(DEBUG2,
-						(errmsg("mux remote worker %d: forwarding query to server \"%s\"",
-								worker_id, slot->remote_server_name)));
-				break;
-
-			case MUX_MSG_CLOSE:
-				SpinLockAcquire(&slot->mutex);
-				slot->count_closes++;
-				SpinLockRelease(&slot->mutex);
-				break;
-
-			case MUX_MSG_TXSTATE:
-				/* Import CSN / transaction state from coordinator */
-				break;
-
-			default:
-				ereport(WARNING,
-						(errmsg("mux remote worker %d: unexpected message type %d",
-								worker_id, (int) hdr->msg_type)));
-				break;
-		}
-
-		/* Send result back to multiplexer */
-		reply_hdr.msg_type = MUX_MSG_RESULT;
-		reply_hdr.conn_id = hdr->conn_id;
-		reply_hdr.payload_len = 0;
-		reply_hdr.requester_pid = hdr->requester_pid;
-
-		result = shm_mq_send(res_mqh,
-							 sizeof(reply_hdr), &reply_hdr,
-							 true /* nowait */,
-							 true /* flush */);
-
-		SpinLockAcquire(&slot->mutex);
-		slot->requests_completed++;
-		slot->phase = MUX_WORKER_IDLE;
-		SpinLockRelease(&slot->mutex);
-
-		ConnMuxWakeup();
-
-		if (result == SHM_MQ_DETACHED)
-			break;
-	}
-
-	shm_mq_detach(req_mqh);
-	shm_mq_detach(res_mqh);
-
-	SpinLockAcquire(&slot->mutex);
-	slot->phase = MUX_WORKER_DEAD;
-	slot->pid = 0;
-	slot->worker_latch = NULL;
-	SpinLockRelease(&slot->mutex);
-
-	ConnMuxWakeup();
-
-	ereport(DEBUG1,
-			(errmsg("mux remote worker %d exiting", worker_id)));
-	proc_exit(0);
-}
-
-
-/* ----------------------------------------------------------------
  * Utility functions
  * ---------------------------------------------------------------- */
 
@@ -1564,9 +961,8 @@ ConnMuxWakeup(void)
 
 /*
  * ConnMuxGetWorkerStats
- *		Copy the current state of up to 'max_slots' worker slots (both local
- *		and remote) into the caller-supplied array 'slots'.  Returns the
- *		number of slots copied.
+ *		Copy the current state of up to 'max_slots' worker slots into the
+ *		caller-supplied array 'slots'.  Returns the number of slots copied.
  *
  *		Called by the pg_stat_conn_multiplexer view function.
  */
@@ -1580,9 +976,7 @@ ConnMuxGetWorkerStats(MuxWorkerSlot *slots, int max_slots)
 	if (MuxState == NULL)
 		return 0;
 
-	/* Return all allocated slots: local workers + remote workers */
-	num = MuxState->num_workers + MuxState->num_remote_workers;
-	num = Min(num, MUX_MAX_WORKERS);
+	num = Min(MuxState->num_workers, MUX_MAX_WORKERS);
 	num = Min(num, max_slots);
 
 	for (i = 0; i < num; i++)
@@ -1600,38 +994,356 @@ ConnMuxGetWorkerStats(MuxWorkerSlot *slots, int max_slots)
 	return n;
 }
 
-/*
- * ConnMuxGetRemoteConnStats
- *		Copy the current state of up to 'max_conns' remote-connection slots
- *		into the caller-supplied array 'conns'.  Returns the number of slots
- *		filled.
+/* ----------------------------------------------------------------
+ * Foreign server connection support
  *
- *		Called by the pg_stat_conn_multiplexer_remotes view function.
+ * The multiplexer provides shared-memory infrastructure for routing
+ * queries to foreign servers.  The actual TCP connections are held by
+ * dedicated extension background workers (ConnMuxForeignWorkerMain,
+ * registered from contrib/postgres_fdw).  This file contains only the
+ * shared-memory and coordination code; no libpq is used here.
+ * ---------------------------------------------------------------- */
+
+/*
+ * mux_find_or_alloc_remote_slot
+ *Find an existing remote-conn slot for serverOid, or allocate a new
+ *free slot.  Returns the slot index, or -1 if the table is full.
+ *Caller must hold MuxState->mutex.
  */
-int
-ConnMuxGetRemoteConnStats(MuxRemoteConn *conns, int max_conns)
+static int
+mux_find_or_alloc_remote_slot(Oid serverOid)
 {
-	int			i;
-	int			n = 0;
+	int			free_slot = -1;
 
-	if (MuxState == NULL)
-		return 0;
-
-	for (i = 0; i < MUX_MAX_REMOTE_CONNS && n < max_conns; i++)
+	for (int i = 0; i < MUX_MAX_REMOTE_CONNS; i++)
 	{
-		MuxRemoteConn *src = &MuxState->remote_conns[i];
+		MuxRemoteConn *rc = &MuxState->remote_conns[i];
 
-		SpinLockAcquire(&src->mutex);
-		if (src->phase != MUX_CONN_UNUSED)
-		{
-			memcpy(&conns[n], src, sizeof(MuxRemoteConn));
-			SpinLockRelease(&src->mutex);
-			SpinLockInit(&conns[n].mutex);
-			n++;
-		}
-		else
-			SpinLockRelease(&src->mutex);
+		if (rc->phase != MUX_CONN_UNUSED && rc->server_oid == serverOid)
+			return i;			/* already registered */
+
+		if (rc->phase == MUX_CONN_UNUSED && free_slot < 0)
+			free_slot = i;
 	}
 
-	return n;
+	return free_slot;
+}
+
+
+/* ----------------------------------------------------------------
+ * Public API: foreign server routing
+ * ---------------------------------------------------------------- */
+
+/*
+ * ConnMuxIsAvailable
+ *		Return true if the multiplexer is running and can accept query
+ *		routing requests for the given foreign server.
+ */
+bool
+ConnMuxIsAvailable(Oid serverOid)
+{
+	pid_t		mux_pid;
+
+	if (MuxState == NULL)
+		return false;
+
+	SpinLockAcquire(&MuxState->mutex);
+	mux_pid = MuxState->mux_pid;
+	SpinLockRelease(&MuxState->mutex);
+
+	return mux_pid != 0;
+}
+
+/*
+ * ConnMuxGetSharedState
+ *		Return a pointer to the MuxSharedState segment.  Intended for use
+ *		by the foreign worker (ConnMuxForeignWorkerMain) running inside the
+ *		postgres_fdw extension, after calling ConnMuxShmemInit().
+ */
+MuxSharedState *
+ConnMuxGetSharedState(void)
+{
+	return MuxState;
+}
+
+/*
+ * ConnMuxRegisterServer
+ *		Register a foreign server with the multiplexer.  Records the server
+ *		metadata in MuxState->remote_conns so it can be found by foreign
+ *		workers and the stats view.
+ *
+ *		Returns the conn_id (remote-conn slot index) on success, or
+ *		(uint32) -1 if no slot is available.
+ */
+uint32
+ConnMuxRegisterServer(Oid serverOid, const char *serverName,
+					  const char *connstr)
+{
+	int			slot_idx;
+
+	if (MuxState == NULL)
+		return (uint32) -1;
+
+	SpinLockAcquire(&MuxState->mutex);
+	slot_idx = mux_find_or_alloc_remote_slot(serverOid);
+
+	if (slot_idx >= 0)
+	{
+		MuxRemoteConn *rc = &MuxState->remote_conns[slot_idx];
+
+		if (rc->phase == MUX_CONN_UNUSED)
+		{
+			/* Fresh slot: initialise it */
+			rc->server_oid = serverOid;
+			strlcpy(rc->server_name, serverName, NAMEDATALEN);
+			strlcpy(rc->connstr, connstr, MUX_CONNSTR_MAXLEN);
+			rc->phase = MUX_CONN_CONNECTING;
+		}
+	}
+	SpinLockRelease(&MuxState->mutex);
+
+	/* Wake the multiplexer so it notices the new server */
+	if (slot_idx >= 0)
+		ConnMuxWakeup();
+
+	return slot_idx >= 0 ? (uint32) slot_idx : (uint32) -1;
+}
+
+/*
+ * ConnMuxReserveWorkerSlot
+ *		Allocate a worker slot for an extension background worker that will
+ *		hold a persistent libpq connection to a foreign server.
+ *
+ *		The caller (from postgres_fdw) should then register a dynamic
+ *		background worker with bgw_main_arg set to this slot index.  The
+ *		foreign worker registers its PID and latch in the slot when it starts.
+ *
+ *		Returns the slot index on success, -1 if no slot is free.
+ */
+int
+ConnMuxReserveWorkerSlot(Oid serverOid, const char *serverName)
+{
+	int			i;
+	int			slot_idx = -1;
+
+	if (MuxState == NULL)
+		return -1;
+
+	SpinLockAcquire(&MuxState->mutex);
+
+	/* Check if a slot already exists for this server */
+	for (i = 0; i < MUX_MAX_WORKERS; i++)
+	{
+		MuxWorkerSlot *slot = &MuxState->workers[i];
+
+		SpinLockAcquire(&slot->mutex);
+		if (slot->is_foreign && slot->server_oid == serverOid)
+		{
+			SpinLockRelease(&slot->mutex);
+			slot_idx = i;		/* already reserved */
+			break;
+		}
+		SpinLockRelease(&slot->mutex);
+	}
+
+	if (slot_idx < 0)
+	{
+		/* Find a dead slot beyond the local-worker range to use */
+		for (i = MuxState->num_workers; i < MUX_MAX_WORKERS; i++)
+		{
+			MuxWorkerSlot *slot = &MuxState->workers[i];
+
+			SpinLockAcquire(&slot->mutex);
+			if (slot->phase == MUX_WORKER_DEAD && !slot->is_foreign)
+			{
+				slot->is_foreign = true;
+				slot->server_oid = serverOid;
+				strlcpy(slot->server_name, serverName, NAMEDATALEN);
+				slot->phase = MUX_WORKER_STARTING;
+				slot_idx = i;
+				SpinLockRelease(&slot->mutex);
+				break;
+			}
+			SpinLockRelease(&slot->mutex);
+		}
+	}
+
+	SpinLockRelease(&MuxState->mutex);
+	return slot_idx;
+}
+
+/*
+ * mux_acquire_query_slot
+ *		Grab a free MuxQuerySlot and mark it in_use.
+ *		Returns the slot index, or -1 if all slots are busy.
+ */
+static int
+mux_acquire_query_slot(void)
+{
+	for (int i = 0; i < MUX_MAX_QUERY_SLOTS; i++)
+	{
+		MuxQuerySlot *slot = &MuxState->query_slots[i];
+
+		SpinLockAcquire(&slot->mutex);
+		if (!slot->in_use)
+		{
+			slot->in_use = true;
+			slot->completed = false;
+			slot->is_error = false;
+			SpinLockRelease(&slot->mutex);
+			return i;
+		}
+		SpinLockRelease(&slot->mutex);
+	}
+	return -1;
+}
+
+/*
+ * mux_wait_for_slot
+ *		Wait until MuxState->query_slots[slot_idx].completed is true,
+ *		or until a postmaster death / query-cancel signal is received.
+ */
+static void
+mux_wait_for_slot(int slot_idx)
+{
+	MuxQuerySlot *slot = &MuxState->query_slots[slot_idx];
+
+	while (!slot->completed)
+	{
+		int			rc;
+
+		rc = WaitLatch(MyLatch,
+					   WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+					   1000,	/* 1 s timeout */
+					   PG_WAIT_IPC);
+
+		ResetLatch(MyLatch);
+
+		if (rc & WL_POSTMASTER_DEATH)
+			ereport(ERROR,
+					(errmsg("postmaster died while waiting for multiplexer")));
+
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
+/*
+ * ConnMuxSubmitQuery
+ *		Execute sql on the foreign server identified by serverOid via the
+ *		multiplexer's extension worker (ConnMuxForeignWorkerMain).
+ *
+ *		Posts a request to a MuxQuerySlot in shared memory, wakes the foreign
+ *		worker that owns this server, then waits for the worker to fill the
+ *		result.
+ *
+ *		On success returns true and fills result_data / nfields_out /
+ *		ntuples_out / truncated_out.  On failure returns false and fills
+ *		error_msg.
+ */
+bool
+ConnMuxSubmitQuery(Oid serverOid, const char *sql,
+				   char *result_data, int result_data_size,
+				   int *nfields_out, int *ntuples_out,
+				   bool *truncated_out,
+				   char *error_msg, int error_msg_size)
+{
+	int			slot_idx;
+	MuxQuerySlot *slot;
+
+	if (MuxState == NULL)
+	{
+		snprintf(error_msg, error_msg_size,
+				 "connection multiplexer not initialised");
+		return false;
+	}
+
+	/* Grab a free request slot */
+	slot_idx = mux_acquire_query_slot();
+	if (slot_idx < 0)
+	{
+		snprintf(error_msg, error_msg_size,
+				 "connection multiplexer: all query slots are busy");
+		return false;
+	}
+
+	slot = &MuxState->query_slots[slot_idx];
+
+	/* Fill in the request */
+	slot->server_oid = serverOid;
+	strlcpy(slot->sql, sql, MUX_SQL_MAXLEN);
+	slot->requester_pid = MyProcPid;
+	slot->requester_latch = MyLatch;
+
+	/*
+	 * Wake the foreign worker that owns this server (it polls query_slots).
+	 * Walk the worker array to find the matching foreign worker.
+	 */
+	for (int i = 0; i < MUX_MAX_WORKERS; i++)
+	{
+		MuxWorkerSlot *ws = &MuxState->workers[i];
+
+		if (ws->is_foreign && ws->server_oid == serverOid && ws->worker_latch)
+		{
+			SetLatch(ws->worker_latch);
+			break;
+		}
+	}
+
+	/* Also wake the multiplexer as a fallback */
+	ConnMuxWakeup();
+
+	/* Wait for the foreign worker to complete the request */
+	mux_wait_for_slot(slot_idx);
+
+	/* Copy result out */
+	if (slot->is_error)
+	{
+		strlcpy(error_msg, slot->error_msg, error_msg_size);
+
+		SpinLockAcquire(&slot->mutex);
+		slot->in_use = false;
+		SpinLockRelease(&slot->mutex);
+
+		return false;
+	}
+
+	if (result_data && result_data_size > 0)
+	{
+		int			copy_len = Min(slot->result_len, result_data_size);
+
+		memcpy(result_data, slot->result_data, copy_len);
+	}
+	if (nfields_out)
+		*nfields_out = slot->result_nfields;
+	if (ntuples_out)
+		*ntuples_out = slot->result_ntuples;
+	if (truncated_out)
+		*truncated_out = slot->result_truncated;
+
+	/* Release the slot */
+	SpinLockAcquire(&slot->mutex);
+	slot->in_use = false;
+	SpinLockRelease(&slot->mutex);
+
+	return true;
+}
+
+/*
+ * ConnMuxSendCommand
+ *		Send a no-result SQL command (BEGIN, COMMIT, ROLLBACK, etc.) to a
+ *		foreign server via the multiplexer's extension worker.
+ */
+bool
+ConnMuxSendCommand(Oid serverOid, const char *sql,
+				   char *error_msg, int error_msg_size)
+{
+	int			nfields,
+				ntuples;
+	bool		truncated;
+	char		dummy_buf[1];
+
+	return ConnMuxSubmitQuery(serverOid, sql,
+							  dummy_buf, sizeof(dummy_buf),
+							  &nfields, &ntuples, &truncated,
+							  error_msg, error_msg_size);
 }
