@@ -705,11 +705,8 @@ ConnMuxWorkerMain(Datum main_arg)
 	sigjmp_buf	local_sigjmp_buf;
 
 	if (worker_id < 0 || worker_id >= MUX_MAX_WORKERS)
-	{
 		ereport(ERROR,
 				(errmsg("mux worker started with invalid id %d", worker_id)));
-		proc_exit(1);
-	}
 
 	slot = &MuxState->workers[worker_id];
 

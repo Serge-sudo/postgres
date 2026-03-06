@@ -93,7 +93,7 @@ typedef enum MuxWorkerPhase
  */
 typedef struct MuxWorkerSlot
 {
-	/* Synchronisation */
+	/* Synchronization */
 	slock_t		mutex;
 
 	/* Identity */

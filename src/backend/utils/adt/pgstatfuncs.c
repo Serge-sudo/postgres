@@ -2059,7 +2059,8 @@ pg_stat_get_conn_mux_workers(PG_FUNCTION_ARGS)
 	if (!has_privs_of_role(GetUserId(), ROLE_PG_MONITOR))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("permission denied to view connection multiplexer statistics")));
+				 errmsg("permission denied for view \"pg_stat_conn_multiplexer\""),
+				 errhint("Must be member of role \"pg_monitor\".")));
 
 	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
 		ereport(ERROR,
@@ -2107,8 +2108,8 @@ pg_stat_get_conn_mux_workers(PG_FUNCTION_ARGS)
 	MemoryContextSwitchTo(oldcontext);
 
 	/* Collect a snapshot of the worker stats */
-	slots = (MuxWorkerSlot *) palloc(sizeof(MuxWorkerSlot) * MUX_MAX_WORKERS);
-	nslots = ConnMuxGetWorkerStats(slots, MUX_MAX_WORKERS);
+	slots = (MuxWorkerSlot *) palloc(sizeof(MuxWorkerSlot) * mux_worker_count);
+	nslots = ConnMuxGetWorkerStats(slots, mux_worker_count);
 
 	for (i = 0; i < nslots; i++)
 	{
