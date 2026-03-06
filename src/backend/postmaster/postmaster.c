@@ -104,6 +104,7 @@
 #include "postmaster/autovacuum.h"
 #include "postmaster/auxprocess.h"
 #include "postmaster/bgworker_internals.h"
+#include "postmaster/conn_multiplexer.h"
 #include "postmaster/pgarch.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/syslogger.h"
@@ -906,6 +907,13 @@ PostmasterMain(int argc, char *argv[])
 	 * before any modules had a chance to take the background worker slots.
 	 */
 	ApplyLauncherRegister();
+
+	/*
+	 * Register the connection multiplexer process.  This must be done before
+	 * process_shared_preload_libraries() so that the GUCs defined by the
+	 * multiplexer are visible to shared_preload_libraries modules.
+	 */
+	ConnMuxRegister();
 
 	/*
 	 * process any libraries that should be preloaded at postmaster start

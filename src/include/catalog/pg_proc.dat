@@ -12202,4 +12202,14 @@
   proargnames => '{summarized_tli,summarized_lsn,pending_lsn,summarizer_pid}',
   prosrc => 'pg_get_wal_summarizer_state' },
 
+{ oid => '6350',
+  descr => 'connection multiplexer worker statistics',
+  proname => 'pg_stat_get_conn_mux_workers', prorows => '64',
+  proretset => 't', provolatile => 'v', prorettype => 'record',
+  proargtypes => '',
+  proallargtypes => '{int4,int4,text,text,int4,int4,int8,int8,int8,int8,int8,timestamptz}',
+  proargmodes => '{o,o,o,o,o,o,o,o,o,o,o,o}',
+  proargnames => '{worker_id,pid,phase,current_request_type,current_conn_id,requester_pid,requests_completed,count_queries,count_connects,count_closes,count_errors,last_active}',
+  prosrc => 'pg_stat_get_conn_mux_workers' },
+
 ]

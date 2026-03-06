@@ -35,6 +35,7 @@
 #include "postmaster/autovacuum.h"
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/bgwriter.h"
+#include "postmaster/conn_multiplexer.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/walsummarizer.h"
 #include "replication/logicallauncher.h"
@@ -152,6 +153,7 @@ CalculateShmemSize(int *num_semaphores)
 	size = add_size(size, WalSummarizerShmemSize());
 	size = add_size(size, PgArchShmemSize());
 	size = add_size(size, ApplyLauncherShmemSize());
+	size = add_size(size, ConnMuxShmemSize());
 	size = add_size(size, BTreeShmemSize());
 	size = add_size(size, SyncScanShmemSize());
 	size = add_size(size, AsyncShmemSize());
@@ -356,6 +358,7 @@ CreateOrAttachShmemStructs(void)
 	WalSummarizerShmemInit();
 	PgArchShmemInit();
 	ApplyLauncherShmemInit();
+	ConnMuxShmemInit();
 	SlotSyncShmemInit();
 
 	/*

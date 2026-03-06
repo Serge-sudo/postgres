@@ -63,6 +63,7 @@
 #include "postmaster/autovacuum.h"
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/bgwriter.h"
+#include "postmaster/conn_multiplexer.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/startup.h"
 #include "postmaster/syslogger.h"
@@ -3443,6 +3444,16 @@ struct config_int ConfigureNamesInt[] =
 		&autovacuum_max_workers,
 		3, 1, MAX_BACKENDS,
 		check_autovacuum_max_workers, NULL, NULL
+	},
+
+	{
+		{"mux_worker_count", PGC_POSTMASTER, RESOURCES_ASYNCHRONOUS,
+			gettext_noop("Sets the number of worker processes in the connection multiplexer pool."),
+			NULL
+		},
+		&mux_worker_count,
+		4, 1, MUX_MAX_WORKERS,
+		NULL, NULL, NULL
 	},
 
 	{

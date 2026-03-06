@@ -2032,3 +2032,172 @@ pg_stat_have_stats(PG_FUNCTION_ARGS)
 
 	PG_RETURN_BOOL(pgstat_have_entry(kind, dboid, objoid));
 }
+
+/* ----------------------------------------------------------------
+ * pg_stat_get_conn_mux_workers
+ *
+ * Returns a set of records describing the status and statistics of each
+ * worker in the connection multiplexer pool.
+ * ----------------------------------------------------------------
+ */
+#include "postmaster/conn_multiplexer.h"
+
+Datum
+pg_stat_get_conn_mux_workers(PG_FUNCTION_ARGS)
+{
+#define CONN_MUX_WORKER_COLS 12
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore;
+	MemoryContext per_query_ctx;
+	MemoryContext oldcontext;
+	MuxWorkerSlot *slots;
+	int			nslots;
+	int			i;
+
+	/* Require pg_monitor membership */
+	if (!has_privs_of_role(GetUserId(), ROLE_PG_MONITOR))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to view connection multiplexer statistics")));
+
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+	if (!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("materialize mode required, but it is not allowed in this context")));
+
+	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+	oldcontext = MemoryContextSwitchTo(per_query_ctx);
+
+	tupdesc = CreateTemplateTupleDesc(CONN_MUX_WORKER_COLS);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 1,  "worker_id",
+					   INT4OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 2,  "pid",
+					   INT4OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 3,  "phase",
+					   TEXTOID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 4,  "current_request_type",
+					   TEXTOID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 5,  "current_conn_id",
+					   INT4OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 6,  "requester_pid",
+					   INT4OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 7,  "requests_completed",
+					   INT8OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 8,  "count_queries",
+					   INT8OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 9,  "count_connects",
+					   INT8OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 10, "count_closes",
+					   INT8OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 11, "count_errors",
+					   INT8OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 12, "last_active",
+					   TIMESTAMPTZOID, -1, 0);
+
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+
+	MemoryContextSwitchTo(oldcontext);
+
+	/* Collect a snapshot of the worker stats */
+	slots = (MuxWorkerSlot *) palloc(sizeof(MuxWorkerSlot) * MUX_MAX_WORKERS);
+	nslots = ConnMuxGetWorkerStats(slots, MUX_MAX_WORKERS);
+
+	for (i = 0; i < nslots; i++)
+	{
+		MuxWorkerSlot *slot = &slots[i];
+		Datum		values[CONN_MUX_WORKER_COLS];
+		bool		nulls[CONN_MUX_WORKER_COLS];
+		const char *phase_str;
+		const char *req_type_str;
+
+		MemSet(nulls, 0, sizeof(nulls));
+
+		values[0] = Int32GetDatum(slot->worker_id);
+
+		if (slot->pid == 0)
+			nulls[1] = true;
+		else
+			values[1] = Int32GetDatum((int32) slot->pid);
+
+		switch (slot->phase)
+		{
+			case MUX_WORKER_DEAD:
+				phase_str = "dead";
+				break;
+			case MUX_WORKER_STARTING:
+				phase_str = "starting";
+				break;
+			case MUX_WORKER_IDLE:
+				phase_str = "idle";
+				break;
+			case MUX_WORKER_BUSY:
+				phase_str = "busy";
+				break;
+			default:
+				phase_str = "unknown";
+				break;
+		}
+		values[2] = CStringGetTextDatum(phase_str);
+
+		if (slot->phase != MUX_WORKER_BUSY)
+		{
+			nulls[3] = true;
+			nulls[4] = true;
+		}
+		else
+		{
+			switch (slot->current_request_type)
+			{
+				case MUX_MSG_QUERY:
+					req_type_str = "query";
+					break;
+				case MUX_MSG_RESULT:
+					req_type_str = "result";
+					break;
+				case MUX_MSG_CLOSE:
+					req_type_str = "close";
+					break;
+				case MUX_MSG_TXSTATE:
+					req_type_str = "txstate";
+					break;
+				case MUX_MSG_ERROR:
+					req_type_str = "error";
+					break;
+				default:
+					req_type_str = "unknown";
+					break;
+			}
+			values[3] = CStringGetTextDatum(req_type_str);
+			values[4] = Int32GetDatum((int32) slot->current_conn_id);
+		}
+
+		if (slot->requester_pid == 0)
+			nulls[5] = true;
+		else
+			values[5] = Int32GetDatum(slot->requester_pid);
+
+		values[6] = Int64GetDatum((int64) slot->requests_completed);
+		values[7] = Int64GetDatum((int64) slot->count_queries);
+		values[8] = Int64GetDatum((int64) slot->count_connects);
+		values[9] = Int64GetDatum((int64) slot->count_closes);
+		values[10] = Int64GetDatum((int64) slot->count_errors);
+
+		if (slot->last_active == 0)
+			nulls[11] = true;
+		else
+			values[11] = TimestampTzGetDatum(slot->last_active);
+
+		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+	}
+
+	pfree(slots);
+	return (Datum) 0;
+}
