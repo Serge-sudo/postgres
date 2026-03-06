@@ -1375,3 +1375,21 @@ CREATE VIEW pg_stat_subscription_stats AS
 
 CREATE VIEW pg_wait_events AS
     SELECT * FROM pg_get_wait_events();
+
+CREATE VIEW pg_stat_conn_multiplexer AS
+    SELECT
+        S.worker_id,
+        S.pid,
+        S.phase,
+        S.current_request_type,
+        S.current_conn_id,
+        S.requester_pid,
+        S.active_connections,
+        S.requests_completed,
+        S.connect_count,
+        S.query_count,
+        S.close_count,
+        S.error_count,
+        S.last_request_time,
+        S.worker_start_time
+    FROM pg_stat_conn_multiplexer() AS S;

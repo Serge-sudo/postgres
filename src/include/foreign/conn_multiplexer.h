@@ -13,6 +13,8 @@
 #ifndef CONN_MULTIPLEXER_H
 #define CONN_MULTIPLEXER_H
 
+#include "fmgr.h"
+
 /* Function declarations */
 extern void InitConnMultiplexer(void);
 extern void RegisterConnMultiplexerWorkers(void);
@@ -23,5 +25,8 @@ extern bool MultiplexerConnect(const char *conninfo, int *conn_id_out);
 extern bool MultiplexerQuery(int conn_id, const char *query, void **result_out);
 extern void MultiplexerClose(int conn_id);
 extern void conn_multiplexer_worker_main(Datum main_arg);
+
+/* SQL-callable progress reporting function */
+extern Datum pg_stat_conn_multiplexer(PG_FUNCTION_ARGS);
 
 #endif							/* CONN_MULTIPLEXER_H */
