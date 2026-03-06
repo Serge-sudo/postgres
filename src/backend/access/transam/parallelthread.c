@@ -33,6 +33,16 @@
  * Page data in pinned buffers may be read concurrently without holding any
  * mutex.
  *
+ * elog() / ereport() must NOT be called from worker threads.  These functions
+ * write to shared logging infrastructure (pipes, log files) in a non-reentrant
+ * way; calling them concurrently from multiple threads causes data races.
+ * Worker threads use the thread-local flag pt_in_worker_thread to detect the
+ * thread context and fall back to write(STDERR_FILENO, ...) + _exit() for
+ * truly fatal semaphore failures.  All other error paths in worker threads
+ * store a message in the thread-local errmsg[] buffer and jump to worker_done
+ * where the leader collects and re-raises the error after all threads have
+ * joined.
+ *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
@@ -47,6 +57,7 @@
 #include <sched.h>
 #include <semaphore.h>
 #include <setjmp.h>
+#include <unistd.h>
 
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -64,6 +75,9 @@
 #include "utils/guc.h"
 #include "storage/shmem.h"
 #include "miscadmin.h"
+
+/* Forward declaration needed before pt_sema_wait/pt_sema_post inline functions. */
+static __thread bool pt_in_worker_thread = false;
 
 
 /*
@@ -88,7 +102,16 @@ pt_sema_wait(sem_t *s)
 	} while (ret < 0 && errno == EINTR);
 
 	if (ret < 0)
+	{
+		if (pt_in_worker_thread)
+		{
+			/* elog() is not thread-safe; use write(2) + _exit(). */
+			const char *msg = "parallel thread worker: sem_wait failed\n";
+			(void) write(STDERR_FILENO, msg, strlen(msg));
+			_exit(1);
+		}
 		elog(FATAL, "sem_wait failed: %m");
+	}
 }
 
 static inline void
@@ -102,7 +125,16 @@ pt_sema_post(sem_t *s)
 	} while (ret < 0 && errno == EINTR);
 
 	if (ret < 0)
+	{
+		if (pt_in_worker_thread)
+		{
+			/* elog() is not thread-safe; use write(2) + _exit(). */
+			const char *msg = "parallel thread worker: sem_post failed\n";
+			(void) write(STDERR_FILENO, msg, strlen(msg));
+			_exit(1);
+		}
 		elog(FATAL, "sem_post failed: %m");
+	}
 }
 
 static inline bool
@@ -121,6 +153,11 @@ pt_sema_trywait(sem_t *s)
 
 /* Thread-local worker number; -1 means "not a thread worker". */
 __thread int ParallelThreadWorkerNumber = -1;
+
+/*
+ * pt_in_worker_thread — see the definition and comment near the top of this
+ * file (before pt_sema_wait).
+ */
 
 
 /* ------------------------------------------------------------------
@@ -813,6 +850,9 @@ thread_scan_worker(void *arg)
 	/* Set the thread-local worker number. */
 	ParallelThreadWorkerNumber = args->worker_num;
 
+	/* Mark that we are inside a worker thread for thread-safe error paths. */
+	pt_in_worker_thread = true;
+
 	/*
 	 * Set up thread-local versions of the key PostgreSQL globals so that
 	 * error handling and memory allocation work independently for this thread.
@@ -1056,7 +1096,23 @@ thread_scan_worker(void *arg)
 					 * sized above BLCKSZ so one tuple can never exceed it.
 					 */
 					if (!batch_add_tuple(filling_batch, &htup))
-						elog(ERROR, "parallel thread batch node unexpectedly full");
+					{
+						/*
+						 * Do NOT call elog() here — we are inside a worker
+						 * thread, and elog() is not fully thread-safe (it
+						 * writes to shared logging infrastructure).  Record
+						 * the failure in the thread-local errmsg buffer and
+						 * jump to the cleanup path instead.
+						 */
+						strlcpy(errmsg,
+								"parallel thread batch node unexpectedly full",
+								PARALLEL_THREAD_ERRMSG_LEN);
+						had_error = true;
+						pthread_mutex_lock(args->buf_mutex);
+						ReleaseBuffer(buf);
+						pthread_mutex_unlock(args->buf_mutex);
+						goto worker_done;
+					}
 				}
 
 				if (pg_atomic_read_u32(&list->had_error) != 0)
