@@ -83,6 +83,13 @@
 int			mux_worker_count = 4;
 
 /*
+ * GUC: maximum number of persistent foreign-server connections.
+ * When the pool is full and a new server needs a slot, the clock-sweep
+ * eviction algorithm releases the least-recently-used idle connection.
+ */
+int			max_mux_connections = 64;
+
+/*
  * Name of the local database to connect to when the multiplexer needs
  * catalog access (e.g. to look up ForeignServer options).
  * Currently unused; kept as a reference for future catalog-access needs.
@@ -164,6 +171,7 @@ ConnMuxShmemInit(void)
 		MuxState->mux_pid = 0;
 		MuxState->mux_latch = NULL;
 		MuxState->num_workers = mux_worker_count;
+		MuxState->clock_hand = 0;
 
 		for (i = 0; i < MUX_MAX_WORKERS; i++)
 		{
@@ -173,6 +181,11 @@ ConnMuxShmemInit(void)
 			slot->worker_id = i;
 			slot->pid = 0;
 			slot->phase = MUX_WORKER_DEAD;
+			slot->is_foreign = false;
+			slot->server_oid = InvalidOid;
+			slot->use_count = 0;
+			slot->active_users = 0;
+			slot->should_exit = false;
 			slot->worker_latch = NULL;
 
 			/* Initialise the two embedded message queues. */
@@ -189,8 +202,7 @@ ConnMuxShmemInit(void)
 			rc->conn_id = (uint32) i;
 			rc->server_oid = InvalidOid;
 			rc->server_name[0] = '\0';
-			rc->connstr[0] = '\0';
-		}
+			rc->connstr[0] = '\0';		}
 
 		for (i = 0; i < MUX_MAX_QUERY_SLOTS; i++)
 		{
@@ -1110,18 +1122,99 @@ ConnMuxRegisterServer(Oid serverOid, const char *serverName,
 }
 
 /*
+ * mux_count_foreign_slots
+ *		Count how many worker slots are currently allocated to foreign workers.
+ *		Caller must hold MuxState->mutex.
+ */
+static int
+mux_count_foreign_slots(void)
+{
+	int			count = 0;
+
+	for (int i = MuxState->num_workers; i < MUX_MAX_WORKERS; i++)
+	{
+		MuxWorkerSlot *slot = &MuxState->workers[i];
+
+		if (slot->is_foreign)
+			count++;
+	}
+	return count;
+}
+
+/*
+ * mux_clock_sweep_foreign
+ *		Find a foreign worker slot eligible for eviction using the clock-sweep
+ *		algorithm.
+ *
+ *		Each eligible slot (is_foreign = true, active_users = 0) has its
+ *		use_count decremented.  The first slot found with use_count == 0 after
+ *		decrement is returned as the victim.  Up to two full sweeps are
+ *		performed so that recently-used slots get a second chance.
+ *
+ *		Caller must hold MuxState->mutex.
+ *		Returns the victim slot index, or -1 if no victim is available.
+ */
+static int
+mux_clock_sweep_foreign(void)
+{
+	int			start = MuxState->clock_hand;
+	int			sweep_count = 0;
+	int			range = MUX_MAX_WORKERS - MuxState->num_workers;
+
+	if (range <= 0)
+		return -1;				/* no foreign-slot range at all */
+
+	/* Allow up to 2 x range steps so recently-used slots get one decrement */
+	while (sweep_count < 2 * range)
+	{
+		int			i = MuxState->num_workers +
+			(start + sweep_count) % range;
+		MuxWorkerSlot *slot = &MuxState->workers[i];
+
+		sweep_count++;
+
+		if (!slot->is_foreign)
+			continue;			/* skip local or unused slots */
+
+		if (slot->active_users > 0)
+			continue;			/* cannot evict: backends still using it */
+
+		if (slot->use_count > 0)
+		{
+			slot->use_count--;	/* give this slot a second chance */
+			continue;
+		}
+
+		/* Victim found: advance clock hand past it */
+		MuxState->clock_hand = (i - MuxState->num_workers + 1) % range;
+
+		return i;
+	}
+
+	return -1;					/* all slots in use or recently accessed */
+}
+
+/*
  * ConnMuxReserveWorkerSlot
- *		Allocate a worker slot for an extension background worker that will
- *		hold a persistent libpq connection to a foreign server.
+ *		Allocate or reuse a worker slot for the foreign server identified by
+ *		serverOid.
  *
- *		The caller (from postgres_fdw) should then register a dynamic
- *		background worker with bgw_main_arg set to this slot index.  The
- *		foreign worker registers its PID and latch in the slot when it starts.
+ *		Connection pooling:
+ *		  If a live worker slot already exists for this server (phase != DEAD),
+ *		  it is reused: active_users and use_count are incremented, and
+ *		  *needs_bgw is set to false (no new background worker needed).
  *
- *		Returns the slot index on success, -1 if no slot is free.
+ *		  Otherwise a new slot is allocated.  When max_mux_connections is
+ *		  reached the clock-sweep eviction algorithm selects an idle victim
+ *		  slot (active_users == 0, use_count == 0 after decrement) and
+ *		  requests its worker to exit before recycling the slot.
+ *		  *needs_bgw is set to true.
+ *
+ *		Returns the slot index on success, or -1 if no slot is available.
  */
 int
-ConnMuxReserveWorkerSlot(Oid serverOid, const char *serverName)
+ConnMuxReserveWorkerSlot(Oid serverOid, const char *serverName,
+						 bool *needs_bgw)
 {
 	int			i;
 	int			slot_idx = -1;
@@ -1131,45 +1224,134 @@ ConnMuxReserveWorkerSlot(Oid serverOid, const char *serverName)
 
 	SpinLockAcquire(&MuxState->mutex);
 
-	/* Check if a slot already exists for this server */
-	for (i = 0; i < MUX_MAX_WORKERS; i++)
+	/* --- Step 1: look for an existing live slot for this server --- */
+	for (i = MuxState->num_workers; i < MUX_MAX_WORKERS; i++)
 	{
 		MuxWorkerSlot *slot = &MuxState->workers[i];
 
-		SpinLockAcquire(&slot->mutex);
-		if (slot->is_foreign && slot->server_oid == serverOid)
+		if (slot->is_foreign &&
+			slot->server_oid == serverOid &&
+			slot->phase != MUX_WORKER_DEAD)
 		{
-			SpinLockRelease(&slot->mutex);
-			slot_idx = i;		/* already reserved */
+			/* Reuse this slot: reset use_count and increment active_users */
+			slot->use_count = MUX_USE_COUNT_MAX;
+			slot->active_users++;
+			slot_idx = i;
+			*needs_bgw = false;
 			break;
 		}
-		SpinLockRelease(&slot->mutex);
 	}
 
-	if (slot_idx < 0)
+	if (slot_idx >= 0)
 	{
-		/* Find a dead slot beyond the local-worker range to use */
+		SpinLockRelease(&MuxState->mutex);
+		return slot_idx;
+	}
+
+	/* --- Step 2: need a new slot --- */
+
+	if (mux_count_foreign_slots() >= max_mux_connections)
+	{
+		/*
+		 * Pool is full.  Find a victim via clock sweep and evict it so
+		 * the new server can take its slot.
+		 */
+		int			victim = mux_clock_sweep_foreign();
+
+		if (victim < 0)
+		{
+			/* All slots are actively in use; cannot evict */
+			SpinLockRelease(&MuxState->mutex);
+			return -1;
+		}
+
+		{
+			MuxWorkerSlot *vs = &MuxState->workers[victim];
+
+			/*
+			 * Signal the victim worker to shut down.  It will notice
+			 * should_exit in its main loop and call ConnMuxReleaseWorkerSlot
+			 * before exiting.
+			 */
+			vs->should_exit = true;
+			if (vs->worker_latch)
+				SetLatch(vs->worker_latch);
+
+			/*
+			 * Pre-emptively clear the slot so subsequent callers do not
+			 * see it as occupied.
+			 */
+			vs->is_foreign = false;
+			vs->server_oid = InvalidOid;
+			vs->phase = MUX_WORKER_DEAD;
+			vs->pid = 0;
+			vs->worker_latch = NULL;
+			vs->use_count = 0;
+			vs->active_users = 0;
+		}
+		slot_idx = victim;
+	}
+	else
+	{
+		/* Find any dead non-foreign slot in the foreign range */
 		for (i = MuxState->num_workers; i < MUX_MAX_WORKERS; i++)
 		{
 			MuxWorkerSlot *slot = &MuxState->workers[i];
 
-			SpinLockAcquire(&slot->mutex);
 			if (slot->phase == MUX_WORKER_DEAD && !slot->is_foreign)
 			{
-				slot->is_foreign = true;
-				slot->server_oid = serverOid;
-				strlcpy(slot->server_name, serverName, NAMEDATALEN);
-				slot->phase = MUX_WORKER_STARTING;
 				slot_idx = i;
-				SpinLockRelease(&slot->mutex);
 				break;
 			}
-			SpinLockRelease(&slot->mutex);
 		}
+	}
+
+	if (slot_idx >= 0)
+	{
+		MuxWorkerSlot *slot = &MuxState->workers[slot_idx];
+
+		slot->is_foreign = true;
+		slot->server_oid = serverOid;
+		strlcpy(slot->server_name, serverName, NAMEDATALEN);
+		slot->phase = MUX_WORKER_STARTING;
+		slot->use_count = MUX_USE_COUNT_MAX;
+		slot->active_users = 1;
+		slot->should_exit = false;
+		*needs_bgw = true;
 	}
 
 	SpinLockRelease(&MuxState->mutex);
 	return slot_idx;
+}
+
+/*
+ * ConnMuxReleaseWorkerSlot
+ *		Release a backend's reference to a foreign worker slot.  Decrements
+ *		active_users but does NOT terminate the worker -- the connection
+ *		remains open for reuse by other backends.
+ *
+ *		The clock-sweep algorithm will reclaim the slot when max_mux_connections
+ *		is reached and the slot's use_count reaches zero.
+ */
+void
+ConnMuxReleaseWorkerSlot(int slot_idx)
+{
+	MuxWorkerSlot *slot;
+
+	if (MuxState == NULL || slot_idx < 0 || slot_idx >= MUX_MAX_WORKERS)
+		return;
+
+	slot = &MuxState->workers[slot_idx];
+
+	/*
+	 * Protect the decrement with MuxState->mutex for consistency with
+	 * ConnMuxReserveWorkerSlot which also modifies active_users under the
+	 * global lock.
+	 */
+	SpinLockAcquire(&MuxState->mutex);
+	if (slot->active_users > 0)
+		slot->active_users--;
+	SpinLockRelease(&MuxState->mutex);
 }
 
 /*

@@ -3457,6 +3457,16 @@ struct config_int ConfigureNamesInt[] =
 	},
 
 	{
+		{"max_mux_connections", PGC_POSTMASTER, RESOURCES_ASYNCHRONOUS,
+			gettext_noop("Sets the maximum number of persistent foreign-server connections in the multiplexer pool."),
+			gettext_noop("When the pool reaches this limit, the least-recently-used idle connection is evicted to make room for a new one (clock-sweep algorithm).")
+		},
+		&max_mux_connections,
+		64, 1, MUX_MAX_WORKERS,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"max_parallel_maintenance_workers", PGC_USERSET, RESOURCES_ASYNCHRONOUS,
 			gettext_noop("Sets the maximum number of parallel processes per maintenance operation."),
 			NULL

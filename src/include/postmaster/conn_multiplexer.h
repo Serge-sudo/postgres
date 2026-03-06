@@ -59,6 +59,14 @@
 #define MUX_SQL_MAXLEN			4096	/* max SQL text length per request */
 #define MUX_RESULT_MAXLEN		(64 * 1024) /* max serialised result (64 kB) */
 
+/*
+ * Maximum "use count" for the clock-sweep eviction algorithm.
+ * Each time a backend acquires a foreign-worker slot the use_count is
+ * bumped up to this value.  The clock sweep decrements it; when it
+ * reaches zero the slot becomes eligible for eviction.
+ */
+#define MUX_USE_COUNT_MAX		5
+
 /* ----------------------------------------------------------------
  * Message types exchanged through the shared-memory queues
  * ---------------------------------------------------------------- */
@@ -105,6 +113,20 @@ typedef enum MuxWorkerPhase
  * database.  Foreign workers (is_foreign = true) are extension background
  * workers (registered by postgres_fdw) that hold a persistent libpq
  * connection to a remote server and execute queries there.
+ *
+ * Connection pooling:
+ *   Foreign worker slots are kept alive after a backend disconnects so
+ *   subsequent backends can reuse the same TCP connection.  The fields
+ *   use_count and active_users implement a clock-sweep eviction policy:
+ *
+ *   use_count    – bumped to MUX_USE_COUNT_MAX when acquired; decremented
+ *                  by the clock sweep.  Slots with use_count == 0 and
+ *                  active_users == 0 are eligible for eviction.
+ *   active_users – number of backends currently holding a sentinel for
+ *                  this slot.  A slot with active_users > 0 must not be
+ *                  evicted regardless of use_count.
+ *   should_exit  – set by the clock-sweep eviction path to request the
+ *                  worker to shut down cleanly after current work.
  */
 typedef struct MuxWorkerSlot
 {
@@ -126,6 +148,13 @@ typedef struct MuxWorkerSlot
 	bool		is_foreign;		/* true = postgres_fdw foreign worker */
 	Oid			server_oid;		/* foreign server OID (InvalidOid for local) */
 	char		server_name[NAMEDATALEN];	/* foreign server name */
+
+	/*
+	 * Connection-pool fields (only meaningful when is_foreign = true).
+	 */
+	uint8		use_count;		/* clock-sweep counter: 0..MUX_USE_COUNT_MAX */
+	int			active_users;	/* backends currently holding a sentinel */
+	volatile bool should_exit;	/* eviction request: worker should shut down */
 
 	/* Current request being processed */
 	MuxMessageType current_request_type;
@@ -238,6 +267,7 @@ typedef struct MuxConnSentinel
 	uint32		magic;			/* always MUX_CONN_MAGIC */
 	Oid			server_oid;		/* foreign server this represents */
 	char		server_name[NAMEDATALEN];
+	int			worker_slot;	/* index into MuxState->workers[] */
 } MuxConnSentinel;
 
 /*
@@ -245,13 +275,14 @@ typedef struct MuxConnSentinel
  * palloc'd in the current memory context.
  */
 static inline MuxConnSentinel *
-MuxConnSentinelCreate(Oid serverOid, const char *serverName)
+MuxConnSentinelCreate(Oid serverOid, const char *serverName, int workerSlot)
 {
 	MuxConnSentinel *s = (MuxConnSentinel *) palloc(sizeof(MuxConnSentinel));
 
 	s->magic = MUX_CONN_MAGIC;
 	s->server_oid = serverOid;
 	strlcpy(s->server_name, serverName, NAMEDATALEN);
+	s->worker_slot = workerSlot;
 	return s;
 }
 
@@ -305,6 +336,12 @@ typedef struct MuxSharedState
 	/* Query routing slots for backend→mux foreign-server queries */
 	MuxQuerySlot query_slots[MUX_MAX_QUERY_SLOTS];
 
+	/*
+	 * Clock-sweep hand for foreign worker slot eviction.
+	 * Protected by MuxState->mutex.
+	 */
+	int			clock_hand;
+
 	/* Global counters */
 	uint64		total_requests;
 	uint64		active_connections;
@@ -314,6 +351,14 @@ typedef struct MuxSharedState
  * GUC variables (defined in conn_multiplexer.c)
  * ---------------------------------------------------------------- */
 extern PGDLLIMPORT int mux_worker_count;
+
+/*
+ * Maximum number of persistent foreign-server connections maintained by the
+ * multiplexer pool.  When the pool is full and a new server needs a slot,
+ * the clock-sweep algorithm evicts the least-recently-used idle connection.
+ * Default: 64.
+ */
+extern PGDLLIMPORT int max_mux_connections;
 
 /* ----------------------------------------------------------------
  * Public API
@@ -369,13 +414,28 @@ extern uint32 ConnMuxRegisterServer(Oid serverOid, const char *serverName,
  * Reserve a worker slot in the pool for an extension background worker that
  * will hold a libpq connection to serverOid's foreign server.
  *
- * Call this from make_new_connection() (postgres_fdw) before registering
- * the dynamic background worker.  Pass the returned slot index as the
- * background worker's bgw_main_arg.
+ * If a live worker already exists for this server, the function increments
+ * active_users and bumps use_count, then returns the existing slot index and
+ * sets *needs_bgw = false (no new background worker needs to be spawned).
  *
- * Returns the slot index (>= 0) on success, or -1 if the pool is full.
+ * If no live worker exists, a new slot is allocated (evicting the least-used
+ * idle slot if the pool is at capacity), and *needs_bgw = true is returned.
+ *
+ * Returns the slot index (>= 0) on success, or -1 if no slot is available
+ * (all slots are at capacity with active_users > 0 and use_count > 0).
  */
-extern int	ConnMuxReserveWorkerSlot(Oid serverOid, const char *serverName);
+extern int	ConnMuxReserveWorkerSlot(Oid serverOid, const char *serverName,
+									 bool *needs_bgw);
+
+/*
+ * Release a previously reserved worker slot.  This decrements active_users
+ * but does NOT terminate the worker – the connection is kept alive for reuse
+ * by future backends.  The clock-sweep eviction policy will eventually
+ * reclaim idle slots when max_mux_connections is reached.
+ *
+ * slot_idx is the index returned by ConnMuxReserveWorkerSlot.
+ */
+extern void ConnMuxReleaseWorkerSlot(int slot_idx);
 
 /*
  * Return a pointer to the MuxSharedState segment.  Call ConnMuxShmemInit()
