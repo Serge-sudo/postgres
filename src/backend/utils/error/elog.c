@@ -102,6 +102,26 @@ __thread ErrorContextCallback *error_context_stack = NULL;
 
 __thread sigjmp_buf *PG_exception_stack = NULL;
 
+/*
+ * pt_in_worker_thread
+ *
+ * Thread-local flag set to true by parallel thread workers (see
+ * parallelthread.c).  When set, errfinish() uses thread-safe output (a
+ * direct write() to STDERR) instead of the process-wide logging machinery
+ * (EmitErrorReport / proc_exit), which is not safe to call concurrently
+ * from multiple threads.
+ *
+ * For ERROR: the worker has already installed PG_exception_stack via
+ * sigsetjmp, so PG_RE_THROW() works correctly — no special treatment needed.
+ *
+ * For WARNING/NOTICE/LOG and below: EmitErrorReport() would write through
+ * shared pipes/sockets; we replace it with write(STDERR_FILENO, ...).
+ *
+ * For FATAL/PANIC: proc_exit() runs on_proc_exit callbacks that are not
+ * thread-safe; we use _exit(1) / abort() instead.
+ */
+__thread bool pt_in_worker_thread = false;
+
 extern bool redirection_done;
 
 /*
@@ -550,7 +570,27 @@ errfinish(const char *filename, int lineno, const char *funcname)
 	}
 
 	/* Emit the message to the right places */
-	EmitErrorReport();
+	if (pt_in_worker_thread)
+	{
+		/*
+		 * We are inside a parallel thread worker.  The normal logging
+		 * machinery (EmitErrorReport) uses non-thread-safe infrastructure
+		 * (shared pipes, sockets, syslog).  Use write() to STDERR instead,
+		 * which is async-signal-safe and thread-safe.
+		 *
+		 * snprintf always null-terminates pt_buf; strlen gives the actual
+		 * written length regardless of whether truncation occurred.
+		 */
+		char		pt_buf[2048];
+		const char *severity = error_severity(elevel);
+		const char *msg = edata->message ? edata->message : "(no message)";
+
+		snprintf(pt_buf, sizeof(pt_buf),
+				 "parallel worker %s: %s\n", severity, msg);
+		(void) write(STDERR_FILENO, pt_buf, strlen(pt_buf));
+	}
+	else
+		EmitErrorReport();
 
 	/* Now free up subsidiary data attached to stack entry, and release it */
 	FreeErrorDataContents(edata);
@@ -581,6 +621,16 @@ errfinish(const char *filename, int lineno, const char *funcname)
 		 * in an on_proc_exit or on_shmem_exit callback instead.
 		 */
 		fflush(NULL);
+
+		if (pt_in_worker_thread)
+		{
+			/*
+			 * Inside a parallel thread worker: proc_exit() runs
+			 * on_proc_exit/on_shmem_exit callbacks that are not thread-safe.
+			 * Use _exit() to terminate the whole process immediately.
+			 */
+			_exit(1);
+		}
 
 		/*
 		 * Let the cumulative stats system know. Only mark the session as

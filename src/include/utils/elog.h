@@ -314,6 +314,13 @@ typedef struct ErrorContextCallback
 
 extern PGDLLIMPORT __thread ErrorContextCallback *error_context_stack;
 
+/*
+ * pt_in_worker_thread: set true by parallel thread workers so that
+ * errfinish() uses thread-safe output paths instead of the process-wide
+ * logging machinery.  See elog.c for details.
+ */
+extern PGDLLIMPORT __thread bool pt_in_worker_thread;
+
 
 /*----------
  * API for catching ereport(ERROR) exits.  Use these macros like so:

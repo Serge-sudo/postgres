@@ -33,15 +33,15 @@
  * Page data in pinned buffers may be read concurrently without holding any
  * mutex.
  *
- * elog() / ereport() must NOT be called from worker threads.  These functions
- * write to shared logging infrastructure (pipes, log files) in a non-reentrant
- * way; calling them concurrently from multiple threads causes data races.
- * Worker threads use the thread-local flag pt_in_worker_thread to detect the
- * thread context and fall back to write(STDERR_FILENO, ...) + _exit() for
- * truly fatal semaphore failures.  All other error paths in worker threads
- * store a message in the thread-local errmsg[] buffer and jump to worker_done
- * where the leader collects and re-raises the error after all threads have
- * joined.
+ * elog() / ereport() from inside worker threads: errfinish() in elog.c checks
+ * the thread-local flag pt_in_worker_thread (defined there, set here) and
+ * redirects output to write(STDERR_FILENO, ...) instead of the non-thread-safe
+ * process-wide logging infrastructure.  For WARNING/NOTICE/LOG and below, the
+ * message is written to stderr and the call returns normally.  For ERROR, the
+ * normal PG_exception_stack / siglongjmp mechanism is used (the worker installs
+ * its own sigsetjmp target at startup, so longjmp is correct and thread-safe).
+ * For FATAL/PANIC, elog.c uses _exit(1)/abort() rather than proc_exit() to
+ * avoid running on_proc_exit callbacks from a non-main thread.
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
@@ -76,8 +76,12 @@
 #include "storage/shmem.h"
 #include "miscadmin.h"
 
-/* Forward declaration needed before pt_sema_wait/pt_sema_post inline functions. */
-static __thread bool pt_in_worker_thread = false;
+/*
+ * pt_in_worker_thread is defined in elog.c and declared in elog.h.
+ * It is included transitively via postgres.h.  The variable is set to true
+ * at the start of thread_scan_worker() so that errfinish() in elog.c can
+ * use thread-safe output paths instead of the process-wide logging machinery.
+ */
 
 
 /*
@@ -155,8 +159,9 @@ pt_sema_trywait(sem_t *s)
 __thread int ParallelThreadWorkerNumber = -1;
 
 /*
- * pt_in_worker_thread — see the definition and comment near the top of this
- * file (before pt_sema_wait).
+ * pt_in_worker_thread is defined in elog.c and declared in elog.h (included
+ * transitively via postgres.h).  It is set to true by thread_scan_worker()
+ * before any PostgreSQL code runs in the thread.
  */
 
 
