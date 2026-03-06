@@ -720,8 +720,10 @@ process_worker_requests(WorkerState *state)
 		progress->error_count++;
 
 	/* Release handles without detaching - queue will be reinited on next call */
+	LWLockAcquire(&wq->queue_lock, LW_EXCLUSIVE);
 	shm_mq_release_handle(req_mqh);
 	shm_mq_release_handle(resp_mqh);
+	LWLockRelease(&wq->queue_lock);
 
 	CHECK_FOR_INTERRUPTS();
 }

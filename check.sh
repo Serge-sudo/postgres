@@ -38,6 +38,6 @@ psql_node "$PORT1" "
 ALTER SHARD GROUP group1 ADD MEMBER node2;
 "
 
-# psql_node "$PORT2" "
-# select * from pg_shardgroups;
-# "
+psql_node "$PORT2" "
+select * from pg_shardgroups;
+"
