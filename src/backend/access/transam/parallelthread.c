@@ -62,6 +62,8 @@
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
 #include "utils/guc.h"
+#include "storage/shmem.h"
+#include "miscadmin.h"
 
 
 /*
@@ -119,6 +121,72 @@ pt_sema_trywait(sem_t *s)
 
 /* Thread-local worker number; -1 means "not a thread worker". */
 __thread int ParallelThreadWorkerNumber = -1;
+
+
+/* ------------------------------------------------------------------
+ * Global shared-memory limit for thread workers
+ * ------------------------------------------------------------------ */
+
+/*
+ * ParallelThreadShmemStruct
+ *
+ * A tiny shared-memory struct that tracks the total number of thread workers
+ * currently active across all backends.  This lets us enforce a server-wide
+ * limit (max_parallel_thread_workers) similar to how max_parallel_workers
+ * caps process-based background workers.
+ *
+ * active_thread_workers is modified atomically:
+ *   - incremented (fetch_add) before attempting each pthread_create; decremented
+ *     back immediately if the limit is exceeded or pthread_create fails
+ *   - decremented (fetch_sub) when the worker thread reaches worker_done
+ */
+typedef struct ParallelThreadShmemStruct
+{
+	pg_atomic_uint32 active_thread_workers;
+} ParallelThreadShmemStruct;
+
+static ParallelThreadShmemStruct *ParallelThreadShmem = NULL;
+
+/* GUC: server-wide cap on thread workers; declared in cost.h */
+int		max_parallel_thread_workers = 8;
+
+/*
+ * ParallelThreadShmemSize
+ *
+ * Return the number of bytes of shared memory needed by this module.
+ * Called from CalculateShmemSize() in ipci.c.
+ */
+Size
+ParallelThreadShmemSize(void)
+{
+	return sizeof(ParallelThreadShmemStruct);
+}
+
+/*
+ * ParallelThreadShmemInit
+ *
+ * Allocate (or re-attach to) the module's shared-memory area and
+ * initialise it on first call.  Called from CreateOrAttachShmemStructs()
+ * in ipci.c, both for the postmaster and for forked backends.
+ */
+void
+ParallelThreadShmemInit(void)
+{
+	bool found;
+
+	ParallelThreadShmem = (ParallelThreadShmemStruct *)
+		ShmemInitStruct("Parallel Thread Workers",
+						sizeof(ParallelThreadShmemStruct),
+						&found);
+
+	if (!IsUnderPostmaster)
+	{
+		Assert(!found);
+		pg_atomic_init_u32(&ParallelThreadShmem->active_thread_workers, 0);
+	}
+	else
+		Assert(found);
+}
 
 
 /*
@@ -1049,6 +1117,13 @@ worker_done:
 		ResourceOwnerDelete(myOwner);
 	}
 
+	/*
+	 * Decrement the global active-thread counter so other backends can use
+	 * the freed slot immediately (without waiting for the leader to join).
+	 */
+	if (ParallelThreadShmem != NULL)
+		pg_atomic_fetch_sub_u32(&ParallelThreadShmem->active_thread_workers, 1);
+
 	return NULL;
 }
 
@@ -1290,9 +1365,48 @@ LaunchParallelThreadWorkers(ParallelThreadContext *ptcxt,
 
 		MemoryContextSwitchTo(oldctx);
 
+		/*
+		 * Atomically claim a slot in the global thread-worker limit.
+		 * If we'd exceed max_parallel_thread_workers, release the unused
+		 * resources and stop launching further workers for this query.
+		 */
+		if (ParallelThreadShmem != NULL)
+		{
+			uint32 old = pg_atomic_fetch_add_u32(
+				&ParallelThreadShmem->active_thread_workers, 1);
+
+			if (old >= (uint32) max_parallel_thread_workers)
+			{
+				/* Give the slot back; we won't create this thread. */
+				pg_atomic_fetch_sub_u32(
+					&ParallelThreadShmem->active_thread_workers, 1);
+
+				ws->launched = false;
+				ws->eval_slot = NULL;
+				pool_return(ptcxt->pool, args->filling_batch);
+				MemoryContextDelete(wctx);
+				ws->worker_context = NULL;
+
+				ereport(DEBUG1,
+						(errmsg("parallel thread worker %d not started: "
+								"global thread worker limit (%d) reached",
+								i, max_parallel_thread_workers)));
+				break;			/* stop launching workers for this query */
+			}
+			/* Slot claimed; decrement will happen in thread_scan_worker. */
+		}
+
 		rc = pthread_create(&ws->thread, NULL, thread_scan_worker, args);
 		if (rc != 0)
 		{
+			/*
+			 * pthread_create failed: release the global slot we just claimed
+			 * (no thread will run to do the decrement).
+			 */
+			if (ParallelThreadShmem != NULL)
+				pg_atomic_fetch_sub_u32(
+					&ParallelThreadShmem->active_thread_workers, 1);
+
 			ws->launched = false;
 			ws->eval_slot = NULL;
 			/* Return the unused filling_batch to the pool before deleting ctx. */

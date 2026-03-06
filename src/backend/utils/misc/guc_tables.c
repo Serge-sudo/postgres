@@ -71,6 +71,7 @@
 #include "replication/slotsync.h"
 #include "replication/syncrep.h"
 #include "storage/bufmgr.h"
+#include "access/parallelthread.h"
 #include "storage/large_object.h"
 #include "storage/pg_shmem.h"
 #include "storage/predicate.h"
@@ -3438,6 +3439,18 @@ struct config_int ConfigureNamesInt[] =
 		},
 		&max_parallel_workers,
 		8, 0, MAX_PARALLEL_WORKER_LIMIT,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"max_parallel_thread_workers", PGC_POSTMASTER, RESOURCES_ASYNCHRONOUS,
+			gettext_noop("Sets the maximum total number of parallel thread workers for temp-table scans."),
+			gettext_noop("Thread workers run inside the backend process to scan temporary tables "
+						 "in parallel.  This limit caps the combined count across all backends."),
+			GUC_EXPLAIN
+		},
+		&max_parallel_thread_workers,
+		8, 0, 1024,
 		NULL, NULL, NULL
 	},
 

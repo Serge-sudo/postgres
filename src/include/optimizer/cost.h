@@ -72,6 +72,7 @@ extern PGDLLIMPORT bool enable_presorted_aggregate;
 extern PGDLLIMPORT bool enable_async_append;
 /* enable parallel query on temporary tables via thread workers */
 extern PGDLLIMPORT bool enable_parallel_temp_table;
+extern PGDLLIMPORT int  max_parallel_thread_workers;
 extern PGDLLIMPORT int constraint_exclusion;
 
 extern double index_pages_fetched(double tuples_fetched, BlockNumber pages,

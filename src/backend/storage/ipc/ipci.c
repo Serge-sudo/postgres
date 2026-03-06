@@ -18,6 +18,7 @@
 #include "access/commit_ts.h"
 #include "access/multixact.h"
 #include "access/nbtree.h"
+#include "access/parallelthread.h"
 #include "access/subtrans.h"
 #include "access/syncscan.h"
 #include "access/transam.h"
@@ -152,6 +153,7 @@ CalculateShmemSize(int *num_semaphores)
 	size = add_size(size, WaitEventCustomShmemSize());
 	size = add_size(size, InjectionPointShmemSize());
 	size = add_size(size, SlotSyncShmemSize());
+	size = add_size(size, ParallelThreadShmemSize());
 #ifdef EXEC_BACKEND
 	size = add_size(size, ShmemBackendArraySize());
 #endif
@@ -347,6 +349,8 @@ CreateOrAttachShmemStructs(void)
 	PgArchShmemInit();
 	ApplyLauncherShmemInit();
 	SlotSyncShmemInit();
+
+	ParallelThreadShmemInit();
 
 	/*
 	 * Set up other modules that need some shared memory space

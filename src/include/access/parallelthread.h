@@ -280,6 +280,10 @@ extern __thread int ParallelThreadWorkerNumber;
  * Public API
  * ------------------------------------------------------------------ */
 
+/* Shared-memory size and initialisation — called from ipci.c */
+extern Size ParallelThreadShmemSize(void);
+extern void ParallelThreadShmemInit(void);
+
 extern ParallelThreadContext *CreateParallelThreadContext(int nworkers);
 
 extern void LaunchParallelThreadWorkers(ParallelThreadContext *ptcxt,
