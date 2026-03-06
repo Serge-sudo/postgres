@@ -1285,8 +1285,11 @@ pg_stat_conn_multiplexer(PG_FUNCTION_ARGS)
 		/* phase */
 		values[2] = CStringGetTextDatum(conn_mux_phase_name(snap.phase));
 
-		/* current_request_type */
-		if (snap.phase > MUX_STATE_RECEIVING && snap.phase < MUX_STATE_STOPPED)
+		/* current_request_type - only meaningful when actively processing */
+		if (snap.phase == MUX_STATE_CONNECTING ||
+			snap.phase == MUX_STATE_EXECUTING ||
+			snap.phase == MUX_STATE_CLOSING ||
+			snap.phase == MUX_STATE_SENDING_RESPONSE)
 			values[3] = CStringGetTextDatum(conn_mux_request_type_name(snap.current_request_type));
 		else
 			nulls[3] = true;
