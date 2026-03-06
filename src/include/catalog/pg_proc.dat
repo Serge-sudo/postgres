@@ -12207,9 +12207,19 @@
   proname => 'pg_stat_get_conn_mux_workers', prorows => '64',
   proretset => 't', provolatile => 'v', prorettype => 'record',
   proargtypes => '',
-  proallargtypes => '{int4,int4,text,text,int4,int4,int8,int8,int8,int8,int8,timestamptz}',
-  proargmodes => '{o,o,o,o,o,o,o,o,o,o,o,o}',
-  proargnames => '{worker_id,pid,phase,current_request_type,current_conn_id,requester_pid,requests_completed,count_queries,count_connects,count_closes,count_errors,last_active}',
+  proallargtypes => '{int4,int4,text,text,text,int4,int4,int8,int8,int8,int8,int8,timestamptz}',
+  proargmodes => '{o,o,o,o,o,o,o,o,o,o,o,o,o}',
+  proargnames => '{worker_id,pid,worker_type,phase,current_request_type,current_conn_id,requester_pid,requests_completed,count_queries,count_connects,count_closes,count_errors,last_active}',
   prosrc => 'pg_stat_get_conn_mux_workers' },
+
+{ oid => '6351',
+  descr => 'connection multiplexer remote connection statistics',
+  proname => 'pg_stat_get_conn_mux_remotes', prorows => '64',
+  proretset => 't', provolatile => 'v', prorettype => 'record',
+  proargtypes => '',
+  proallargtypes => '{int4,text,oid,text,text,int8,int8,int8,int8,timestamptz}',
+  proargmodes => '{o,o,o,o,o,o,o,o,o,o}',
+  proargnames => '{conn_id,phase,server_oid,server_name,connstr,bytes_sent,bytes_recv,msgs_sent,msgs_recv,connect_time}',
+  prosrc => 'pg_stat_get_conn_mux_remotes' },
 
 ]

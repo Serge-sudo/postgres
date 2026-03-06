@@ -8,7 +8,7 @@
  *  - Connects to peer multiplexers via a single connection per remote node
  *  - Maintains a pool of workers that execute sub-statement level queries
  *  - Communicates with workers and backends via shared-memory queues
- *
+ *  - Discovers remote nodes from pg_foreign_server / pg_shardmembers catalog *
  * This dramatically reduces the total number of connections and processes
  * in a cluster compared to the traditional per-connection model.
  *
@@ -18,7 +18,24 @@
  *
  * The multiplexer event loop moves data between:
  *   - Local backends ↔ local workers (via shm_mq)
- *   - Local workers  ↔ remote nodes  (via single TCP connection per node)
+ *   - Local workers  ↔ remote nodes  (via single persistent connection per
+ *                                      foreign server)
+ *
+ * Foreign-server integration
+ * --------------------------
+ * When remote nodes are declared as foreign servers (e.g., via
+ * ADD MEMBER to a shard group), the multiplexer discovers them from the
+ * pg_foreign_server catalog at startup.  For each such server it allocates
+ * a MuxRemoteConn slot that stores the server OID, name, and a libpq-style
+ * connection string built from the server's srvoptions.
+ *
+ * Remote workers
+ * --------------
+ * For each registered foreign server, the multiplexer spawns a dedicated
+ * "remote worker" background process.  A remote worker has database access
+ * and executes sub-statements on the foreign server using SPI and the
+ * postgres_fdw connection infrastructure, then returns results back to the
+ * multiplexer via its worker_to_mux shm_mq queue.
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
@@ -60,6 +77,7 @@ typedef enum MuxMessageType
 	MUX_MSG_CLOSE,				/* either direction: close/cancel request */
 	MUX_MSG_TXSTATE,			/* coordinator → worker: transaction state */
 	MUX_MSG_ERROR,				/* worker  → backend: error report */
+	MUX_MSG_REMOTE_QUERY,		/* mux → remote worker: forward query to a foreign server */
 } MuxMessageType;
 
 /*
@@ -86,6 +104,16 @@ typedef enum MuxWorkerPhase
 } MuxWorkerPhase;
 
 /*
+ * Worker type: local workers execute queries locally; remote workers proxy
+ * requests through a specific foreign server via postgres_fdw / SPI.
+ */
+typedef enum MuxWorkerType
+{
+	MUX_WORKER_LOCAL = 0,		/* executes queries on the local node */
+	MUX_WORKER_REMOTE,			/* proxies queries to a foreign server */
+} MuxWorkerType;
+
+/*
  * One slot in the worker pool, stored in shared memory.
  *
  * The two shm_mq queues are embedded directly in this struct so that no
@@ -99,6 +127,11 @@ typedef struct MuxWorkerSlot
 	/* Identity */
 	int			worker_id;		/* 0-based index in the pool */
 	pid_t		pid;			/* worker OS PID; 0 if not running */
+
+	/* Worker type and associated foreign server (for remote workers) */
+	MuxWorkerType worker_type;
+	Oid			remote_server_oid;	/* OID of the ForeignServer (0 = local) */
+	char		remote_server_name[NAMEDATALEN]; /* server name for display */
 
 	/* State */
 	MuxWorkerPhase phase;
@@ -148,7 +181,13 @@ typedef struct MuxRemoteConn
 	slock_t		mutex;
 	MuxConnPhase phase;
 	uint32		conn_id;		/* identifier used in MuxMsgHeader */
-	char		connstr[MUX_CONNSTR_MAXLEN]; /* libpq connection string */
+
+	/* Foreign server identity */
+	Oid			server_oid;		/* OID of pg_foreign_server (0 if unknown) */
+	char		server_name[NAMEDATALEN]; /* server name for display */
+
+	/* libpq-style connection string built from foreign server options */
+	char		connstr[MUX_CONNSTR_MAXLEN];
 
 	/* Statistics */
 	uint64		bytes_sent;
@@ -174,9 +213,10 @@ typedef struct MuxSharedState
 
 	/* Worker pool */
 	int			num_workers;		/* configured pool size (GUC) */
+	int			num_remote_workers; /* count of remote-worker slots */
 	MuxWorkerSlot workers[MUX_MAX_WORKERS];
 
-	/* Remote connections */
+	/* Remote connections (one per foreign server) */
 	MuxRemoteConn remote_conns[MUX_MAX_REMOTE_CONNS];
 
 	/* Global counters */
@@ -203,16 +243,35 @@ extern void ConnMuxRegister(void);
 /* Entry point for the multiplexer background worker */
 extern PGDLLIMPORT void ConnMuxMain(Datum main_arg);
 
-/* Entry point for each pool worker background worker */
+/* Entry point for each local pool worker background worker */
 extern PGDLLIMPORT void ConnMuxWorkerMain(Datum main_arg);
+
+/* Entry point for each remote worker background worker */
+extern PGDLLIMPORT void ConnMuxRemoteWorkerMain(Datum main_arg);
 
 /* Wake the multiplexer from a backend or worker */
 extern void ConnMuxWakeup(void);
+
+/*
+ * Register a foreign server with the multiplexer so that a persistent
+ * remote worker will be spawned for it.  Safe to call from any backend
+ * that has database access.  Returns the conn_id assigned to this server,
+ * or (uint32) -1 if the server is already registered or no slot is free.
+ *
+ * The caller is responsible for ensuring the server exists in the catalog.
+ */
+extern uint32 ConnMuxRegisterForeignServer(Oid serverOid);
 
 /*
  * Statistics accessor – fills a caller-allocated array of MuxWorkerSlot
  * copies (for the stats view).  Returns the number of slots filled.
  */
 extern int	ConnMuxGetWorkerStats(MuxWorkerSlot *slots, int max_slots);
+
+/*
+ * Remote-connection statistics accessor – fills a caller-allocated array
+ * of MuxRemoteConn copies.  Returns the number of slots filled.
+ */
+extern int	ConnMuxGetRemoteConnStats(MuxRemoteConn *conns, int max_conns);
 
 #endif							/* CONN_MULTIPLEXER_H */

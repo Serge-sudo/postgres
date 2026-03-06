@@ -1380,6 +1380,7 @@ CREATE VIEW pg_stat_conn_multiplexer AS
     SELECT
         worker_id,
         pid,
+        worker_type,
         phase,
         current_request_type,
         current_conn_id,
@@ -1391,3 +1392,17 @@ CREATE VIEW pg_stat_conn_multiplexer AS
         count_errors,
         last_active
     FROM pg_stat_get_conn_mux_workers();
+
+CREATE VIEW pg_stat_conn_multiplexer_remotes AS
+    SELECT
+        conn_id,
+        phase,
+        server_oid,
+        server_name,
+        connstr,
+        bytes_sent,
+        bytes_recv,
+        msgs_sent,
+        msgs_recv,
+        connect_time
+    FROM pg_stat_get_conn_mux_remotes();

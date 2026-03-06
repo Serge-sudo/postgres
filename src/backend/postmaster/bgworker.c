@@ -139,6 +139,9 @@ static const struct
 	},
 	{
 		"ConnMuxWorkerMain", ConnMuxWorkerMain
+	},
+	{
+		"ConnMuxRemoteWorkerMain", ConnMuxRemoteWorkerMain
 	}
 };
 
