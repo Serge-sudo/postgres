@@ -492,6 +492,7 @@ mux_connect_to_peer(int rc_idx)
 {
 	MuxRemoteConn *rc = &MuxState->remote_conns[rc_idx];
 	char		host[MUX_PEER_HOST_MAXLEN];
+	int			peer_port;
 	struct addrinfo hints;
 	struct addrinfo *res,
 			   *rp;
@@ -503,14 +504,16 @@ mux_connect_to_peer(int rc_idx)
 	if (outbound_socks[rc_idx] != PGINVALID_SOCKET)
 		return outbound_socks[rc_idx];
 
+	/* Read both fields under the spinlock for a consistent snapshot */
 	SpinLockAcquire(&rc->mutex);
 	strlcpy(host, rc->peer_host, sizeof(host));
+	peer_port = rc->peer_mux_port;
 	SpinLockRelease(&rc->mutex);
 
 	if (host[0] == '\0')
 		strlcpy(host, MUX_DEFAULT_PEER_HOST, sizeof(host));
-
-	snprintf(portstr, sizeof(portstr), "%d", mux_tcp_port);
+	snprintf(portstr, sizeof(portstr), "%d",
+			 (peer_port > 0) ? peer_port : mux_tcp_port);
 
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_UNSPEC;
@@ -540,8 +543,8 @@ mux_connect_to_peer(int rc_idx)
 
 	if (sock == PGINVALID_SOCKET)
 	{
-		ereport(WARNING, (errmsg("mux: could not connect to peer %s:%d: %m",
-								 host, mux_tcp_port)));
+		ereport(WARNING, (errmsg("mux: could not connect to peer %s:%s: %m",
+								 host, portstr)));
 		return PGINVALID_SOCKET;
 	}
 
@@ -549,8 +552,8 @@ mux_connect_to_peer(int rc_idx)
 	outbound_socks[rc_idx] = sock;
 
 	ereport(MULTIPLEXER_LOG_LEVEL,
-			(errmsg("mux: connected outbound to peer %s:%d (rc_idx=%d)",
-					host, mux_tcp_port, rc_idx)));
+			(errmsg("mux: connected outbound to peer %s:%s (rc_idx=%d)",
+					host, portstr, rc_idx)));
 	return sock;
 }
 
@@ -1930,7 +1933,8 @@ ConnMuxIsAvailable(Oid serverOid)
  */
 uint32
 ConnMuxRegisterServer(Oid serverOid, const char *serverName,
-					  const char *connstr, const char *peer_host)
+					  const char *connstr, const char *peer_host,
+					  int peer_port)
 {
 	int			slot_idx;
 
@@ -1953,13 +1957,17 @@ ConnMuxRegisterServer(Oid serverOid, const char *serverName,
 			strlcpy(rc->peer_host,
 					(peer_host && peer_host[0]) ? peer_host : MUX_DEFAULT_PEER_HOST,
 					sizeof(rc->peer_host));
+			rc->peer_mux_port = (peer_port > 0) ? peer_port : 0;
 			rc->phase = MUX_CONN_CONNECTING;
 			rc->use_count = MUX_USE_COUNT_MAX;
 		}
-		else if (peer_host && peer_host[0])
+		else
 		{
-			/* Update peer_host even if already registered */
-			strlcpy(rc->peer_host, peer_host, sizeof(rc->peer_host));
+			/* Update peer_host / peer_mux_port even if already registered */
+			if (peer_host && peer_host[0])
+				strlcpy(rc->peer_host, peer_host, sizeof(rc->peer_host));
+			if (peer_port > 0)
+				rc->peer_mux_port = peer_port;
 		}
 	}
 	SpinLockRelease(&MuxState->mutex);
@@ -1967,10 +1975,13 @@ ConnMuxRegisterServer(Oid serverOid, const char *serverName,
 	/* Wake the multiplexer so it notices the new server */
 	if (slot_idx >= 0)
 	{
+		int			effective_port = (peer_port > 0) ? peer_port : mux_tcp_port;
+
 		ereport(MULTIPLEXER_LOG_LEVEL,
-				(errmsg("mux: registered foreign server \"%s\" (oid=%u) at slot %d, peer_host=%s",
+				(errmsg("mux: registered foreign server \"%s\" (oid=%u) at slot %d, peer=%s:%d",
 						serverName, serverOid, slot_idx,
-						(peer_host && peer_host[0]) ? peer_host : MUX_DEFAULT_PEER_HOST)));
+						(peer_host && peer_host[0]) ? peer_host : MUX_DEFAULT_PEER_HOST,
+						effective_port)));
 		ConnMuxWakeup();
 	}
 

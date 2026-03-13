@@ -232,6 +232,13 @@ typedef struct MuxRemoteConn
 	char		peer_host[MUX_PEER_HOST_MAXLEN];
 
 	/*
+	 * TCP port on which the peer multiplexer is listening.
+	 * Set to 0 to fall back to the local mux_tcp_port GUC.
+	 * Populated from the "mux_port" option of the foreign server definition.
+	 */
+	int			peer_mux_port;
+
+	/*
 	 * Clock-sweep counter for the connection eviction algorithm.
 	 * Bumped to MUX_USE_COUNT_MAX whenever a query is routed through this
 	 * connection.  The clock sweep decrements it; when it reaches zero
@@ -445,7 +452,8 @@ extern bool ConnMuxIsAvailable(Oid serverOid);
  */
 extern uint32 ConnMuxRegisterServer(Oid serverOid, const char *serverName,
 									const char *connstr,
-									const char *peer_host);
+									const char *peer_host,
+									int peer_port);
 
 /*
  * Submit a query for execution on a remote node via the multiplexer.

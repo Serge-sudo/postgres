@@ -452,8 +452,9 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 		ListCell   *lc2;
 		uint32		conn_id;
 
-		/* Build a libpq-compatible connstr from the server's srvoptions and extract peer_host */
+		/* Build a libpq-compatible connstr from the server's srvoptions and extract peer info */
 		const char *peer_host = MUX_DEFAULT_PEER_HOST;
+		int			peer_mux_port = 0;	/* 0 means fall back to mux_tcp_port GUC */
 
 		initStringInfo(&sb);
 		foreach(lc2, server->options)
@@ -465,6 +466,26 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 			/* Extract host for peer multiplexer connection */
 			if (strcmp(def->defname, "host") == 0)
 				peer_host = defGetString(def);
+
+			/*
+			 * mux_port: the TCP port on which the peer node's multiplexer
+			 * listens.  Defaults to the local mux_tcp_port GUC when not set.
+			 * This option is consumed here and must NOT be forwarded to libpq.
+			 */
+			if (strcmp(def->defname, "mux_port") == 0)
+			{
+				char	   *endptr;
+				long		v = strtol(defGetString(def), &endptr, 10);
+
+				if (*endptr != '\0' || v <= 0 || v > 65535)
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("invalid value for option \"mux_port\": \"%s\"",
+									defGetString(def)),
+							 errhint("Valid port numbers are integers between 1 and 65535.")));
+				peer_mux_port = (int) v;
+				continue;		/* not a libpq option */
+			}
 
 			/* Skip FDW meta-options that aren't libpq options */
 			if (strcmp(def->defname, "keep_connections") == 0 ||
@@ -495,12 +516,14 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 		/*
 		 * Register the server in the multiplexer's remote_conns table.
 		 * The multiplexer will connect lazily via TCP when the first query
-		 * arrives via ConnMuxSubmitQuery.
+		 * arrives via ConnMuxSubmitQuery.  peer_mux_port=0 means the
+		 * multiplexer will fall back to the local mux_tcp_port GUC.
 		 */
 		conn_id = ConnMuxRegisterServer(server->serverid,
 										server->servername,
 										sb.data,
-										peer_host);
+										peer_host,
+										peer_mux_port);
 		pfree(sb.data);
 
 		if (conn_id != (uint32) -1)
