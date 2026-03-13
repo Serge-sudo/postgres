@@ -3,35 +3,29 @@
  * conn_multiplexer.c
  *	  Connection multiplexer for distributed PostgreSQL transport
  *
- * Architecture (C10K-style distributed model):
+ * Architecture:
  *
- *   Each node runs ONE multiplexer process, N local workers, and ONE networker.
+ *   Each node runs ONE multiplexer process and N strictly-local workers.
+ *   There is NO separate networker process.
  *
  *   - Local workers execute sub-statement queries on the CURRENT node via SPI.
  *     They receive the query text and transaction state from the multiplexer
  *     via shm_mq and return serialised results through shm_mq.
  *     Workers NEVER make outbound TCP connections.
  *
- *   - The multiplexer holds the transaction state and routes requests:
- *       * Local queries  → dispatched to an idle local worker via shm_mq.
- *       * Remote queries → the multiplexer wakes the networker by setting
- *                          MuxState->networker.latch.
- *     The multiplexer itself never opens TCP connections.
+ *   - The multiplexer manages ALL TCP sockets to peer multiplexers directly
+ *     inside ConnMuxMain.  It listens on mux_tcp_port for incoming peer
+ *     connections and connects outbound to peers on demand (lazy).
  *
- *   - The networker (ConnMuxNetworkerMain, registered in postgres_fdw) is a
- *     SINGLE extension worker process per node that manages ALL persistent
- *     TCP connections to remote multiplexers.  It polls MuxQuerySlot[] for
- *     remote requests and executes them via libpq on the appropriate PGconn*.
- *     There is exactly ONE networker per node (not one per remote server).
- *
- * Multiplexer main loop
- * ---------------------
- * On each iteration the multiplexer:
- *   1. Drains all local worker result queues and routes replies.
- *   2. Dispatches pending local requests to idle workers.
- *   3. Checks if any remote MuxQuerySlots are pending; if so, wakes the
- *      networker.
- *   4. Re-spawns any dead local workers.
+ *   Multiplexer main loop
+ *   ---------------------
+ *   On each iteration the multiplexer:
+ *     1. Accepts any new inbound peer connections.
+ *     2. Drains all local worker result queues and routes replies
+ *        (either back to the local backend or via TCP to the requesting peer).
+ *     3. Dispatches pending local requests to idle workers.
+ *     4. Dispatches pending remote query slots to peer multiplexers via TCP.
+ *     5. Re-spawns any dead local workers.
  *
  * Shared memory layout
  * --------------------
@@ -51,6 +45,12 @@
 
 #include <signal.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <fcntl.h>
+#include <errno.h>
 
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
@@ -90,12 +90,8 @@ int			mux_worker_count = 4;
  */
 int			max_mux_connections = 64;
 
-/*
- * Name of the local database to connect to when the multiplexer needs
- * catalog access (e.g. to look up ForeignServer options).
- * Currently unused; kept as a reference for future catalog-access needs.
- */
-/* #define MUX_LOCAL_DATABASE "postgres" */
+/* GUC: TCP port for inter-multiplexer communication */
+int			mux_tcp_port = 7432;
 
 /* Pointer to the shared-memory state; set by ConnMuxShmemInit(). */
 static MuxSharedState *MuxState = NULL;
@@ -117,6 +113,38 @@ static MuxPendingRequest pending_requests[MUX_PENDING_QUEUE_MAX];
 static int	pending_head = 0;
 static int	pending_tail = 0;
 
+/* ----------------------------------------------------------------
+ * TCP socket state (process-local, non-shared)
+ * ---------------------------------------------------------------- */
+
+/* Listening socket for inbound peer connections */
+static int	listen_sock = PGINVALID_SOCKET;
+
+/* Outbound peer sockets, indexed by MuxRemoteConn slot */
+static int	outbound_socks[MUX_MAX_REMOTE_CONNS];
+
+/* Inbound peer sockets (peers that connected to us) */
+/* 16 peers is sufficient for a small cluster; increase if needed */
+#define MUX_MAX_INBOUND_PEERS	16
+static int	inbound_socks[MUX_MAX_INBOUND_PEERS];
+static int	n_inbound = 0;
+
+/*
+ * Tracking for in-flight inbound requests dispatched to local workers.
+ * conn_id values >= MUX_INBOUND_CONN_BASE identify inbound (remote-originated)
+ * requests; values below that are local backend requests (query slot indices).
+ */
+#define MUX_INBOUND_CONN_BASE	MUX_MAX_QUERY_SLOTS
+
+typedef struct MuxInboundReq
+{
+	bool		in_use;
+	int			peer_idx;		/* inbound_socks[] index */
+	uint32		remote_slot_id; /* slot_id on the sending multiplexer side */
+} MuxInboundReq;
+
+static MuxInboundReq inbound_reqs[MUX_MAX_QUERY_SLOTS];
+
 
 /* ----------------------------------------------------------------
  * Forward declarations
@@ -124,7 +152,6 @@ static int	pending_tail = 0;
 static void mux_handle_sigterm(SIGNAL_ARGS);
 static void mux_setup_signals(void);
 static void mux_spawn_workers(int n);
-static void mux_spawn_networker(void);
 static int	mux_find_idle_worker(void);
 static bool mux_dispatch_to_worker(int worker_id, const char *data, Size len);
 static void mux_drain_worker_queues(void);
@@ -132,7 +159,17 @@ static void mux_drain_backend_requests(void);
 static bool mux_pending_enqueue(const char *data, Size len);
 static bool mux_pending_dequeue(char *buf, Size bufsz, Size *lenp);
 static void mux_worker_setup_signals(void);
-static void mux_wake_networker_if_needed(void);
+
+/* TCP helper forward declarations */
+static void mux_set_nonblocking(int sock);
+static int	mux_init_listen_socket(void);
+static int	mux_accept_peer(void);
+static int	mux_connect_to_peer(int rc_idx);
+static bool mux_send_all(int sock, const void *buf, size_t len);
+static bool mux_recv_available(int sock, void *buf, size_t len, size_t *got);
+static bool mux_dispatch_remote_slots(void);
+static void mux_process_inbound_message(int peer_idx);
+static void mux_process_outbound_result(int rc_idx);
 
 
 /* ----------------------------------------------------------------
@@ -200,14 +237,9 @@ ConnMuxShmemInit(void)
 			rc->server_oid = InvalidOid;
 			rc->server_name[0] = '\0';
 			rc->connstr[0] = '\0';
+			rc->peer_host[0] = '\0';
 			rc->use_count = 0;	/* 0 means "unused slot, no connection" */
 		}
-
-		/* Initialise the networker slot */
-		SpinLockInit(&MuxState->networker.mutex);
-		MuxState->networker.pid = 0;
-		MuxState->networker.latch = NULL;
-		MuxState->networker.phase = MUX_WORKER_DEAD;
 
 		for (i = 0; i < MUX_MAX_QUERY_SLOTS; i++)
 		{
@@ -332,97 +364,571 @@ mux_spawn_workers(int n)
 	}
 }
 
+
+/* ----------------------------------------------------------------
+ * TCP socket helper functions
+ * ---------------------------------------------------------------- */
+
 /*
- * mux_spawn_networker
- *		Register the ConnMuxNetworkerMain extension background worker.
- *		The networker (registered in postgres_fdw) is the single process
- *		that manages all persistent TCP connections to remote servers.
- *		Called once from the multiplexer's startup path.
+ * mux_set_nonblocking
+ *		Set O_NONBLOCK on a socket.
  */
 static void
-mux_spawn_networker(void)
+mux_set_nonblocking(int sock)
 {
-	BackgroundWorker bgw;
-	BackgroundWorkerHandle *handle;
+	int			flags;
 
-	/* Don't spawn a second one if it's already running */
-	SpinLockAcquire(&MuxState->networker.mutex);
-	if (MuxState->networker.phase != MUX_WORKER_DEAD)
+	flags = fcntl(sock, F_GETFL, 0);
+	if (flags < 0)
 	{
-		SpinLockRelease(&MuxState->networker.mutex);
+		ereport(WARNING, (errmsg("mux: fcntl F_GETFL failed: %m")));
 		return;
 	}
-	MuxState->networker.phase = MUX_WORKER_STARTING;
-	SpinLockRelease(&MuxState->networker.mutex);
-
-	MemSet(&bgw, 0, sizeof(bgw));
-	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS;
-	bgw.bgw_start_time = BgWorkerStart_PostmasterStart;
-	bgw.bgw_restart_time = BGW_NEVER_RESTART;	/* multiplexer re-spawns */
-	snprintf(bgw.bgw_library_name, MAXPGPATH, "postgres_fdw");
-	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "ConnMuxNetworkerMain");
-	snprintf(bgw.bgw_name, BGW_MAXLEN, "mux networker");
-	snprintf(bgw.bgw_type, BGW_MAXLEN, "mux networker");
-	bgw.bgw_main_arg = Int32GetDatum(0);
-	bgw.bgw_notify_pid = MyProcPid;
-
-	if (!RegisterDynamicBackgroundWorker(&bgw, &handle))
-	{
-		SpinLockAcquire(&MuxState->networker.mutex);
-		MuxState->networker.phase = MUX_WORKER_DEAD;
-		SpinLockRelease(&MuxState->networker.mutex);
-		ereport(WARNING,
-				(errmsg("connection multiplexer: could not register networker")));
-		return;
-	}
-
-	pfree(handle);
-
-	ereport(DEBUG1,
-			(errmsg("mux: networker registered")));
+	if (fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0)
+		ereport(WARNING, (errmsg("mux: fcntl F_SETFL failed: %m")));
 }
 
 /*
- * mux_wake_networker_if_needed
- *		If any MuxQuerySlot targets a remote server (server_oid != InvalidOid)
- *		and is not yet completed, wake the networker so it processes the slot.
- *		Called on every iteration of the multiplexer main loop.
+ * mux_init_listen_socket
+ *		Create a TCP listening socket on 0.0.0.0:mux_tcp_port.
+ *		Returns the socket fd on success, PGINVALID_SOCKET on failure.
  */
-static void
-mux_wake_networker_if_needed(void)
+static int
+mux_init_listen_socket(void)
 {
-	bool		has_remote = false;
-	Latch	   *net_latch;
+	int			sock;
+	int			on = 1;
+	struct sockaddr_in addr;
+
+	sock = socket(AF_INET, SOCK_STREAM, 0);
+	if (sock < 0)
+	{
+		ereport(WARNING, (errmsg("mux: could not create listen socket: %m")));
+		return PGINVALID_SOCKET;
+	}
+
+	if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0)
+		ereport(WARNING, (errmsg("mux: setsockopt SO_REUSEADDR failed: %m")));
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = htonl(INADDR_ANY);
+	addr.sin_port = htons((uint16) mux_tcp_port);
+
+	if (bind(sock, (struct sockaddr *) &addr, sizeof(addr)) < 0)
+	{
+		ereport(WARNING, (errmsg("mux: could not bind listen socket on port %d: %m",
+								 mux_tcp_port)));
+		close(sock);
+		return PGINVALID_SOCKET;
+	}
+
+	if (listen(sock, 8) < 0)
+	{
+		ereport(WARNING, (errmsg("mux: listen() failed: %m")));
+		close(sock);
+		return PGINVALID_SOCKET;
+	}
+
+	mux_set_nonblocking(sock);
+
+	ereport(LOG, (errmsg("mux: listening on port %d", mux_tcp_port)));
+	return sock;
+}
+
+/*
+ * mux_accept_peer
+ *		Accept one inbound peer connection and store it in inbound_socks[].
+ *		Returns the new fd, or PGINVALID_SOCKET if nothing to accept.
+ */
+static int
+mux_accept_peer(void)
+{
+	int			fd;
+	struct sockaddr_in peer_addr;
+	socklen_t	peer_len = sizeof(peer_addr);
+
+	if (n_inbound >= MUX_MAX_INBOUND_PEERS)
+	{
+		ereport(WARNING, (errmsg("mux: too many inbound peers, ignoring accept")));
+		return PGINVALID_SOCKET;
+	}
+
+	fd = accept(listen_sock, (struct sockaddr *) &peer_addr, &peer_len);
+	if (fd < 0)
+	{
+		if (errno != EAGAIN && errno != EWOULDBLOCK)
+			ereport(WARNING, (errmsg("mux: accept() failed: %m")));
+		return PGINVALID_SOCKET;
+	}
+
+	mux_set_nonblocking(fd);
+	inbound_socks[n_inbound] = fd;
+	n_inbound++;
+
+	ereport(DEBUG1, (errmsg("mux: accepted peer connection from %s",
+							inet_ntoa(peer_addr.sin_addr))));
+	return fd;
+}
+
+/*
+ * mux_connect_to_peer
+ *		Lazily connect to the peer multiplexer for remote_conns[rc_idx].
+ *		Returns the socket fd on success, PGINVALID_SOCKET on failure.
+ *		Stores the fd in outbound_socks[rc_idx].
+ */
+static int
+mux_connect_to_peer(int rc_idx)
+{
+	MuxRemoteConn *rc = &MuxState->remote_conns[rc_idx];
+	char		host[MUX_PEER_HOST_MAXLEN];
+	struct addrinfo hints;
+	struct addrinfo *res,
+			   *rp;
+	char		portstr[16];
+	int			sock = PGINVALID_SOCKET;
+	int			ret;
+
+	/* Already connected */
+	if (outbound_socks[rc_idx] != PGINVALID_SOCKET)
+		return outbound_socks[rc_idx];
+
+	SpinLockAcquire(&rc->mutex);
+	strlcpy(host, rc->peer_host, sizeof(host));
+	SpinLockRelease(&rc->mutex);
+
+	if (host[0] == '\0')
+		strlcpy(host, MUX_DEFAULT_PEER_HOST, sizeof(host));
+
+	snprintf(portstr, sizeof(portstr), "%d", mux_tcp_port);
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+
+	ret = getaddrinfo(host, portstr, &hints, &res);
+	if (ret != 0)
+	{
+		ereport(WARNING, (errmsg("mux: getaddrinfo(%s): %s", host,
+								 gai_strerror(ret))));
+		return PGINVALID_SOCKET;
+	}
+
+	for (rp = res; rp != NULL; rp = rp->ai_next)
+	{
+		sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+		if (sock < 0)
+			continue;
+
+		if (connect(sock, rp->ai_addr, rp->ai_addrlen) == 0)
+			break;				/* connected */
+
+		close(sock);
+		sock = PGINVALID_SOCKET;
+	}
+	freeaddrinfo(res);
+
+	if (sock == PGINVALID_SOCKET)
+	{
+		ereport(WARNING, (errmsg("mux: could not connect to peer %s:%d: %m",
+								 host, mux_tcp_port)));
+		return PGINVALID_SOCKET;
+	}
+
+	mux_set_nonblocking(sock);
+	outbound_socks[rc_idx] = sock;
+
+	ereport(DEBUG1, (errmsg("mux: connected to peer %s:%d (rc_idx=%d)",
+							host, mux_tcp_port, rc_idx)));
+	return sock;
+}
+
+/*
+ * mux_send_all
+ *		Send exactly 'len' bytes to 'sock'.  Retries on EAGAIN.
+ *		Returns true on success, false on error.
+ */
+static bool
+mux_send_all(int sock, const void *buf, size_t len)
+{
+	const char *p = (const char *) buf;
+	size_t		remaining = len;
+
+	while (remaining > 0)
+	{
+		ssize_t		sent;
+		fd_set		wfds;
+		struct timeval tv;
+
+		sent = send(sock, p, remaining, 0);
+		if (sent > 0)
+		{
+			p += sent;
+			remaining -= sent;
+			continue;
+		}
+		if (sent == 0)
+			return false;		/* connection closed */
+
+		if (errno != EAGAIN && errno != EWOULDBLOCK)
+		{
+			ereport(WARNING, (errmsg("mux: send() failed: %m")));
+			return false;
+		}
+
+		/* Wait briefly for socket to become writable */
+		FD_ZERO(&wfds);
+		FD_SET(sock, &wfds);
+		tv.tv_sec = 1;
+		tv.tv_usec = 0;
+		if (select(sock + 1, NULL, &wfds, NULL, &tv) <= 0)
+			return false;
+	}
+	return true;
+}
+
+/*
+ * mux_recv_available
+ *		Non-blocking receive: try to read exactly 'len' bytes from 'sock'.
+ *		Sets *got to the number of bytes actually read.
+ *		Returns true if all 'len' bytes were read (or if len == 0),
+ *		false if the socket would block (partial or zero read) or on error.
+ */
+static bool
+mux_recv_available(int sock, void *buf, size_t len, size_t *got)
+{
+	char	   *p = (char *) buf;
+	size_t		remaining = len;
+
+	*got = 0;
+	while (remaining > 0)
+	{
+		ssize_t		n = recv(sock, p, remaining, 0);
+
+		if (n > 0)
+		{
+			p += n;
+			remaining -= n;
+			*got += n;
+			continue;
+		}
+		if (n == 0)
+			return false;		/* connection closed */
+
+		if (errno == EAGAIN || errno == EWOULDBLOCK)
+			return false;		/* would block */
+
+		ereport(WARNING, (errmsg("mux: recv() failed: %m")));
+		return false;
+	}
+	return true;
+}
+
+/*
+ * mux_find_remote_conn_idx
+ *		Find the MuxRemoteConn slot index for the given server_oid.
+ *		Returns -1 if not found.
+ */
+static int
+mux_find_remote_conn_idx(Oid server_oid)
+{
+	for (int i = 0; i < MUX_MAX_REMOTE_CONNS; i++)
+	{
+		MuxRemoteConn *rc = &MuxState->remote_conns[i];
+
+		if (rc->phase != MUX_CONN_UNUSED && rc->server_oid == server_oid)
+			return i;
+	}
+	return -1;
+}
+
+/*
+ * mux_dispatch_remote_slots
+ *		Scan MuxQuerySlot[] for pending remote queries and send each one to
+ *		the appropriate peer multiplexer via TCP.
+ *		Returns true if any slot was dispatched.
+ */
+static bool
+mux_dispatch_remote_slots(void)
+{
+	bool		any = false;
 
 	for (int q = 0; q < MUX_MAX_QUERY_SLOTS; q++)
 	{
 		MuxQuerySlot *qs = &MuxState->query_slots[q];
+		int			rc_idx;
+		int			sock;
+		MuxNetMsgHeader nethdr;
+		size_t		sql_len;
 
 		SpinLockAcquire(&qs->mutex);
-		if (qs->in_use && !qs->completed && qs->server_oid != InvalidOid)
-			has_remote = true;
+		if (!qs->in_use || qs->completed || qs->server_oid == InvalidOid)
+		{
+			SpinLockRelease(&qs->mutex);
+			continue;
+		}
 		SpinLockRelease(&qs->mutex);
 
-		if (has_remote)
-			break;
+		/* Find the remote conn slot for this server */
+		rc_idx = mux_find_remote_conn_idx(qs->server_oid);
+		if (rc_idx < 0)
+		{
+			/* No remote conn registered yet – skip for now */
+			continue;
+		}
+
+		sock = mux_connect_to_peer(rc_idx);
+		if (sock == PGINVALID_SOCKET)
+			continue;
+
+		sql_len = strlen(qs->sql) + 1;	/* include NUL terminator */
+
+		nethdr.magic = MUXNET_MAGIC;
+		nethdr.msg_type = MUXNET_MSG_QUERY;
+		nethdr.slot_id = (uint32) q;
+		nethdr.server_oid = (uint32) qs->server_oid;
+		nethdr.payload_len = (uint32) sql_len;
+		nethdr.is_error = 0;
+
+		if (!mux_send_all(sock, &nethdr, sizeof(nethdr)) ||
+			!mux_send_all(sock, qs->sql, sql_len))
+		{
+			ereport(WARNING, (errmsg("mux: failed to send query to peer (rc_idx=%d)",
+									 rc_idx)));
+			close(sock);
+			outbound_socks[rc_idx] = PGINVALID_SOCKET;
+			continue;
+		}
+
+		/*
+		 * Mark slot as "dispatched" by setting server_oid to InvalidOid
+		 * so we do not re-send it on the next loop iteration.
+		 * The slot stays in_use=true until the result arrives.
+		 */
+		SpinLockAcquire(&qs->mutex);
+		qs->server_oid = InvalidOid;	/* prevents re-dispatch */
+		SpinLockRelease(&qs->mutex);
+
+		any = true;
 	}
+	return any;
+}
 
-	if (!has_remote)
-		return;
-
-	/* Ensure networker is running */
-	SpinLockAcquire(&MuxState->networker.mutex);
-	if (MuxState->networker.phase == MUX_WORKER_DEAD)
+/*
+ * mux_find_inbound_req_slot
+ *		Find a free slot in inbound_reqs[].  Returns index or -1 if full.
+ */
+static int
+mux_find_inbound_req_slot(void)
+{
+	for (int i = 0; i < MUX_MAX_QUERY_SLOTS; i++)
 	{
-		SpinLockRelease(&MuxState->networker.mutex);
-		mux_spawn_networker();
+		if (!inbound_reqs[i].in_use)
+			return i;
+	}
+	return -1;
+}
+
+/*
+ * mux_process_inbound_message
+ *		Read and process one message from inbound_socks[peer_idx].
+ *		For MUXNET_MSG_QUERY: allocate an inbound_req slot, find an idle
+ *		local worker, and dispatch the query to it.
+ */
+static void
+mux_process_inbound_message(int peer_idx)
+{
+	MuxNetMsgHeader nethdr;
+	size_t		got;
+	char		sql_buf[MUX_SQL_MAXLEN];
+	int			req_idx;
+	int			worker_id;
+
+	if (!mux_recv_available(inbound_socks[peer_idx], &nethdr, sizeof(nethdr), &got))
+		return;					/* nothing available or error */
+
+	if (nethdr.magic != MUXNET_MAGIC)
+	{
+		ereport(WARNING, (errmsg("mux: bad magic from peer %d", peer_idx)));
 		return;
 	}
-	net_latch = MuxState->networker.latch;
-	SpinLockRelease(&MuxState->networker.mutex);
 
-	if (net_latch)
-		SetLatch(net_latch);
+	if (nethdr.msg_type != MUXNET_MSG_QUERY)
+	{
+		ereport(WARNING, (errmsg("mux: unexpected msg_type %u from peer %d",
+								 nethdr.msg_type, peer_idx)));
+		return;
+	}
+
+	if (nethdr.payload_len == 0 || nethdr.payload_len > MUX_SQL_MAXLEN)
+	{
+		ereport(WARNING, (errmsg("mux: bad payload_len %u from peer %d",
+								 nethdr.payload_len, peer_idx)));
+		return;
+	}
+
+	/* Read the SQL payload (blocking loop since we got the header) */
+	{
+		char	   *p = sql_buf;
+		size_t		remaining = nethdr.payload_len;
+
+		while (remaining > 0)
+		{
+			ssize_t		n = recv(inbound_socks[peer_idx], p, remaining, 0);
+
+			if (n <= 0)
+			{
+				if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+				{
+					ereport(WARNING, (errmsg("mux: short read of payload from peer %d", peer_idx)));
+					return;
+				}
+				pg_usleep(1000);	/* brief wait */
+				continue;
+			}
+			p += n;
+			remaining -= n;
+		}
+	}
+	sql_buf[nethdr.payload_len - 1] = '\0';		/* ensure NUL-terminated */
+
+	/* Allocate an inbound request slot */
+	req_idx = mux_find_inbound_req_slot();
+	if (req_idx < 0)
+	{
+		ereport(WARNING, (errmsg("mux: no free inbound request slots")));
+		return;
+	}
+
+	/* Find an idle local worker */
+	worker_id = mux_find_idle_worker();
+	if (worker_id < 0)
+	{
+		ereport(WARNING, (errmsg("mux: no idle worker for inbound query from peer %d", peer_idx)));
+		return;
+	}
+
+	/* Set up the inbound request tracking */
+	inbound_reqs[req_idx].in_use = true;
+	inbound_reqs[req_idx].peer_idx = peer_idx;
+	inbound_reqs[req_idx].remote_slot_id = nethdr.slot_id;
+
+	/* Build a MuxMsgHeader + SQL payload and dispatch to the worker */
+	{
+		char		dispatch_buf[sizeof(MuxMsgHeader) + MUX_SQL_MAXLEN];
+		MuxMsgHeader *hdr = (MuxMsgHeader *) dispatch_buf;
+		char	   *payload = dispatch_buf + sizeof(MuxMsgHeader);
+		Size		total_len;
+
+		hdr->msg_type = MUX_MSG_QUERY;
+		hdr->conn_id = (uint32)(MUX_INBOUND_CONN_BASE + req_idx);
+		hdr->payload_len = nethdr.payload_len;
+		hdr->requester_pid = 0;	/* no local backend pid for remote requests */
+
+		memcpy(payload, sql_buf, nethdr.payload_len);
+		total_len = sizeof(MuxMsgHeader) + nethdr.payload_len;
+
+		if (!mux_dispatch_to_worker(worker_id, dispatch_buf, total_len))
+		{
+			ereport(WARNING, (errmsg("mux: dispatch to worker %d failed", worker_id)));
+			inbound_reqs[req_idx].in_use = false;
+		}
+	}
+}
+
+/*
+ * mux_process_outbound_result
+ *		Read and process one result message from outbound_socks[rc_idx].
+ *		Look up the query slot, fill the result, and signal the requester.
+ */
+static void
+mux_process_outbound_result(int rc_idx)
+{
+	MuxNetMsgHeader nethdr;
+	size_t		got;
+	int			slot_id;
+	MuxQuerySlot *qs;
+
+	if (!mux_recv_available(outbound_socks[rc_idx], &nethdr, sizeof(nethdr), &got))
+		return;
+
+	if (nethdr.magic != MUXNET_MAGIC)
+	{
+		ereport(WARNING, (errmsg("mux: bad magic from outbound peer rc_idx=%d", rc_idx)));
+		return;
+	}
+
+	if (nethdr.msg_type != MUXNET_MSG_RESULT && nethdr.msg_type != MUXNET_MSG_ERROR)
+	{
+		ereport(WARNING, (errmsg("mux: unexpected result msg_type %u from rc_idx=%d",
+								 nethdr.msg_type, rc_idx)));
+		return;
+	}
+
+	slot_id = (int) nethdr.slot_id;
+	if (slot_id < 0 || slot_id >= MUX_MAX_QUERY_SLOTS)
+	{
+		ereport(WARNING, (errmsg("mux: invalid slot_id %u in result", nethdr.slot_id)));
+		return;
+	}
+
+	qs = &MuxState->query_slots[slot_id];
+
+	if (nethdr.is_error || nethdr.msg_type == MUXNET_MSG_ERROR)
+	{
+		qs->is_error = true;
+		if (nethdr.payload_len > 0 && nethdr.payload_len < sizeof(qs->error_msg))
+		{
+			char	   *p = qs->error_msg;
+			size_t		remaining = nethdr.payload_len;
+
+			while (remaining > 0)
+			{
+				ssize_t		n = recv(outbound_socks[rc_idx], p, remaining, 0);
+
+				if (n <= 0)
+					break;
+				p += n;
+				remaining -= n;
+			}
+			/* NUL-terminate at the actual bytes received, not payload_len */
+			*p = '\0';
+		}
+		else
+		{
+			strlcpy(qs->error_msg, "remote query failed", sizeof(qs->error_msg));
+		}
+	}
+	else
+	{
+		/* Read result payload into result_data */
+		uint32		plen = nethdr.payload_len;
+
+		qs->is_error = false;
+		if (plen > 0 && plen <= MUX_RESULT_MAXLEN)
+		{
+			char	   *p = qs->result_data;
+			size_t		remaining = plen;
+
+			while (remaining > 0)
+			{
+				ssize_t		n = recv(outbound_socks[rc_idx], p, remaining, 0);
+
+				if (n <= 0)
+					break;
+				p += n;
+				remaining -= n;
+			}
+			qs->result_len = (int) plen;
+		}
+	}
+
+	SpinLockAcquire(&qs->mutex);
+	qs->completed = true;
+	SpinLockRelease(&qs->mutex);
+
+	if (qs->requester_latch)
+		SetLatch(qs->requester_latch);
 }
 
 
@@ -548,13 +1054,88 @@ mux_drain_worker_queues(void)
 				MuxState->total_requests++;
 				SpinLockRelease(&MuxState->mutex);
 
-				/*
-				 * In a full implementation we would now look up the requesting
-				 * backend (by hdr->requester_pid / hdr->conn_id) and forward
-				 * the payload either into its response queue or onto the
-				 * appropriate remote TCP socket.  For the current scope of
-				 * this implementation we log and continue.
-				 */
+				if (hdr->conn_id >= MUX_INBOUND_CONN_BASE)
+				{
+					/* This result is for a remote-originated (inbound) request */
+					int			req_idx = (int)(hdr->conn_id - MUX_INBOUND_CONN_BASE);
+
+					if (req_idx >= 0 && req_idx < MUX_MAX_QUERY_SLOTS &&
+						inbound_reqs[req_idx].in_use)
+					{
+						int			peer_idx = inbound_reqs[req_idx].peer_idx;
+						int			peer_sock;
+						MuxNetMsgHeader nethdr;
+						const char *payload = (const char *) data + sizeof(MuxMsgHeader);
+						uint32		payload_len = (nbytes > sizeof(MuxMsgHeader)) ?
+							(uint32)(nbytes - sizeof(MuxMsgHeader)) : 0;
+
+						nethdr.magic = MUXNET_MAGIC;
+						nethdr.msg_type = (hdr->msg_type == MUX_MSG_ERROR) ?
+							MUXNET_MSG_ERROR : MUXNET_MSG_RESULT;
+						nethdr.slot_id = inbound_reqs[req_idx].remote_slot_id;
+						nethdr.server_oid = 0;
+						nethdr.payload_len = payload_len;
+						nethdr.is_error = (hdr->msg_type == MUX_MSG_ERROR) ? 1 : 0;
+
+						if (peer_idx >= 0 && peer_idx < n_inbound)
+						{
+							peer_sock = inbound_socks[peer_idx];
+							if (peer_sock != PGINVALID_SOCKET)
+							{
+								if (!mux_send_all(peer_sock, &nethdr, sizeof(nethdr)) ||
+									(payload_len > 0 &&
+									 !mux_send_all(peer_sock, payload, payload_len)))
+								{
+									ereport(WARNING, (errmsg("mux: failed to send result to peer %d", peer_idx)));
+									close(peer_sock);
+									inbound_socks[peer_idx] = PGINVALID_SOCKET;
+								}
+							}
+						}
+
+						inbound_reqs[req_idx].in_use = false;
+					}
+				}
+				else
+				{
+					/* Local backend request: fill the query slot and signal */
+					uint32		conn_id = hdr->conn_id;
+
+					if (conn_id < MUX_MAX_QUERY_SLOTS)
+					{
+						MuxQuerySlot *qs = &MuxState->query_slots[conn_id];
+
+						qs->is_error = (hdr->msg_type == MUX_MSG_ERROR);
+						if (nbytes > sizeof(MuxMsgHeader))
+						{
+							uint32		plen = (uint32)(nbytes - sizeof(MuxMsgHeader));
+							const char *payload = (const char *) data + sizeof(MuxMsgHeader);
+
+							if (qs->is_error)
+							{
+								Size		copy_len = Min(plen, sizeof(qs->error_msg) - 1);
+
+								memcpy(qs->error_msg, payload, copy_len);
+								qs->error_msg[copy_len] = '\0';
+							}
+							else
+							{
+								Size		copy_len = Min(plen, MUX_RESULT_MAXLEN);
+
+								memcpy(qs->result_data, payload, copy_len);
+								qs->result_len = (int) copy_len;
+							}
+						}
+
+						SpinLockAcquire(&qs->mutex);
+						qs->completed = true;
+						SpinLockRelease(&qs->mutex);
+
+						if (qs->requester_latch)
+							SetLatch(qs->requester_latch);
+					}
+				}
+
 				ereport(DEBUG2,
 						(errmsg("mux: result from worker %d conn_id=%u type=%d",
 								i, hdr->conn_id, (int) hdr->msg_type)));
@@ -658,15 +1239,17 @@ mux_pending_dequeue(char *buf, Size bufsz, Size *lenp)
  * This function:
  *   1. Initialises shared memory state.
  *   2. Spawns the worker pool.
- *   3. Runs the event loop.
+ *   3. Opens the TCP listening socket.
+ *   4. Runs the event loop.
  */
 void
 ConnMuxMain(Datum main_arg)
 {
 	MemoryContext mux_context;
 	WaitEventSet *wes;
-	int			rc;
+	int			n_events;
 	sigjmp_buf	local_sigjmp_buf;
+	int			i;
 
 	/* Basic process setup */
 	mux_setup_signals();
@@ -708,18 +1291,38 @@ ConnMuxMain(Datum main_arg)
 	}
 	PG_exception_stack = &local_sigjmp_buf;
 
+	/* Initialise private TCP socket arrays */
+	for (i = 0; i < MUX_MAX_REMOTE_CONNS; i++)
+		outbound_socks[i] = PGINVALID_SOCKET;
+	for (i = 0; i < MUX_MAX_INBOUND_PEERS; i++)
+		inbound_socks[i] = PGINVALID_SOCKET;
+	n_inbound = 0;
+	memset(inbound_reqs, 0, sizeof(inbound_reqs));
+
 	/* Spawn the initial local worker pool */
 	mux_spawn_workers(mux_worker_count);
 
-	/* Spawn the single networker for all inter-node TCP connections */
-	mux_spawn_networker();
+	/* Open the TCP listening socket */
+	listen_sock = mux_init_listen_socket();
 
-	/* Build the WaitEventSet: latch + timeout */
-	wes = CreateWaitEventSet(CurrentResourceOwner, 2);
+	/*
+	 * Build the WaitEventSet large enough for:
+	 *   2 fixed slots (latch + PM death)
+	 *   1 listen socket
+	 *   MUX_MAX_REMOTE_CONNS outbound sockets
+	 *   MUX_MAX_INBOUND_PEERS inbound sockets
+	 */
+	wes = CreateWaitEventSet(CurrentResourceOwner,
+							 2 + 1 + MUX_MAX_REMOTE_CONNS + MUX_MAX_INBOUND_PEERS);
 	AddWaitEventToSet(wes, WL_LATCH_SET, PGINVALID_SOCKET,
 					  MyLatch, NULL);
 	AddWaitEventToSet(wes, WL_EXIT_ON_PM_DEATH, PGINVALID_SOCKET,
 					  NULL, NULL);
+
+	/* Add the listen socket (user_data = NULL means "listen socket") */
+	if (listen_sock != PGINVALID_SOCKET)
+		AddWaitEventToSet(wes, WL_SOCKET_READABLE, listen_sock,
+						  NULL, NULL);
 
 	set_ps_display("main loop");
 
@@ -728,7 +1331,8 @@ ConnMuxMain(Datum main_arg)
 	 * ---------------------------------------------------------------- */
 	for (;;)
 	{
-		WaitEvent	events[8];
+		WaitEvent	events[32];
+		int			j;
 
 		if (mux_got_sigterm)
 			break;
@@ -742,81 +1346,116 @@ ConnMuxMain(Datum main_arg)
 		/* Dispatch any pending backend requests to idle local workers */
 		mux_drain_backend_requests();
 
-		/*
-		 * If any remote MuxQuerySlots are pending, wake the networker so
-		 * it can execute them on the appropriate TCP connection.
-		 * (Re-spawn the networker if it is dead.)
-		 */
-		mux_wake_networker_if_needed();
+		/* Send pending remote query slots to peer multiplexers via TCP */
+		mux_dispatch_remote_slots();
 
-		/*
-		 * Re-spawn any dead local workers.  The networker is re-spawned
-		 * by mux_wake_networker_if_needed() when there is pending work,
-		 * and also explicitly here to keep it running.
-		 */
+		/* Re-spawn any dead local workers */
+		for (i = 0; i < MuxState->num_workers && i < MUX_MAX_WORKERS; i++)
 		{
-			int			i;
+			MuxWorkerSlot *slot = &MuxState->workers[i];
 
-			for (i = 0; i < MuxState->num_workers && i < MUX_MAX_WORKERS; i++)
+			if (slot->phase == MUX_WORKER_DEAD)
 			{
-				MuxWorkerSlot *slot = &MuxState->workers[i];
-
-				if (slot->phase == MUX_WORKER_DEAD)
-				{
-					ereport(DEBUG1,
-							(errmsg("mux: re-spawning worker %d", i)));
-					mux_spawn_workers(1);
-				}
-			}
-
-			/* Re-spawn networker if it has died */
-			SpinLockAcquire(&MuxState->networker.mutex);
-			if (MuxState->networker.phase == MUX_WORKER_DEAD)
-			{
-				SpinLockRelease(&MuxState->networker.mutex);
 				ereport(DEBUG1,
-						(errmsg("mux: re-spawning networker")));
-				mux_spawn_networker();
+						(errmsg("mux: re-spawning worker %d", i)));
+				mux_spawn_workers(1);
 			}
-			else
-				SpinLockRelease(&MuxState->networker.mutex);
 		}
 
-		/*
-		 * Sleep until our latch is set or 100 ms elapses so we do not busy-
-		 * spin.  In a full implementation we would also add socket file
-		 * descriptors for remote-node connections.
-		 */
-		rc = WaitEventSetWait(wes, 100 /* ms */, events,
-							  lengthof(events),
-							  WAIT_EVENT_CONN_MUX_MAIN);
-		(void) rc;				/* silence "unused variable" warning */
+		/* Sleep until our latch is set, a socket is readable, or 100 ms elapses */
+		n_events = WaitEventSetWait(wes, 100 /* ms */, events,
+									lengthof(events),
+									WAIT_EVENT_CONN_MUX_MAIN);
+
+		for (j = 0; j < n_events; j++)
+		{
+			WaitEvent  *ev = &events[j];
+
+			if (ev->events & WL_LATCH_SET)
+				continue;		/* handled by ResetLatch above */
+
+			if (!(ev->events & WL_SOCKET_READABLE))
+				continue;
+
+			if (ev->fd == listen_sock)
+			{
+				/* New inbound peer connection */
+				int			new_fd = mux_accept_peer();
+
+				if (new_fd != PGINVALID_SOCKET)
+				{
+					/* Add the new inbound socket to the WES */
+					AddWaitEventToSet(wes, WL_SOCKET_READABLE, new_fd,
+									  NULL, NULL);
+				}
+			}
+			else
+			{
+				/* Check if it's an inbound peer socket */
+				bool		handled = false;
+
+				for (i = 0; i < n_inbound; i++)
+				{
+					if (inbound_socks[i] == ev->fd)
+					{
+						mux_process_inbound_message(i);
+						handled = true;
+						break;
+					}
+				}
+
+				if (!handled)
+				{
+					/* Check if it's an outbound peer socket */
+					for (i = 0; i < MUX_MAX_REMOTE_CONNS; i++)
+					{
+						if (outbound_socks[i] == ev->fd)
+						{
+							mux_process_outbound_result(i);
+							break;
+						}
+					}
+				}
+			}
+		}
 	}
 
 	FreeWaitEventSet(wes);
 
-	/* Shutdown: mark all workers as needing to stop */
+	/* Shutdown: close all TCP sockets and signal workers */
+	if (listen_sock != PGINVALID_SOCKET)
 	{
-		int			i;
-
-		SpinLockAcquire(&MuxState->mutex);
-		for (i = 0; i < MUX_MAX_WORKERS; i++)
-		{
-			MuxWorkerSlot *slot = &MuxState->workers[i];
-
-			if (slot->worker_latch)
-				SetLatch(slot->worker_latch);
-		}
-		MuxState->mux_pid = 0;
-		MuxState->mux_latch = NULL;
-		SpinLockRelease(&MuxState->mutex);
-
-		/* Signal the networker to exit as well */
-		SpinLockAcquire(&MuxState->networker.mutex);
-		if (MuxState->networker.latch)
-			SetLatch(MuxState->networker.latch);
-		SpinLockRelease(&MuxState->networker.mutex);
+		close(listen_sock);
+		listen_sock = PGINVALID_SOCKET;
 	}
+	for (i = 0; i < MUX_MAX_REMOTE_CONNS; i++)
+	{
+		if (outbound_socks[i] != PGINVALID_SOCKET)
+		{
+			close(outbound_socks[i]);
+			outbound_socks[i] = PGINVALID_SOCKET;
+		}
+	}
+	for (i = 0; i < n_inbound; i++)
+	{
+		if (inbound_socks[i] != PGINVALID_SOCKET)
+		{
+			close(inbound_socks[i]);
+			inbound_socks[i] = PGINVALID_SOCKET;
+		}
+	}
+
+	SpinLockAcquire(&MuxState->mutex);
+	for (i = 0; i < MUX_MAX_WORKERS; i++)
+	{
+		MuxWorkerSlot *slot = &MuxState->workers[i];
+
+		if (slot->worker_latch)
+			SetLatch(slot->worker_latch);
+	}
+	MuxState->mux_pid = 0;
+	MuxState->mux_latch = NULL;
+	SpinLockRelease(&MuxState->mutex);
 
 	ereport(LOG,
 			(errmsg("connection multiplexer shutting down")));
@@ -1192,21 +1831,9 @@ ConnMuxIsAvailable(Oid serverOid)
 }
 
 /*
- * ConnMuxGetSharedState
- *		Return a pointer to the MuxSharedState segment.  Intended for use
- *		by the networker (ConnMuxNetworkerMain) running inside the
- *		postgres_fdw extension, after calling ConnMuxShmemInit().
- */
-MuxSharedState *
-ConnMuxGetSharedState(void)
-{
-	return MuxState;
-}
-
-/*
  * ConnMuxRegisterServer
  *		Register a foreign server with the multiplexer.  Records the server
- *		metadata in MuxState->remote_conns so the networker can find it
+ *		metadata in MuxState->remote_conns so the multiplexer can find it
  *		when the first query arrives.
  *
  *		Returns the conn_id (remote-conn slot index) on success, or
@@ -1214,7 +1841,7 @@ ConnMuxGetSharedState(void)
  */
 uint32
 ConnMuxRegisterServer(Oid serverOid, const char *serverName,
-					  const char *connstr)
+					  const char *connstr, const char *peer_host)
 {
 	int			slot_idx;
 
@@ -1234,8 +1861,16 @@ ConnMuxRegisterServer(Oid serverOid, const char *serverName,
 			rc->server_oid = serverOid;
 			strlcpy(rc->server_name, serverName, NAMEDATALEN);
 			strlcpy(rc->connstr, connstr, MUX_CONNSTR_MAXLEN);
+			strlcpy(rc->peer_host,
+					(peer_host && peer_host[0]) ? peer_host : MUX_DEFAULT_PEER_HOST,
+					sizeof(rc->peer_host));
 			rc->phase = MUX_CONN_CONNECTING;
 			rc->use_count = MUX_USE_COUNT_MAX;
+		}
+		else if (peer_host && peer_host[0])
+		{
+			/* Update peer_host even if already registered */
+			strlcpy(rc->peer_host, peer_host, sizeof(rc->peer_host));
 		}
 	}
 	SpinLockRelease(&MuxState->mutex);
@@ -1349,13 +1984,10 @@ ConnMuxSubmitQuery(Oid serverOid, const char *sql,
 	slot->requester_pid = MyProcPid;
 	slot->requester_latch = MyLatch;
 
-	/*
-	 * Wake the multiplexer so it calls mux_wake_networker_if_needed() and
-	 * signals the networker to dispatch the slot.
-	 */
+	/* Wake the multiplexer so it dispatches the remote query via TCP */
 	ConnMuxWakeup();
 
-	/* Wait for the networker to complete the request */
+	/* Wait for the result to arrive */
 	mux_wait_for_slot(slot_idx);
 
 	/* Copy result out */

@@ -195,9 +195,6 @@ static void pgfdw_security_check(const char **keywords, const char **values,
 static bool UserMappingPasswordRequired(UserMapping *user);
 static bool disconnect_cached_connections(Oid serverid);
 
-/* Networker entry point -- registered via bgw_function_name in RegisterDynamicBackgroundWorker */
-PGDLLEXPORT void ConnMuxNetworkerMain(Datum main_arg);
-
 /*
  * Get a PGconn which can be used to execute queries on the remote PostgreSQL
  * server with the user's authorization.  A new connection is established
@@ -445,9 +442,9 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 	 * If the connection multiplexer is running, route this foreign-server
 	 * connection through it.  We store a lightweight MuxConnSentinel cast to
 	 * PGconn* in entry->conn so that all subsequent callers can detect the mux
-	 * path via IS_MUX_CONN().  The networker (ConnMuxNetworkerMain) manages
-	 * the actual persistent TCP connection to the remote server.  Individual
-	 * backends never hold direct TCP connections to remote servers.
+	 * path via IS_MUX_CONN().  The multiplexer manages
+	 * the actual persistent TCP connection to the peer multiplexer.
+	 * Individual backends never hold direct TCP connections to remote servers.
 	 */
 	if (ConnMuxIsAvailable(server->serverid))
 	{
@@ -455,13 +452,19 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 		ListCell   *lc2;
 		uint32		conn_id;
 
-		/* Build a libpq-compatible connstr from the server's srvoptions */
+		/* Build a libpq-compatible connstr from the server's srvoptions and extract peer_host */
+		const char *peer_host = "127.0.0.1";
+
 		initStringInfo(&sb);
 		foreach(lc2, server->options)
 		{
 			DefElem    *def = (DefElem *) lfirst(lc2);
 			const char *p;
 			char	   *val;
+
+			/* Extract host for peer multiplexer connection */
+			if (strcmp(def->defname, "host") == 0)
+				peer_host = defGetString(def);
 
 			/* Skip FDW meta-options that aren't libpq options */
 			if (strcmp(def->defname, "keep_connections") == 0 ||
@@ -491,12 +494,13 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 
 		/*
 		 * Register the server in the multiplexer's remote_conns table.
-		 * The networker will connect lazily when the first query arrives
-		 * via ConnMuxSubmitQuery.
+		 * The multiplexer will connect lazily via TCP when the first query
+		 * arrives via ConnMuxSubmitQuery.
 		 */
 		conn_id = ConnMuxRegisterServer(server->serverid,
 										server->servername,
-										sb.data);
+										sb.data,
+										peer_host);
 		pfree(sb.data);
 
 		if (conn_id != (uint32) -1)
@@ -728,9 +732,8 @@ disconnect_pg_server(ConnCacheEntry *entry)
 		{
 			/*
 			 * This is a multiplexer-routed connection.  The actual TCP
-			 * connection is held by the networker (ConnMuxNetworkerMain) and
-			 * persists for reuse by other backends — we just free the
-			 * sentinel and return without disturbing the networker.
+			 * connection is held by the multiplexer process and persists for
+			 * reuse — we just free the sentinel and return.
 			 */
 			pfree(entry->conn);
 			entry->conn = NULL;
@@ -2914,427 +2917,4 @@ GetConnCacheEntryInfo(void *entry_ptr, Oid *serverid, int *remote_backend_pid)
 	*serverid = entry->serverid;
 	*remote_backend_pid = PQbackendPID(entry->conn);
 	return true;
-}
-/* ----------------------------------------------------------------
- * Connection multiplexer -- networker
- *
- * ConnMuxNetworkerMain is the SINGLE extension background worker per node
- * that manages ALL persistent TCP connections to remote servers.  It is
- * spawned by the multiplexer process (ConnMuxMain) at startup.
- *
- * There is exactly ONE networker per node — not one per remote server.
- * The actual per-server PGconn* pool is stored in this process private
- * (non-shared) memory.  The MuxRemoteConn[] array in shared memory holds
- * only metadata (server OID, name, connstr) and per-connection use_count
- * for the clock-sweep eviction algorithm.
- *
- * Architecture:
- *   1. Multiplexer receives a remote query in a MuxQuerySlot (server_oid != 0).
- *   2. Multiplexer calls mux_wake_networker_if_needed(), which sets the
- *      networker's latch.
- *   3. Networker wakes, scans MuxQuerySlot[] for pending remote requests,
- *      executes them on the appropriate PGconn*, serialises the result into
- *      the slot, and signals the waiting backend latch.
- * ---------------------------------------------------------------- */
-
-/*
- * mux_serialize_result
- *		Serialise a PGresult into slot->result_data.
- *
- *		Format:  int32 nfields | int32 ntuples
- *		         for each field: NUL-terminated name | int32 type_oid
- *		         for each (tuple, field):
- *		             int32 -1  (NULL)
- *		             OR int32 vlen | char[vlen] value
- */
-static void
-mux_serialize_result(MuxQuerySlot *slot, PGresult *res)
-{
-	int			nf = PQnfields(res);
-	int			nt = PQntuples(res);
-	char	   *buf = slot->result_data;
-	char	   *end = buf + MUX_RESULT_MAXLEN;
-	char	   *p = buf;
-	int32		tmp;
-
-#define WI32(v) do { \
-	if (p + 4 > end) { slot->result_truncated = true; return; } \
-	tmp = (int32)(v); memcpy(p, &tmp, 4); p += 4; } while (0)
-
-#define WBYTES(s, n) do { \
-	if (p + (n) > end) { slot->result_truncated = true; return; } \
-	memcpy(p, (s), (n)); p += (n); } while (0)
-
-	WI32(nf);
-	WI32(nt);
-
-	for (int f = 0; f < nf; f++)
-	{
-		const char *fname = PQfname(res, f);
-		size_t		fnlen = strlen(fname) + 1;
-		Oid			ftype = PQftype(res, f);
-
-		WBYTES(fname, fnlen);
-		WI32((int32) ftype);
-	}
-
-	for (int t = 0; t < nt; t++)
-	{
-		for (int f = 0; f < nf; f++)
-		{
-			if (PQgetisnull(res, t, f))
-			{
-				int32		null_marker = -1;
-
-				WI32(null_marker);
-			}
-			else
-			{
-				int32		vlen = PQgetlength(res, t, f);
-				const char *val = PQgetvalue(res, t, f);
-
-				WI32(vlen);
-				WBYTES(val, vlen);
-			}
-		}
-	}
-
-#undef WI32
-#undef WBYTES
-
-	slot->result_len = (int) (p - buf);
-	slot->result_nfields = nf;
-	slot->result_ntuples = nt;
-}
-
-/*
- * net_find_remote_conn_idx
- *		Find the index in MuxState->remote_conns[] for a given serverOid.
- *		Returns -1 if not found.
- */
-static int
-net_find_remote_conn_idx(MuxSharedState *mux_state, Oid server_oid)
-{
-	for (int i = 0; i < MUX_MAX_REMOTE_CONNS; i++)
-	{
-		if (mux_state->remote_conns[i].server_oid == server_oid &&
-			mux_state->remote_conns[i].phase != MUX_CONN_UNUSED)
-			return i;
-	}
-	return -1;
-}
-
-/*
- * net_get_connection
- *		Return the live PGconn* for remote_conns[rc_idx], establishing it
- *		if necessary.  When the pool is full the clock-sweep algorithm evicts
- *		the least-recently-used idle connection before opening a new one.
- *
- *		Returns the PGconn* on success, NULL on failure (errbuf is filled).
- */
-static PGconn *
-net_get_connection(MuxSharedState *mux_state,
-				   PGconn **peer_conns, int *net_conn_count,
-				   int *clock_hand,
-				   int rc_idx,
-				   char *errbuf, int errbuf_size)
-{
-	MuxRemoteConn *rc = &mux_state->remote_conns[rc_idx];
-	char		connstr[MUX_CONNSTR_MAXLEN];
-
-	/* Fast path: connection already live — reset use_count to max so the
-	 * clock-sweep gives this connection a full second chance before eviction */
-	if (peer_conns[rc_idx] != NULL &&
-		PQstatus(peer_conns[rc_idx]) == CONNECTION_OK)
-	{
-		SpinLockAcquire(&rc->mutex);
-		rc->use_count = MUX_USE_COUNT_MAX;
-		SpinLockRelease(&rc->mutex);
-		return peer_conns[rc_idx];
-	}
-
-	/* Close any dead connection in this slot */
-	if (peer_conns[rc_idx] != NULL)
-	{
-		libpqsrv_disconnect(peer_conns[rc_idx]);
-		peer_conns[rc_idx] = NULL;
-		(*net_conn_count)--;
-	}
-
-	/* Copy connstr under spinlock to avoid partial reads */
-	SpinLockAcquire(&rc->mutex);
-	strlcpy(connstr, rc->connstr, MUX_CONNSTR_MAXLEN);
-	SpinLockRelease(&rc->mutex);
-
-	/* Evict the least-recently-used idle connection when pool is full */
-	if (*net_conn_count >= max_mux_connections)
-	{
-		int			start = *clock_hand;
-		int			victim = -1;
-
-		for (int pass = 0; pass < 2 * MUX_MAX_REMOTE_CONNS; pass++)
-		{
-			int			idx = (start + pass) % MUX_MAX_REMOTE_CONNS;
-
-			if (peer_conns[idx] == NULL)
-				continue;
-
-			SpinLockAcquire(&mux_state->remote_conns[idx].mutex);
-			if (mux_state->remote_conns[idx].use_count > 0)
-			{
-				mux_state->remote_conns[idx].use_count--;
-				SpinLockRelease(&mux_state->remote_conns[idx].mutex);
-				continue;
-			}
-			SpinLockRelease(&mux_state->remote_conns[idx].mutex);
-
-			victim = idx;
-			*clock_hand = (idx + 1) % MUX_MAX_REMOTE_CONNS;
-			break;
-		}
-
-		if (victim >= 0)
-		{
-			libpqsrv_disconnect(peer_conns[victim]);
-			peer_conns[victim] = NULL;
-			(*net_conn_count)--;
-			elog(DEBUG1, "mux networker: evicted connection to \"%s\"",
-				 mux_state->remote_conns[victim].server_name);
-		}
-		else
-		{
-			snprintf(errbuf, errbuf_size,
-					 "mux networker: connection pool full (%d/%d), all connections active",
-					 *net_conn_count, max_mux_connections);
-			return NULL;
-		}
-	}
-
-	/* Establish a new connection */
-	peer_conns[rc_idx] = libpqsrv_connect(connstr, PG_WAIT_CLIENT);
-	if (peer_conns[rc_idx] == NULL ||
-		PQstatus(peer_conns[rc_idx]) != CONNECTION_OK)
-	{
-		snprintf(errbuf, errbuf_size,
-				 "mux networker: could not connect to \"%s\": %s",
-				 rc->server_name,
-				 peer_conns[rc_idx] ? PQerrorMessage(peer_conns[rc_idx]) : "out of memory");
-		if (peer_conns[rc_idx])
-		{
-			libpqsrv_disconnect(peer_conns[rc_idx]);
-			peer_conns[rc_idx] = NULL;
-		}
-		return NULL;
-	}
-
-	(*net_conn_count)++;
-
-	SpinLockAcquire(&rc->mutex);
-	rc->use_count = MUX_USE_COUNT_MAX;
-	rc->phase = MUX_CONN_ACTIVE;
-	SpinLockRelease(&rc->mutex);
-
-	elog(DEBUG1, "mux networker: connected to server \"%s\"", rc->server_name);
-
-	return peer_conns[rc_idx];
-}
-
-/*
- * ConnMuxNetworkerMain
- *		Entry point for the single networker background worker per node.
- *
- *		Spawned by the multiplexer (conn_multiplexer.c) via
- *		RegisterDynamicBackgroundWorker.  Does not require a local database
- *		connection (BGWORKER_SHMEM_ACCESS only).
- */
-PGDLLEXPORT void
-ConnMuxNetworkerMain(Datum main_arg)
-{
-	MuxSharedState *mux_state;
-	PGconn	   *peer_conns[MUX_MAX_REMOTE_CONNS];
-	int			net_conn_count = 0;
-	int			clock_hand = 0;
-	sigjmp_buf	local_sigjmp_buf;
-
-	MemSet(peer_conns, 0, sizeof(peer_conns));
-
-	/* Attach to the multiplexer shared-memory segment */
-	ConnMuxShmemInit();
-	mux_state = ConnMuxGetSharedState();
-	Assert(mux_state != NULL);
-
-	/* Register our PID and latch in MuxState->networker */
-	SpinLockAcquire(&mux_state->networker.mutex);
-	mux_state->networker.pid = MyProcPid;
-	mux_state->networker.latch = &MyProc->procLatch;
-	mux_state->networker.phase = MUX_WORKER_IDLE;
-	SpinLockRelease(&mux_state->networker.mutex);
-
-	ereport(LOG,
-			(errmsg("mux networker started (manages all inter-node TCP connections)")));
-
-	/* Set up error-recovery jump point */
-	if (sigsetjmp(local_sigjmp_buf, 1) != 0)
-	{
-		EmitErrorReport();
-		FlushErrorState();
-	}
-	PG_exception_stack = &local_sigjmp_buf;
-
-	for (;;)
-	{
-		bool		did_work = false;
-
-		if (QueryCancelPending || ProcDiePending)
-			break;
-
-		for (int q = 0; q < MUX_MAX_QUERY_SLOTS; q++)
-		{
-			MuxQuerySlot *slot = &mux_state->query_slots[q];
-			Oid			server_oid;
-			char		sql[MUX_SQL_MAXLEN];
-			int			rc_idx;
-			PGconn	   *conn;
-			PGresult   *res;
-			char		errbuf[256];
-
-			SpinLockAcquire(&slot->mutex);
-			if (!slot->in_use || slot->completed ||
-				slot->server_oid == InvalidOid)
-			{
-				SpinLockRelease(&slot->mutex);
-				continue;
-			}
-			server_oid = slot->server_oid;
-			strlcpy(sql, slot->sql, sizeof(sql));
-			SpinLockRelease(&slot->mutex);
-
-			rc_idx = net_find_remote_conn_idx(mux_state, server_oid);
-			if (rc_idx < 0)
-			{
-				SpinLockAcquire(&slot->mutex);
-				slot->is_error = true;
-				snprintf(slot->error_msg, sizeof(slot->error_msg),
-						 "mux networker: no registered conn for server OID %u",
-						 server_oid);
-				slot->completed = true;
-				SpinLockRelease(&slot->mutex);
-				if (slot->requester_latch)
-					SetLatch(slot->requester_latch);
-				did_work = true;
-				continue;
-			}
-
-			SpinLockAcquire(&mux_state->networker.mutex);
-			mux_state->networker.phase = MUX_WORKER_BUSY;
-			SpinLockRelease(&mux_state->networker.mutex);
-
-			errbuf[0] = '\0';
-			conn = net_get_connection(mux_state, peer_conns, &net_conn_count,
-									  &clock_hand, rc_idx,
-									  errbuf, sizeof(errbuf));
-			if (conn == NULL)
-			{
-				SpinLockAcquire(&slot->mutex);
-				slot->is_error = true;
-				strlcpy(slot->error_msg, errbuf, sizeof(slot->error_msg));
-				slot->completed = true;
-				SpinLockRelease(&slot->mutex);
-				if (slot->requester_latch)
-					SetLatch(slot->requester_latch);
-
-				SpinLockAcquire(&mux_state->networker.mutex);
-				mux_state->networker.phase = MUX_WORKER_IDLE;
-				mux_state->networker.count_errors++;
-				SpinLockRelease(&mux_state->networker.mutex);
-				did_work = true;
-				continue;
-			}
-
-			res = libpqsrv_exec(conn, sql, PG_WAIT_CLIENT);
-
-			SpinLockAcquire(&slot->mutex);
-			slot->result_truncated = false;
-			slot->result_len = 0;
-
-			if (res == NULL)
-			{
-				slot->is_error = true;
-				strlcpy(slot->error_msg, PQerrorMessage(conn),
-						sizeof(slot->error_msg));
-				/*
-				 * Connection may be broken; close it.  This is safe without
-				 * extra locking because net_get_connection and this section
-				 * both run in the single-threaded networker process — the
-				 * clock-sweep eviction loop is also in net_get_connection,
-				 * not in a separate thread.
-				 */
-				libpqsrv_disconnect(peer_conns[rc_idx]);
-				peer_conns[rc_idx] = NULL;
-				net_conn_count--;
-			}
-			else if (PQresultStatus(res) == PGRES_TUPLES_OK)
-			{
-				slot->is_error = false;
-				mux_serialize_result(slot, res);
-			}
-			else if (PQresultStatus(res) == PGRES_COMMAND_OK)
-			{
-				slot->is_error = false;
-				slot->result_nfields = 0;
-				slot->result_ntuples = 0;
-			}
-			else
-			{
-				slot->is_error = true;
-				strlcpy(slot->error_msg, PQresultErrorMessage(res),
-						sizeof(slot->error_msg));
-			}
-
-			if (res)
-				PQclear(res);
-
-			slot->completed = true;
-			SpinLockRelease(&slot->mutex);
-
-			if (slot->requester_latch)
-				SetLatch(slot->requester_latch);
-
-			SpinLockAcquire(&mux_state->networker.mutex);
-			mux_state->networker.phase = MUX_WORKER_IDLE;
-			mux_state->networker.requests_completed++;
-			mux_state->networker.count_queries++;
-			SpinLockRelease(&mux_state->networker.mutex);
-
-			did_work = true;
-		}
-
-		if (!did_work)
-		{
-			WaitLatch(MyLatch,
-					  WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-					  100,		/* 100 ms */
-					  PG_WAIT_IPC);
-			ResetLatch(MyLatch);
-		}
-	}
-
-	/* Cleanup: disconnect all open connections */
-	for (int i = 0; i < MUX_MAX_REMOTE_CONNS; i++)
-	{
-		if (peer_conns[i] != NULL)
-		{
-			libpqsrv_disconnect(peer_conns[i]);
-			peer_conns[i] = NULL;
-		}
-	}
-
-	SpinLockAcquire(&mux_state->networker.mutex);
-	mux_state->networker.phase = MUX_WORKER_DEAD;
-	mux_state->networker.pid = 0;
-	mux_state->networker.latch = NULL;
-	SpinLockRelease(&mux_state->networker.mutex);
-
-	ereport(LOG,
-			(errmsg("mux networker exiting")));
 }

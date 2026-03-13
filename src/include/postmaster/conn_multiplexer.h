@@ -3,33 +3,31 @@
  * conn_multiplexer.h
  *	  Connection multiplexer for distributed PostgreSQL transport
  *
- * Architecture (C10K-style distributed model):
+ * Architecture:
  *
- *   Each node runs ONE multiplexer process, N local workers, and ONE networker.
+ *   Each node runs ONE multiplexer process and N strictly-local workers.
+ *   There is NO separate networker process.
  *
  *   - Local workers execute queries on the CURRENT node only (via SPI).
  *     Workers never make outbound TCP connections to any remote servers.
  *     Workers receive the query text and transaction state from the multiplexer
  *     via shm_mq, execute locally, and return results back through shm_mq.
  *
- *   - The multiplexer holds the transaction state and routes queries:
- *       * Local queries  → dispatched to an idle local worker via shm_mq.
- *       * Remote queries → signalled to the networker via MuxQuerySlot.
- *     The multiplexer never opens TCP connections itself.
+ *   - The multiplexer manages ALL TCP sockets to peer multiplexers directly
+ *     inside ConnMuxMain.  TCP connections are lazy: established on first use.
+ *     The multiplexer listens on mux_tcp_port (default 7432) for incoming
+ *     peer connections and connects outbound to peers when remote queries
+ *     arrive.
  *
- *   - The networker (ConnMuxNetworkerMain, one process per node, registered in
- *     postgres_fdw) is the sole owner of all outbound TCP connections.  It
- *     maintains one persistent libpq PGconn* per registered remote server and
- *     services all remote MuxQuerySlot requests.  There is exactly ONE networker
- *     per node — not one per remote server.  Connection pooling (eviction when
- *     max_mux_connections is reached) is managed entirely by the networker.
+ *   Query routing:
+ *       * Local queries  → dispatched to an idle local worker via shm_mq.
+ *       * Remote queries → sent via raw TCP to the peer multiplexer.
+ *     When a remote query arrives via TCP, the multiplexer dispatches it to
+ *     a local worker, waits for the result, then sends it back via TCP.
  *
  *   Per-node process count (single node view):
- *     1 multiplexer + W local workers + 1 networker
+ *     1 multiplexer + W local workers
  *     + M backend processes (one per external client)
- *
- *   Cluster-wide connection count: M + N
- *     (M external clients to any node, N persistent TCP connections total)
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
@@ -60,6 +58,12 @@
 
 /* Maximum length of a connection string stored in shared memory */
 #define MUX_CONNSTR_MAXLEN		256
+
+/* Maximum length of a peer host string stored in shared memory */
+#define MUX_PEER_HOST_MAXLEN	256
+
+/* Default peer host when none is specified in server options */
+#define MUX_DEFAULT_PEER_HOST	"127.0.0.1"
 
 /*
  * Query request/response slot sizing for backend→multiplexer routing.
@@ -170,6 +174,30 @@ typedef struct MuxWorkerSlot
 } MuxWorkerSlot;
 
 /* ----------------------------------------------------------------
+ * TCP wire protocol for inter-multiplexer communication
+ * ---------------------------------------------------------------- */
+
+#define MUXNET_MAGIC  0x4D58544EU	/* 'M','X','T','N' */
+
+typedef enum MuxNetMsgType
+{
+	MUXNET_MSG_QUERY  = 1,		/* sender→receiver: execute query */
+	MUXNET_MSG_RESULT = 2,		/* receiver→sender: query result */
+	MUXNET_MSG_ERROR  = 3,		/* receiver→sender: query error */
+} MuxNetMsgType;
+
+/* Fixed-size TCP message header sent before payload */
+typedef struct MuxNetMsgHeader
+{
+	uint32		magic;			/* always MUXNET_MAGIC */
+	uint32		msg_type;		/* MuxNetMsgType */
+	uint32		slot_id;		/* sender's MuxQuerySlot index */
+	uint32		server_oid;		/* (QUERY only) target local server OID on receiver */
+	uint32		payload_len;	/* length of payload following this header */
+	uint32		is_error;		/* (RESULT/ERROR) 1 if error, 0 if success */
+} MuxNetMsgHeader;
+
+/* ----------------------------------------------------------------
  * Per-remote-connection slot in shared memory
  * ---------------------------------------------------------------- */
 typedef enum MuxConnPhase
@@ -191,10 +219,13 @@ typedef struct MuxRemoteConn
 	char		server_name[NAMEDATALEN];	/* pg_foreign_server.srvname */
 	char		connstr[MUX_CONNSTR_MAXLEN]; /* libpq connection string */
 
+	/* Hostname of the peer multiplexer (for outbound TCP connections) */
+	char		peer_host[MUX_PEER_HOST_MAXLEN];
+
 	/*
-	 * Clock-sweep counter for the networker's connection eviction algorithm.
+	 * Clock-sweep counter for the connection eviction algorithm.
 	 * Bumped to MUX_USE_COUNT_MAX whenever a query is routed through this
-	 * connection.  The networker's sweep decrements it; when it reaches zero
+	 * connection.  The clock sweep decrements it; when it reaches zero
 	 * the connection is eligible for eviction when the pool is full.
 	 */
 	uint8		use_count;
@@ -206,34 +237,6 @@ typedef struct MuxRemoteConn
 	uint64		msgs_recv;
 	TimestampTz connect_time;
 } MuxRemoteConn;
-
-/* ----------------------------------------------------------------
- * Networker slot in shared memory
- *
- * One ConnMuxNetworkerMain process per node (registered in postgres_fdw)
- * holds ALL persistent TCP connections to remote servers.  The multiplexer
- * wakes it when remote MuxQuerySlots are pending; the networker polls the
- * slot array, executes the query on the appropriate PGconn*, serialises the
- * result, and signals the waiting backend.
- *
- * There is exactly ONE networker per node — not one per remote server.
- * The actual PGconn* pool lives in the networker's private process memory,
- * not in shared memory.
- * ---------------------------------------------------------------- */
-typedef struct MuxNetworkerSlot
-{
-	slock_t		mutex;
-
-	/* Networker process identity */
-	pid_t		pid;			/* networker OS PID; 0 if not running */
-	Latch	   *latch;			/* pointer to networker's MyProc->procLatch */
-	MuxWorkerPhase phase;
-
-	/* Cumulative statistics */
-	uint64		requests_completed;
-	uint64		count_queries;
-	uint64		count_errors;
-} MuxNetworkerSlot;
 
 /* ----------------------------------------------------------------
  * Query routing slot (backend → multiplexer → foreign server)
@@ -352,15 +355,8 @@ typedef struct MuxSharedState
 	int			num_workers;		/* configured pool size (GUC) */
 	MuxWorkerSlot workers[MUX_MAX_WORKERS];
 
-	/* Remote connections (metadata; actual PGconn* lives in the networker) */
+	/* Remote connections (metadata; actual TCP sockets live in the multiplexer process) */
 	MuxRemoteConn remote_conns[MUX_MAX_REMOTE_CONNS];
-
-	/*
-	 * Networker: the single extension process (ConnMuxNetworkerMain) that
-	 * holds all outbound TCP connections.  The multiplexer wakes it by
-	 * setting networker.latch when remote MuxQuerySlots are pending.
-	 */
-	MuxNetworkerSlot networker;
 
 	/* Query routing slots for backend→mux foreign-server queries */
 	MuxQuerySlot query_slots[MUX_MAX_QUERY_SLOTS];
@@ -377,11 +373,17 @@ extern PGDLLIMPORT int mux_worker_count;
 
 /*
  * Maximum number of persistent remote-server connections maintained by the
- * networker.  When the pool is full and a new server needs a connection, the
- * networker's clock-sweep algorithm evicts the least-recently-used idle
- * connection.  Default: 64.
+ * multiplexer.  When the pool is full and a new server needs a connection, the
+ * clock-sweep algorithm evicts the least-recently-used idle connection.
+ * Default: 64.
  */
 extern PGDLLIMPORT int max_mux_connections;
+
+/*
+ * TCP port on which each multiplexer listens for incoming peer connections.
+ * All multiplexers in a cluster must use the same port.  Default: 7432.
+ */
+extern PGDLLIMPORT int mux_tcp_port;
 
 /* ----------------------------------------------------------------
  * Public API
@@ -425,29 +427,23 @@ extern bool ConnMuxIsAvailable(Oid serverOid);
 
 /*
  * Register a foreign server with the multiplexer.  Records the server
- * metadata in MuxState->remote_conns so the networker (ConnMuxNetworkerMain)
- * can connect to it when the first query arrives.
+ * metadata in MuxState->remote_conns so the multiplexer can connect to it
+ * when the first query arrives.
  * connstr must be a libpq-compatible connection string.
+ * peer_host is the hostname/IP of the peer multiplexer to connect to.
  * Returns the conn_id on success, or (uint32) -1 on failure.
  * Safe to call from any backend.
  */
 extern uint32 ConnMuxRegisterServer(Oid serverOid, const char *serverName,
-									const char *connstr);
-
-/*
- * Return a pointer to the MuxSharedState segment.  Call ConnMuxShmemInit()
- * first (which is a no-op if already initialised).  Intended for use by
- * ConnMuxNetworkerMain running inside the postgres_fdw extension.
- */
-extern MuxSharedState *ConnMuxGetSharedState(void);
+									const char *connstr,
+									const char *peer_host);
 
 /*
  * Submit a query for execution on a remote node via the multiplexer.
  *
  * The backend posts the request into a MuxQuerySlot and waits.  The
- * multiplexer wakes the networker (ConnMuxNetworkerMain), which executes
- * the query on the appropriate persistent TCP connection and writes the
- * result back into the slot.
+ * multiplexer sends it via raw TCP to the peer multiplexer, which executes
+ * the query via a local worker and writes the result back.
  *
  * result_data receives a compact binary stream (nfields, ntuples, field
  * descriptors, then row values).  The caller must supply a buffer of at
@@ -456,7 +452,7 @@ extern MuxSharedState *ConnMuxGetSharedState(void);
  * Returns true on success, false on error (error_msg is then filled with
  * a NUL-terminated message string).
  *
- * Blocks until the networker completes the request (or timeout occurs).
+ * Blocks until the peer multiplexer completes the request (or timeout occurs).
  */
 extern bool ConnMuxSubmitQuery(Oid serverOid, const char *sql,
 							   char *result_data, int result_data_size,

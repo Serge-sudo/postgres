@@ -3467,6 +3467,16 @@ struct config_int ConfigureNamesInt[] =
 	},
 
 	{
+		{"mux_tcp_port", PGC_POSTMASTER, RESOURCES_ASYNCHRONOUS,
+			gettext_noop("TCP port for inter-multiplexer communication."),
+			NULL
+		},
+		&mux_tcp_port,
+		7432, 1024, 65535,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"max_parallel_maintenance_workers", PGC_USERSET, RESOURCES_ASYNCHRONOUS,
 			gettext_noop("Sets the maximum number of parallel processes per maintenance operation."),
 			NULL
