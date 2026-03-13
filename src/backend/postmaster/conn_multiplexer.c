@@ -154,6 +154,20 @@ typedef struct MuxInboundReq
 
 static MuxInboundReq inbound_reqs[MUX_MAX_QUERY_SLOTS];
 
+/*
+ * Persistent shm_mq handles for communication with local workers.
+ *
+ * The multiplexer attaches once when a worker slot transitions to IDLE and
+ * keeps both handles alive until the worker exits.  This prevents the
+ * mq->mq_detached flag from being set between loop iterations (which would
+ * cause the worker to see SHM_MQ_DETACHED and exit prematurely).
+ *
+ * worker_send_mqh[i]  — handle on the mux_to_worker queue  (mux is sender)
+ * worker_recv_mqh[i]  — handle on the worker_to_mux queue  (mux is receiver)
+ */
+static shm_mq_handle *worker_send_mqh[MUX_MAX_WORKERS];
+static shm_mq_handle *worker_recv_mqh[MUX_MAX_WORKERS];
+
 
 /* ----------------------------------------------------------------
  * Forward declarations
@@ -161,6 +175,7 @@ static MuxInboundReq inbound_reqs[MUX_MAX_QUERY_SLOTS];
 static void mux_handle_sigterm(SIGNAL_ARGS);
 static void mux_setup_signals(void);
 static void mux_spawn_workers(int n);
+static void mux_attach_worker_queues(int worker_id);
 static int	mux_find_idle_worker(void);
 static bool mux_dispatch_to_worker(int worker_id, const char *data, Size len);
 static void mux_drain_worker_queues(void);
@@ -1122,25 +1137,43 @@ mux_find_idle_worker(void)
  * mux_dispatch_to_worker
  *		Write 'len' bytes starting at 'data' into the mux_to_worker queue
  *		of worker[worker_id] and wake the worker.
- *		Returns true on success, false if the queue is full.
+ *		Returns true on success, false if the queue is full or the worker
+ *		has detached (died).
  */
 static bool
 mux_dispatch_to_worker(int worker_id, const char *data, Size len)
 {
 	MuxWorkerSlot *slot = &MuxState->workers[worker_id];
-	shm_mq	   *mq = (shm_mq *) slot->mux_to_worker_buf;
-	shm_mq_handle *mqh;
+	shm_mq_handle *mqh = worker_send_mqh[worker_id];
 	shm_mq_result result;
 
-	/*
-	 * Attach to the queue in the sender role.  We pass NULL for the
-	 * BackgroundWorkerHandle since the worker is already running.
-	 */
-	shm_mq_set_sender(mq, MyProc);
-	mqh = shm_mq_attach(mq, NULL, NULL);
+	if (mqh == NULL)
+	{
+		/* No persistent handle yet — worker hasn't announced itself */
+		return false;
+	}
 
 	result = shm_mq_send(mqh, len, data, true /* nowait */, true /* flush */);
-	shm_mq_detach(mqh);
+
+	if (result == SHM_MQ_DETACHED)
+	{
+		/*
+		 * Worker died; clean up both handles.
+		 * shm_mq_detach() is safe to call here even though the queue's
+		 * receiver may have already detached — it simply sets mq_detached
+		 * again and wakes a NULL victim (no-op on the wake).
+		 */
+		worker_send_mqh[worker_id] = NULL;
+		shm_mq_detach(mqh);
+		if (worker_recv_mqh[worker_id] != NULL)
+		{
+			shm_mq_handle *rh = worker_recv_mqh[worker_id];
+
+			worker_recv_mqh[worker_id] = NULL;
+			shm_mq_detach(rh);
+		}
+		return false;
+	}
 
 	if (result != SHM_MQ_SUCCESS)
 		return false;
@@ -1170,11 +1203,40 @@ mux_dispatch_to_worker(int worker_id, const char *data, Size len)
  * ---------------------------------------------------------------- */
 
 /*
+ * mux_attach_worker_queues
+ *		Attach the multiplexer to the shm_mq queues of worker[worker_id]
+ *		and store persistent handles.  Must be called after the worker has
+ *		initialised its queues and announced itself in the slot (phase ==
+ *		MUX_WORKER_IDLE).
+ */
+static void
+mux_attach_worker_queues(int worker_id)
+{
+	MuxWorkerSlot *slot = &MuxState->workers[worker_id];
+	shm_mq	   *send_mq = (shm_mq *) slot->mux_to_worker_buf;
+	shm_mq	   *recv_mq = (shm_mq *) slot->worker_to_mux_buf;
+
+	Assert(worker_send_mqh[worker_id] == NULL);
+	Assert(worker_recv_mqh[worker_id] == NULL);
+
+	shm_mq_set_sender(send_mq, MyProc);
+	shm_mq_set_receiver(recv_mq, MyProc);
+
+	worker_send_mqh[worker_id] = shm_mq_attach(send_mq, NULL, NULL);
+	worker_recv_mqh[worker_id] = shm_mq_attach(recv_mq, NULL, NULL);
+
+	ereport(MULTIPLEXER_LOG_LEVEL,
+			(errmsg("mux: attached to worker %d queues", worker_id)));
+}
+
+/*
  * mux_drain_worker_queues
  *		Poll every active worker's worker_to_mux queue for completed results.
  *		For each complete message, update statistics and (in a full
  *		implementation) route the reply to the requesting backend or remote
  *		socket.
+ *
+ *		Also attaches to newly-started workers that have set up their queues.
  */
 static void
 mux_drain_worker_queues(void)
@@ -1185,18 +1247,25 @@ mux_drain_worker_queues(void)
 	for (i = 0; i < num && i < MUX_MAX_WORKERS; i++)
 	{
 		MuxWorkerSlot *slot = &MuxState->workers[i];
-		shm_mq	   *mq;
 		shm_mq_handle *mqh;
 		shm_mq_result result;
 		Size		nbytes;
 		void	   *data;
 
-		if (slot->phase != MUX_WORKER_BUSY && slot->phase != MUX_WORKER_IDLE)
-			continue;
+		/*
+		 * Attach to a newly-started worker as soon as it transitions to IDLE.
+		 * The worker initialises its queues BEFORE announcing itself, so by
+		 * the time we see phase == IDLE the queues are ready.
+		 */
+		if ((slot->phase == MUX_WORKER_IDLE || slot->phase == MUX_WORKER_BUSY)
+			&& worker_recv_mqh[i] == NULL)
+		{
+			mux_attach_worker_queues(i);
+		}
 
-		mq = (shm_mq *) slot->worker_to_mux_buf;
-		shm_mq_set_receiver(mq, MyProc);
-		mqh = shm_mq_attach(mq, NULL, NULL);
+		mqh = worker_recv_mqh[i];
+		if (mqh == NULL)
+			continue;
 
 		for (;;)
 		{
@@ -1204,7 +1273,22 @@ mux_drain_worker_queues(void)
 			if (result == SHM_MQ_WOULD_BLOCK)
 				break;
 			if (result == SHM_MQ_DETACHED)
+			{
+				/*
+				 * Worker exited; drop both handles so the slot can be
+				 * re-spawned cleanly.  Null the pointers first so a
+				 * concurrent signal handler can't see stale values.
+				 */
+				shm_mq_handle *rh = worker_recv_mqh[i];
+				shm_mq_handle *sh = worker_send_mqh[i];
+
+				worker_recv_mqh[i] = NULL;
+				worker_send_mqh[i] = NULL;
+				shm_mq_detach(rh);
+				if (sh != NULL)
+					shm_mq_detach(sh);
 				break;
+			}
 
 			/* We have a complete message. */
 			if (nbytes >= sizeof(MuxMsgHeader))
@@ -1330,8 +1414,6 @@ mux_drain_worker_queues(void)
 				}
 			}
 		}
-
-		shm_mq_detach(mqh);
 	}
 }
 
@@ -1476,6 +1558,13 @@ ConnMuxMain(Datum main_arg)
 		inbound_socks[i] = PGINVALID_SOCKET;
 	n_inbound = 0;
 	memset(inbound_reqs, 0, sizeof(inbound_reqs));
+
+	/* Initialise persistent worker queue handles */
+	for (i = 0; i < MUX_MAX_WORKERS; i++)
+	{
+		worker_send_mqh[i] = NULL;
+		worker_recv_mqh[i] = NULL;
+	}
 
 	/* Spawn the initial local worker pool */
 	mux_spawn_workers(mux_worker_count);
@@ -1703,6 +1792,7 @@ ConnMuxWorkerMain(Datum main_arg)
 	shm_mq_handle *req_mqh,
 			   *res_mqh;
 	MemoryContext worker_context;
+	MemoryContext old_cxt;
 	sigjmp_buf	local_sigjmp_buf;
 
 	if (worker_id < 0 || worker_id >= MUX_MAX_WORKERS)
@@ -1719,6 +1809,30 @@ ConnMuxWorkerMain(Datum main_arg)
 										   ALLOCSET_DEFAULT_SIZES);
 	MemoryContextSwitchTo(worker_context);
 
+	/*
+	 * Initialise the shm_mq ring buffers BEFORE announcing ourselves.
+	 *
+	 * The multiplexer calls mux_attach_worker_queues() as soon as it sees
+	 * slot->phase == MUX_WORKER_IDLE, so both the sender/receiver roles and
+	 * the ring-buffer headers must already be in place when we set that flag.
+	 *
+	 * Allocate the handles in TopMemoryContext so they survive
+	 * MemoryContextReset(worker_context) on error recovery.  The multiplexer
+	 * must NEVER call shm_mq_detach on an active worker's queue (that sets
+	 * mq->mq_detached = true, making every subsequent receive/send return
+	 * SHM_MQ_DETACHED and causing the worker to exit prematurely).
+	 */
+	req_mq = shm_mq_create(slot->mux_to_worker_buf, MUX_QUEUE_SIZE);
+	res_mq = shm_mq_create(slot->worker_to_mux_buf, MUX_QUEUE_SIZE);
+
+	shm_mq_set_receiver(req_mq, MyProc);
+	shm_mq_set_sender(res_mq, MyProc);
+
+	old_cxt = MemoryContextSwitchTo(TopMemoryContext);
+	req_mqh = shm_mq_attach(req_mq, NULL, NULL);
+	res_mqh = shm_mq_attach(res_mq, NULL, NULL);
+	MemoryContextSwitchTo(old_cxt);
+
 	/* Announce ourselves in the shared slot */
 	SpinLockAcquire(&slot->mutex);
 	slot->pid = MyProcPid;
@@ -1726,7 +1840,7 @@ ConnMuxWorkerMain(Datum main_arg)
 	slot->phase = MUX_WORKER_IDLE;
 	SpinLockRelease(&slot->mutex);
 
-	/* Wake the multiplexer so it sees the new idle worker */
+	/* Wake the multiplexer so it attaches to the queues and sees us */
 	ConnMuxWakeup();
 
 	ereport(MULTIPLEXER_LOG_LEVEL,
@@ -1752,22 +1866,16 @@ ConnMuxWorkerMain(Datum main_arg)
 		FlushErrorState();
 		MemoryContextReset(worker_context);
 		RESUME_INTERRUPTS();
+		/* req_mqh / res_mqh live in TopMemoryContext — still valid */
 	}
 	PG_exception_stack = &local_sigjmp_buf;
 
 	/*
-	 * Re-initialise the queues for this worker invocation.  We call
-	 * shm_mq_create() to reset the ring buffers, then set the sender and
-	 * receiver roles.
+	 * Do NOT call shm_mq_create() here.  The queue handles were set up once
+	 * above and survive error recovery.  Re-initialising the ring buffers
+	 * after an error would invalidate the multiplexer's persistent handles
+	 * and cause data corruption.
 	 */
-	req_mq = shm_mq_create(slot->mux_to_worker_buf, MUX_QUEUE_SIZE);
-	res_mq = shm_mq_create(slot->worker_to_mux_buf, MUX_QUEUE_SIZE);
-
-	shm_mq_set_receiver(req_mq, MyProc);
-	shm_mq_set_sender(res_mq, MyProc);
-
-	req_mqh = shm_mq_attach(req_mq, NULL, NULL);
-	res_mqh = shm_mq_attach(res_mq, NULL, NULL);
 
 	/* ----------------------------------------------------------------
 	 * Worker request loop
@@ -1891,6 +1999,21 @@ ConnMuxWorkerMain(Datum main_arg)
 							 true /* nowait */,
 							 true /* flush */);
 
+		if (result == SHM_MQ_DETACHED)
+		{
+			/*
+			 * The multiplexer's recv handle is gone.  Don't mark the slot as
+			 * IDLE (the slot is about to become DEAD in the cleanup below).
+			 */
+			ereport(WARNING,
+					(errmsg("mux worker %d: multiplexer detached while sending result for conn_id=%u",
+							worker_id, reply_hdr.conn_id)));
+			SpinLockAcquire(&slot->mutex);
+			slot->requests_completed++;
+			SpinLockRelease(&slot->mutex);
+			break;				/* multiplexer shut down */
+		}
+
 		SpinLockAcquire(&slot->mutex);
 		slot->requests_completed++;
 		slot->phase = MUX_WORKER_IDLE;
@@ -1902,9 +2025,6 @@ ConnMuxWorkerMain(Datum main_arg)
 
 		/* Wake the multiplexer to pick up the result */
 		ConnMuxWakeup();
-
-		if (result == SHM_MQ_DETACHED)
-			break;
 	}
 
 	/* Clean up */
