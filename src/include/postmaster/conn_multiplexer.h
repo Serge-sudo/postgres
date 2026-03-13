@@ -5,27 +5,31 @@
  *
  * Architecture (C10K-style distributed model):
  *
- *   Each node runs ONE multiplexer process and N local workers.
+ *   Each node runs ONE multiplexer process, N local workers, and ONE networker.
  *
  *   - Local workers execute queries on the CURRENT node only (via SPI).
- *     Workers never make outbound TCP connections to foreign servers.
+ *     Workers never make outbound TCP connections to any remote servers.
+ *     Workers receive the query text and transaction state from the multiplexer
+ *     via shm_mq, execute locally, and return results back through shm_mq.
  *
- *   - The multiplexer maintains persistent peer connections to each remote
- *     node (via ConnMuxPeerWorkerMain extension workers that hold PGconn*).
- *     These peer connections are spawned and managed by the multiplexer,
- *     NOT by individual backends.
+ *   - The multiplexer holds the transaction state and routes queries:
+ *       * Local queries  → dispatched to an idle local worker via shm_mq.
+ *       * Remote queries → signalled to the networker via MuxQuerySlot.
+ *     The multiplexer never opens TCP connections itself.
  *
- *   - Backends submit queries to the multiplexer via MuxQuerySlot shared
- *     memory.  For local queries the mux dispatches to a local worker via
- *     shm_mq.  For remote queries the mux routes the slot to the appropriate
- *     peer worker (one per remote server), which executes on the peer node.
+ *   - The networker (ConnMuxNetworkerMain, one process per node, registered in
+ *     postgres_fdw) is the sole owner of all outbound TCP connections.  It
+ *     maintains one persistent libpq PGconn* per registered remote server and
+ *     services all remote MuxQuerySlot requests.  There is exactly ONE networker
+ *     per node — not one per remote server.  Connection pooling (eviction when
+ *     max_mux_connections is reached) is managed entirely by the networker.
  *
  *   Per-node process count (single node view):
- *     1 multiplexer + W local workers + up to max_mux_connections peer workers
+ *     1 multiplexer + W local workers + 1 networker
  *     + M backend processes (one per external client)
  *
  *   Cluster-wide connection count: M + N
- *     (M external clients to any node, N peer connections between nodes)
+ *     (M external clients to any node, N persistent TCP connections total)
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
@@ -67,10 +71,11 @@
 #define MUX_RESULT_MAXLEN		(64 * 1024) /* max serialised result (64 kB) */
 
 /*
- * Maximum "use count" for the clock-sweep eviction algorithm.
- * Each time a backend acquires a foreign-worker slot the use_count is
- * bumped up to this value.  The clock sweep decrements it; when it
- * reaches zero the slot becomes eligible for eviction.
+ * Maximum "use count" for the clock-sweep eviction algorithm used by the
+ * networker to decide which remote connection to evict.  Each time a query
+ * is routed through a remote connection its use_count is reset to this value.
+ * The networker's clock sweep decrements it; when it reaches zero the
+ * connection is eligible for eviction.
  */
 #define MUX_USE_COUNT_MAX		5
 
@@ -110,29 +115,18 @@ typedef enum MuxWorkerPhase
 } MuxWorkerPhase;
 
 /*
- * One slot in the worker pool, stored in shared memory.
+ * One slot in the local worker pool, stored in shared memory.
  *
  * The two shm_mq queues are embedded directly in this struct so that no
  * DSM segment is needed for basic multiplexer ↔ worker communication.
  *
- * Local workers (is_foreign = false, slots 0..num_workers-1) execute queries
- * via SPI on the local database.  They never make outbound TCP connections.
+ * Local workers execute sub-statement queries via SPI on the local database.
+ * They never make outbound TCP connections; all remote communication is
+ * handled by the networker process (ConnMuxNetworkerMain).
  *
- * Peer workers (is_foreign = true, slots num_workers..MUX_MAX_WORKERS-1) are
- * extension background workers (ConnMuxPeerWorkerMain, registered in
- * postgres_fdw) that hold a persistent libpq connection to one remote node.
- * Peer workers are spawned and managed by the MULTIPLEXER, not by individual
- * backends.  Connection pooling (one connection per remote server, shared
- * across all backends) is therefore a property of the multiplexer, not of
- * the per-backend connection cache.
- *
- * Eviction policy for peer worker slots:
- *   use_count    – bumped to MUX_USE_COUNT_MAX when a query is routed through
- *                  the slot; decremented by the clock sweep.  Slots with
- *                  use_count == 0 and phase == MUX_WORKER_IDLE are eligible
- *                  for eviction.
- *   should_exit  – set by the clock-sweep eviction path to request the
- *                  peer worker to shut down after its current work.
+ * The multiplexer sends the query text and transaction state to the worker
+ * via mux_to_worker_buf (MUX_MSG_QUERY / MUX_MSG_TXSTATE), and the worker
+ * returns serialised results via worker_to_mux_buf (MUX_MSG_RESULT).
  */
 typedef struct MuxWorkerSlot
 {
@@ -145,22 +139,6 @@ typedef struct MuxWorkerSlot
 
 	/* State */
 	MuxWorkerPhase phase;
-
-	/*
-	 * Peer-worker fields.  When is_foreign is true this slot belongs to a
-	 * ConnMuxPeerWorkerMain worker (in postgres_fdw) that holds the actual
-	 * PGconn* to the remote server.  The multiplexer spawns and manages
-	 * these workers; backends do not interact with them directly.
-	 */
-	bool		is_foreign;		/* true = peer worker for a remote node */
-	Oid			server_oid;		/* remote server OID (InvalidOid for local) */
-	char		server_name[NAMEDATALEN];	/* remote server name */
-
-	/*
-	 * Eviction fields (only meaningful when is_foreign = true).
-	 */
-	uint8		use_count;		/* clock-sweep counter: 0..MUX_USE_COUNT_MAX */
-	volatile bool should_exit;	/* eviction request: peer worker should exit */
 
 	/* Current request being processed */
 	MuxMessageType current_request_type;
@@ -213,6 +191,14 @@ typedef struct MuxRemoteConn
 	char		server_name[NAMEDATALEN];	/* pg_foreign_server.srvname */
 	char		connstr[MUX_CONNSTR_MAXLEN]; /* libpq connection string */
 
+	/*
+	 * Clock-sweep counter for the networker's connection eviction algorithm.
+	 * Bumped to MUX_USE_COUNT_MAX whenever a query is routed through this
+	 * connection.  The networker's sweep decrements it; when it reaches zero
+	 * the connection is eligible for eviction when the pool is full.
+	 */
+	uint8		use_count;
+
 	/* Statistics */
 	uint64		bytes_sent;
 	uint64		bytes_recv;
@@ -220,6 +206,34 @@ typedef struct MuxRemoteConn
 	uint64		msgs_recv;
 	TimestampTz connect_time;
 } MuxRemoteConn;
+
+/* ----------------------------------------------------------------
+ * Networker slot in shared memory
+ *
+ * One ConnMuxNetworkerMain process per node (registered in postgres_fdw)
+ * holds ALL persistent TCP connections to remote servers.  The multiplexer
+ * wakes it when remote MuxQuerySlots are pending; the networker polls the
+ * slot array, executes the query on the appropriate PGconn*, serialises the
+ * result, and signals the waiting backend.
+ *
+ * There is exactly ONE networker per node — not one per remote server.
+ * The actual PGconn* pool lives in the networker's private process memory,
+ * not in shared memory.
+ * ---------------------------------------------------------------- */
+typedef struct MuxNetworkerSlot
+{
+	slock_t		mutex;
+
+	/* Networker process identity */
+	pid_t		pid;			/* networker OS PID; 0 if not running */
+	Latch	   *latch;			/* pointer to networker's MyProc->procLatch */
+	MuxWorkerPhase phase;
+
+	/* Cumulative statistics */
+	uint64		requests_completed;
+	uint64		count_queries;
+	uint64		count_errors;
+} MuxNetworkerSlot;
 
 /* ----------------------------------------------------------------
  * Query routing slot (backend → multiplexer → foreign server)
@@ -334,21 +348,22 @@ typedef struct MuxSharedState
 	/* Latch of the multiplexer process for wake-up from workers/backends */
 	Latch	   *mux_latch;
 
-	/* Worker pool */
+	/* Local worker pool (all workers execute queries on this node only) */
 	int			num_workers;		/* configured pool size (GUC) */
 	MuxWorkerSlot workers[MUX_MAX_WORKERS];
 
-	/* Remote connections (metadata; actual PGconn* lives in mux process) */
+	/* Remote connections (metadata; actual PGconn* lives in the networker) */
 	MuxRemoteConn remote_conns[MUX_MAX_REMOTE_CONNS];
+
+	/*
+	 * Networker: the single extension process (ConnMuxNetworkerMain) that
+	 * holds all outbound TCP connections.  The multiplexer wakes it by
+	 * setting networker.latch when remote MuxQuerySlots are pending.
+	 */
+	MuxNetworkerSlot networker;
 
 	/* Query routing slots for backend→mux foreign-server queries */
 	MuxQuerySlot query_slots[MUX_MAX_QUERY_SLOTS];
-
-	/*
-	 * Clock-sweep hand for foreign worker slot eviction.
-	 * Protected by MuxState->mutex.
-	 */
-	int			clock_hand;
 
 	/* Global counters */
 	uint64		total_requests;
@@ -361,10 +376,10 @@ typedef struct MuxSharedState
 extern PGDLLIMPORT int mux_worker_count;
 
 /*
- * Maximum number of persistent foreign-server connections maintained by the
- * multiplexer pool.  When the pool is full and a new server needs a slot,
- * the clock-sweep algorithm evicts the least-recently-used idle connection.
- * Default: 64.
+ * Maximum number of persistent remote-server connections maintained by the
+ * networker.  When the pool is full and a new server needs a connection, the
+ * networker's clock-sweep algorithm evicts the least-recently-used idle
+ * connection.  Default: 64.
  */
 extern PGDLLIMPORT int max_mux_connections;
 
@@ -410,8 +425,8 @@ extern bool ConnMuxIsAvailable(Oid serverOid);
 
 /*
  * Register a foreign server with the multiplexer.  Records the server
- * metadata in MuxState->remote_conns so the multiplexer can spawn a peer
- * worker (ConnMuxPeerWorkerMain) and route queries to it.
+ * metadata in MuxState->remote_conns so the networker (ConnMuxNetworkerMain)
+ * can connect to it when the first query arrives.
  * connstr must be a libpq-compatible connection string.
  * Returns the conn_id on success, or (uint32) -1 on failure.
  * Safe to call from any backend.
@@ -422,7 +437,7 @@ extern uint32 ConnMuxRegisterServer(Oid serverOid, const char *serverName,
 /*
  * Return a pointer to the MuxSharedState segment.  Call ConnMuxShmemInit()
  * first (which is a no-op if already initialised).  Intended for use by
- * ConnMuxPeerWorkerMain running inside the postgres_fdw extension.
+ * ConnMuxNetworkerMain running inside the postgres_fdw extension.
  */
 extern MuxSharedState *ConnMuxGetSharedState(void);
 
@@ -430,9 +445,9 @@ extern MuxSharedState *ConnMuxGetSharedState(void);
  * Submit a query for execution on a remote node via the multiplexer.
  *
  * The backend posts the request into a MuxQuerySlot and waits.  The
- * multiplexer dispatches it to the appropriate peer worker
- * (ConnMuxPeerWorkerMain), which executes it on the remote server and
- * writes the result back into the slot.
+ * multiplexer wakes the networker (ConnMuxNetworkerMain), which executes
+ * the query on the appropriate persistent TCP connection and writes the
+ * result back into the slot.
  *
  * result_data receives a compact binary stream (nfields, ntuples, field
  * descriptors, then row values).  The caller must supply a buffer of at
@@ -441,7 +456,7 @@ extern MuxSharedState *ConnMuxGetSharedState(void);
  * Returns true on success, false on error (error_msg is then filled with
  * a NUL-terminated message string).
  *
- * Blocks until the peer worker completes the request (or timeout occurs).
+ * Blocks until the networker completes the request (or timeout occurs).
  */
 extern bool ConnMuxSubmitQuery(Oid serverOid, const char *sql,
 							   char *result_data, int result_data_size,
