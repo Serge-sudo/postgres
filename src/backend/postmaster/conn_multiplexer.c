@@ -783,14 +783,28 @@ mux_process_inbound_message(int peer_idx)
 					ereport(WARNING, (errmsg("mux: short read of payload from peer %d", peer_idx)));
 					return;
 				}
-				pg_usleep(1000);	/* brief wait */
+				/* Wait briefly for more data rather than busy-spinning */
+				{
+					fd_set		rfds;
+					struct timeval tv;
+
+					FD_ZERO(&rfds);
+					FD_SET(inbound_socks[peer_idx], &rfds);
+					tv.tv_sec = 1;
+					tv.tv_usec = 0;
+					if (select(inbound_socks[peer_idx] + 1, &rfds, NULL, NULL, &tv) <= 0)
+					{
+						ereport(WARNING, (errmsg("mux: timeout reading payload from peer %d", peer_idx)));
+						return;
+					}
+				}
 				continue;
 			}
 			p += n;
 			remaining -= n;
 		}
 	}
-	sql_buf[nethdr.payload_len - 1] = '\0';		/* ensure NUL-terminated */
+	/* Sender already includes the NUL terminator in payload_len */
 
 	/* Allocate an inbound request slot */
 	req_idx = mux_find_inbound_req_slot();
@@ -1319,10 +1333,21 @@ ConnMuxMain(Datum main_arg)
 	AddWaitEventToSet(wes, WL_EXIT_ON_PM_DEATH, PGINVALID_SOCKET,
 					  NULL, NULL);
 
-	/* Add the listen socket (user_data = NULL means "listen socket") */
+	/*
+	 * Listen socket uses user_data = (void *)(intptr_t)0.
+	 * Inbound sockets use user_data = (void *)(intptr_t)(1 + peer_idx).
+	 * Outbound sockets use user_data = (void *)(intptr_t)(1 + MUX_MAX_INBOUND_PEERS + rc_idx).
+	 * This lets us identify which socket type fired without scanning arrays.
+	 */
 	if (listen_sock != PGINVALID_SOCKET)
 		AddWaitEventToSet(wes, WL_SOCKET_READABLE, listen_sock,
-						  NULL, NULL);
+						  NULL, (void *) (intptr_t) 0);
+
+	/* Track which outbound sockets have been added to the WES */
+	{
+		bool		outbound_in_wes[MUX_MAX_REMOTE_CONNS];
+
+		memset(outbound_in_wes, 0, sizeof(outbound_in_wes));
 
 	set_ps_display("main loop");
 
@@ -1349,6 +1374,25 @@ ConnMuxMain(Datum main_arg)
 		/* Send pending remote query slots to peer multiplexers via TCP */
 		mux_dispatch_remote_slots();
 
+		/*
+		 * Register any newly-connected outbound sockets with the WES so
+		 * we get notified when results arrive.
+		 */
+		for (i = 0; i < MUX_MAX_REMOTE_CONNS; i++)
+		{
+			if (outbound_socks[i] != PGINVALID_SOCKET && !outbound_in_wes[i])
+			{
+				AddWaitEventToSet(wes, WL_SOCKET_READABLE, outbound_socks[i],
+								  NULL, (void *) (intptr_t) (1 + MUX_MAX_INBOUND_PEERS + i));
+				outbound_in_wes[i] = true;
+			}
+			else if (outbound_socks[i] == PGINVALID_SOCKET && outbound_in_wes[i])
+			{
+				/* Socket was closed — clear the flag (WES entry stays but fd is gone) */
+				outbound_in_wes[i] = false;
+			}
+		}
+
 		/* Re-spawn any dead local workers */
 		for (i = 0; i < MuxState->num_workers && i < MUX_MAX_WORKERS; i++)
 		{
@@ -1370,6 +1414,7 @@ ConnMuxMain(Datum main_arg)
 		for (j = 0; j < n_events; j++)
 		{
 			WaitEvent  *ev = &events[j];
+			intptr_t	ud = (intptr_t) ev->user_data;
 
 			if (ev->events & WL_LATCH_SET)
 				continue;		/* handled by ResetLatch above */
@@ -1377,48 +1422,40 @@ ConnMuxMain(Datum main_arg)
 			if (!(ev->events & WL_SOCKET_READABLE))
 				continue;
 
-			if (ev->fd == listen_sock)
+			if (ud == 0)
 			{
-				/* New inbound peer connection */
+				/* New inbound peer connection on the listen socket */
 				int			new_fd = mux_accept_peer();
 
 				if (new_fd != PGINVALID_SOCKET)
 				{
-					/* Add the new inbound socket to the WES */
+					int			peer_idx = n_inbound - 1;
+
 					AddWaitEventToSet(wes, WL_SOCKET_READABLE, new_fd,
-									  NULL, NULL);
+									  NULL,
+									  (void *) (intptr_t) (1 + peer_idx));
 				}
+			}
+			else if (ud <= MUX_MAX_INBOUND_PEERS)
+			{
+				/* Inbound peer socket — process incoming query */
+				int			peer_idx = (int) (ud - 1);
+
+				if (peer_idx >= 0 && peer_idx < n_inbound)
+					mux_process_inbound_message(peer_idx);
 			}
 			else
 			{
-				/* Check if it's an inbound peer socket */
-				bool		handled = false;
+				/* Outbound peer socket — process incoming result */
+				int			rc_idx = (int) (ud - 1 - MUX_MAX_INBOUND_PEERS);
 
-				for (i = 0; i < n_inbound; i++)
-				{
-					if (inbound_socks[i] == ev->fd)
-					{
-						mux_process_inbound_message(i);
-						handled = true;
-						break;
-					}
-				}
-
-				if (!handled)
-				{
-					/* Check if it's an outbound peer socket */
-					for (i = 0; i < MUX_MAX_REMOTE_CONNS; i++)
-					{
-						if (outbound_socks[i] == ev->fd)
-						{
-							mux_process_outbound_result(i);
-							break;
-						}
-					}
-				}
+				if (rc_idx >= 0 && rc_idx < MUX_MAX_REMOTE_CONNS)
+					mux_process_outbound_result(rc_idx);
 			}
 		}
 	}
+
+	} /* end outbound_in_wes scope */
 
 	FreeWaitEventSet(wes);
 
@@ -1776,8 +1813,8 @@ ConnMuxGetWorkerStats(MuxWorkerSlot *slots, int max_slots)
  * Remote connection metadata management
  *
  * MuxState->remote_conns[] stores metadata for each registered foreign
- * server (OID, name, connstr, use_count).  The actual PGconn* pool lives
- * in the networker's private process memory (ConnMuxNetworkerMain).
+ * server (OID, name, connstr, peer_host, use_count).  The actual TCP socket
+ * to each peer multiplexer lives in the multiplexer's private process memory.
  * ---------------------------------------------------------------- */
 
 /*
@@ -1939,12 +1976,11 @@ mux_wait_for_slot(int slot_idx)
 
 /*
  * ConnMuxSubmitQuery
- *		Execute sql on the remote server identified by serverOid via the
- *		networker (ConnMuxNetworkerMain).
- *
- *		Posts a request to a MuxQuerySlot in shared memory, wakes the
- *		multiplexer so it signals the networker, then waits for the networker
- *		to fill the result.
+ *		Execute sql on the remote server identified by serverOid by posting
+ *		a request to a MuxQuerySlot in shared memory and waking the
+ *		multiplexer.  The multiplexer sends the query to the peer node's
+ *		multiplexer via a raw TCP socket, which dispatches it to a local
+ *		worker, then sends the result back via TCP and signals this backend.
  *
  *		On success returns true and fills result_data / nfields_out /
  *		ntuples_out / truncated_out.  On failure returns false and fills

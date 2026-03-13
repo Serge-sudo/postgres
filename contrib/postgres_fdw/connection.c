@@ -453,7 +453,7 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 		uint32		conn_id;
 
 		/* Build a libpq-compatible connstr from the server's srvoptions and extract peer_host */
-		const char *peer_host = "127.0.0.1";
+		const char *peer_host = MUX_DEFAULT_PEER_HOST;
 
 		initStringInfo(&sb);
 		foreach(lc2, server->options)
