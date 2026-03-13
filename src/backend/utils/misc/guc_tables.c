@@ -4802,6 +4802,18 @@ struct config_string ConfigureNamesString[] =
 		check_restrict_nonsystem_relation_kind, assign_restrict_nonsystem_relation_kind, NULL
 	},
 
+	{
+		{"mux_local_database", PGC_POSTMASTER, RESOURCES_ASYNCHRONOUS,
+			gettext_noop("Sets the database that multiplexer workers connect to for executing inbound queries."),
+			gettext_noop("Multiplexer workers use this database name when calling "
+						 "BackgroundWorkerInitializeConnection() to execute queries from "
+						 "remote nodes via SPI. Must be a valid existing database name.")
+		},
+		&mux_local_database,
+		"postgres",
+		NULL, NULL, NULL
+	},
+
 	/* End-of-list marker */
 	{
 		{NULL, 0, 0, NULL, NULL}, NULL, NULL, NULL, NULL, NULL

@@ -52,6 +52,8 @@
 #include <fcntl.h>
 #include <errno.h>
 
+#include "access/xact.h"
+#include "executor/spi.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -92,6 +94,13 @@ int			max_mux_connections = 64;
 
 /* GUC: TCP port for inter-multiplexer communication */
 int			mux_tcp_port = 7432;
+
+/*
+ * GUC: local database name that multiplexer workers connect to via
+ * BackgroundWorkerInitializeConnection() in order to execute inbound
+ * queries from remote nodes.  Must be a valid existing database.
+ */
+char	   *mux_local_database = "postgres";
 
 /* Pointer to the shared-memory state; set by ConnMuxShmemInit(). */
 static MuxSharedState *MuxState = NULL;
@@ -183,6 +192,21 @@ static void mux_drain_backend_requests(void);
 static bool mux_pending_enqueue(const char *data, Size len);
 static bool mux_pending_dequeue(char *buf, Size bufsz, Size *lenp);
 static void mux_worker_setup_signals(void);
+
+/* Worker SQL execution helpers */
+typedef enum MuxSqlKind
+{
+	MUX_SQL_BEGIN,				/* BEGIN / START TRANSACTION */
+	MUX_SQL_COMMIT,				/* COMMIT / END */
+	MUX_SQL_ROLLBACK,			/* ROLLBACK / ABORT */
+	MUX_SQL_SAVEPOINT,			/* SAVEPOINT / RELEASE / ROLLBACK TO */
+	MUX_SQL_OTHER,				/* regular DML / DDL */
+} MuxSqlKind;
+
+static MuxSqlKind mux_classify_sql(const char *sql);
+static int	mux_parse_isolation_level(const char *sql);
+static int	mux_serialize_results(char *buf, int bufsz,
+								  int *nfields_out, int *ntuples_out);
 
 /* TCP helper forward declarations */
 static void mux_set_nonblocking(int sock);
@@ -367,8 +391,8 @@ mux_spawn_workers(int n)
 		SpinLockRelease(&slot->mutex);
 
 		MemSet(&bgw, 0, sizeof(bgw));
-		bgw.bgw_flags = BGWORKER_SHMEM_ACCESS;
-		bgw.bgw_start_time = BgWorkerStart_PostmasterStart;
+		bgw.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+		bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
 		bgw.bgw_restart_time = BGW_NEVER_RESTART;	/* multiplexer re-spawns */
 		snprintf(bgw.bgw_library_name, MAXPGPATH, "postgres");
 		snprintf(bgw.bgw_function_name, BGW_MAXLEN, "ConnMuxWorkerMain");
@@ -1770,17 +1794,225 @@ mux_worker_setup_signals(void)
 	pqsignal(SIGCHLD, SIG_DFL);
 }
 
+
+/* ----------------------------------------------------------------
+ * Worker SQL execution helper functions
+ * ---------------------------------------------------------------- */
+
+/*
+ * mux_classify_sql
+ *		Return the "kind" of a SQL statement so the worker can decide how to
+ *		handle transaction control without going through SPI (which rejects
+ *		transaction statements with SPI_ERROR_TRANSACTION).
+ */
+static MuxSqlKind
+mux_classify_sql(const char *sql)
+{
+	/* Skip leading whitespace */
+	while (*sql && (*sql == ' ' || *sql == '\t' || *sql == '\n' || *sql == '\r'))
+		sql++;
+
+#define IS_WORD_BOUNDARY(c) \
+	((c) == '\0' || (c) == ' ' || (c) == '\t' || (c) == '\n' || (c) == '\r' || (c) == ';')
+
+	if (pg_strncasecmp(sql, "BEGIN", 5) == 0 && IS_WORD_BOUNDARY(sql[5]))
+		return MUX_SQL_BEGIN;
+
+	if (pg_strncasecmp(sql, "START", 5) == 0 && IS_WORD_BOUNDARY(sql[5]))
+		return MUX_SQL_BEGIN;
+
+	if (pg_strncasecmp(sql, "COMMIT", 6) == 0 && IS_WORD_BOUNDARY(sql[6]))
+		return MUX_SQL_COMMIT;
+
+	if (pg_strncasecmp(sql, "END", 3) == 0 && IS_WORD_BOUNDARY(sql[3]))
+		return MUX_SQL_COMMIT;
+
+	if (pg_strncasecmp(sql, "ROLLBACK", 8) == 0 && IS_WORD_BOUNDARY(sql[8]))
+		return MUX_SQL_ROLLBACK;
+
+	if (pg_strncasecmp(sql, "ABORT", 5) == 0 && IS_WORD_BOUNDARY(sql[5]))
+		return MUX_SQL_ROLLBACK;
+
+	if (pg_strncasecmp(sql, "SAVEPOINT", 9) == 0 ||
+		pg_strncasecmp(sql, "RELEASE", 7) == 0)
+		return MUX_SQL_SAVEPOINT;
+
+#undef IS_WORD_BOUNDARY
+
+	return MUX_SQL_OTHER;
+}
+
+/*
+ * mux_parse_isolation_level
+ *		Scan a "BEGIN" or "START TRANSACTION" statement for an
+ *		"ISOLATION LEVEL <level>" clause and return the corresponding
+ *		XACT_* constant.  Returns -1 if no isolation level clause is found
+ *		so callers can distinguish "explicitly READ COMMITTED" from "not set".
+ */
+static int
+mux_parse_isolation_level(const char *sql)
+{
+	const char *p = sql;
+
+	while (*p)
+	{
+		if (pg_strncasecmp(p, "ISOLATION", 9) == 0)
+		{
+			const char *q = p + 9;
+
+			while (*q == ' ' || *q == '\t')
+				q++;
+
+			if (pg_strncasecmp(q, "LEVEL", 5) == 0)
+			{
+				q += 5;
+				while (*q == ' ' || *q == '\t')
+					q++;
+
+				if (pg_strncasecmp(q, "SERIALIZABLE", 12) == 0)
+					return XACT_SERIALIZABLE;
+				if (pg_strncasecmp(q, "REPEATABLE READ", 15) == 0)
+					return XACT_REPEATABLE_READ;
+				if (pg_strncasecmp(q, "READ COMMITTED", 14) == 0)
+					return XACT_READ_COMMITTED;
+				if (pg_strncasecmp(q, "READ UNCOMMITTED", 16) == 0)
+					return XACT_READ_UNCOMMITTED;
+			}
+		}
+		p++;
+	}
+	return -1;					/* not found */
+}
+
+/*
+ * mux_serialize_results
+ *		Serialize the current SPI result set (SPI_tuptable) into 'buf'.
+ *
+ *		Format (all values are native int32 unless noted):
+ *		  nfields  int32
+ *		  ntuples  int32
+ *		  for each field:
+ *		    name   NUL-terminated string
+ *		    typid  int32 (type OID)
+ *		  for each tuple, for each field:
+ *		    vlen   int32 (-1 for NULL, otherwise byte length of text repr)
+ *		    data   vlen bytes (text representation, no NUL terminator)
+ *
+ *		Returns the number of bytes written, or -1 if 'bufsz' was too small
+ *		(result is truncated in that case).
+ */
+static int
+mux_serialize_results(char *buf, int bufsz, int *nfields_out, int *ntuples_out)
+{
+	SPITupleTable *tuptable = SPI_tuptable;
+	TupleDesc	tupdesc;
+	int			nfields,
+				ntuples;
+	char	   *p = buf;
+	int			remaining = bufsz;
+	int			i,
+				j;
+
+#define NEED(n)     do { if (remaining < (int)(n)) return -1; } while (0)
+#define PUT_INT32(v) do { int32 _v = (int32)(v); memcpy(p, &_v, 4); p += 4; remaining -= 4; } while (0)
+#define PUT_STR(s) do { \
+	int _len = strlen(s) + 1; \
+	NEED(_len); \
+	memcpy(p, (s), _len); p += _len; remaining -= _len; \
+} while (0)
+
+	if (tuptable == NULL)
+	{
+		/* No result set (e.g. INSERT, UPDATE, DDL) */
+		NEED(8);
+		PUT_INT32(0);
+		PUT_INT32(0);
+		if (nfields_out)
+			*nfields_out = 0;
+		if (ntuples_out)
+			*ntuples_out = 0;
+		return (int) (p - buf);
+	}
+
+	tupdesc = tuptable->tupdesc;
+	nfields = tupdesc->natts;
+	ntuples = (int) SPI_processed;
+
+	NEED(8);
+	PUT_INT32(nfields);
+	PUT_INT32(ntuples);
+
+	/* Field descriptors */
+	for (i = 0; i < nfields; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+
+		PUT_STR(NameStr(attr->attname));
+		NEED(4);
+		PUT_INT32((int32) attr->atttypid);
+	}
+
+	/* Row data */
+	for (j = 0; j < ntuples; j++)
+	{
+		HeapTuple	tup = tuptable->vals[j];
+
+		for (i = 0; i < nfields; i++)
+		{
+			char	   *str;
+			int			slen;
+
+			/*
+			 * SPI_getvalue returns NULL for NULL attribute values and a
+			 * non-null text representation otherwise.
+			 */
+			str = SPI_getvalue(tup, tupdesc, i + 1);
+
+			if (str == NULL)
+			{
+				NEED(4);
+				PUT_INT32(-1);
+			}
+			else
+			{
+				slen = strlen(str);
+				NEED(4 + slen);
+				PUT_INT32(slen);
+				memcpy(p, str, slen);
+				p += slen;
+				remaining -= slen;
+			}
+		}
+	}
+
+	if (nfields_out)
+		*nfields_out = nfields;
+	if (ntuples_out)
+		*ntuples_out = ntuples;
+
+	return (int) (p - buf);
+
+#undef NEED
+#undef PUT_INT32
+#undef PUT_STR
+}
+
 /*
  * ConnMuxWorkerMain
  *		Entry point for each pool worker background worker.
  *
- * The worker:
- *   1. Claims a slot in MuxState->workers[].
- *   2. Sets up the mux↔worker shared-memory queues.
- *   3. Loops: wait for a request, execute it, send back the result.
+ * Each worker:
+ *   1. Connects to mux_local_database via BackgroundWorkerInitializeConnection.
+ *   2. Claims a slot in MuxState->workers[].
+ *   3. Sets up the mux↔worker shared-memory queues.
+ *   4. Loops: wait for a request, execute it via SPI, send back the result.
  *
- * Workers are stateless – no transaction state is kept between requests.
- * The coordinator transfers any required state via the request payload.
+ * Transaction state is maintained across messages within the same logical
+ * transaction:
+ *   MUX_MSG_TXSTATE – store isolation level for the upcoming BEGIN
+ *   MUX_MSG_QUERY   – execute one SQL statement (handles BEGIN/COMMIT/ROLLBACK
+ *                     specially; all other SQL goes through SPI)
+ *   MUX_MSG_CLOSE   – abort any open transaction and become idle
  */
 void
 ConnMuxWorkerMain(Datum main_arg)
@@ -1795,6 +2027,10 @@ ConnMuxWorkerMain(Datum main_arg)
 	MemoryContext old_cxt;
 	sigjmp_buf	local_sigjmp_buf;
 
+	/* Per-worker transaction state */
+	bool		worker_in_txn = false;	/* inside an explicit transaction block */
+	int			worker_isolation = XACT_READ_COMMITTED;	/* pending BEGIN isolation */
+
 	if (worker_id < 0 || worker_id >= MUX_MAX_WORKERS)
 		ereport(ERROR,
 				(errmsg("mux worker started with invalid id %d", worker_id)));
@@ -1802,6 +2038,13 @@ ConnMuxWorkerMain(Datum main_arg)
 	slot = &MuxState->workers[worker_id];
 
 	mux_worker_setup_signals();
+
+	/*
+	 * Connect to the local database so we can execute queries via SPI.
+	 * This must be done before unblocking signals.
+	 */
+	BackgroundWorkerInitializeConnection(mux_local_database, NULL, 0);
+
 	sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
 
 	worker_context = AllocSetContextCreate(TopMemoryContext,
@@ -1857,6 +2100,14 @@ ConnMuxWorkerMain(Datum main_arg)
 		LWLockReleaseAll();
 		pgstat_report_wait_end();
 
+		/*
+		 * Abort any open transaction.  AbortCurrentTransaction() is safe to
+		 * call even in TBLOCK_DEFAULT (no-op) so we call it unconditionally.
+		 */
+		AbortCurrentTransaction();
+		worker_in_txn = false;
+		worker_isolation = XACT_READ_COMMITTED;
+
 		SpinLockAcquire(&slot->mutex);
 		slot->count_errors++;
 		slot->phase = MUX_WORKER_IDLE;
@@ -1882,11 +2133,20 @@ ConnMuxWorkerMain(Datum main_arg)
 	 * ---------------------------------------------------------------- */
 	for (;;)
 	{
-		shm_mq_result result;
+		shm_mq_result mqresult;
 		Size		nbytes;
 		void	   *data;
 		MuxMsgHeader *hdr;
-		MuxMsgHeader reply_hdr;
+		const char *sql;
+		Size		sql_len;
+
+		/* Buffers for reply (header + serialised result) */
+		char		reply_buf[sizeof(MuxMsgHeader) + MUX_RESULT_MAXLEN];
+		MuxMsgHeader *reply_hdr = (MuxMsgHeader *) reply_buf;
+		char	   *reply_payload = reply_buf + sizeof(MuxMsgHeader);
+		int			reply_payload_len = 0;
+		bool		reply_is_error = false;
+		char		errmsg_buf[256];
 
 		if (mux_got_sigterm)
 			break;
@@ -1894,15 +2154,13 @@ ConnMuxWorkerMain(Datum main_arg)
 		/*
 		 * Try to receive a message without blocking first.  If no message is
 		 * available, wait on the latch (which the multiplexer will set when
-		 * it dispatches a request) before trying again.  Using nowait + latch
-		 * ensures SIGTERM is processed promptly.
+		 * it dispatches a request) before trying again.
 		 */
 		set_ps_display("idle");
-		result = shm_mq_receive(req_mqh, &nbytes, &data, true /* nowait */);
+		mqresult = shm_mq_receive(req_mqh, &nbytes, &data, true /* nowait */);
 
-		if (result == SHM_MQ_WOULD_BLOCK)
+		if (mqresult == SHM_MQ_WOULD_BLOCK)
 		{
-			/* Nothing to do; wait for the mux to wake us up */
 			ResetLatch(MyLatch);
 			if (mux_got_sigterm)
 				break;
@@ -1913,10 +2171,10 @@ ConnMuxWorkerMain(Datum main_arg)
 			continue;
 		}
 
-		if (result == SHM_MQ_DETACHED)
+		if (mqresult == SHM_MQ_DETACHED)
 			break;				/* multiplexer shut down */
 
-		if (result != SHM_MQ_SUCCESS)
+		if (mqresult != SHM_MQ_SUCCESS)
 			continue;
 
 		if (nbytes < sizeof(MuxMsgHeader))
@@ -1945,69 +2203,311 @@ ConnMuxWorkerMain(Datum main_arg)
 
 		set_ps_display("executing");
 
-		/*
-		 * Execute the request.
-		 *
-		 * In the current implementation we perform the minimal processing
-		 * to validate the infrastructure.  A complete implementation would
-		 * deserialise the payload, set up the transaction context (using the
-		 * CSN transferred by the coordinator), execute the sub-statement, and
-		 * serialise the result.
-		 *
-		 * Request types:
-		 *   MUX_MSG_QUERY   – execute a query sub-statement
-		 *   MUX_MSG_TXSTATE – apply transaction state from coordinator
-		 *   MUX_MSG_CLOSE   – release any held resources and become idle
-		 */
+		MemoryContextSwitchTo(worker_context);
+
 		switch (hdr->msg_type)
 		{
-			case MUX_MSG_QUERY:
-				SpinLockAcquire(&slot->mutex);
-				slot->count_queries++;
-				SpinLockRelease(&slot->mutex);
-				/* Full impl: deserialise and execute query here */
-				break;
-
+				/* --------------------------------------------------------
+				 * MUX_MSG_TXSTATE
+				 *		The multiplexer is sending transaction state (isolation
+				 *		level) that should be applied when the next BEGIN is
+				 *		processed.  Payload is a MuxTxStatePayload struct.
+				 * -------------------------------------------------------- */
 			case MUX_MSG_TXSTATE:
-				/* Full impl: import CSN snapshot and transaction state */
-				break;
+				{
+					if (hdr->payload_len >= (uint32) sizeof(MuxTxStatePayload))
+					{
+						const MuxTxStatePayload *txstate =
+						(const MuxTxStatePayload *)
+						((const char *) data + sizeof(MuxMsgHeader));
 
+						worker_isolation = txstate->isolation_level;
+						ereport(MULTIPLEXER_LOG_LEVEL,
+								(errmsg("mux worker %d: stored isolation_level=%d for conn_id=%u",
+										worker_id, worker_isolation, hdr->conn_id)));
+					}
+					/* Empty success reply */
+					reply_payload_len = 0;
+					break;
+				}
+
+				/* --------------------------------------------------------
+				 * MUX_MSG_QUERY
+				 *		Execute one SQL statement.  Transaction control
+				 *		statements (BEGIN/COMMIT/ROLLBACK) are handled
+				 *		directly via the transaction state machine.  All
+				 *		other statements run through SPI.
+				 * -------------------------------------------------------- */
+			case MUX_MSG_QUERY:
+				{
+					MuxSqlKind	sqlkind;
+					int			spi_ret;
+
+					SpinLockAcquire(&slot->mutex);
+					slot->count_queries++;
+					SpinLockRelease(&slot->mutex);
+
+					sql = (const char *) data + sizeof(MuxMsgHeader);
+					sql_len = (Size) hdr->payload_len;
+
+					/*
+					 * The SQL text might not be NUL-terminated inside the
+					 * shm_mq buffer.  Copy it to worker_context and
+					 * NUL-terminate.
+					 */
+					{
+						char	   *sqlcopy = palloc(sql_len + 1);
+
+						memcpy(sqlcopy, sql, sql_len);
+						sqlcopy[sql_len] = '\0';
+						sql = sqlcopy;
+					}
+
+					sqlkind = mux_classify_sql(sql);
+
+					ereport(MULTIPLEXER_LOG_LEVEL,
+							(errmsg("mux worker %d: executing sql_kind=%d sql=\"%.100s%s\"",
+									worker_id, (int) sqlkind, sql,
+									sql_len > 100 ? "..." : "")));
+
+					switch (sqlkind)
+					{
+						case MUX_SQL_BEGIN:
+							{
+								/*
+								 * Start a new explicit transaction block.
+								 * Use the isolation level from the SQL if explicitly
+								 * specified; otherwise fall back to the pending
+								 * transaction state set by MUX_MSG_TXSTATE.
+								 */
+								if (worker_in_txn)
+								{
+									/*
+									 * Nested BEGIN: silently ignore (matches
+									 * PostgreSQL's behaviour of issuing a
+									 * WARNING and staying in the block).
+									 */
+									ereport(MULTIPLEXER_LOG_LEVEL,
+											(errmsg("mux worker %d: BEGIN inside open transaction — ignored",
+													worker_id)));
+								}
+								else
+								{
+									int			iso = mux_parse_isolation_level(sql);
+
+									/*
+									 * If no isolation level was specified in
+									 * the SQL (iso == -1), use the pending
+									 * isolation level from MUX_MSG_TXSTATE.
+									 */
+									if (iso < 0)
+										iso = worker_isolation;
+
+									StartTransactionCommand();
+									XactIsoLevel = iso;
+									BeginTransactionBlock();
+									CommitTransactionCommand(); /* state → INPROGRESS */
+									worker_in_txn = true;
+
+									ereport(MULTIPLEXER_LOG_LEVEL,
+											(errmsg("mux worker %d: BEGIN isolation=%d",
+													worker_id, iso)));
+								}
+								reply_payload_len = 0;
+								break;
+							}
+
+						case MUX_SQL_COMMIT:
+							{
+								if (worker_in_txn)
+								{
+									StartTransactionCommand();
+									if (!EndTransactionBlock(false))
+									{
+										/*
+										 * EndTransactionBlock returned false
+										 * if we were in an aborted block; we
+										 * still call CommitTransactionCommand
+										 * which will do a cleanup/rollback.
+										 */
+									}
+									CommitTransactionCommand(); /* actually commits */
+									worker_in_txn = false;
+
+									ereport(MULTIPLEXER_LOG_LEVEL,
+											(errmsg("mux worker %d: COMMIT done",
+													worker_id)));
+								}
+								reply_payload_len = 0;
+								break;
+							}
+
+						case MUX_SQL_ROLLBACK:
+							{
+								if (worker_in_txn)
+								{
+									StartTransactionCommand();
+									UserAbortTransactionBlock(false);
+									CommitTransactionCommand(); /* actually aborts */
+									worker_in_txn = false;
+
+									ereport(MULTIPLEXER_LOG_LEVEL,
+											(errmsg("mux worker %d: ROLLBACK done",
+													worker_id)));
+								}
+								reply_payload_len = 0;
+								break;
+							}
+
+						case MUX_SQL_SAVEPOINT:
+							{
+								/*
+								 * Savepoint commands are executed through SPI
+								 * just like regular statements — SPI handles
+								 * them as utility statements within the open
+								 * transaction.  They cannot be executed here
+								 * outside a transaction block.
+								 */
+								if (!worker_in_txn)
+								{
+									snprintf(errmsg_buf, sizeof(errmsg_buf),
+											 "SAVEPOINT command outside transaction block");
+									reply_is_error = true;
+									reply_payload_len = strlen(errmsg_buf);
+									if (reply_payload_len > MUX_RESULT_MAXLEN)
+										reply_payload_len = MUX_RESULT_MAXLEN;
+									memcpy(reply_payload, errmsg_buf, reply_payload_len);
+									break;
+								}
+								/* Fall through to SPI execution */
+							}
+							/* fall through */
+
+						case MUX_SQL_OTHER:
+						default:
+							{
+								/*
+								 * Regular DML / DDL / SELECT.
+								 * Execute via SPI within the current or a new
+								 * single-statement transaction.
+								 */
+								bool		auto_txn = !worker_in_txn;
+
+								if (auto_txn)
+									StartTransactionCommand();
+
+								SPI_connect();
+								PushActiveSnapshot(GetTransactionSnapshot());
+
+								spi_ret = SPI_execute(sql, false /* read-write */, 0);
+
+								if (spi_ret < 0)
+								{
+									/* SPI error — build an error reply */
+									snprintf(errmsg_buf, sizeof(errmsg_buf),
+											 "SPI_execute failed: %s",
+											 SPI_result_code_string(spi_ret));
+									reply_is_error = true;
+									reply_payload_len = strlen(errmsg_buf);
+									if (reply_payload_len > MUX_RESULT_MAXLEN)
+										reply_payload_len = MUX_RESULT_MAXLEN;
+									memcpy(reply_payload, errmsg_buf, reply_payload_len);
+								}
+								else
+								{
+									/* Serialise results into reply_payload */
+									int			nf,
+												nt;
+									int			serialised;
+
+									serialised = mux_serialize_results(
+																	   reply_payload,
+																	   MUX_RESULT_MAXLEN,
+																	   &nf, &nt);
+									if (serialised < 0)
+									{
+										snprintf(errmsg_buf, sizeof(errmsg_buf),
+												 "result too large for mux buffer");
+										reply_is_error = true;
+										reply_payload_len = strlen(errmsg_buf);
+										memcpy(reply_payload, errmsg_buf, reply_payload_len);
+									}
+									else
+									{
+										reply_payload_len = serialised;
+										ereport(MULTIPLEXER_LOG_LEVEL,
+												(errmsg("mux worker %d: query ok nfields=%d ntuples=%d",
+														worker_id, nf, nt)));
+									}
+								}
+
+								PopActiveSnapshot();
+								SPI_finish();
+
+								if (auto_txn)
+									CommitTransactionCommand();
+
+								break;
+							}
+					}
+
+					break;
+				}
+
+				/* --------------------------------------------------------
+				 * MUX_MSG_CLOSE
+				 *		Abort any open transaction and return to idle.
+				 * -------------------------------------------------------- */
 			case MUX_MSG_CLOSE:
-				SpinLockAcquire(&slot->mutex);
-				slot->count_closes++;
-				SpinLockRelease(&slot->mutex);
-				break;
+				{
+					SpinLockAcquire(&slot->mutex);
+					slot->count_closes++;
+					SpinLockRelease(&slot->mutex);
+
+					if (worker_in_txn)
+					{
+						AbortCurrentTransaction();
+						worker_in_txn = false;
+						ereport(MULTIPLEXER_LOG_LEVEL,
+								(errmsg("mux worker %d: CLOSE — aborted open transaction",
+										worker_id)));
+					}
+					worker_isolation = XACT_READ_COMMITTED;
+					reply_payload_len = 0;
+					break;
+				}
 
 			default:
 				ereport(WARNING,
 						(errmsg("mux worker %d: unknown message type %d",
 								worker_id, (int) hdr->msg_type)));
+				reply_payload_len = 0;
 				break;
 		}
 
+		MemoryContextSwitchTo(worker_context);
+
 		/*
 		 * Send the result back to the multiplexer.
-		 * The reply header echoes the conn_id so the mux can route it.
+		 * The reply carries the conn_id so the mux can route it.
+		 * On error we send MUX_MSG_ERROR with the error text as payload.
 		 */
-		reply_hdr.msg_type = MUX_MSG_RESULT;
-		reply_hdr.conn_id = hdr->conn_id;
-		reply_hdr.payload_len = 0;
-		reply_hdr.requester_pid = hdr->requester_pid;
+		reply_hdr->msg_type = reply_is_error ? MUX_MSG_ERROR : MUX_MSG_RESULT;
+		reply_hdr->conn_id = hdr->conn_id;
+		reply_hdr->payload_len = (uint32) reply_payload_len;
+		reply_hdr->requester_pid = hdr->requester_pid;
 
-		result = shm_mq_send(res_mqh,
-							 sizeof(reply_hdr), &reply_hdr,
-							 true /* nowait */,
-							 true /* flush */);
+		mqresult = shm_mq_send(res_mqh,
+							   sizeof(MuxMsgHeader) + reply_payload_len,
+							   reply_buf,
+							   true /* nowait */,
+							   true /* flush */);
 
-		if (result == SHM_MQ_DETACHED)
+		if (mqresult == SHM_MQ_DETACHED)
 		{
-			/*
-			 * The multiplexer's recv handle is gone.  Don't mark the slot as
-			 * IDLE (the slot is about to become DEAD in the cleanup below).
-			 */
 			ereport(WARNING,
 					(errmsg("mux worker %d: multiplexer detached while sending result for conn_id=%u",
-							worker_id, reply_hdr.conn_id)));
+							worker_id, hdr->conn_id)));
 			SpinLockAcquire(&slot->mutex);
 			slot->requests_completed++;
 			SpinLockRelease(&slot->mutex);
@@ -2020,11 +2520,29 @@ ConnMuxWorkerMain(Datum main_arg)
 		SpinLockRelease(&slot->mutex);
 
 		ereport(MULTIPLEXER_LOG_LEVEL,
-				(errmsg("mux worker %d: sent result for conn_id=%u to multiplexer",
-						worker_id, reply_hdr.conn_id)));
+				(errmsg("mux worker %d: sent result for conn_id=%u to multiplexer (%s, payload=%d)",
+						worker_id, hdr->conn_id,
+						reply_is_error ? "error" : "ok",
+						reply_payload_len)));
 
 		/* Wake the multiplexer to pick up the result */
 		ConnMuxWakeup();
+	}
+
+	/* Abort any lingering transaction on exit */
+	if (worker_in_txn)
+	{
+		PG_TRY();
+		{
+			AbortCurrentTransaction();
+		}
+		PG_CATCH();
+		{
+			EmitErrorReport();
+			FlushErrorState();
+		}
+		PG_END_TRY();
+		worker_in_txn = false;
 	}
 
 	/* Clean up */

@@ -116,6 +116,19 @@ typedef struct MuxMsgHeader
 	int32		requester_pid;	/* PID of the requesting backend */
 } MuxMsgHeader;
 
+/*
+ * Payload for MUX_MSG_TXSTATE messages.
+ *
+ * The multiplexer sends this to a worker before the first query in a new
+ * transaction to convey the isolation level that the client requested.
+ * The worker stores it and applies it when it processes the subsequent BEGIN.
+ */
+typedef struct MuxTxStatePayload
+{
+	int32		isolation_level;	/* XACT_READ_COMMITTED, XACT_REPEATABLE_READ,
+									 * or XACT_SERIALIZABLE */
+} MuxTxStatePayload;
+
 /* ----------------------------------------------------------------
  * Per-worker slot in shared memory
  * ---------------------------------------------------------------- */
@@ -400,6 +413,14 @@ extern PGDLLIMPORT int max_mux_connections;
  * All multiplexers in a cluster must use the same port.  Default: 7432.
  */
 extern PGDLLIMPORT int mux_tcp_port;
+
+/*
+ * Name of the local database that multiplexer workers connect to in order
+ * to execute inbound queries from remote nodes via SPI.
+ * Defaults to "postgres".  Must be set to a valid database name before
+ * inbound remote queries can be executed.
+ */
+extern PGDLLIMPORT char *mux_local_database;
 
 /* ----------------------------------------------------------------
  * Public API
