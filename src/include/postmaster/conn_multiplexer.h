@@ -44,6 +44,15 @@
 #include "utils/timestamp.h"
 
 /* ----------------------------------------------------------------
+ * Logging
+ *
+ * All multiplexer events (startup, shutdown, query requests, results,
+ * worker lifecycle, TCP connections) are emitted at this level so that
+ * they appear in the server log by default.
+ * ---------------------------------------------------------------- */
+#define MULTIPLEXER_LOG_LEVEL	WARNING
+
+/* ----------------------------------------------------------------
  * Configuration constants
  * ---------------------------------------------------------------- */
 

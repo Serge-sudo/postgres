@@ -279,6 +279,9 @@ ConnMuxRegister(void)
 	bgw.bgw_notify_pid = 0;
 
 	RegisterBackgroundWorker(&bgw);
+
+	ereport(MULTIPLEXER_LOG_LEVEL,
+			(errmsg("connection multiplexer registered as background worker")));
 }
 
 
@@ -359,6 +362,11 @@ mux_spawn_workers(int n)
 			ereport(WARNING,
 					(errmsg("connection multiplexer: could not register worker %d", i)));
 		}
+		else
+		{
+			ereport(MULTIPLEXER_LOG_LEVEL,
+					(errmsg("mux: spawned worker %d", i)));
+		}
 		/* We intentionally do not wait for the worker to start here;
 		 * the worker will announce itself via its latch. */
 	}
@@ -432,7 +440,8 @@ mux_init_listen_socket(void)
 
 	mux_set_nonblocking(sock);
 
-	ereport(LOG, (errmsg("mux: listening on port %d", mux_tcp_port)));
+	ereport(MULTIPLEXER_LOG_LEVEL,
+			(errmsg("mux: listening for peer connections on port %d", mux_tcp_port)));
 	return sock;
 }
 
@@ -466,8 +475,9 @@ mux_accept_peer(void)
 	inbound_socks[n_inbound] = fd;
 	n_inbound++;
 
-	ereport(DEBUG1, (errmsg("mux: accepted peer connection from %s",
-							inet_ntoa(peer_addr.sin_addr))));
+	ereport(MULTIPLEXER_LOG_LEVEL,
+			(errmsg("mux: accepted inbound peer connection from %s (peer_idx=%d)",
+					inet_ntoa(peer_addr.sin_addr), n_inbound - 1)));
 	return fd;
 }
 
@@ -538,8 +548,9 @@ mux_connect_to_peer(int rc_idx)
 	mux_set_nonblocking(sock);
 	outbound_socks[rc_idx] = sock;
 
-	ereport(DEBUG1, (errmsg("mux: connected to peer %s:%d (rc_idx=%d)",
-							host, mux_tcp_port, rc_idx)));
+	ereport(MULTIPLEXER_LOG_LEVEL,
+			(errmsg("mux: connected outbound to peer %s:%d (rc_idx=%d)",
+					host, mux_tcp_port, rc_idx)));
 	return sock;
 }
 
@@ -700,6 +711,11 @@ mux_dispatch_remote_slots(void)
 			continue;
 		}
 
+		ereport(MULTIPLEXER_LOG_LEVEL,
+				(errmsg("mux: dispatched remote query slot %d to peer rc_idx=%d sql=\"%.100s%s\"",
+						q, rc_idx, qs->sql,
+						strlen(qs->sql) > 100 ? "..." : "")));
+
 		/*
 		 * Mark slot as "dispatched" by setting server_oid to InvalidOid
 		 * so we do not re-send it on the next loop iteration.
@@ -842,6 +858,12 @@ mux_process_inbound_message(int peer_idx)
 		memcpy(payload, sql_buf, nethdr.payload_len);
 		total_len = sizeof(MuxMsgHeader) + nethdr.payload_len;
 
+		ereport(MULTIPLEXER_LOG_LEVEL,
+				(errmsg("mux: inbound query from peer %d slot_id=%u sql=\"%.100s%s\" -> dispatching to worker %d",
+						peer_idx, nethdr.slot_id, sql_buf,
+						nethdr.payload_len > 101 ? "..." : "",
+						worker_id)));
+
 		if (!mux_dispatch_to_worker(worker_id, dispatch_buf, total_len))
 		{
 			ereport(WARNING, (errmsg("mux: dispatch to worker %d failed", worker_id)));
@@ -941,6 +963,11 @@ mux_process_outbound_result(int rc_idx)
 	qs->completed = true;
 	SpinLockRelease(&qs->mutex);
 
+	ereport(MULTIPLEXER_LOG_LEVEL,
+			(errmsg("mux: received %s for slot %d from peer rc_idx=%d payload_len=%u",
+					(nethdr.msg_type == MUXNET_MSG_ERROR || nethdr.is_error) ? "error" : "result",
+					slot_id, rc_idx, nethdr.payload_len)));
+
 	if (qs->requester_latch)
 		SetLatch(qs->requester_latch);
 }
@@ -996,6 +1023,12 @@ mux_dispatch_to_worker(int worker_id, const char *data, Size len)
 
 	if (result != SHM_MQ_SUCCESS)
 		return false;
+
+	ereport(MULTIPLEXER_LOG_LEVEL,
+			(errmsg("mux: dispatched request to worker %d (conn_id=%u, len=%zu)",
+					worker_id,
+					((const MuxMsgHeader *) data)->conn_id,
+					len)));
 
 	/* Mark slot as busy */
 	SpinLockAcquire(&slot->mutex);
@@ -1104,6 +1137,15 @@ mux_drain_worker_queues(void)
 									close(peer_sock);
 									inbound_socks[peer_idx] = PGINVALID_SOCKET;
 								}
+								else
+								{
+									ereport(MULTIPLEXER_LOG_LEVEL,
+											(errmsg("mux: sent %s to peer %d for remote_slot_id=%u payload_len=%u",
+													(nethdr.is_error ? "error" : "result"),
+													peer_idx,
+													inbound_reqs[req_idx].remote_slot_id,
+													payload_len)));
+								}
 							}
 						}
 
@@ -1145,14 +1187,15 @@ mux_drain_worker_queues(void)
 						qs->completed = true;
 						SpinLockRelease(&qs->mutex);
 
+						ereport(MULTIPLEXER_LOG_LEVEL,
+								(errmsg("mux: local result delivered to backend pid=%d slot=%u %s",
+										qs->requester_pid, conn_id,
+										qs->is_error ? "(error)" : "(ok)")));
+
 						if (qs->requester_latch)
 							SetLatch(qs->requester_latch);
 					}
 				}
-
-				ereport(DEBUG2,
-						(errmsg("mux: result from worker %d conn_id=%u type=%d",
-								i, hdr->conn_id, (int) hdr->msg_type)));
 
 				/* Try to dispatch a pending request to the now-idle worker */
 				{
@@ -1285,9 +1328,9 @@ ConnMuxMain(Datum main_arg)
 	MuxState->num_workers = mux_worker_count;
 	SpinLockRelease(&MuxState->mutex);
 
-	ereport(LOG,
-			(errmsg("connection multiplexer started, worker pool size = %d",
-					mux_worker_count)));
+	ereport(MULTIPLEXER_LOG_LEVEL,
+			(errmsg("connection multiplexer started (pid %d), worker pool size = %d, tcp_port = %d",
+					MyProcPid, mux_worker_count, mux_tcp_port)));
 
 	/* Set up the error-recovery jump point */
 	if (sigsetjmp(local_sigjmp_buf, 1) != 0)
@@ -1400,8 +1443,8 @@ ConnMuxMain(Datum main_arg)
 
 			if (slot->phase == MUX_WORKER_DEAD)
 			{
-				ereport(DEBUG1,
-						(errmsg("mux: re-spawning worker %d", i)));
+				ereport(MULTIPLEXER_LOG_LEVEL,
+						(errmsg("mux: re-spawning dead worker %d", i)));
 				mux_spawn_workers(1);
 			}
 		}
@@ -1494,7 +1537,7 @@ ConnMuxMain(Datum main_arg)
 	MuxState->mux_latch = NULL;
 	SpinLockRelease(&MuxState->mutex);
 
-	ereport(LOG,
+	ereport(MULTIPLEXER_LOG_LEVEL,
 			(errmsg("connection multiplexer shutting down")));
 	proc_exit(0);
 }
@@ -1565,7 +1608,7 @@ ConnMuxWorkerMain(Datum main_arg)
 	/* Wake the multiplexer so it sees the new idle worker */
 	ConnMuxWakeup();
 
-	ereport(DEBUG1,
+	ereport(MULTIPLEXER_LOG_LEVEL,
 			(errmsg("mux worker %d started (pid %d)", worker_id, MyProcPid)));
 
 	set_ps_display("idle");
@@ -1657,6 +1700,11 @@ ConnMuxWorkerMain(Datum main_arg)
 
 		hdr = (MuxMsgHeader *) data;
 
+		ereport(MULTIPLEXER_LOG_LEVEL,
+				(errmsg("mux worker %d: received request type=%d conn_id=%u requester_pid=%d",
+						worker_id, (int) hdr->msg_type, hdr->conn_id,
+						hdr->requester_pid)));
+
 		/* Mark slot as busy */
 		SpinLockAcquire(&slot->mutex);
 		slot->phase = MUX_WORKER_BUSY;
@@ -1727,6 +1775,10 @@ ConnMuxWorkerMain(Datum main_arg)
 		slot->phase = MUX_WORKER_IDLE;
 		SpinLockRelease(&slot->mutex);
 
+		ereport(MULTIPLEXER_LOG_LEVEL,
+				(errmsg("mux worker %d: sent result for conn_id=%u to multiplexer",
+						worker_id, reply_hdr.conn_id)));
+
 		/* Wake the multiplexer to pick up the result */
 		ConnMuxWakeup();
 
@@ -1746,7 +1798,7 @@ ConnMuxWorkerMain(Datum main_arg)
 
 	ConnMuxWakeup();
 
-	ereport(DEBUG1,
+	ereport(MULTIPLEXER_LOG_LEVEL,
 			(errmsg("mux worker %d exiting", worker_id)));
 	proc_exit(0);
 }
@@ -1914,7 +1966,13 @@ ConnMuxRegisterServer(Oid serverOid, const char *serverName,
 
 	/* Wake the multiplexer so it notices the new server */
 	if (slot_idx >= 0)
+	{
+		ereport(MULTIPLEXER_LOG_LEVEL,
+				(errmsg("mux: registered foreign server \"%s\" (oid=%u) at slot %d, peer_host=%s",
+						serverName, serverOid, slot_idx,
+						(peer_host && peer_host[0]) ? peer_host : MUX_DEFAULT_PEER_HOST)));
 		ConnMuxWakeup();
+	}
 
 	return slot_idx >= 0 ? (uint32) slot_idx : (uint32) -1;
 }
@@ -2020,6 +2078,11 @@ ConnMuxSubmitQuery(Oid serverOid, const char *sql,
 	slot->requester_pid = MyProcPid;
 	slot->requester_latch = MyLatch;
 
+	ereport(MULTIPLEXER_LOG_LEVEL,
+			(errmsg("mux: backend pid=%d submitted query to server_oid=%u slot=%d sql=\"%.100s%s\"",
+					MyProcPid, serverOid, slot_idx, sql,
+					strlen(sql) > 100 ? "..." : "")));
+
 	/* Wake the multiplexer so it dispatches the remote query via TCP */
 	ConnMuxWakeup();
 
@@ -2031,12 +2094,20 @@ ConnMuxSubmitQuery(Oid serverOid, const char *sql,
 	{
 		strlcpy(error_msg, slot->error_msg, error_msg_size);
 
+		ereport(MULTIPLEXER_LOG_LEVEL,
+				(errmsg("mux: query for backend pid=%d slot=%d returned error: %s",
+						MyProcPid, slot_idx, error_msg)));
+
 		SpinLockAcquire(&slot->mutex);
 		slot->in_use = false;
 		SpinLockRelease(&slot->mutex);
 
 		return false;
 	}
+
+	ereport(MULTIPLEXER_LOG_LEVEL,
+			(errmsg("mux: query for backend pid=%d slot=%d completed ok (ntuples=%d)",
+					MyProcPid, slot_idx, slot->result_ntuples)));
 
 	if (result_data && result_data_size > 0)
 	{
