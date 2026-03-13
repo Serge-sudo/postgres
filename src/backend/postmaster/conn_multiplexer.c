@@ -123,6 +123,15 @@ static int	listen_sock = PGINVALID_SOCKET;
 /* Outbound peer sockets, indexed by MuxRemoteConn slot */
 static int	outbound_socks[MUX_MAX_REMOTE_CONNS];
 
+/*
+ * Per-RC consecutive connection-failure counter.  Reset to zero on a
+ * successful connect.  When the count reaches MUX_MAX_PEER_FAILURES the
+ * multiplexer gives up on the pending query slot and signals an error to
+ * the waiting backend so it does not hang indefinitely.
+ */
+#define MUX_MAX_PEER_FAILURES	30	/* ~3 s at 100 ms loop interval */
+static int	peer_connect_failures[MUX_MAX_REMOTE_CONNS];
+
 /* Inbound peer sockets (peers that connected to us) */
 /* 16 peers is sufficient for a small cluster; increase if needed */
 #define MUX_MAX_INBOUND_PEERS	16
@@ -493,6 +502,7 @@ mux_connect_to_peer(int rc_idx)
 	MuxRemoteConn *rc = &MuxState->remote_conns[rc_idx];
 	char		host[MUX_PEER_HOST_MAXLEN];
 	int			peer_port;
+	int			effective_port;
 	struct addrinfo hints;
 	struct addrinfo *res,
 			   *rp;
@@ -512,8 +522,8 @@ mux_connect_to_peer(int rc_idx)
 
 	if (host[0] == '\0')
 		strlcpy(host, MUX_DEFAULT_PEER_HOST, sizeof(host));
-	snprintf(portstr, sizeof(portstr), "%d",
-			 (peer_port > 0) ? peer_port : mux_tcp_port);
+	effective_port = (peer_port > 0) ? peer_port : mux_tcp_port;
+	snprintf(portstr, sizeof(portstr), "%d", effective_port);
 
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_UNSPEC;
@@ -524,7 +534,62 @@ mux_connect_to_peer(int rc_idx)
 	{
 		ereport(WARNING, (errmsg("mux: getaddrinfo(%s): %s", host,
 								 gai_strerror(ret))));
+		peer_connect_failures[rc_idx]++;
 		return PGINVALID_SOCKET;
+	}
+
+	/*
+	 * Self-connection guard.
+	 *
+	 * If the effective target port equals our own mux_tcp_port AND any
+	 * resolved address is a loopback address, we would be connecting to our
+	 * own multiplexer.  That creates a routing loop: the query would arrive
+	 * as an *inbound* message and be dispatched to a local worker on this
+	 * node instead of being forwarded to the actual peer node.
+	 *
+	 * The most common cause is a foreign server created without the 'mux_port'
+	 * option when both nodes run on the same host with different mux ports.
+	 * The fix is to set "mux_port '<peer_port>'" in CREATE SERVER ... OPTIONS.
+	 */
+	if (effective_port == mux_tcp_port)
+	{
+		for (rp = res; rp != NULL; rp = rp->ai_next)
+		{
+			bool		is_loopback = false;
+
+			if (rp->ai_family == AF_INET)
+			{
+				const struct sockaddr_in *sin =
+				(const struct sockaddr_in *) rp->ai_addr;
+				uint32		ip = ntohl(sin->sin_addr.s_addr);
+
+				/* 127.0.0.0/8 loopback range */
+				is_loopback = ((ip & 0xFF000000U) == 0x7F000000U);
+			}
+			else if (rp->ai_family == AF_INET6)
+			{
+				const struct sockaddr_in6 *sin6 =
+				(const struct sockaddr_in6 *) rp->ai_addr;
+
+				is_loopback = (memcmp(&sin6->sin6_addr, &in6addr_loopback,
+									  sizeof(in6addr_loopback)) == 0);
+			}
+
+			if (is_loopback)
+			{
+				freeaddrinfo(res);
+				ereport(WARNING,
+						(errmsg("mux: refusing self-connection to %s:%d — "
+								"this would route queries back to local workers "
+								"instead of forwarding them to the peer node; "
+								"set the 'mux_port' option on the foreign server "
+								"to the peer multiplexer's TCP port "
+								"(current local mux_tcp_port = %d)",
+								host, effective_port, mux_tcp_port)));
+				peer_connect_failures[rc_idx]++;
+				return PGINVALID_SOCKET;
+			}
+		}
 	}
 
 	for (rp = res; rp != NULL; rp = rp->ai_next)
@@ -545,11 +610,13 @@ mux_connect_to_peer(int rc_idx)
 	{
 		ereport(WARNING, (errmsg("mux: could not connect to peer %s:%s: %m",
 								 host, portstr)));
+		peer_connect_failures[rc_idx]++;
 		return PGINVALID_SOCKET;
 	}
 
 	mux_set_nonblocking(sock);
 	outbound_socks[rc_idx] = sock;
+	peer_connect_failures[rc_idx] = 0;	/* reset on success */
 
 	ereport(MULTIPLEXER_LOG_LEVEL,
 			(errmsg("mux: connected outbound to peer %s:%s (rc_idx=%d)",
@@ -693,7 +760,58 @@ mux_dispatch_remote_slots(void)
 
 		sock = mux_connect_to_peer(rc_idx);
 		if (sock == PGINVALID_SOCKET)
+		{
+			/*
+			 * Connection to the peer failed.  If the failure count has
+			 * reached the threshold, give up on this slot and signal an
+			 * error to the waiting backend so it does not hang indefinitely.
+			 * The failure counter is reset on a successful connect, so a
+			 * transient outage does not permanently block subsequent queries.
+			 */
+			if (peer_connect_failures[rc_idx] >= MUX_MAX_PEER_FAILURES)
+			{
+				MuxRemoteConn *rc = &MuxState->remote_conns[rc_idx];
+				char		srvname[NAMEDATALEN];
+				Latch	   *latch;
+				int			nfail = peer_connect_failures[rc_idx];
+
+				SpinLockAcquire(&rc->mutex);
+				strlcpy(srvname, rc->server_name, sizeof(srvname));
+				SpinLockRelease(&rc->mutex);
+
+				ereport(MULTIPLEXER_LOG_LEVEL,
+						(errmsg("mux: giving up on slot %d after %d failed "
+								"connection attempts to peer "
+								"(rc_idx=%d server=\"%s\") — "
+								"failing the query slot",
+								q, nfail, rc_idx, srvname)));
+
+				SpinLockAcquire(&qs->mutex);
+				qs->is_error = true;
+				snprintf(qs->error_msg, sizeof(qs->error_msg),
+						 "could not connect to peer multiplexer for server "
+						 "\"%s\" after %d attempts",
+						 srvname, nfail);
+				qs->server_oid = InvalidOid;	/* prevent re-dispatch */
+				qs->completed = true;
+				latch = qs->requester_latch;
+				SpinLockRelease(&qs->mutex);
+
+				if (latch)
+					SetLatch(latch);
+
+				/*
+				 * Do NOT reset the failure counter here.  Leaving it at or
+				 * above the threshold means any subsequent query for this RC
+				 * will also fail immediately rather than silently retrying for
+				 * another MUX_MAX_PEER_FAILURES iterations.  The counter is
+				 * reset to zero only when a TCP connect to the peer actually
+				 * succeeds, so a corrected mux_port or restarted peer will
+				 * be retried normally.
+				 */
+			}
 			continue;
+		}
 
 		sql_len = strlen(qs->sql) + 1;	/* include NUL terminator */
 
