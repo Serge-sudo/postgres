@@ -148,6 +148,20 @@ static int	inbound_socks[MUX_MAX_INBOUND_PEERS];
 static int	n_inbound = 0;
 
 /*
+ * SQL statement kind classification – used for transaction affinity tracking.
+ * Defined here (before MuxInboundReq which embeds a MuxSqlKind field) even
+ * though the classifier function is implemented later in the file.
+ */
+typedef enum MuxSqlKind
+{
+	MUX_SQL_BEGIN,				/* BEGIN / START TRANSACTION */
+	MUX_SQL_COMMIT,				/* COMMIT / END */
+	MUX_SQL_ROLLBACK,			/* ROLLBACK / ABORT */
+	MUX_SQL_SAVEPOINT,			/* SAVEPOINT / RELEASE / ROLLBACK TO */
+	MUX_SQL_OTHER,				/* regular DML / DDL */
+} MuxSqlKind;
+
+/*
  * Tracking for in-flight inbound requests dispatched to local workers.
  * conn_id values >= MUX_INBOUND_CONN_BASE identify inbound (remote-originated)
  * requests; values below that are local backend requests (query slot indices).
@@ -159,9 +173,30 @@ typedef struct MuxInboundReq
 	bool		in_use;
 	int			peer_idx;		/* inbound_socks[] index */
 	uint32		remote_slot_id; /* slot_id on the sending multiplexer side */
+	int			assigned_worker; /* worker that handles this request */
+	MuxSqlKind	sql_kind;		/* kind of SQL dispatched (for txn affinity) */
 } MuxInboundReq;
 
 static MuxInboundReq inbound_reqs[MUX_MAX_QUERY_SLOTS];
+
+/*
+ * Transaction affinity map for inbound remote requests.
+ *
+ * When an inbound BEGIN arrives from (peer_idx, remote_slot_id), we assign
+ * it to a local worker and record that assignment here.  Subsequent queries
+ * from the same (peer_idx, remote_slot_id) pair are always routed to the
+ * same worker so that transaction state is preserved across statements.
+ * The entry is cleared when COMMIT or ROLLBACK is processed.
+ */
+typedef struct MuxTxnAffinity
+{
+	bool		in_use;
+	int			peer_idx;
+	uint32		remote_slot_id;
+	int			worker_id;
+} MuxTxnAffinity;
+
+static MuxTxnAffinity inbound_txn_map[MUX_MAX_QUERY_SLOTS];
 
 /*
  * Persistent shm_mq handles for communication with local workers.
@@ -193,16 +228,6 @@ static bool mux_pending_enqueue(const char *data, Size len);
 static bool mux_pending_dequeue(char *buf, Size bufsz, Size *lenp);
 static void mux_worker_setup_signals(void);
 
-/* Worker SQL execution helpers */
-typedef enum MuxSqlKind
-{
-	MUX_SQL_BEGIN,				/* BEGIN / START TRANSACTION */
-	MUX_SQL_COMMIT,				/* COMMIT / END */
-	MUX_SQL_ROLLBACK,			/* ROLLBACK / ABORT */
-	MUX_SQL_SAVEPOINT,			/* SAVEPOINT / RELEASE / ROLLBACK TO */
-	MUX_SQL_OTHER,				/* regular DML / DDL */
-} MuxSqlKind;
-
 static MuxSqlKind mux_classify_sql(const char *sql);
 static int	mux_parse_isolation_level(const char *sql);
 static int	mux_serialize_results(char *buf, int bufsz,
@@ -218,6 +243,11 @@ static bool mux_recv_available(int sock, void *buf, size_t len, size_t *got);
 static bool mux_dispatch_remote_slots(void);
 static void mux_process_inbound_message(int peer_idx);
 static void mux_process_outbound_result(int rc_idx);
+
+/* Transaction affinity helpers */
+static int	mux_txnmap_find_worker(int peer_idx, uint32 remote_slot_id);
+static void mux_txnmap_set(int peer_idx, uint32 remote_slot_id, int worker_id);
+static void mux_txnmap_clear(int peer_idx, uint32 remote_slot_id);
 
 
 /* ----------------------------------------------------------------
@@ -906,6 +936,78 @@ mux_find_inbound_req_slot(void)
 }
 
 /*
+ * mux_txnmap_find_worker
+ *		Look up the transaction affinity table for (peer_idx, remote_slot_id).
+ *		Returns the assigned worker_id, or -1 if no entry exists.
+ */
+static int
+mux_txnmap_find_worker(int peer_idx, uint32 remote_slot_id)
+{
+	for (int i = 0; i < MUX_MAX_QUERY_SLOTS; i++)
+	{
+		if (inbound_txn_map[i].in_use &&
+			inbound_txn_map[i].peer_idx == peer_idx &&
+			inbound_txn_map[i].remote_slot_id == remote_slot_id)
+			return inbound_txn_map[i].worker_id;
+	}
+	return -1;
+}
+
+/*
+ * mux_txnmap_set
+ *		Record that (peer_idx, remote_slot_id) should always use worker_id
+ *		for the duration of a transaction.
+ */
+static void
+mux_txnmap_set(int peer_idx, uint32 remote_slot_id, int worker_id)
+{
+	/* If an entry already exists, update it */
+	for (int i = 0; i < MUX_MAX_QUERY_SLOTS; i++)
+	{
+		if (inbound_txn_map[i].in_use &&
+			inbound_txn_map[i].peer_idx == peer_idx &&
+			inbound_txn_map[i].remote_slot_id == remote_slot_id)
+		{
+			inbound_txn_map[i].worker_id = worker_id;
+			return;
+		}
+	}
+	/* Allocate a new entry */
+	for (int i = 0; i < MUX_MAX_QUERY_SLOTS; i++)
+	{
+		if (!inbound_txn_map[i].in_use)
+		{
+			inbound_txn_map[i].in_use = true;
+			inbound_txn_map[i].peer_idx = peer_idx;
+			inbound_txn_map[i].remote_slot_id = remote_slot_id;
+			inbound_txn_map[i].worker_id = worker_id;
+			return;
+		}
+	}
+	ereport(WARNING, (errmsg("mux: inbound_txn_map full — cannot track transaction affinity")));
+}
+
+/*
+ * mux_txnmap_clear
+ *		Remove any transaction affinity entry for (peer_idx, remote_slot_id).
+ *		Called when COMMIT or ROLLBACK completes.
+ */
+static void
+mux_txnmap_clear(int peer_idx, uint32 remote_slot_id)
+{
+	for (int i = 0; i < MUX_MAX_QUERY_SLOTS; i++)
+	{
+		if (inbound_txn_map[i].in_use &&
+			inbound_txn_map[i].peer_idx == peer_idx &&
+			inbound_txn_map[i].remote_slot_id == remote_slot_id)
+		{
+			inbound_txn_map[i].in_use = false;
+			return;
+		}
+	}
+}
+
+/*
  * mux_process_inbound_message
  *		Read and process one message from inbound_socks[peer_idx].
  *		For MUXNET_MSG_QUERY: allocate an inbound_req slot, find an idle
@@ -990,44 +1092,73 @@ mux_process_inbound_message(int peer_idx)
 		return;
 	}
 
-	/* Find an idle local worker */
-	worker_id = mux_find_idle_worker();
-	if (worker_id < 0)
+	/*
+	 * Classify the SQL so we can manage transaction affinity.
+	 * sql_buf is NUL-terminated: sender includes the terminator in payload_len.
+	 */
 	{
-		ereport(WARNING, (errmsg("mux: no idle worker for inbound query from peer %d", peer_idx)));
-		return;
-	}
+		MuxSqlKind	sqlkind = mux_classify_sql(sql_buf);
 
-	/* Set up the inbound request tracking */
-	inbound_reqs[req_idx].in_use = true;
-	inbound_reqs[req_idx].peer_idx = peer_idx;
-	inbound_reqs[req_idx].remote_slot_id = nethdr.slot_id;
-
-	/* Build a MuxMsgHeader + SQL payload and dispatch to the worker */
-	{
-		char		dispatch_buf[sizeof(MuxMsgHeader) + MUX_SQL_MAXLEN];
-		MuxMsgHeader *hdr = (MuxMsgHeader *) dispatch_buf;
-		char	   *payload = dispatch_buf + sizeof(MuxMsgHeader);
-		Size		total_len;
-
-		hdr->msg_type = MUX_MSG_QUERY;
-		hdr->conn_id = (uint32)(MUX_INBOUND_CONN_BASE + req_idx);
-		hdr->payload_len = nethdr.payload_len;
-		hdr->requester_pid = 0;	/* no local backend pid for remote requests */
-
-		memcpy(payload, sql_buf, nethdr.payload_len);
-		total_len = sizeof(MuxMsgHeader) + nethdr.payload_len;
-
-		ereport(MULTIPLEXER_LOG_LEVEL,
-				(errmsg("mux: inbound query from peer %d slot_id=%u sql=\"%.100s%s\" -> dispatching to worker %d",
-						peer_idx, nethdr.slot_id, sql_buf,
-						nethdr.payload_len > 101 ? "..." : "",
-						worker_id)));
-
-		if (!mux_dispatch_to_worker(worker_id, dispatch_buf, total_len))
+		/*
+		 * Transaction affinity: if there is an open transaction on a
+		 * specific worker for this (peer_idx, remote_slot_id) pair, route
+		 * the query to that worker so that transaction state is preserved.
+		 * Only look for a new idle worker when no affinity exists.
+		 */
+		worker_id = mux_txnmap_find_worker(peer_idx, nethdr.slot_id);
+		if (worker_id < 0)
 		{
-			ereport(WARNING, (errmsg("mux: dispatch to worker %d failed", worker_id)));
-			inbound_reqs[req_idx].in_use = false;
+			worker_id = mux_find_idle_worker();
+			if (worker_id < 0)
+			{
+				ereport(WARNING, (errmsg("mux: no idle worker for inbound query from peer %d", peer_idx)));
+				return;
+			}
+		}
+
+		/* Set up the inbound request tracking */
+		inbound_reqs[req_idx].in_use = true;
+		inbound_reqs[req_idx].peer_idx = peer_idx;
+		inbound_reqs[req_idx].remote_slot_id = nethdr.slot_id;
+		inbound_reqs[req_idx].assigned_worker = worker_id;
+		inbound_reqs[req_idx].sql_kind = sqlkind;
+
+		/*
+		 * If this is a BEGIN, create/update the transaction affinity entry so
+		 * all subsequent statements in the transaction go to the same worker.
+		 */
+		if (sqlkind == MUX_SQL_BEGIN)
+			mux_txnmap_set(peer_idx, nethdr.slot_id, worker_id);
+
+		/* Build a MuxMsgHeader + SQL payload and dispatch to the worker */
+		{
+			char		dispatch_buf[sizeof(MuxMsgHeader) + MUX_SQL_MAXLEN];
+			MuxMsgHeader *hdr = (MuxMsgHeader *) dispatch_buf;
+			char	   *payload = dispatch_buf + sizeof(MuxMsgHeader);
+			Size		total_len;
+
+			hdr->msg_type = MUX_MSG_QUERY;
+			hdr->conn_id = (uint32)(MUX_INBOUND_CONN_BASE + req_idx);
+			hdr->payload_len = nethdr.payload_len;
+			hdr->requester_pid = 0;	/* no local backend pid for remote requests */
+
+			memcpy(payload, sql_buf, nethdr.payload_len);
+			total_len = sizeof(MuxMsgHeader) + nethdr.payload_len;
+
+			ereport(MULTIPLEXER_LOG_LEVEL,
+					(errmsg("mux: inbound query from peer %d slot_id=%u sql=\"%.100s%s\" -> dispatching to worker %d (sql_kind=%d)",
+							peer_idx, nethdr.slot_id, sql_buf,
+							nethdr.payload_len > 101 ? "..." : "",
+							worker_id, (int) sqlkind)));
+
+			if (!mux_dispatch_to_worker(worker_id, dispatch_buf, total_len))
+			{
+				ereport(WARNING, (errmsg("mux: dispatch to worker %d failed", worker_id)));
+				inbound_reqs[req_idx].in_use = false;
+				/* Undo affinity assignment on dispatch failure */
+				if (sqlkind == MUX_SQL_BEGIN)
+					mux_txnmap_clear(peer_idx, nethdr.slot_id);
+			}
 		}
 	}
 }
@@ -1378,7 +1509,20 @@ mux_drain_worker_queues(void)
 							}
 						}
 
-						inbound_reqs[req_idx].in_use = false;
+						/*
+					 * If this request was a COMMIT or ROLLBACK (or an error),
+					 * clear the transaction affinity so the next transaction
+					 * from the same peer/slot can be assigned to any idle worker.
+					 */
+					if (inbound_reqs[req_idx].sql_kind == MUX_SQL_COMMIT ||
+						inbound_reqs[req_idx].sql_kind == MUX_SQL_ROLLBACK ||
+						hdr->msg_type == MUX_MSG_ERROR)
+					{
+						mux_txnmap_clear(inbound_reqs[req_idx].peer_idx,
+										 inbound_reqs[req_idx].remote_slot_id);
+					}
+
+					inbound_reqs[req_idx].in_use = false;
 					}
 				}
 				else
@@ -1582,6 +1726,7 @@ ConnMuxMain(Datum main_arg)
 		inbound_socks[i] = PGINVALID_SOCKET;
 	n_inbound = 0;
 	memset(inbound_reqs, 0, sizeof(inbound_reqs));
+	memset(inbound_txn_map, 0, sizeof(inbound_txn_map));
 
 	/* Initialise persistent worker queue handles */
 	for (i = 0; i < MUX_MAX_WORKERS; i++)
