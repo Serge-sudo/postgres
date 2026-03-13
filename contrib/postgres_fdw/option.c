@@ -285,6 +285,8 @@ InitPgFdwOptions(void)
 		{"parallel_commit", ForeignServerRelationId, false},
 		{"parallel_abort", ForeignServerRelationId, false},
 		{"keep_connections", ForeignServerRelationId, false},
+		/* multiplexer peer port (consumed by conn_multiplexer, not forwarded to libpq) */
+		{"mux_port", ForeignServerRelationId, false},
 		{"password_required", UserMappingRelationId, false},
 
 		/* sampling is available on both server and table */
