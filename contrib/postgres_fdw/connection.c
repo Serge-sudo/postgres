@@ -195,6 +195,9 @@ static void pgfdw_security_check(const char **keywords, const char **values,
 static bool UserMappingPasswordRequired(UserMapping *user);
 static bool disconnect_cached_connections(Oid serverid);
 
+/* Peer worker entry point -- registered via bgw_function_name in RegisterDynamicBackgroundWorker */
+PGDLLEXPORT void ConnMuxPeerWorkerMain(Datum main_arg);
+
 /*
  * Get a PGconn which can be used to execute queries on the remote PostgreSQL
  * server with the user's authorization.  A new connection is established
@@ -440,17 +443,19 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 
 	/*
 	 * If the connection multiplexer is running, route this foreign-server
-	 * connection through it.  We store a MuxConnSentinel cast to PGconn* in
-	 * entry->conn so that all subsequent callers can detect the mux path via
-	 * IS_MUX_CONN().  The multiplexer maintains the actual TCP connection to
-	 * the remote server and all SQL goes through shared-memory queues.
+	 * connection through it.  We store a lightweight MuxConnSentinel cast to
+	 * PGconn* in entry->conn so that all subsequent callers can detect the mux
+	 * path via IS_MUX_CONN().  The multiplexer manages the actual persistent
+	 * TCP connection to the remote server: it spawns a ConnMuxPeerWorkerMain
+	 * worker on demand the first time a query arrives for this server, and
+	 * keeps that worker (and its TCP connection) alive for reuse by later
+	 * backends.  Individual backends never spawn or directly control workers.
 	 */
 	if (ConnMuxIsAvailable(server->serverid))
 	{
 		StringInfoData sb;
 		ListCell   *lc2;
 		uint32		conn_id;
-		int			worker_slot;
 
 		/* Build a libpq-compatible connstr from the server's srvoptions */
 		initStringInfo(&sb);
@@ -486,105 +491,39 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 		appendStringInfo(&sb, "application_name='pg_mux_%s'",
 						 server->servername);
 
-		/* Register the server in the multiplexer's remote_conns table */
+		/*
+		 * Register the server in the multiplexer's remote_conns table.
+		 * The multiplexer will spawn a ConnMuxPeerWorkerMain worker when the
+		 * first query for this server arrives via ConnMuxSubmitQuery.
+		 */
 		conn_id = ConnMuxRegisterServer(server->serverid,
 										server->servername,
 										sb.data);
-
-		/*
-		 * Reserve (or reuse) a worker slot.
-		 *
-		 * ConnMuxReserveWorkerSlot returns the slot index and sets needs_bgw
-		 * to indicate whether a new background worker must be spawned.  When
-		 * needs_bgw is false a live worker already exists for this server and
-		 * can be reused immediately -- the connection is pooled.
-		 */
-		{
-			bool		needs_bgw = false;
-
-			worker_slot = (conn_id != (uint32) -1) ?
-				ConnMuxReserveWorkerSlot(server->serverid, server->servername,
-										 &needs_bgw) : -1;
-
-			if (worker_slot >= 0)
-			{
-				MemoryContext old_ctx;
-				MuxConnSentinel *sentinel;
-
-				if (needs_bgw)
-				{
-					/* No live worker yet: spawn one */
-					BackgroundWorker bgw;
-					BackgroundWorkerHandle *handle;
-
-					MemSet(&bgw, 0, sizeof(bgw));
-					bgw.bgw_flags =
-						BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
-					bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
-					bgw.bgw_restart_time = BGW_NEVER_RESTART;
-					snprintf(bgw.bgw_library_name, MAXPGPATH, "postgres_fdw");
-					snprintf(bgw.bgw_function_name, BGW_MAXLEN,
-							 "ConnMuxForeignWorkerMain");
-					snprintf(bgw.bgw_name, BGW_MAXLEN,
-							 "mux foreign worker for \"%s\"",
-							 server->servername);
-					snprintf(bgw.bgw_type, BGW_MAXLEN, "mux foreign worker");
-					bgw.bgw_main_arg = Int32GetDatum(worker_slot);
-					bgw.bgw_notify_pid = 0;
-					/* Pass database name so the worker can initialise */
-					strlcpy(bgw.bgw_extra, get_database_name(MyDatabaseId),
-							BGW_EXTRALEN);
-
-					if (!RegisterDynamicBackgroundWorker(&bgw, &handle))
-					{
-						/*
-						 * Worker registration failed.  Undo the slot
-						 * reservation and fall through to a direct connect.
-						 */
-						ConnMuxReleaseWorkerSlot(worker_slot);
-						pfree(sb.data);
-						ereport(WARNING,
-								(errmsg("postgres_fdw: multiplexer worker for server \"%s\" could not be started, using direct connection",
-										server->servername)));
-						goto direct_connect;
-					}
-
-					/* Wait briefly for the worker to become ready */
-					WaitForBackgroundWorkerStartup(handle, NULL);
-					pfree(handle);
-
-					elog(DEBUG3,
-						 "postgres_fdw: spawned new mux worker for \"%s\" (slot %d)",
-						 server->servername, worker_slot);
-				}
-				else
-				{
-					elog(DEBUG3,
-						 "postgres_fdw: reusing mux connection to \"%s\" (slot %d)",
-						 server->servername, worker_slot);
-				}
-
-				old_ctx = MemoryContextSwitchTo(CacheMemoryContext);
-				sentinel = MuxConnSentinelCreate(server->serverid,
-												 server->servername,
-												 worker_slot);
-				MemoryContextSwitchTo(old_ctx);
-
-				entry->conn = (PGconn *) sentinel;
-				pfree(sb.data);
-				return;
-			}
-		}
-
 		pfree(sb.data);
 
-		/* Pool full and eviction failed; fall through to direct connect */
+		if (conn_id != (uint32) -1)
+		{
+			MemoryContext old_ctx;
+			MuxConnSentinel *sentinel;
+
+			old_ctx = MemoryContextSwitchTo(CacheMemoryContext);
+			sentinel = MuxConnSentinelCreate(server->serverid,
+											 server->servername);
+			MemoryContextSwitchTo(old_ctx);
+
+			entry->conn = (PGconn *) sentinel;
+
+			elog(DEBUG3,
+				 "postgres_fdw: connection to \"%s\" routed through multiplexer (conn_id %u)",
+				 server->servername, conn_id);
+			return;
+		}
+
+		/* Registration failed; fall through to direct connect */
 		ereport(WARNING,
-				(errmsg("postgres_fdw: multiplexer pool full for server \"%s\", using direct connection",
+				(errmsg("postgres_fdw: multiplexer unavailable for server \"%s\", using direct connection",
 						server->servername)));
 	}
-
-direct_connect:
 	entry->conn = connect_pg_server(server, user);
 
 	elog(DEBUG3, "new postgres_fdw connection %p for server \"%s\" (user mapping oid %u, userid %u)",
@@ -791,14 +730,10 @@ disconnect_pg_server(ConnCacheEntry *entry)
 		{
 			/*
 			 * This is a multiplexer-routed connection.  The actual TCP
-			 * connection is managed by the foreign worker process and must
-			 * NOT be closed -- it stays open for reuse by other backends.
-			 * We just decrement active_users in the shared slot so the
-			 * clock-sweep eviction policy can reclaim it when appropriate.
+			 * connection is held by the ConnMuxPeerWorkerMain process and
+			 * persists for reuse by other backends -- we just free the
+			 * sentinel and return without touching the worker.
 			 */
-			MuxConnSentinel *sentinel = (MuxConnSentinel *) entry->conn;
-
-			ConnMuxReleaseWorkerSlot(sentinel->worker_slot);
 			pfree(entry->conn);
 			entry->conn = NULL;
 			return;
@@ -2983,15 +2918,15 @@ GetConnCacheEntryInfo(void *entry_ptr, Oid *serverid, int *remote_backend_pid)
 	return true;
 }
 /* ----------------------------------------------------------------
- * Connection multiplexer -- foreign worker
+ * Connection multiplexer -- peer worker
  *
- * ConnMuxForeignWorkerMain is an extension background worker registered
- * by postgres_fdw via RegisterDynamicBackgroundWorker when the connection
- * multiplexer is running.  It holds a persistent libpq connection to a
- * single foreign server and services MuxQuerySlot requests posted by
- * backends via ConnMuxSubmitQuery / ConnMuxSendCommand.
+ * ConnMuxPeerWorkerMain is an extension background worker spawned and
+ * managed by the multiplexer process (ConnMuxMain).  It holds a persistent
+ * libpq connection to a single remote server node and services MuxQuerySlot
+ * requests routed to it by the multiplexer.
  *
  * The slot index (and thus the target server OID) is passed in bgw_main_arg.
+ * Individual backends NEVER spawn peer workers; only the multiplexer does.
  * ---------------------------------------------------------------- */
 
 /*
@@ -3061,14 +2996,18 @@ mux_serialize_result_fdw(MuxQuerySlot *slot, PGresult *res)
 }
 
 /*
- * ConnMuxForeignWorkerMain
- *		Entry point for the extension background worker that handles a
- *		single foreign server's persistent libpq connection.
+ * ConnMuxPeerWorkerMain
+ *		Entry point for the peer background worker that handles a single
+ *		remote node's persistent libpq connection.
+ *
+ *		Spawned by the multiplexer (conn_multiplexer.c) via
+ *		RegisterDynamicBackgroundWorker.  Does not require a local database
+ *		connection (BGWORKER_SHMEM_ACCESS only).
  *
  *		bgw_main_arg = slot index in MuxState->workers[].
  */
 PGDLLEXPORT void
-ConnMuxForeignWorkerMain(Datum main_arg)
+ConnMuxPeerWorkerMain(Datum main_arg)
 {
 	int			slot_idx = DatumGetInt32(main_arg);
 	MuxSharedState *mux_state;
@@ -3076,13 +3015,6 @@ ConnMuxForeignWorkerMain(Datum main_arg)
 	PGconn	   *pgconn = NULL;
 	char		connstr[MUX_CONNSTR_MAXLEN];
 	sigjmp_buf	local_sigjmp_buf;
-
-	/*
-	 * Connect to the database specified in bgw_extra so we can use catalog
-	 * access (needed for BackgroundWorkerInitializeConnection semantics).
-	 */
-	if (MyBgworkerEntry->bgw_extra[0] != '\0')
-		BackgroundWorkerInitializeConnection(MyBgworkerEntry->bgw_extra, NULL, 0);
 
 	/* Attach to the multiplexer shared-memory segment */
 	ConnMuxShmemInit();
@@ -3119,7 +3051,7 @@ ConnMuxForeignWorkerMain(Datum main_arg)
 		if (!found)
 		{
 			ereport(LOG,
-					(errmsg("mux foreign worker: no connstr for server OID %u",
+					(errmsg("mux peer worker: no connstr for server OID %u",
 							server_oid)));
 			goto shutdown;
 		}
@@ -3130,7 +3062,7 @@ ConnMuxForeignWorkerMain(Datum main_arg)
 	if (pgconn == NULL || PQstatus(pgconn) != CONNECTION_OK)
 	{
 		ereport(WARNING,
-				(errmsg("mux foreign worker: could not connect to foreign server: %s",
+				(errmsg("mux peer worker: could not connect to remote server: %s",
 						pgconn ? PQerrorMessage(pgconn) : "out of memory")));
 		if (pgconn)
 		{
@@ -3144,7 +3076,7 @@ ConnMuxForeignWorkerMain(Datum main_arg)
 	}
 
 	ereport(LOG,
-			(errmsg("mux foreign worker: connected to foreign server \"%s\"",
+			(errmsg("mux peer worker: connected to remote server \"%s\"",
 					my_slot->server_name)));
 
 	SpinLockAcquire(&my_slot->mutex);
@@ -3178,7 +3110,7 @@ ConnMuxForeignWorkerMain(Datum main_arg)
 		/* Check if the clock-sweep eviction has requested us to exit */
 		if (my_slot->should_exit)
 		{
-			elog(DEBUG3, "mux foreign worker for \"%s\": evicted by clock sweep",
+			elog(DEBUG3, "mux peer worker for \"%s\": evicted by clock sweep",
 				 my_slot->server_name);
 			break;
 		}
@@ -3213,7 +3145,7 @@ ConnMuxForeignWorkerMain(Datum main_arg)
 					SpinLockAcquire(&slot->mutex);
 					slot->is_error = true;
 					strlcpy(slot->error_msg,
-							"mux foreign worker: lost connection to remote server",
+							"mux peer worker: lost connection to remote server",
 							sizeof(slot->error_msg));
 					slot->completed = true;
 					SpinLockRelease(&slot->mutex);
@@ -3293,7 +3225,6 @@ shutdown:
 	my_slot->is_foreign = false;
 	my_slot->server_oid = InvalidOid;
 	my_slot->use_count = 0;
-	my_slot->active_users = 0;
 	my_slot->should_exit = false;
 	SpinLockRelease(&my_slot->mutex);
 }

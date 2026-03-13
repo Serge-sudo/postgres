@@ -3,34 +3,32 @@
  * conn_multiplexer.c
  *	  Connection multiplexer for distributed PostgreSQL transport
  *
- * This module implements a new transport and connection model for
- * distributed PostgreSQL clusters.  The design mirrors the architecture
- * described in the "C10K-style" Postgres Professional proposal:
+ * Architecture (C10K-style distributed model):
  *
- *   - One multiplexer background-worker process per node.
- *   - Multiplexers on different nodes share a single TCP connection.
- *   - A local pool of workers (background workers) executes queries.
- *   - Workers and backends communicate with the multiplexer through
- *     shared-memory message queues (shm_mq).
+ *   Each node runs ONE multiplexer process and N local workers.
+ *
+ *   - Local workers execute queries on the CURRENT node only (via SPI).
+ *     Workers never make outbound TCP connections to remote servers.
+ *
+ *   - The multiplexer maintains persistent peer connections to each remote
+ *     node via ConnMuxPeerWorkerMain extension workers (registered in
+ *     postgres_fdw).  Each peer worker holds a single persistent PGconn*
+ *     to its assigned remote server.  The MULTIPLEXER spawns and manages
+ *     these peer workers; backends never interact with them directly.
+ *
+ *   - Backends submit queries to the multiplexer via MuxQuerySlot shared
+ *     memory.  The multiplexer routes each slot to the appropriate peer
+ *     worker (one per remote server), which executes the query on the remote
+ *     node and writes the result back.
  *
  * Multiplexer main loop
  * ---------------------
- * The multiplexer runs a WaitEventSet loop.  On each iteration it:
- *   1. Drains all worker-to-mux result queues and routes the messages
- *      either back to the requesting backend or to the appropriate remote
- *      node TCP socket.
- *   2. Accepts new query messages from local backends and dispatches
- *      them to an idle worker (or queues them if all workers are busy).
- *   3. Reads data from remote TCP connections and routes it to workers.
- *   4. Writes accumulated outbound data to remote TCP sockets.
- *
- * Worker behaviour
- * ----------------
- * Workers are stateless: transaction state lives on the coordinator.
- * A worker receives a MuxMsgHeader + payload via its mux_to_worker queue,
- * executes the sub-statement, and writes a MuxMsgHeader + result back
- * through its worker_to_mux queue.  Workers use CSN-based global snapshots
- * where available.
+ * On each iteration the multiplexer:
+ *   1. Drains all local worker result queues and routes replies.
+ *   2. Dispatches pending local requests to idle workers.
+ *   3. Scans MuxQuerySlot[] for remote query requests; for each one,
+ *      ensures the appropriate peer worker is running and wakes it.
+ *   4. Re-spawns any dead local workers.
  *
  * Shared memory layout
  * --------------------
@@ -83,8 +81,8 @@
 int			mux_worker_count = 4;
 
 /*
- * GUC: maximum number of persistent foreign-server connections.
- * When the pool is full and a new server needs a slot, the clock-sweep
+ * GUC: maximum number of persistent peer connections.
+ * When the pool is full and a new remote server needs a slot, the clock-sweep
  * eviction algorithm releases the least-recently-used idle connection.
  */
 int			max_mux_connections = 64;
@@ -130,6 +128,11 @@ static void mux_drain_backend_requests(void);
 static bool mux_pending_enqueue(const char *data, Size len);
 static bool mux_pending_dequeue(char *buf, Size bufsz, Size *lenp);
 static void mux_worker_setup_signals(void);
+static int	mux_find_peer_worker(Oid serverOid);
+static int	mux_spawn_peer_worker(Oid serverOid);
+static int	mux_count_foreign_slots(void);
+static int	mux_clock_sweep_foreign(void);
+static void mux_route_remote_query_slots(void);
 
 
 /* ----------------------------------------------------------------
@@ -184,7 +187,6 @@ ConnMuxShmemInit(void)
 			slot->is_foreign = false;
 			slot->server_oid = InvalidOid;
 			slot->use_count = 0;
-			slot->active_users = 0;
 			slot->should_exit = false;
 			slot->worker_latch = NULL;
 
@@ -642,8 +644,14 @@ ConnMuxMain(Datum main_arg)
 		mux_drain_backend_requests();
 
 		/*
-		 * Re-spawn any dead local workers (foreign workers are managed by
-		 * postgres_fdw and respawned via dynamic bgw registration).
+		 * For each remote query slot that has not yet been completed, ensure
+		 * a peer worker exists for the target server and wake it.
+		 */
+		mux_route_remote_query_slots();
+
+		/*
+		 * Re-spawn any dead local workers.  Peer workers (for remote nodes)
+		 * are managed by the multiplexer itself via mux_route_remote_query_slots.
 		 */
 		{
 			int			i;
@@ -1007,13 +1015,14 @@ ConnMuxGetWorkerStats(MuxWorkerSlot *slots, int max_slots)
 }
 
 /* ----------------------------------------------------------------
- * Foreign server connection support
+ * Peer worker management
  *
- * The multiplexer provides shared-memory infrastructure for routing
- * queries to foreign servers.  The actual TCP connections are held by
- * dedicated extension background workers (ConnMuxForeignWorkerMain,
- * registered from contrib/postgres_fdw).  This file contains only the
- * shared-memory and coordination code; no libpq is used here.
+ * The multiplexer maintains one ConnMuxPeerWorkerMain background worker
+ * (registered in postgres_fdw) per remote server.  Each peer worker holds
+ * a single persistent PGconn* to the remote node.  The multiplexer spawns
+ * peer workers on demand (when the first query for a server arrives) and
+ * evicts them when max_mux_connections is reached, using the clock-sweep
+ * algorithm.  Individual backends never spawn or release peer workers.
  * ---------------------------------------------------------------- */
 
 /*
@@ -1069,7 +1078,7 @@ ConnMuxIsAvailable(Oid serverOid)
 /*
  * ConnMuxGetSharedState
  *		Return a pointer to the MuxSharedState segment.  Intended for use
- *		by the foreign worker (ConnMuxForeignWorkerMain) running inside the
+ *		by the peer worker (ConnMuxPeerWorkerMain) running inside the
  *		postgres_fdw extension, after calling ConnMuxShmemInit().
  */
 MuxSharedState *
@@ -1143,10 +1152,10 @@ mux_count_foreign_slots(void)
 
 /*
  * mux_clock_sweep_foreign
- *		Find a foreign worker slot eligible for eviction using the clock-sweep
+ *		Find a peer worker slot eligible for eviction using the clock-sweep
  *		algorithm.
  *
- *		Each eligible slot (is_foreign = true, active_users = 0) has its
+ *		Each eligible slot (is_foreign = true, phase != BUSY) has its
  *		use_count decremented.  The first slot found with use_count == 0 after
  *		decrement is returned as the victim.  Up to two full sweeps are
  *		performed so that recently-used slots get a second chance.
@@ -1162,7 +1171,7 @@ mux_clock_sweep_foreign(void)
 	int			range = MUX_MAX_WORKERS - MuxState->num_workers;
 
 	if (range <= 0)
-		return -1;				/* no foreign-slot range at all */
+		return -1;				/* no peer-slot range at all */
 
 	/* Allow up to 2 x range steps so recently-used slots get one decrement */
 	while (sweep_count < 2 * range)
@@ -1176,8 +1185,8 @@ mux_clock_sweep_foreign(void)
 		if (!slot->is_foreign)
 			continue;			/* skip local or unused slots */
 
-		if (slot->active_users > 0)
-			continue;			/* cannot evict: backends still using it */
+		if (slot->phase == MUX_WORKER_BUSY)
+			continue;			/* cannot evict: currently executing a query */
 
 		if (slot->use_count > 0)
 		{
@@ -1191,76 +1200,93 @@ mux_clock_sweep_foreign(void)
 		return i;
 	}
 
-	return -1;					/* all slots in use or recently accessed */
+	return -1;					/* all slots busy or recently accessed */
 }
 
 /*
- * ConnMuxReserveWorkerSlot
- *		Allocate or reuse a worker slot for the foreign server identified by
- *		serverOid.
- *
- *		Connection pooling:
- *		  If a live worker slot already exists for this server (phase != DEAD),
- *		  it is reused: active_users and use_count are incremented, and
- *		  *needs_bgw is set to false (no new background worker needed).
- *
- *		  Otherwise a new slot is allocated.  When max_mux_connections is
- *		  reached the clock-sweep eviction algorithm selects an idle victim
- *		  slot (active_users == 0, use_count == 0 after decrement) and
- *		  requests its worker to exit before recycling the slot.
- *		  *needs_bgw is set to true.
- *
- *		Returns the slot index on success, or -1 if no slot is available.
+ * mux_find_peer_worker
+ *		Search the peer-worker slot range for a live worker assigned to the
+ *		given serverOid.  Returns the slot index, or -1 if none exists.
+ *		Caller must NOT hold MuxState->mutex.
  */
-int
-ConnMuxReserveWorkerSlot(Oid serverOid, const char *serverName,
-						 bool *needs_bgw)
+static int
+mux_find_peer_worker(Oid serverOid)
 {
 	int			i;
-	int			slot_idx = -1;
 
-	if (MuxState == NULL)
-		return -1;
-
-	SpinLockAcquire(&MuxState->mutex);
-
-	/* --- Step 1: look for an existing live slot for this server --- */
 	for (i = MuxState->num_workers; i < MUX_MAX_WORKERS; i++)
 	{
 		MuxWorkerSlot *slot = &MuxState->workers[i];
 
 		if (slot->is_foreign &&
 			slot->server_oid == serverOid &&
-			slot->phase != MUX_WORKER_DEAD)
+			slot->phase != MUX_WORKER_DEAD &&
+			!slot->should_exit)
+			return i;
+	}
+	return -1;
+}
+
+/*
+ * mux_spawn_peer_worker
+ *		Allocate a worker slot for serverOid and register a
+ *		ConnMuxPeerWorkerMain dynamic background worker (from the
+ *		postgres_fdw extension) to service it.
+ *
+ *		Called from the multiplexer process only.  If max_mux_connections is
+ *		reached the clock-sweep eviction algorithm is used to reclaim an idle
+ *		slot before allocating a new one.
+ *
+ *		Returns the new slot index on success, or -1 on failure.
+ */
+static int
+mux_spawn_peer_worker(Oid serverOid)
+{
+	int			i;
+	int			slot_idx = -1;
+	MuxWorkerSlot *slot;
+	BackgroundWorker bgw;
+	BackgroundWorkerHandle *handle;
+	const char *server_name = "";
+
+	SpinLockAcquire(&MuxState->mutex);
+
+	/* Double-check: another iteration may have already spawned a worker */
+	for (i = MuxState->num_workers; i < MUX_MAX_WORKERS; i++)
+	{
+		MuxWorkerSlot *ws = &MuxState->workers[i];
+
+		if (ws->is_foreign && ws->server_oid == serverOid &&
+			ws->phase != MUX_WORKER_DEAD && !ws->should_exit)
 		{
-			/* Reuse this slot: reset use_count and increment active_users */
-			slot->use_count = MUX_USE_COUNT_MAX;
-			slot->active_users++;
-			slot_idx = i;
-			*needs_bgw = false;
+			SpinLockRelease(&MuxState->mutex);
+			return i;			/* already spawned by a concurrent iteration */
+		}
+	}
+
+	/* Find the server name from remote_conns[] for log messages */
+	for (i = 0; i < MUX_MAX_REMOTE_CONNS; i++)
+	{
+		MuxRemoteConn *rc = &MuxState->remote_conns[i];
+
+		if (rc->server_oid == serverOid)
+		{
+			server_name = rc->server_name;
 			break;
 		}
 	}
 
-	if (slot_idx >= 0)
-	{
-		SpinLockRelease(&MuxState->mutex);
-		return slot_idx;
-	}
-
-	/* --- Step 2: need a new slot --- */
-
 	if (mux_count_foreign_slots() >= max_mux_connections)
 	{
 		/*
-		 * Pool is full.  Find a victim via clock sweep and evict it so
-		 * the new server can take its slot.
+		 * Pool is full.  Find a victim via clock sweep and evict it so the
+		 * new server can take its slot.
 		 */
 		int			victim = mux_clock_sweep_foreign();
 
 		if (victim < 0)
 		{
-			/* All slots are actively in use; cannot evict */
+			/* All slots are busy; cannot evict anything right now */
 			SpinLockRelease(&MuxState->mutex);
 			return -1;
 		}
@@ -1269,36 +1295,31 @@ ConnMuxReserveWorkerSlot(Oid serverOid, const char *serverName,
 			MuxWorkerSlot *vs = &MuxState->workers[victim];
 
 			/*
-			 * Signal the victim worker to shut down.  It will notice
-			 * should_exit in its main loop and call ConnMuxReleaseWorkerSlot
-			 * before exiting.
+			 * Signal the victim peer worker to shut down.  It checks
+			 * should_exit at the top of its main loop and exits cleanly.
 			 */
 			vs->should_exit = true;
 			if (vs->worker_latch)
 				SetLatch(vs->worker_latch);
 
-			/*
-			 * Pre-emptively clear the slot so subsequent callers do not
-			 * see it as occupied.
-			 */
+			/* Pre-emptively clear the slot for immediate reuse */
 			vs->is_foreign = false;
 			vs->server_oid = InvalidOid;
 			vs->phase = MUX_WORKER_DEAD;
 			vs->pid = 0;
 			vs->worker_latch = NULL;
 			vs->use_count = 0;
-			vs->active_users = 0;
 		}
 		slot_idx = victim;
 	}
 	else
 	{
-		/* Find any dead non-foreign slot in the foreign range */
+		/* Find any dead / unused slot in the peer-worker range */
 		for (i = MuxState->num_workers; i < MUX_MAX_WORKERS; i++)
 		{
-			MuxWorkerSlot *slot = &MuxState->workers[i];
+			MuxWorkerSlot *ws = &MuxState->workers[i];
 
-			if (slot->phase == MUX_WORKER_DEAD && !slot->is_foreign)
+			if (ws->phase == MUX_WORKER_DEAD && !ws->is_foreign)
 			{
 				slot_idx = i;
 				break;
@@ -1306,52 +1327,118 @@ ConnMuxReserveWorkerSlot(Oid serverOid, const char *serverName,
 		}
 	}
 
-	if (slot_idx >= 0)
+	if (slot_idx < 0)
 	{
-		MuxWorkerSlot *slot = &MuxState->workers[slot_idx];
-
-		slot->is_foreign = true;
-		slot->server_oid = serverOid;
-		strlcpy(slot->server_name, serverName, NAMEDATALEN);
-		slot->phase = MUX_WORKER_STARTING;
-		slot->use_count = MUX_USE_COUNT_MAX;
-		slot->active_users = 1;
-		slot->should_exit = false;
-		*needs_bgw = true;
+		SpinLockRelease(&MuxState->mutex);
+		return -1;
 	}
 
+	/* Initialise the new peer worker slot */
+	slot = &MuxState->workers[slot_idx];
+	slot->is_foreign = true;
+	slot->server_oid = serverOid;
+	strlcpy(slot->server_name, server_name, NAMEDATALEN);
+	slot->phase = MUX_WORKER_STARTING;
+	slot->use_count = MUX_USE_COUNT_MAX;
+	slot->should_exit = false;
+	slot->pid = 0;
+	slot->worker_latch = NULL;
+
 	SpinLockRelease(&MuxState->mutex);
+
+	/* Register the ConnMuxPeerWorkerMain dynamic background worker */
+	MemSet(&bgw, 0, sizeof(bgw));
+	/*
+	 * BGWORKER_SHMEM_ACCESS is all we need: peer workers only hold a libpq
+	 * connection to a remote node and poll the query-slot array in shared
+	 * memory.  They do not access the local catalogs or any database, so
+	 * BGWORKER_BACKEND_DATABASE_CONNECTION is deliberately omitted.
+	 */
+	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS;
+	bgw.bgw_start_time = BgWorkerStart_PostmasterStart;
+	bgw.bgw_restart_time = BGW_NEVER_RESTART;	/* multiplexer re-spawns */
+	snprintf(bgw.bgw_library_name, MAXPGPATH, "postgres_fdw");
+	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "ConnMuxPeerWorkerMain");
+	snprintf(bgw.bgw_name, BGW_MAXLEN, "mux peer worker for server %u",
+			 serverOid);
+	snprintf(bgw.bgw_type, BGW_MAXLEN, "mux peer worker");
+	bgw.bgw_main_arg = Int32GetDatum(slot_idx);
+	bgw.bgw_notify_pid = MyProcPid;
+
+	if (!RegisterDynamicBackgroundWorker(&bgw, &handle))
+	{
+		ereport(WARNING,
+				(errmsg("connection multiplexer: could not register peer worker for server %u",
+						serverOid)));
+
+		SpinLockAcquire(&MuxState->mutex);
+		slot->phase = MUX_WORKER_DEAD;
+		slot->is_foreign = false;
+		slot->server_oid = InvalidOid;
+		SpinLockRelease(&MuxState->mutex);
+
+		return -1;
+	}
+
+	/* We don't track the handle; the peer worker announces itself via its latch */
+	pfree(handle);
+
+	ereport(DEBUG1,
+			(errmsg("mux: spawned peer worker for server \"%s\" (slot %d)",
+					server_name, slot_idx)));
+
 	return slot_idx;
 }
 
 /*
- * ConnMuxReleaseWorkerSlot
- *		Release a backend's reference to a foreign worker slot.  Decrements
- *		active_users but does NOT terminate the worker -- the connection
- *		remains open for reuse by other backends.
+ * mux_route_remote_query_slots
+ *		Scan MuxQuerySlot[] for remote query requests (server_oid != InvalidOid)
+ *		that have not yet been completed.  For each one, ensure a peer worker
+ *		exists for the target server and wake it.
  *
- *		The clock-sweep algorithm will reclaim the slot when max_mux_connections
- *		is reached and the slot's use_count reaches zero.
+ *		Called from the multiplexer main loop on every iteration.
  */
-void
-ConnMuxReleaseWorkerSlot(int slot_idx)
+static void
+mux_route_remote_query_slots(void)
 {
-	MuxWorkerSlot *slot;
+	for (int q = 0; q < MUX_MAX_QUERY_SLOTS; q++)
+	{
+		MuxQuerySlot *qs = &MuxState->query_slots[q];
+		Oid			server_oid;
+		bool		needs_routing;
 
-	if (MuxState == NULL || slot_idx < 0 || slot_idx >= MUX_MAX_WORKERS)
-		return;
+		SpinLockAcquire(&qs->mutex);
+		needs_routing = (qs->in_use && !qs->completed &&
+						 qs->server_oid != InvalidOid);
+		server_oid = needs_routing ? qs->server_oid : InvalidOid;
+		SpinLockRelease(&qs->mutex);
 
-	slot = &MuxState->workers[slot_idx];
+		if (!needs_routing)
+			continue;
 
-	/*
-	 * Protect the decrement with MuxState->mutex for consistency with
-	 * ConnMuxReserveWorkerSlot which also modifies active_users under the
-	 * global lock.
-	 */
-	SpinLockAcquire(&MuxState->mutex);
-	if (slot->active_users > 0)
-		slot->active_users--;
-	SpinLockRelease(&MuxState->mutex);
+		/* Find or spawn a peer worker for this server */
+		{
+			int			peer_slot = mux_find_peer_worker(server_oid);
+
+			if (peer_slot < 0)
+				peer_slot = mux_spawn_peer_worker(server_oid);
+
+			if (peer_slot >= 0)
+			{
+				MuxWorkerSlot *ws = &MuxState->workers[peer_slot];
+
+				/* Bump use_count so the clock-sweep gives it a second chance */
+				SpinLockAcquire(&ws->mutex);
+				if (ws->use_count < MUX_USE_COUNT_MAX)
+					ws->use_count++;
+				SpinLockRelease(&ws->mutex);
+
+				/* Wake the peer worker so it picks up the new query slot */
+				if (ws->worker_latch)
+					SetLatch(ws->worker_latch);
+			}
+		}
+	}
 }
 
 /*
@@ -1411,12 +1498,12 @@ mux_wait_for_slot(int slot_idx)
 
 /*
  * ConnMuxSubmitQuery
- *		Execute sql on the foreign server identified by serverOid via the
- *		multiplexer's extension worker (ConnMuxForeignWorkerMain).
+ *		Execute sql on the remote server identified by serverOid via the
+ *		multiplexer's peer worker (ConnMuxPeerWorkerMain).
  *
- *		Posts a request to a MuxQuerySlot in shared memory, wakes the foreign
- *		worker that owns this server, then waits for the worker to fill the
- *		result.
+ *		Posts a request to a MuxQuerySlot in shared memory, wakes the
+ *		multiplexer so it routes the slot to the right peer worker, then
+ *		waits for the peer worker to fill the result.
  *
  *		On success returns true and fills result_data / nfields_out /
  *		ntuples_out / truncated_out.  On failure returns false and fills
@@ -1457,24 +1544,12 @@ ConnMuxSubmitQuery(Oid serverOid, const char *sql,
 	slot->requester_latch = MyLatch;
 
 	/*
-	 * Wake the foreign worker that owns this server (it polls query_slots).
-	 * Walk the worker array to find the matching foreign worker.
+	 * Wake the multiplexer so it calls mux_route_remote_query_slots() and
+	 * dispatches the slot to the appropriate peer worker.
 	 */
-	for (int i = 0; i < MUX_MAX_WORKERS; i++)
-	{
-		MuxWorkerSlot *ws = &MuxState->workers[i];
-
-		if (ws->is_foreign && ws->server_oid == serverOid && ws->worker_latch)
-		{
-			SetLatch(ws->worker_latch);
-			break;
-		}
-	}
-
-	/* Also wake the multiplexer as a fallback */
 	ConnMuxWakeup();
 
-	/* Wait for the foreign worker to complete the request */
+	/* Wait for the peer worker to complete the request */
 	mux_wait_for_slot(slot_idx);
 
 	/* Copy result out */
@@ -1513,7 +1588,7 @@ ConnMuxSubmitQuery(Oid serverOid, const char *sql,
 /*
  * ConnMuxSendCommand
  *		Send a no-result SQL command (BEGIN, COMMIT, ROLLBACK, etc.) to a
- *		foreign server via the multiplexer's extension worker.
+ *		remote server via the multiplexer's peer worker.
  */
 bool
 ConnMuxSendCommand(Oid serverOid, const char *sql,
