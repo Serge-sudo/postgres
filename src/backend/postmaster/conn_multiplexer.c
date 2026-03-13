@@ -199,6 +199,25 @@ typedef struct MuxTxnAffinity
 static MuxTxnAffinity inbound_txn_map[MUX_MAX_QUERY_SLOTS];
 
 /*
+ * Transaction affinity map for local backend requests.
+ *
+ * When a local backend's BEGIN is dispatched to a worker, the mapping
+ * (conn_id → worker_id) is recorded here.  All subsequent requests from
+ * the same conn_id are routed to that same worker so that transaction state
+ * is preserved across statements (e.g. BEGIN goes to worker 1, INSERT goes
+ * to worker 1, COMMIT goes to worker 1).
+ * The entry is cleared when COMMIT or ROLLBACK is dispatched.
+ */
+typedef struct MuxLocalTxnAffinity
+{
+	bool		in_use;
+	uint32		conn_id;		/* MuxMsgHeader.conn_id (query slot index) */
+	int			worker_id;
+} MuxLocalTxnAffinity;
+
+static MuxLocalTxnAffinity local_txn_map[MUX_MAX_QUERY_SLOTS];
+
+/*
  * Persistent shm_mq handles for communication with local workers.
  *
  * The multiplexer attaches once when a worker slot transitions to IDLE and
@@ -244,10 +263,15 @@ static bool mux_dispatch_remote_slots(void);
 static void mux_process_inbound_message(int peer_idx);
 static void mux_process_outbound_result(int rc_idx);
 
-/* Transaction affinity helpers */
+/* Transaction affinity helpers (inbound/remote) */
 static int	mux_txnmap_find_worker(int peer_idx, uint32 remote_slot_id);
 static void mux_txnmap_set(int peer_idx, uint32 remote_slot_id, int worker_id);
 static void mux_txnmap_clear(int peer_idx, uint32 remote_slot_id);
+
+/* Transaction affinity helpers (local/outbound) */
+static int	mux_local_txnmap_find_worker(uint32 conn_id);
+static void mux_local_txnmap_set(uint32 conn_id, int worker_id);
+static void mux_local_txnmap_clear(uint32 conn_id);
 
 
 /* ----------------------------------------------------------------
@@ -1007,6 +1031,75 @@ mux_txnmap_clear(int peer_idx, uint32 remote_slot_id)
 	}
 }
 
+/* ----------------------------------------------------------------
+ * Local (outbound) transaction affinity helpers
+ * ---------------------------------------------------------------- */
+
+/*
+ * mux_local_txnmap_find_worker
+ *		Look up the local transaction affinity table for conn_id.
+ *		Returns the assigned worker_id, or -1 if no entry exists.
+ */
+static int
+mux_local_txnmap_find_worker(uint32 conn_id)
+{
+	for (int i = 0; i < MUX_MAX_QUERY_SLOTS; i++)
+	{
+		if (local_txn_map[i].in_use && local_txn_map[i].conn_id == conn_id)
+			return local_txn_map[i].worker_id;
+	}
+	return -1;
+}
+
+/*
+ * mux_local_txnmap_set
+ *		Record that conn_id should always use worker_id for the duration of
+ *		a transaction.
+ */
+static void
+mux_local_txnmap_set(uint32 conn_id, int worker_id)
+{
+	/* If an entry already exists, update it */
+	for (int i = 0; i < MUX_MAX_QUERY_SLOTS; i++)
+	{
+		if (local_txn_map[i].in_use && local_txn_map[i].conn_id == conn_id)
+		{
+			local_txn_map[i].worker_id = worker_id;
+			return;
+		}
+	}
+	/* Allocate a new entry */
+	for (int i = 0; i < MUX_MAX_QUERY_SLOTS; i++)
+	{
+		if (!local_txn_map[i].in_use)
+		{
+			local_txn_map[i].in_use = true;
+			local_txn_map[i].conn_id = conn_id;
+			local_txn_map[i].worker_id = worker_id;
+			return;
+		}
+	}
+	ereport(WARNING, (errmsg("mux: local_txn_map full -- cannot track local transaction affinity")));
+}
+
+/*
+ * mux_local_txnmap_clear
+ *		Remove any local transaction affinity entry for conn_id.
+ *		Called when COMMIT or ROLLBACK is dispatched.
+ */
+static void
+mux_local_txnmap_clear(uint32 conn_id)
+{
+	for (int i = 0; i < MUX_MAX_QUERY_SLOTS; i++)
+	{
+		if (local_txn_map[i].in_use && local_txn_map[i].conn_id == conn_id)
+		{
+			local_txn_map[i].in_use = false;
+			return;
+		}
+	}
+}
+
 /*
  * mux_process_inbound_message
  *		Read and process one message from inbound_socks[peer_idx].
@@ -1556,6 +1649,15 @@ mux_drain_worker_queues(void)
 							}
 						}
 
+						/*
+						 * On error the transaction is implicitly aborted on
+						 * the worker, so we must clear the local affinity for
+						 * this conn_id so the next transaction can go to any
+						 * idle worker.
+						 */
+						if (qs->is_error)
+							mux_local_txnmap_clear(conn_id);
+
 						SpinLockAcquire(&qs->mutex);
 						qs->completed = true;
 						SpinLockRelease(&qs->mutex);
@@ -1570,14 +1672,36 @@ mux_drain_worker_queues(void)
 					}
 				}
 
-				/* Try to dispatch a pending request to the now-idle worker */
+				/*
+				 * Try to dispatch a pending request to the now-idle worker,
+				 * but only if the request's transaction affinity allows it
+				 * (either no affinity or affinity pinned to this specific
+				 * worker).  If the head of the queue is pinned to a different
+				 * worker, skip the opportunistic dispatch and let
+				 * mux_drain_backend_requests() sort it out on the next
+				 * iteration.
+				 */
 				{
-					char		buf[sizeof(MuxMsgHeader) + 4096];
-					Size		len;
+					char		ibuf[sizeof(MuxMsgHeader) + 4096];
+					Size		ilen;
 
-					if (mux_pending_dequeue(buf, sizeof(buf), &len))
+					if (mux_pending_dequeue(ibuf, sizeof(ibuf), &ilen))
 					{
-						(void) mux_dispatch_to_worker(i, buf, len);
+						MuxMsgHeader *ihdr = (MuxMsgHeader *) ibuf;
+						uint32		dequeued_conn_id = (ilen >= sizeof(MuxMsgHeader)) ?
+							ihdr->conn_id : (uint32) -1;
+						int			pinned = mux_local_txnmap_find_worker(dequeued_conn_id);
+
+						if (pinned < 0 || pinned == i)
+						{
+							/* No affinity, or pinned to this worker — dispatch now */
+							(void) mux_dispatch_to_worker(i, ibuf, ilen);
+						}
+						else
+						{
+							/* Pinned to a different worker — put it back */
+							mux_pending_enqueue(ibuf, ilen);
+						}
 					}
 				}
 			}
@@ -1587,29 +1711,76 @@ mux_drain_worker_queues(void)
 
 /*
  * mux_drain_backend_requests
- *		In a complete implementation this function would read from the
- *		per-backend request queues.  For simplicity the current version
- *		handles requests submitted via the pending_requests array, which
- *		an external caller fills through ConnMuxSubmitRequest().
+ *		Dispatches each pending local request to an idle local worker,
+ *		respecting transaction affinity: all messages that belong to the
+ *		same open transaction (identified by MuxMsgHeader.conn_id) are
+ *		always routed to the same worker so that transaction state is
+ *		preserved across statements (BEGIN → DML → COMMIT always land on
+ *		the same worker process).
  *
- *		It dispatches each pending request to an idle worker (if available).
+ *		If all workers are busy the item is re-queued and we stop draining
+ *		until the next loop iteration.
  */
 static void
 mux_drain_backend_requests(void)
 {
-	int			worker_id;
 	char		buf[sizeof(MuxMsgHeader) + 4096];
 	Size		len;
 
 	while (mux_pending_dequeue(buf, sizeof(buf), &len))
 	{
-		worker_id = mux_find_idle_worker();
+		MuxMsgHeader *hdr = (MuxMsgHeader *) buf;
+		uint32		conn_id = (len >= sizeof(MuxMsgHeader)) ? hdr->conn_id : (uint32) -1;
+		MuxSqlKind	sqlkind = MUX_SQL_OTHER;
+		int			worker_id;
+		const char *sql;
+
+		/* Classify the SQL so we can manage transaction affinity */
+		if (hdr->msg_type == MUX_MSG_QUERY && len > sizeof(MuxMsgHeader))
+		{
+			sql = buf + sizeof(MuxMsgHeader);
+			sqlkind = mux_classify_sql(sql);
+		}
+
+		/*
+		 * Look up transaction affinity: if this conn_id already has an
+		 * open transaction on a specific worker, route to that worker.
+		 * Only look for a new idle worker when no affinity exists.
+		 */
+		worker_id = mux_local_txnmap_find_worker(conn_id);
 		if (worker_id < 0)
 		{
-			/* No idle worker – re-queue at the front */
-			mux_pending_enqueue(buf, len);
-			break;
+			worker_id = mux_find_idle_worker();
+			if (worker_id < 0)
+			{
+				/* No idle worker – re-queue and stop draining */
+				mux_pending_enqueue(buf, len);
+				break;
+			}
 		}
+
+		/*
+		 * If this is a BEGIN, record/update the transaction affinity so
+		 * that all subsequent messages for this conn_id go to the same
+		 * worker.
+		 */
+		if (sqlkind == MUX_SQL_BEGIN)
+		{
+			mux_local_txnmap_set(conn_id, worker_id);
+			ereport(MULTIPLEXER_LOG_LEVEL,
+					(errmsg("mux: local txn affinity set conn_id=%u -> worker %d",
+							conn_id, worker_id)));
+		}
+		else if (sqlkind == MUX_SQL_COMMIT || sqlkind == MUX_SQL_ROLLBACK)
+		{
+			/* Clear affinity after the transaction ends */
+			mux_local_txnmap_clear(conn_id);
+			ereport(MULTIPLEXER_LOG_LEVEL,
+					(errmsg("mux: local txn affinity cleared conn_id=%u (worker %d, %s)",
+							conn_id, worker_id,
+							sqlkind == MUX_SQL_COMMIT ? "COMMIT" : "ROLLBACK")));
+		}
+
 		(void) mux_dispatch_to_worker(worker_id, buf, len);
 	}
 }
@@ -1727,6 +1898,7 @@ ConnMuxMain(Datum main_arg)
 	n_inbound = 0;
 	memset(inbound_reqs, 0, sizeof(inbound_reqs));
 	memset(inbound_txn_map, 0, sizeof(inbound_txn_map));
+	memset(local_txn_map, 0, sizeof(local_txn_map));
 
 	/* Initialise persistent worker queue handles */
 	for (i = 0; i < MUX_MAX_WORKERS; i++)
