@@ -24,8 +24,13 @@ typedef void (*SyscacheCallbackFunction) (Datum arg, int cacheid, uint32 hashval
 typedef void (*RelcacheCallbackFunction) (Datum arg, Oid relid);
 typedef void (*RelSyncCallbackFunction) (Datum arg, Oid relid);
 
+/* Hook for extensions to receive custom invalidation messages */
+typedef void (*ReceiveCustomInvalMessage_hook_type) (void);
+extern PGDLLIMPORT ReceiveCustomInvalMessage_hook_type ReceiveCustomInvalMessage_hook;
+
 
 extern void AcceptInvalidationMessages(void);
+extern void ReceiveCustomInvalMessage(void);
 
 extern void AtEOXact_Inval(bool isCommit);
 

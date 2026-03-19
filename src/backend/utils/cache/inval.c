@@ -259,6 +259,9 @@ static InvalidationInfo *inplaceInvalInfo = NULL;
 /* GUC storage */
 int			debug_discard_caches = 0;
 
+/* Hook for extensions to receive custom invalidation messages */
+ReceiveCustomInvalMessage_hook_type ReceiveCustomInvalMessage_hook = NULL;
+
 /*
  * Dynamically-registered callback functions.  Current implementation
  * assumes there won't be enough of these to justify a dynamically resizable
@@ -918,6 +921,18 @@ InvalidateSystemCaches(void)
 }
 
 /*
+ * ReceiveCustomInvalMessage
+ *		Call the ReceiveCustomInvalMessage_hook if set, allowing extensions
+ *		to process their own invalidation messages.
+ */
+void
+ReceiveCustomInvalMessage(void)
+{
+	if (ReceiveCustomInvalMessage_hook)
+		(*ReceiveCustomInvalMessage_hook) ();
+}
+
+/*
  * AcceptInvalidationMessages
  *		Read and process invalidation messages from the shared invalidation
  *		message queue.
@@ -928,6 +943,8 @@ InvalidateSystemCaches(void)
 void
 AcceptInvalidationMessages(void)
 {
+	ReceiveCustomInvalMessage();
+
 	ReceiveSharedInvalidMessages(LocalExecuteInvalidationMessage,
 								 InvalidateSystemCaches);
 
