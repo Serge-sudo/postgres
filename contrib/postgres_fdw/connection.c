@@ -463,8 +463,25 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 			const char *p;
 			char	   *val;
 
-			/* Extract host for peer multiplexer connection */
+			/*
+			 * Extract host for peer multiplexer connection.
+			 *
+			 * For postgres_fdw/libpq, "host" may be a Unix-domain socket
+			 * directory (e.g. "/tmp/..."), but the multiplexer uses raw TCP
+			 * sockets and therefore needs a TCP-resolvable hostname/address.
+			 * Ignore socket-path hosts here and keep fallback/default unless
+			 * a proper hostname or hostaddr is provided.
+			 */
 			if (strcmp(def->defname, "host") == 0)
+			{
+				const char *hostval = defGetString(def);
+
+				if (hostval && hostval[0] != '\0' && hostval[0] != '/')
+					peer_host = hostval;
+			}
+
+			/* hostaddr is always a TCP address and is preferred when present */
+			if (strcmp(def->defname, "hostaddr") == 0)
 				peer_host = defGetString(def);
 
 			/*
