@@ -910,6 +910,18 @@ configure_remote_session(PGconn *conn)
 void
 do_sql_command(PGconn *conn, const char *sql)
 {
+	if (IS_MUX_CONN(conn))
+	{
+		char		mux_errmsg[512];
+
+		if (!ConnMuxSendCommand(MUX_CONN_SRVOID(conn), sql,
+								mux_errmsg, sizeof(mux_errmsg)))
+			ereport(ERROR,
+					(errmsg("could not send command to foreign server via multiplexer: %s",
+							mux_errmsg)));
+		return;
+	}
+
 	do_sql_command_begin(conn, sql);
 	do_sql_command_end(conn, sql, false);
 }
