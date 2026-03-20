@@ -1571,7 +1571,7 @@ mux_drain_worker_queues(void)
 
 						nethdr.magic = MUXNET_MAGIC;
 						nethdr.msg_type = (hdr->msg_type == MUX_MSG_ERROR) ?
-							MUXNET_MSG_ERROR : MUXNET_MSG_RESULT;
+							MUXNET_MSG_ERROR : MUXNET_MSG_RESULT; 
 						nethdr.slot_id = inbound_reqs[req_idx].remote_slot_id;
 						nethdr.server_oid = 0;
 						nethdr.payload_len = payload_len;
@@ -1602,7 +1602,7 @@ mux_drain_worker_queues(void)
 							}
 						}
 
-						/*
+					/*
 					 * If this request was a COMMIT or ROLLBACK (or an error),
 					 * clear the transaction affinity so the next transaction
 					 * from the same peer/slot can be assigned to any idle worker.

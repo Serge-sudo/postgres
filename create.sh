@@ -15,6 +15,9 @@ PATH="$PATH:/workspaces/postgres/tmp_install/usr/local/pgsql/bin"
 PORT1=5432
 PORT2=5433
 PORT3=5434
+PORT1_MUX=6432
+PORT2_MUX=6433
+PORT3_MUX=6434
 HOST=127.0.0.1
 
 command -v initdb >/dev/null
@@ -28,7 +31,8 @@ log() { echo "[$(date +'%H:%M:%S')] $*"; }
 init_node() {
   local dir="$1"
   local port="$2"
-  local name="$3"
+  local mux_port="$3"
+  local name="$4"
 
   rm -rf "$dir"
   mkdir -p "$dir"
@@ -48,6 +52,8 @@ synchronous_commit = off
 full_page_writes = off
 logging_collector = on
 log_statement = 'all'
+mux_worker_count = 2
+mux_tcp_port = $mux_port
 log_directory = 'log'
 shared_preload_libraries = 'postgres_fdw'
 log_filename = '${name}.log'
@@ -65,7 +71,7 @@ EOF
 
 stop_node() {
   local dir="$1"
-  [[ -d "$dir" ]] && pg_ctl -D "$dir" -w stop -m fast >/dev/null || true
+  [[ -d "$dir" ]] && pg_ctl -D "$dir" -w stop -m immediate >/dev/null || true
 }
 
 psql_node() {
@@ -84,9 +90,9 @@ cleanup() {
 cleanup
 
 # ---- init & start nodes ----
-init_node "$NODE1_DIR" "$PORT1" "node1"
-init_node "$NODE2_DIR" "$PORT2" "node2"
-init_node "$NODE3_DIR" "$PORT3" "node3"
+init_node "$NODE1_DIR" "$PORT1" "$PORT1_MUX" "node1"
+init_node "$NODE2_DIR" "$PORT2" "$PORT2_MUX" "node2"
+init_node "$NODE3_DIR" "$PORT3" "$PORT3_MUX" "node3"
 
 # ---- install postgres_fdw ----
 log "installing postgres_fdw"
@@ -101,11 +107,11 @@ log "creating FDW servers and user mappings"
 psql_node "$PORT1" "
 CREATE SERVER IF NOT EXISTS node2
   FOREIGN DATA WRAPPER postgres_fdw
-  OPTIONS (host '$HOST', dbname 'postgres', port '$PORT2');
+  OPTIONS (host '$HOST', dbname 'postgres', port '$PORT2', mux_port '$PORT2_MUX');
   
 CREATE SERVER IF NOT EXISTS node3
   FOREIGN DATA WRAPPER postgres_fdw
-  OPTIONS (host '$HOST', dbname 'postgres', port '$PORT3');
+  OPTIONS (host '$HOST', dbname 'postgres', port '$PORT3', mux_port '$PORT3_MUX');
 
 CREATE USER MAPPING IF NOT EXISTS
   FOR CURRENT_USER SERVER node2;
@@ -118,11 +124,11 @@ CREATE USER MAPPING IF NOT EXISTS
 psql_node "$PORT2" "
 CREATE SERVER IF NOT EXISTS node1
   FOREIGN DATA WRAPPER postgres_fdw
-  OPTIONS (host '$HOST', dbname 'postgres', port '$PORT1');
+  OPTIONS (host '$HOST', dbname 'postgres', port '$PORT1', mux_port '$PORT1_MUX');
   
 CREATE SERVER IF NOT EXISTS node3
   FOREIGN DATA WRAPPER postgres_fdw
-  OPTIONS (host '$HOST', dbname 'postgres', port '$PORT3');
+  OPTIONS (host '$HOST', dbname 'postgres', port '$PORT3', mux_port '$PORT3_MUX');
 
 CREATE USER MAPPING IF NOT EXISTS
   FOR CURRENT_USER SERVER node1;
@@ -135,11 +141,11 @@ CREATE USER MAPPING IF NOT EXISTS
 psql_node "$PORT3" "
 CREATE SERVER IF NOT EXISTS node1
   FOREIGN DATA WRAPPER postgres_fdw
-  OPTIONS (host '$HOST', dbname 'postgres', port '$PORT1');
+  OPTIONS (host '$HOST', dbname 'postgres', port '$PORT1', mux_port '$PORT1_MUX');
 
 CREATE SERVER IF NOT EXISTS node2
   FOREIGN DATA WRAPPER postgres_fdw
-  OPTIONS (host '$HOST', dbname 'postgres', port '$PORT2');
+  OPTIONS (host '$HOST', dbname 'postgres', port '$PORT2', mux_port '$PORT2_MUX');
 
 CREATE USER MAPPING IF NOT EXISTS
   FOR CURRENT_USER SERVER node1;
