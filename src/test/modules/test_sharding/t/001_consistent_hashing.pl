@@ -11,10 +11,15 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
+my $node1_mux_port = 17432;
+my $node2_mux_port = 17433;
+my $node3_mux_port = 17434;
+
 # Create three PostgreSQL nodes to act as shard members
 my $node1 = PostgreSQL::Test::Cluster->new('node1');
 $node1->init;
 $node1->append_conf('postgresql.conf', qq(
+mux_tcp_port = $node1_mux_port
 cluster_name = 'node1'
 ));
 $node1->start;
@@ -22,6 +27,7 @@ $node1->start;
 my $node2 = PostgreSQL::Test::Cluster->new('node2');
 $node2->init;
 $node2->append_conf('postgresql.conf', qq(
+mux_tcp_port = $node2_mux_port
 cluster_name = 'node2'
 ));
 $node2->start;
@@ -29,6 +35,7 @@ $node2->start;
 my $node3 = PostgreSQL::Test::Cluster->new('node3');
 $node3->init;
 $node3->append_conf('postgresql.conf', qq(
+mux_tcp_port = $node3_mux_port
 cluster_name = 'node3'
 ));
 $node3->start;
@@ -51,11 +58,11 @@ foreach my $node ($node1, $node2, $node3)
 # Setup foreign servers on node1
 $node1->safe_psql('postgres', qq[
 	CREATE SERVER node2 FOREIGN DATA WRAPPER postgres_fdw 
-		OPTIONS (host '$node2_host', dbname 'postgres', port '$node2_port');
+		OPTIONS (host '$node2_host', dbname 'postgres', port '$node2_port', mux_port '$node2_mux_port');
 	CREATE USER MAPPING FOR CURRENT_USER SERVER node2;
 	
 	CREATE SERVER node3 FOREIGN DATA WRAPPER postgres_fdw 
-		OPTIONS (host '$node3_host', dbname 'postgres', port '$node3_port');
+		OPTIONS (host '$node3_host', dbname 'postgres', port '$node3_port', mux_port '$node3_mux_port');
 	CREATE USER MAPPING FOR CURRENT_USER SERVER node3;
 
 ]);
@@ -63,11 +70,11 @@ $node1->safe_psql('postgres', qq[
 # Setup foreign servers on node2
 $node2->safe_psql('postgres', qq[
 	CREATE SERVER node1 FOREIGN DATA WRAPPER postgres_fdw 
-		OPTIONS (host '$node1_host', dbname 'postgres', port '$node1_port');
+		OPTIONS (host '$node1_host', dbname 'postgres', port '$node1_port', mux_port '$node1_mux_port');
 	CREATE USER MAPPING FOR CURRENT_USER SERVER node1;
 	
 	CREATE SERVER node3 FOREIGN DATA WRAPPER postgres_fdw 
-		OPTIONS (host '$node3_host', dbname 'postgres', port '$node3_port');
+		OPTIONS (host '$node3_host', dbname 'postgres', port '$node3_port', mux_port '$node3_mux_port');
 	CREATE USER MAPPING FOR CURRENT_USER SERVER node3;
 
 ]);
@@ -75,11 +82,11 @@ $node2->safe_psql('postgres', qq[
 # Setup foreign servers on node3
 $node3->safe_psql('postgres', qq[
 	CREATE SERVER node1 FOREIGN DATA WRAPPER postgres_fdw 
-		OPTIONS (host '$node1_host', dbname 'postgres', port '$node1_port');
+		OPTIONS (host '$node1_host', dbname 'postgres', port '$node1_port', mux_port '$node1_mux_port');
 	CREATE USER MAPPING FOR CURRENT_USER SERVER node1;
 	
 	CREATE SERVER node2 FOREIGN DATA WRAPPER postgres_fdw 
-		OPTIONS (host '$node2_host', dbname 'postgres', port '$node2_port');
+		OPTIONS (host '$node2_host', dbname 'postgres', port '$node2_port', mux_port '$node2_mux_port');
 	CREATE USER MAPPING FOR CURRENT_USER SERVER node2;
 
 ]);
@@ -101,6 +108,14 @@ is($result, '1', 'node1 sees 1 shard members (excluding itself)');
 $result = $node2->safe_psql('postgres', 
     "SELECT COUNT(*) FROM pg_shardmembers WHERE sgid = (SELECT oid FROM pg_shardgroups WHERE sgname = 'sg1');");
 is($result, '1', 'node2 sees 1 shard members (excluding itself)');
+
+my $node1_mux_workers = $node1->safe_psql('postgres',
+	"SELECT COUNT(*) FROM pg_stat_conn_multiplexer;");
+ok($node1_mux_workers > 0, 'node1 has active multiplexer workers');
+
+my $node2_mux_workers = $node2->safe_psql('postgres',
+	"SELECT COUNT(*) FROM pg_stat_conn_multiplexer;");
+ok($node2_mux_workers > 0, 'node2 has active multiplexer workers');
 
 # Create a distributed partitioned table on node1
 $node1->safe_psql('postgres', qq(
@@ -195,6 +210,17 @@ is($node1_count, '10', 'node1 can see all 10 rows');
 
 my $node2_count = $node2->safe_psql('postgres', "SELECT COUNT(*) FROM orders;");
 is($node2_count, '10', 'node2 can see all 10 rows');
+
+# Validate transactional command flow through FDW/multiplexer paths.
+$node1->safe_psql('postgres', qq(
+	BEGIN;
+	INSERT INTO orders VALUES (1001, 201, '2024-02-10', 111.00);
+	INSERT INTO orders VALUES (1002, 202, '2024-08-10', 222.00);
+	ROLLBACK;
+));
+
+$node1_count = $node1->safe_psql('postgres', "SELECT COUNT(*) FROM orders;");
+is($node1_count, '10', 'transaction rollback keeps row count unchanged on node1');
 
 # Test RESHARD command - add a third node and reshard
 $node1->safe_psql('postgres', qq(
