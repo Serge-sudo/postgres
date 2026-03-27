@@ -40,6 +40,8 @@
 #error "libpq may not be used code directly built into the backend"
 #endif
 
+#include <limits.h>
+
 #include "libpq-fe.h"
 #include "libpq-int.h"
 #include "miscadmin.h"
@@ -48,6 +50,8 @@
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
+/* Upper bound chosen to avoid negative pgsocket values on signed platforms */
+#define MUX_CONN_ID_MAX ((uint32) INT_MAX)
 
 static inline void libpqsrv_connect_prepare(void);
 static inline void libpqsrv_connect_internal(PGconn *conn, uint32 wait_event_info);
@@ -127,11 +131,17 @@ libpqsrv_disconnect(PGconn *conn)
  * This creates a PGconn that looks like a valid connection but is actually
  * routed through the connection multiplexer. The is_mux_conn flag is set,
  * and multiplexer-aware code can detect and handle this appropriately.
+ *
+ * Callers must pass a valid mux_conn_id returned by ConnMuxRegisterServer;
+ * UINT32_MAX is reserved as the failure sentinel and must never be used.
  */
 static inline PGconn *
 libpqsrv_create_mux_conn(Oid server_oid, const char *server_name, uint32 mux_conn_id)
 {
 	PGconn	   *conn;
+
+	StaticAssertStmt(sizeof(pgsocket) >= sizeof(uint32),
+					 "pgsocket must be able to store uint32 mux_conn_id values while remaining non-negative");
 
 	conn = (PGconn *) palloc0(sizeof(PGconn));
 	conn->is_mux_conn = true;
@@ -142,7 +152,15 @@ libpqsrv_create_mux_conn(Oid server_oid, const char *server_name, uint32 mux_con
 	 * Stash the multiplexer connection identifier directly in conn->sock so
 	 * fe-misc/fe-connect level code can route transparently without inventing
 	 * new PGconn fields.
+	 *
+	 * The static assertion above guarantees pgsocket is wide enough for the
+	 * uint32 value; we still bound the ID to INT_MAX (MUX_CONN_ID_MAX) to
+	 * avoid negative socket values on platforms where pgsocket is signed.
 	 */
+	/* UINT32_MAX is reserved as the ConnMuxRegisterServer failure sentinel. */
+	Assert(mux_conn_id != UINT32_MAX);
+	/* Bound to avoid negative sockets when pgsocket is signed. */
+	Assert(mux_conn_id <= MUX_CONN_ID_MAX);
 	conn->sock = (pgsocket) mux_conn_id;
 	conn->asyncStatus = PGASYNC_IDLE;
 	conn->xactStatus = PQTRANS_IDLE;
@@ -176,8 +194,15 @@ libpqsrv_mux_server_oid(PGconn *conn)
 static inline uint32
 libpqsrv_mux_conn_id(PGconn *conn)
 {
+	uint32		conn_id;
+
 	Assert(conn != NULL && conn->is_mux_conn);
-	return (uint32) conn->sock;
+	conn_id = (uint32) conn->sock;
+	/* Reserved failure sentinel should never appear here. */
+	Assert(conn_id != UINT32_MAX);
+	/* Ensure stored sock value stayed within the non-negative bound. */
+	Assert(conn_id <= MUX_CONN_ID_MAX);
+	return conn_id;
 }
 
 
