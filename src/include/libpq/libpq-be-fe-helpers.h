@@ -129,7 +129,7 @@ libpqsrv_disconnect(PGconn *conn)
  * and multiplexer-aware code can detect and handle this appropriately.
  */
 static inline PGconn *
-libpqsrv_create_mux_conn(Oid server_oid, const char *server_name)
+libpqsrv_create_mux_conn(Oid server_oid, const char *server_name, uint32 mux_conn_id)
 {
 	PGconn	   *conn;
 
@@ -138,7 +138,12 @@ libpqsrv_create_mux_conn(Oid server_oid, const char *server_name)
 	conn->mux_server_oid = server_oid;
 	conn->mux_server_name = pstrdup(server_name);
 	conn->status = CONNECTION_OK;
-	conn->sock = PGINVALID_SOCKET;
+	/*
+	 * Stash the multiplexer connection identifier directly in conn->sock so
+	 * fe-misc/fe-connect level code can route transparently without inventing
+	 * new PGconn fields.
+	 */
+	conn->sock = (pgsocket) mux_conn_id;
 	conn->asyncStatus = PGASYNC_IDLE;
 	conn->xactStatus = PQTRANS_IDLE;
 
@@ -163,6 +168,16 @@ libpqsrv_mux_server_oid(PGconn *conn)
 {
 	Assert(conn != NULL && conn->is_mux_conn);
 	return conn->mux_server_oid;
+}
+
+/*
+ * Get the multiplexer connection identifier encoded in conn->sock.
+ */
+static inline uint32
+libpqsrv_mux_conn_id(PGconn *conn)
+{
+	Assert(conn != NULL && conn->is_mux_conn);
+	return (uint32) conn->sock;
 }
 
 

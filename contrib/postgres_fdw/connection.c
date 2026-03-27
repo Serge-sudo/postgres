@@ -554,7 +554,8 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 			 */
 			old_ctx = MemoryContextSwitchTo(CacheMemoryContext);
 			entry->conn = libpqsrv_create_mux_conn(server->serverid,
-												   server->servername);
+												   server->servername,
+												   conn_id);
 			MemoryContextSwitchTo(old_ctx);
 
 			elog(DEBUG3,
