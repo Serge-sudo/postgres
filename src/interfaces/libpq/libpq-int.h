@@ -517,6 +517,10 @@ struct pg_conn
 	PGlobjfuncs *lobjfuncs;		/* private state for large-object access fns */
 	pg_prng_state prng_state;	/* prng state for load balancing connections */
 
+	/* Multiplexer routing information */
+	bool		is_mux_conn;	/* true if this connection routes through multiplexer */
+	uint32		mux_server_oid;	/* foreign server OID for multiplexer routing */
+	char	   *mux_server_name; /* foreign server name for multiplexer routing */
 
 	/* Buffer for data received from backend and not yet processed */
 	char	   *inBuffer;		/* currently allocated buffer */

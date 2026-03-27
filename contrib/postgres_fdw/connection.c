@@ -327,7 +327,7 @@ GetConnection(UserMapping *user, bool will_prep_stmt, PgFdwConnState **state)
 		 * for any libpq-originated error condition.
 		 */
 		if (errdata->sqlerrcode != ERRCODE_CONNECTION_FAILURE ||
-			IS_MUX_CONN(entry->conn) ||
+			libpqsrv_is_mux_conn(entry->conn) ||
 			PQstatus(entry->conn) != CONNECTION_BAD ||
 			entry->xact_depth > 0)
 		{
@@ -357,7 +357,7 @@ GetConnection(UserMapping *user, bool will_prep_stmt, PgFdwConnState **state)
 				(errmsg_internal("could not start remote transaction on connection %p",
 								 entry->conn)),
 				errdetail_internal("%s",
-								   IS_MUX_CONN(entry->conn) ? "(mux connection)" :
+								   libpqsrv_is_mux_conn(entry->conn) ? "(mux connection)" :
 								   pchomp(PQerrorMessage(entry->conn))));
 
 		elog(DEBUG3, "closing connection %p to reestablish a new one",
@@ -442,7 +442,7 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 	 * If the connection multiplexer is running, route this foreign-server
 	 * connection through it.  We store a lightweight MuxConnSentinel cast to
 	 * PGconn* in entry->conn so that all subsequent callers can detect the mux
-	 * path via IS_MUX_CONN().  The multiplexer manages
+	 * path via libpqsrv_is_mux_conn().  The multiplexer manages
 	 * the actual persistent TCP connection to the peer multiplexer.
 	 * Individual backends never hold direct TCP connections to remote servers.
 	 */
@@ -546,14 +546,16 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 		if (conn_id != (uint32) -1)
 		{
 			MemoryContext old_ctx;
-			MuxConnSentinel *sentinel;
 
+			/*
+			 * Create a PGconn structure for multiplexer routing.
+			 * This allows standard libpq functions to work transparently,
+			 * with the multiplexer logic handled at a lower level.
+			 */
 			old_ctx = MemoryContextSwitchTo(CacheMemoryContext);
-			sentinel = MuxConnSentinelCreate(server->serverid,
-											 server->servername);
+			entry->conn = libpqsrv_create_mux_conn(server->serverid,
+												   server->servername);
 			MemoryContextSwitchTo(old_ctx);
-
-			entry->conn = (PGconn *) sentinel;
 
 			elog(DEBUG3,
 				 "postgres_fdw: connection to \"%s\" routed through multiplexer (conn_id %u)",
@@ -575,7 +577,7 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 	 * Register the connection in shared memory for distributed deadlock detection
 	 * Track the mapping: local_pid + server_oid -> remote_backend_pid
 	 */
-	if (entry->conn != NULL && !IS_MUX_CONN(entry->conn))
+	if (entry->conn != NULL && !libpqsrv_is_mux_conn(entry->conn))
 	{
 		int remote_backend_pid = PQbackendPID(entry->conn);
 		if (remote_backend_pid > 0)
@@ -768,13 +770,15 @@ disconnect_pg_server(ConnCacheEntry *entry)
 {
 	if (entry->conn != NULL)
 	{
-		if (IS_MUX_CONN(entry->conn))
+		if (entry->conn->is_mux_conn)
 		{
 			/*
 			 * This is a multiplexer-routed connection.  The actual TCP
 			 * connection is held by the multiplexer process and persists for
-			 * reuse — we just free the sentinel and return.
+			 * reuse — we just free the PGconn structure and return.
 			 */
+			if (entry->conn->mux_server_name)
+				pfree(entry->conn->mux_server_name);
 			pfree(entry->conn);
 			entry->conn = NULL;
 			return;
@@ -923,11 +927,11 @@ do_sql_command(PGconn *conn, const char *sql)
 static void
 do_sql_command_entry(ConnCacheEntry *entry, const char *sql)
 {
-	if (IS_MUX_CONN(entry->conn))
+	if (libpqsrv_is_mux_conn(entry->conn))
 	{
 		char		mux_errmsg[512];
 
-		if (!ConnMuxSendCommand(MUX_CONN_SRVOID(entry->conn), sql,
+		if (!ConnMuxSendCommand(libpqsrv_mux_server_oid(entry->conn), sql,
 								mux_errmsg, sizeof(mux_errmsg)))
 			ereport(ERROR,
 					(errmsg("could not send command to foreign server via multiplexer: %s",
@@ -1200,7 +1204,7 @@ pgfdw_build_result_from_mux(const char *data, int data_len,
  *
  * Caller is responsible for the error handling on the result.
  *
- * When conn is a MuxConnSentinel (IS_MUX_CONN(conn)), the query is sent to
+ * When conn is a MuxConnSentinel (libpqsrv_is_mux_conn(conn)), the query is sent to
  * the foreign server via the connection multiplexer instead of the direct
  * libpq path.  The returned PGresult* is actually a MuxPGresult* in that
  * case; callers must use the mux-aware accessor macros
@@ -1215,9 +1219,9 @@ pgfdw_exec_query(PGconn *conn, const char *query, PgFdwConnState *state)
 		process_pending_request(state->pendingAreq);
 
 	/* Multiplexer-routed connection: submit via shm_mq */
-	if (IS_MUX_CONN(conn))
+	if (libpqsrv_is_mux_conn(conn))
 	{
-		Oid			server_oid = MUX_CONN_SRVOID(conn);
+		Oid			server_oid = libpqsrv_mux_server_oid(conn);
 		char	   *result_buf = palloc(MUX_RESULT_MAXLEN);
 		char		mux_errmsg[512];
 		int			nfields,
@@ -1283,7 +1287,7 @@ pgfdw_report_error(int elevel, PGresult *res, PGconn *conn,
 	 * For mux-routed connections, the error was already raised in
 	 * pgfdw_exec_query; nothing more to report here.
 	 */
-	if (IS_MUX_CONN(conn))
+	if (libpqsrv_is_mux_conn(conn))
 	{
 		if (clear && res && IS_MUX_RESULT(res))
 			pfree(res);
@@ -1575,7 +1579,7 @@ error:
 
 					/* Commit all remote transactions during pre-commit */
 					entry->changing_xact_state = true;
-					if (entry->parallel_commit && !IS_MUX_CONN(entry->conn))
+					if (entry->parallel_commit && !libpqsrv_is_mux_conn(entry->conn))
 					{
 						do_sql_command_begin(entry->conn, "COMMIT TRANSACTION");
 						pending_entries = lappend(pending_entries, entry);
@@ -1711,11 +1715,11 @@ deallocate_prepared_stmts(ConnCacheEntry *entry)
 
 	if (entry->have_prep_stmt && entry->have_error)
 	{
-		if (IS_MUX_CONN(entry->conn))
+		if (libpqsrv_is_mux_conn(entry->conn))
 		{
 			char	errmsg[512];
 
-			ConnMuxSendCommand(MUX_CONN_SRVOID(entry->conn),
+			ConnMuxSendCommand(libpqsrv_mux_server_oid(entry->conn),
 							   "DEALLOCATE ALL",
 							   errmsg, sizeof(errmsg));
 		}
@@ -2311,13 +2315,13 @@ pgfdw_abort_cleanup(ConnCacheEntry *entry, bool toplevel)
 	 * We can't call PQtransactionStatus on a sentinel, so skip the cancel
 	 * logic and go straight to the abort SQL.
 	 */
-	if (IS_MUX_CONN(entry->conn))
+	if (libpqsrv_is_mux_conn(entry->conn))
 	{
 		char		sql[100];
 		char		errmsg[512];
 
 		CONSTRUCT_ABORT_COMMAND(sql, entry, toplevel);
-		ConnMuxSendCommand(MUX_CONN_SRVOID(entry->conn), sql,
+		ConnMuxSendCommand(libpqsrv_mux_server_oid(entry->conn), sql,
 						   errmsg, sizeof(errmsg));
 		/* Ignore errors during cleanup */
 		entry->have_prep_stmt = false;

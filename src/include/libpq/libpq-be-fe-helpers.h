@@ -41,6 +41,7 @@
 #endif
 
 #include "libpq-fe.h"
+#include "libpq-int.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "storage/latch.h"
@@ -118,6 +119,50 @@ libpqsrv_disconnect(PGconn *conn)
 
 	ReleaseExternalFD();
 	PQfinish(conn);
+}
+
+/*
+ * Create a minimal PGconn for multiplexer routing.
+ *
+ * This creates a PGconn that looks like a valid connection but is actually
+ * routed through the connection multiplexer. The is_mux_conn flag is set,
+ * and multiplexer-aware code can detect and handle this appropriately.
+ */
+static inline PGconn *
+libpqsrv_create_mux_conn(Oid server_oid, const char *server_name)
+{
+	PGconn	   *conn;
+
+	conn = (PGconn *) palloc0(sizeof(PGconn));
+	conn->is_mux_conn = true;
+	conn->mux_server_oid = server_oid;
+	conn->mux_server_name = pstrdup(server_name);
+	conn->status = CONNECTION_OK;
+	conn->sock = PGINVALID_SOCKET;
+	conn->asyncStatus = PGASYNC_IDLE;
+	conn->xactStatus = PQTRANS_IDLE;
+
+	return conn;
+}
+
+/*
+ * Check if a PGconn is a multiplexer-routed connection.
+ */
+static inline bool
+libpqsrv_is_mux_conn(PGconn *conn)
+{
+	return conn != NULL && conn->is_mux_conn;
+}
+
+/*
+ * Get the server OID from a multiplexer-routed connection.
+ * Caller must ensure conn is a mux connection first.
+ */
+static inline Oid
+libpqsrv_mux_server_oid(PGconn *conn)
+{
+	Assert(conn != NULL && conn->is_mux_conn);
+	return conn->mux_server_oid;
 }
 
 
