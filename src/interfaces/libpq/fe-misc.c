@@ -57,6 +57,33 @@ static int	pqSocketCheck(PGconn *conn, int forRead, int forWrite,
 						  pg_usec_time_t end_time);
 
 /*
+ * Multiplexer connection sentinel detection.
+ *
+ * When postgres_fdw uses the connection multiplexer, it stores a
+ * MuxConnSentinel* cast to PGconn* instead of a real libpq connection.
+ * We detect these by checking the magic number at the start of the struct.
+ *
+ * For sentinels, most libpq operations should no-op since the actual
+ * query execution is handled by the multiplexer infrastructure, not libpq.
+ */
+#define MUX_CONN_MAGIC		0x4D555803U	/* 'M','U','X','\3' */
+
+static inline bool
+pqIsMuxConnSentinel(const PGconn *conn)
+{
+	/*
+	 * Check if the pointer looks like a MuxConnSentinel by examining the
+	 * first uint32. This is safe because:
+	 * 1. Real PGconn structs never have this magic value in their first field
+	 * 2. The sentinel is always properly allocated (palloc'd)
+	 * 3. This avoids depending on backend-only headers in libpq
+	 */
+	if (conn == NULL)
+		return false;
+	return (*((const uint32 *) conn) == MUX_CONN_MAGIC);
+}
+
+/*
  * PQlibVersion: return the libpq version number
  */
 int
@@ -76,6 +103,9 @@ PQlibVersion(void)
 int
 pqGetc(char *result, PGconn *conn)
 {
+	/* Multiplexer sentinels don't have real input buffers */
+	if (pqIsMuxConnSentinel(conn))
+		return EOF;
 	if (conn->inCursor >= conn->inEnd)
 		return EOF;
 
@@ -91,6 +121,9 @@ pqGetc(char *result, PGconn *conn)
 int
 pqPutc(char c, PGconn *conn)
 {
+	/* Multiplexer sentinels don't have real output buffers */
+	if (pqIsMuxConnSentinel(conn))
+		return 0;
 	if (pqPutMsgBytes(&c, 1, conn))
 		return EOF;
 
@@ -113,6 +146,10 @@ pqGets_internal(PQExpBuffer buf, PGconn *conn, bool resetbuffer)
 	int			inCursor = conn->inCursor;
 	int			inEnd = conn->inEnd;
 	int			slen;
+
+	/* Multiplexer sentinels don't have real input buffers */
+	if (pqIsMuxConnSentinel(conn))
+		return EOF;
 
 	while (inCursor < inEnd && inBuffer[inCursor])
 		inCursor++;
@@ -151,6 +188,9 @@ pqGets_append(PQExpBuffer buf, PGconn *conn)
 int
 pqPuts(const char *s, PGconn *conn)
 {
+	/* Multiplexer sentinels don't have real output buffers */
+	if (pqIsMuxConnSentinel(conn))
+		return 0;
 	if (pqPutMsgBytes(s, strlen(s) + 1, conn))
 		return EOF;
 
@@ -164,6 +204,9 @@ pqPuts(const char *s, PGconn *conn)
 int
 pqGetnchar(char *s, size_t len, PGconn *conn)
 {
+	/* Multiplexer sentinels don't have real input buffers */
+	if (pqIsMuxConnSentinel(conn))
+		return EOF;
 	if (len > (size_t) (conn->inEnd - conn->inCursor))
 		return EOF;
 
@@ -186,6 +229,9 @@ pqGetnchar(char *s, size_t len, PGconn *conn)
 int
 pqSkipnchar(size_t len, PGconn *conn)
 {
+	/* Multiplexer sentinels don't have real input buffers */
+	if (pqIsMuxConnSentinel(conn))
+		return EOF;
 	if (len > (size_t) (conn->inEnd - conn->inCursor))
 		return EOF;
 
@@ -201,6 +247,9 @@ pqSkipnchar(size_t len, PGconn *conn)
 int
 pqPutnchar(const char *s, size_t len, PGconn *conn)
 {
+	/* Multiplexer sentinels don't have real output buffers */
+	if (pqIsMuxConnSentinel(conn))
+		return 0;
 	if (pqPutMsgBytes(s, len, conn))
 		return EOF;
 
@@ -217,6 +266,10 @@ pqGetInt(int *result, size_t bytes, PGconn *conn)
 {
 	uint16		tmp2;
 	uint32		tmp4;
+
+	/* Multiplexer sentinels don't have real input buffers */
+	if (pqIsMuxConnSentinel(conn))
+		return EOF;
 
 	switch (bytes)
 	{
@@ -255,6 +308,10 @@ pqPutInt(int value, size_t bytes, PGconn *conn)
 	uint16		tmp2;
 	uint32		tmp4;
 
+	/* Multiplexer sentinels don't have real output buffers */
+	if (pqIsMuxConnSentinel(conn))
+		return 0;
+
 	switch (bytes)
 	{
 		case 2:
@@ -278,8 +335,7 @@ pqPutInt(int value, size_t bytes, PGconn *conn)
 }
 
 /*
- * Make sure conn's output buffer can hold bytes_needed bytes (caller must
- * include already-stored data into the value!)
+ * pqCheckOutBufferSpace: ensure conn's output buffer has room
  *
  * Returns 0 on success, EOF if failed to enlarge buffer
  */
@@ -288,6 +344,10 @@ pqCheckOutBufferSpace(size_t bytes_needed, PGconn *conn)
 {
 	int			newsize = conn->outBufSize;
 	char	   *newbuf;
+
+	/* Multiplexer sentinels don't have real buffers */
+	if (pqIsMuxConnSentinel(conn))
+		return 0;
 
 	/* Quick exit if we have enough space */
 	if (bytes_needed <= (size_t) newsize)
@@ -342,8 +402,7 @@ pqCheckOutBufferSpace(size_t bytes_needed, PGconn *conn)
 }
 
 /*
- * Make sure conn's input buffer can hold bytes_needed bytes (caller must
- * include already-stored data into the value!)
+ * pqCheckInBufferSpace: ensure conn's input buffer has room
  *
  * Returns 0 on success, EOF if failed to enlarge buffer
  */
@@ -352,6 +411,10 @@ pqCheckInBufferSpace(size_t bytes_needed, PGconn *conn)
 {
 	int			newsize = conn->inBufSize;
 	char	   *newbuf;
+
+	/* Multiplexer sentinels don't have real buffers */
+	if (pqIsMuxConnSentinel(conn))
+		return 0;
 
 	/* Quick exit if we have enough space */
 	if (bytes_needed <= (size_t) newsize)
@@ -460,6 +523,10 @@ pqPutMsgStart(char msg_type, PGconn *conn)
 	int			lenPos;
 	int			endPos;
 
+	/* Multiplexer sentinels don't have real socket buffers */
+	if (pqIsMuxConnSentinel(conn))
+		return 0;
+
 	/* allow room for message type byte */
 	if (msg_type)
 		endPos = conn->outCount + 1;
@@ -516,6 +583,9 @@ pqPutMsgBytes(const void *buf, size_t len, PGconn *conn)
 int
 pqPutMsgEnd(PGconn *conn)
 {
+	/* Multiplexer sentinels don't have real socket buffers */
+	if (pqIsMuxConnSentinel(conn))
+		return 0;
 	/* Fill in length word if needed */
 	if (conn->outMsgStart >= 0)
 	{
@@ -566,6 +636,10 @@ pqReadData(PGconn *conn)
 {
 	int			someread = 0;
 	int			nread;
+
+	/* Multiplexer sentinels don't have real sockets */
+	if (pqIsMuxConnSentinel(conn))
+		return 0;
 
 	if (conn->sock == PGINVALID_SOCKET)
 	{
@@ -952,6 +1026,9 @@ pqSendSome(PGconn *conn, int len)
 int
 pqFlush(PGconn *conn)
 {
+	/* Multiplexer sentinels don't have real socket buffers */
+	if (pqIsMuxConnSentinel(conn))
+		return 0;
 	if (conn->outCount > 0)
 	{
 		if (conn->Pfdebug)
