@@ -305,68 +305,6 @@ typedef struct MuxQuerySlot
 } MuxQuerySlot;
 
 /* ----------------------------------------------------------------
- * Sentinel PGconn* for multiplexer-routed postgres_fdw connections.
- *
- * When the multiplexer is active for a foreign server, postgres_fdw stores
- * a pointer to a MuxConnSentinel cast to PGconn* in the connection cache
- * entry instead of a real libpq connection.  Code that needs to distinguish
- * the two cases uses IS_MUX_CONN().
- *
- * The sentinel is lightweight: it only identifies the server.  The actual
- * peer connection is managed by the multiplexer (not the backend), so there
- * is no per-backend worker-slot reference.
- * ---------------------------------------------------------------- */
-#define MUX_CONN_MAGIC		0x4D555803U	/* 'M','U','X','\3' */
-
-typedef struct MuxConnSentinel
-{
-	uint32		magic;			/* always MUX_CONN_MAGIC */
-	Oid			server_oid;		/* foreign server this represents */
-	char		server_name[NAMEDATALEN];
-} MuxConnSentinel;
-
-/*
- * Allocate a new sentinel for the given server.  The sentinel is
- * palloc'd in the current memory context.
- */
-static inline MuxConnSentinel *
-MuxConnSentinelCreate(Oid serverOid, const char *serverName)
-{
-	MuxConnSentinel *s = (MuxConnSentinel *) palloc(sizeof(MuxConnSentinel));
-
-	s->magic = MUX_CONN_MAGIC;
-	s->server_oid = serverOid;
-	strlcpy(s->server_name, serverName, NAMEDATALEN);
-	return s;
-}
-
-/* Test whether a PGconn* is actually a MuxConnSentinel */
-#define IS_MUX_CONN(conn) \
-	((conn) != NULL && \
-	 ((const MuxConnSentinel *)(conn))->magic == MUX_CONN_MAGIC)
-
-/* Extract the foreign server OID from a sentinel */
-#define MUX_CONN_SRVOID(conn) \
-	(((const MuxConnSentinel *)(conn))->server_oid)
-
-/*
- * Magic value for MuxPGresult – a palloc'd result struct returned by
- * pgfdw_exec_query() when a query was executed via the multiplexer.
- * Having this constant in the shared header lets both connection.c and
- * postgres_fdw.h use IS_MUX_RESULT without a forward declaration.
- */
-#define MUX_RESULT_MAGIC	0x4D555852U		/* 'M','U','X','R' */
-
-/*
- * IS_MUX_RESULT – test whether a PGresult* is actually a MuxPGresult*
- * returned by pgfdw_exec_query.  Uses a raw uint32 cast so no MuxPGresult
- * type definition is needed at the call site.
- */
-#define IS_MUX_RESULT(res) \
-	((res) != NULL && \
-	 *((const uint32 *)(res)) == MUX_RESULT_MAGIC)
-
-/* ----------------------------------------------------------------
  * Global multiplexer shared-memory state
  * ---------------------------------------------------------------- */
 typedef struct MuxSharedState

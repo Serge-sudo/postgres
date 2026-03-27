@@ -89,6 +89,36 @@ typedef struct
 #define CMDSTATUS_LEN 64		/* should match COMPLETION_TAG_BUFSIZE */
 
 /*
+ * Multiplexer (mux) protocol constants usable from frontend libpq.
+ * These mirror the backend definitions in conn_multiplexer.h but live
+ * here to keep frontend code free of backend-only headers.
+ */
+#define MUX_DEFAULT_TCP_PORT 7432
+#define MUX_DEFAULT_PEER_HOST "127.0.0.1"
+#define MUX_SQL_MAXLEN 4096
+#define MUX_RESULT_MAXLEN (64 * 1024)
+#define MUX_MAX_QUERY_SLOTS 64
+#define MUX_PEER_HOST_MAXLEN 256
+#define MUXNET_MAGIC 0x4D58544EU
+
+typedef enum MuxNetMsgType
+{
+	MUXNET_MSG_QUERY = 1,
+	MUXNET_MSG_RESULT = 2,
+	MUXNET_MSG_ERROR = 3
+} MuxNetMsgType;
+
+typedef struct MuxNetMsgHeader
+{
+	uint32		magic;
+	uint32		msg_type;		/* MuxNetMsgType */
+	uint32		slot_id;		/* sender's logical slot */
+	uint32		server_oid;		/* target server on receiver (unused today) */
+	uint32		payload_len;	/* bytes following header */
+	uint32		is_error;		/* 1 if error payload */
+} MuxNetMsgHeader;
+
+/*
  * PGresult and the subsidiary types PGresAttDesc, PGresAttValue
  * represent the result of a query (or more precisely, of a single SQL
  * command --- a query string given to PQexec can contain multiple commands).
@@ -612,6 +642,13 @@ struct pg_conn
 								 * results into our output buffer */
 #endif
 
+	/* Multiplexer (mux) transport state */
+	bool		is_mux_conn;	/* true if this PGconn talks to a mux peer */
+	uint32		mux_slot_id;	/* logical slot identifier used on peer mux */
+	Oid			mux_server_oid; /* target foreign server identifier */
+	char		mux_peer_host[MUX_PEER_HOST_MAXLEN];
+	int			mux_peer_port;
+
 #ifdef ENABLE_SSPI
 	CredHandle *sspicred;		/* SSPI credentials handle */
 	CtxtHandle *sspictx;		/* SSPI context */
@@ -682,6 +719,9 @@ extern int	pqConnectDBComplete(PGconn *conn);
 extern PGconn *pqMakeEmptyPGconn(void);
 extern void pqReleaseConnHosts(PGconn *conn);
 extern void pqClosePGconn(PGconn *conn);
+extern PGconn *PQconnectMux(const char *peer_host, int peer_port,
+							Oid server_oid);
+extern int	PQisMuxConnection(const PGconn *conn);
 extern int	pqPacketSend(PGconn *conn, char pack_type,
 						 const void *buf, size_t buf_len);
 extern bool pqGetHomeDirectory(char *buf, int bufsize);

@@ -274,36 +274,4 @@ extern bool FdwConnShmemGetNext(HASH_SEQ_STATUS *status, char *cluster_name,
 								int *local_pid, int *remote_backend_pid);
 extern void FdwConnShmemOnProcExit(void);
 
-/*
- * Multiplexer-result compatibility helpers.
- *
- * When pgfdw_exec_query() routes a query through the connection multiplexer
- * it returns a MuxPGresult* cast to PGresult*.  These macros let callers
- * work transparently with either kind of result object.
- *
- * IS_MUX_RESULT and MUX_RESULT_MAGIC are defined in conn_multiplexer.h
- * (via MuxConnSentinel / MuxPGresult).
- *
- * pgfdw_PQclear     – safe PQclear that handles both result types
- */
-#include "postmaster/conn_multiplexer.h"
-
-/* Forward declaration only (full type in connection.c) */
-struct MuxPGresult;
-
-/*
- * pgfdw_PQclear: free a result object regardless of its origin.
- * MuxPGresult objects are palloc'd; real PGresults are freed by libpq.
- */
-static inline void
-pgfdw_PQclear(PGresult *res)
-{
-	if (res == NULL)
-		return;
-	if (IS_MUX_RESULT(res))
-		pfree(res);
-	else
-		PQclear(res);
-}
-
 #endif							/* POSTGRES_FDW_H */

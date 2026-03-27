@@ -84,6 +84,15 @@ static int	check_field_number(const PGresult *res, int field_num);
 static void pqPipelineProcessQueue(PGconn *conn);
 static int	pqPipelineSyncInternal(PGconn *conn, bool immediate_flush);
 static int	pqPipelineFlush(PGconn *conn);
+static bool pqMuxSendAll(PGconn *conn, const void *buf, size_t len);
+static bool pqMuxRecvAll(PGconn *conn, void *buf, size_t len);
+static PGresult *pqMuxBuildErrorResult(PGconn *conn, const char *payload,
+									   size_t payload_len,
+									   const char *fallback);
+static PGresult *pqMuxBuildResult(PGconn *conn, const char *payload,
+								  uint32 payload_len);
+static PGresult *pqMuxReceiveResult(PGconn *conn);
+static bool pqMuxSendAndStoreResult(PGconn *conn, const char *query);
 
 
 /* ----------------
@@ -1439,6 +1448,9 @@ PQsendQueryInternal(PGconn *conn, const char *query, bool newQuery)
 		return 0;
 	}
 
+	if (conn->is_mux_conn)
+		return pqMuxSendAndStoreResult(conn, query) ? 1 : 0;
+
 	if (conn->pipelineStatus != PQ_PIPELINE_OFF)
 	{
 		libpq_append_conn_error(conn, "%s not allowed in pipeline mode",
@@ -1505,6 +1517,11 @@ PQsendQueryParams(PGconn *conn,
 	if (!command)
 	{
 		libpq_append_conn_error(conn, "command string is a null pointer");
+		return 0;
+	}
+	if (conn->is_mux_conn)
+	{
+		libpq_append_conn_error(conn, "extended queries are not supported for multiplexer connections");
 		return 0;
 	}
 	if (nParams < 0 || nParams > PQ_QUERY_PARAM_MAX_LIMIT)
@@ -1645,6 +1662,11 @@ PQsendQueryPrepared(PGconn *conn,
 	if (!stmtName)
 	{
 		libpq_append_conn_error(conn, "statement name is a null pointer");
+		return 0;
+	}
+	if (conn->is_mux_conn)
+	{
+		libpq_append_conn_error(conn, "extended queries are not supported for multiplexer connections");
 		return 0;
 	}
 	if (nParams < 0 || nParams > PQ_QUERY_PARAM_MAX_LIMIT)
@@ -1975,6 +1997,310 @@ PQsetChunkedRowsMode(PGconn *conn, int chunkSize)
 		return 0;
 }
 
+/* ------ Mux helpers ------ */
+
+static bool
+pqMuxSendAll(PGconn *conn, const void *buf, size_t len)
+{
+	const char *p = (const char *) buf;
+	size_t		remaining = len;
+	char		sebuf[PG_STRERROR_R_BUFLEN];
+
+	while (remaining > 0)
+	{
+		ssize_t		sent = send(conn->sock, p, remaining, 0);
+
+		if (sent > 0)
+		{
+			p += sent;
+			remaining -= sent;
+			continue;
+		}
+
+		libpq_append_conn_error(conn, "multiplexer send failed: %s",
+								SOCK_STRERROR(SOCK_ERRNO, sebuf, sizeof(sebuf)));
+		return false;
+	}
+	return true;
+}
+
+static bool
+pqMuxRecvAll(PGconn *conn, void *buf, size_t len)
+{
+	char	   *p = (char *) buf;
+	size_t		remaining = len;
+	char		sebuf[PG_STRERROR_R_BUFLEN];
+
+	while (remaining > 0)
+	{
+		ssize_t		n = recv(conn->sock, p, remaining, 0);
+
+		if (n > 0)
+		{
+			p += n;
+			remaining -= n;
+			continue;
+		}
+
+		libpq_append_conn_error(conn, "multiplexer receive failed: %s",
+								SOCK_STRERROR(SOCK_ERRNO, sebuf, sizeof(sebuf)));
+		return false;
+	}
+	return true;
+}
+
+static PGresult *
+pqMuxBuildErrorResult(PGconn *conn, const char *payload, size_t payload_len,
+					  const char *fallback)
+{
+	const char *msg = fallback;
+	size_t		msglen = fallback ? strlen(fallback) : 0;
+	PGresult   *res;
+	char	   *err;
+
+	if (payload && payload_len > 0)
+	{
+		msg = payload;
+		msglen = payload_len;
+	}
+	else if (!msg)
+	{
+		msg = "unknown multiplexer error";
+		msglen = strlen(msg);
+	}
+
+	res = PQmakeEmptyPGresult(conn, PGRES_FATAL_ERROR);
+	if (!res)
+		return NULL;
+
+	err = (char *) pqResultAlloc(res, msglen + 2, false);
+	if (err)
+	{
+		memcpy(err, msg, msglen);
+		err[msglen] = '\n';
+		err[msglen + 1] = '\0';
+		res->errMsg = err;
+	}
+	else
+		res->errMsg = libpq_gettext("out of memory\n");
+
+	if (conn)
+	{
+		resetPQExpBuffer(&conn->errorMessage);
+		appendBinaryPQExpBuffer(&conn->errorMessage, msg, msglen);
+		appendPQExpBufferChar(&conn->errorMessage, '\n');
+		conn->error_result = true;
+	}
+
+	return res;
+}
+
+static PGresult *
+pqMuxBuildResult(PGconn *conn, const char *payload, uint32 payload_len)
+{
+	const char *p = payload;
+	const char *end = payload + payload_len;
+	PGresult   *res;
+	int32		nfields;
+	int32		ntuples;
+
+	if (payload_len < 8)
+		return pqMuxBuildErrorResult(conn, NULL, 0,
+									 "malformed multiplexer result");
+
+	memcpy(&nfields, p, 4);
+	memcpy(&ntuples, p + 4, 4);
+	p += 8;
+
+	res = PQmakeEmptyPGresult(conn,
+							  (nfields > 0) ? PGRES_TUPLES_OK : PGRES_COMMAND_OK);
+	if (!res)
+		return NULL;
+
+	res->binary = 0;
+	res->numAttributes = nfields;
+	res->ntups = ntuples;
+	res->tupArrSize = ntuples;
+
+	if (nfields > 0)
+	{
+		int			i;
+
+		res->attDescs = (PGresAttDesc *)
+			pqResultAlloc(res, nfields * sizeof(PGresAttDesc), true);
+		if (res->attDescs == NULL)
+			return pqMuxBuildErrorResult(conn, NULL, 0, "out of memory");
+
+		for (i = 0; i < nfields; i++)
+		{
+			size_t		nlen;
+			Oid			typid;
+
+			if (p >= end)
+				return pqMuxBuildErrorResult(conn, NULL, 0,
+											 "malformed multiplexer result");
+
+			nlen = strnlen(p, end - p);
+			if (p + nlen + 1 + 4 > end)
+				return pqMuxBuildErrorResult(conn, NULL, 0,
+											 "malformed multiplexer result");
+
+			res->attDescs[i].name = pqResultStrdup(res, p);
+			p += nlen + 1;
+			memcpy(&typid, p, 4);
+			p += 4;
+
+			res->attDescs[i].tableid = InvalidOid;
+			res->attDescs[i].columnid = 0;
+			res->attDescs[i].format = 0;
+			res->attDescs[i].typid = typid;
+			res->attDescs[i].typlen = -1;
+			res->attDescs[i].atttypmod = -1;
+		}
+	}
+
+	if (ntuples > 0 && nfields > 0)
+	{
+		int			t;
+
+		res->tuples = (PGresAttValue **)
+			malloc(sizeof(PGresAttValue *) * ntuples);
+		if (res->tuples == NULL)
+			return pqMuxBuildErrorResult(conn, NULL, 0, "out of memory");
+
+		for (t = 0; t < ntuples; t++)
+		{
+			int			f;
+
+			res->tuples[t] = (PGresAttValue *)
+				pqResultAlloc(res, nfields * sizeof(PGresAttValue), true);
+			if (res->tuples[t] == NULL)
+				return pqMuxBuildErrorResult(conn, NULL, 0, "out of memory");
+
+			for (f = 0; f < nfields; f++)
+			{
+				int32		vlen;
+
+				if (p + 4 > end)
+					return pqMuxBuildErrorResult(conn, NULL, 0,
+												 "malformed multiplexer result");
+				memcpy(&vlen, p, 4);
+				p += 4;
+
+				if (vlen < 0)
+				{
+					res->tuples[t][f].len = NULL_LEN;
+					res->tuples[t][f].value = res->null_field;
+				}
+				else
+				{
+					char	   *val;
+
+					if (p + vlen > end)
+						return pqMuxBuildErrorResult(conn, NULL, 0,
+													 "malformed multiplexer result");
+					val = (char *) pqResultAlloc(res, vlen + 1, false);
+					if (val == NULL)
+						return pqMuxBuildErrorResult(conn, NULL, 0, "out of memory");
+					memcpy(val, p, vlen);
+					val[vlen] = '\0';
+					res->tuples[t][f].len = vlen;
+					res->tuples[t][f].value = val;
+					p += vlen;
+				}
+			}
+		}
+	}
+
+	strlcpy(res->cmdStatus, (nfields > 0) ? "SELECT" : "COMMAND OK",
+			CMDSTATUS_LEN);
+
+	return res;
+}
+
+static PGresult *
+pqMuxReceiveResult(PGconn *conn)
+{
+	MuxNetMsgHeader hdr;
+	char	   *payload = NULL;
+	PGresult   *res = NULL;
+
+	if (!pqMuxRecvAll(conn, &hdr, sizeof(hdr)))
+		return NULL;
+
+	if (hdr.magic != MUXNET_MAGIC)
+		return pqMuxBuildErrorResult(conn, NULL, 0,
+									 "invalid multiplexer response");
+
+	if (hdr.payload_len > 0)
+	{
+		payload = (char *) malloc(hdr.payload_len);
+		if (payload == NULL)
+			return pqMuxBuildErrorResult(conn, NULL, 0, "out of memory");
+		if (!pqMuxRecvAll(conn, payload, hdr.payload_len))
+		{
+			free(payload);
+			return NULL;
+		}
+	}
+
+	if (hdr.msg_type == MUXNET_MSG_ERROR || hdr.is_error)
+		res = pqMuxBuildErrorResult(conn, payload, hdr.payload_len, NULL);
+	else if (hdr.msg_type == MUXNET_MSG_RESULT)
+		res = pqMuxBuildResult(conn, payload, hdr.payload_len);
+	else
+		res = pqMuxBuildErrorResult(conn, NULL, 0,
+									"unexpected multiplexer message");
+
+	free(payload);
+	return res;
+}
+
+static bool
+pqMuxSendAndStoreResult(PGconn *conn, const char *query)
+{
+	MuxNetMsgHeader hdr;
+	size_t		qlen;
+	PGresult   *res;
+
+	if (query == NULL)
+	{
+		libpq_append_conn_error(conn, "multiplexer query is NULL");
+		return false;
+	}
+
+	qlen = strlen(query) + 1;
+	if (qlen > MUX_SQL_MAXLEN)
+	{
+		libpq_append_conn_error(conn, "multiplexer query too long (%zu > %d)",
+								qlen, MUX_SQL_MAXLEN);
+		return false;
+	}
+
+	hdr.magic = MUXNET_MAGIC;
+	hdr.msg_type = MUXNET_MSG_QUERY;
+	hdr.slot_id = conn->mux_slot_id;
+	hdr.server_oid = (uint32) conn->mux_server_oid;
+	hdr.payload_len = (uint32) qlen;
+	hdr.is_error = 0;
+
+	if (!pqMuxSendAll(conn, &hdr, sizeof(hdr)) ||
+		!pqMuxSendAll(conn, query, qlen))
+		return false;
+
+	res = pqMuxReceiveResult(conn);
+	if (res == NULL)
+		return false;
+
+	/* replace any previous result state */
+	pqClearAsyncResult(conn);
+	conn->result = res;
+	conn->asyncStatus = PGASYNC_READY;
+	conn->error_result = (PQresultStatus(res) == PGRES_FATAL_ERROR);
+
+	return true;
+}
+
 /*
  * Consume any available input from the backend
  * 0 return: some kind of trouble
@@ -1985,6 +2311,9 @@ PQconsumeInput(PGconn *conn)
 {
 	if (!conn)
 		return 0;
+
+	if (conn->is_mux_conn)
+		return 1;
 
 	/*
 	 * for non-blocking connections try to flush the send-queue, otherwise we
@@ -2033,6 +2362,9 @@ PQisBusy(PGconn *conn)
 	if (!conn)
 		return false;
 
+	if (conn->is_mux_conn)
+		return conn->asyncStatus == PGASYNC_BUSY;
+
 	/* Parse any available data, if our state permits. */
 	parseInput(conn);
 
@@ -2065,6 +2397,18 @@ PQgetResult(PGconn *conn)
 
 	if (!conn)
 		return NULL;
+
+	if (conn->is_mux_conn)
+	{
+		if (conn->asyncStatus == PGASYNC_READY && conn->result)
+		{
+			res = conn->result;
+			conn->result = NULL;
+			conn->asyncStatus = PGASYNC_IDLE;
+			return res;
+		}
+		return NULL;
+	}
 
 	/* Parse any available data, if our state permits. */
 	parseInput(conn);

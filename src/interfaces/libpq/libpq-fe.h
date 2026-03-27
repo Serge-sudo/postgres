@@ -315,6 +315,8 @@ extern PostgresPollingStatusType PQconnectPoll(PGconn *conn);
 extern PGconn *PQconnectdb(const char *conninfo);
 extern PGconn *PQconnectdbParams(const char *const *keywords,
 								 const char *const *values, int expand_dbname);
+extern PGconn *PQconnectMux(const char *peer_host, int peer_port,
+							Oid server_oid);
 extern PGconn *PQsetdbLogin(const char *pghost, const char *pgport,
 							const char *pgoptions, const char *pgtty,
 							const char *dbName,
@@ -389,6 +391,7 @@ extern char *PQport(const PGconn *conn);
 extern char *PQtty(const PGconn *conn);
 extern char *PQoptions(const PGconn *conn);
 extern ConnStatusType PQstatus(const PGconn *conn);
+extern int	PQisMuxConnection(const PGconn *conn);
 extern PGTransactionStatusType PQtransactionStatus(const PGconn *conn);
 extern const char *PQparameterStatus(const PGconn *conn,
 									 const char *paramName);

@@ -27,7 +27,6 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/bgworker.h"
-#include "postmaster/conn_multiplexer.h"
 #include "postgres_fdw.h"
 #include "storage/fd.h"
 #include "storage/latch.h"
@@ -39,6 +38,9 @@
 #include "utils/snapmgr.h"
 #include "utils/snapshot.h"
 #include "utils/syscache.h"
+
+#define FDW_MUX_DEFAULT_HOST "127.0.0.1"
+#define FDW_MUX_DEFAULT_PORT 7432
 
 /*
  * Connection cache hash table entry
@@ -327,7 +329,7 @@ GetConnection(UserMapping *user, bool will_prep_stmt, PgFdwConnState **state)
 		 * for any libpq-originated error condition.
 		 */
 		if (errdata->sqlerrcode != ERRCODE_CONNECTION_FAILURE ||
-			IS_MUX_CONN(entry->conn) ||
+			PQisMuxConnection(entry->conn) ||
 			PQstatus(entry->conn) != CONNECTION_BAD ||
 			entry->xact_depth > 0)
 		{
@@ -357,7 +359,7 @@ GetConnection(UserMapping *user, bool will_prep_stmt, PgFdwConnState **state)
 				(errmsg_internal("could not start remote transaction on connection %p",
 								 entry->conn)),
 				errdetail_internal("%s",
-								   IS_MUX_CONN(entry->conn) ? "(mux connection)" :
+								   PQisMuxConnection(entry->conn) ? "(mux connection)" :
 								   pchomp(PQerrorMessage(entry->conn))));
 
 		elog(DEBUG3, "closing connection %p to reestablish a new one",
@@ -437,41 +439,16 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 	}
 
 	/* Now try to make the connection */
-
-	/*
-	 * If the connection multiplexer is running, route this foreign-server
-	 * connection through it.  We store a lightweight MuxConnSentinel cast to
-	 * PGconn* in entry->conn so that all subsequent callers can detect the mux
-	 * path via IS_MUX_CONN().  The multiplexer manages
-	 * the actual persistent TCP connection to the peer multiplexer.
-	 * Individual backends never hold direct TCP connections to remote servers.
-	 */
-	if (ConnMuxIsAvailable(server->serverid))
 	{
-		StringInfoData sb;
+		const char *peer_host = FDW_MUX_DEFAULT_HOST;
+		int			peer_mux_port = FDW_MUX_DEFAULT_PORT;
 		ListCell   *lc2;
-		uint32		conn_id;
+		PGconn	   *muxconn;
 
-		/* Build a libpq-compatible connstr from the server's srvoptions and extract peer info */
-		const char *peer_host = MUX_DEFAULT_PEER_HOST;
-		int			peer_mux_port = 0;	/* 0 means fall back to mux_tcp_port GUC */
-
-		initStringInfo(&sb);
 		foreach(lc2, server->options)
 		{
 			DefElem    *def = (DefElem *) lfirst(lc2);
-			const char *p;
-			char	   *val;
 
-			/*
-			 * Extract host for peer multiplexer connection.
-			 *
-			 * For postgres_fdw/libpq, "host" may be a Unix-domain socket
-			 * directory (e.g. "/tmp/..."), but the multiplexer uses raw TCP
-			 * sockets and therefore needs a TCP-resolvable hostname/address.
-			 * Ignore socket-path hosts here and keep fallback/default unless
-			 * a proper hostname or hostaddr is provided.
-			 */
 			if (strcmp(def->defname, "host") == 0)
 			{
 				const char *hostval = defGetString(def);
@@ -479,17 +456,9 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 				if (hostval && hostval[0] != '\0' && hostval[0] != '/')
 					peer_host = hostval;
 			}
-
-			/* hostaddr is always a TCP address and is preferred when present */
-			if (strcmp(def->defname, "hostaddr") == 0)
+			else if (strcmp(def->defname, "hostaddr") == 0)
 				peer_host = defGetString(def);
-
-			/*
-			 * mux_port: the TCP port on which the peer node's multiplexer
-			 * listens.  Defaults to the local mux_tcp_port GUC when not set.
-			 * This option is consumed here and must NOT be forwarded to libpq.
-			 */
-			if (strcmp(def->defname, "mux_port") == 0)
+			else if (strcmp(def->defname, "mux_port") == 0)
 			{
 				char	   *endptr;
 				long		v = strtol(defGetString(def), &endptr, 10);
@@ -501,72 +470,27 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 									defGetString(def)),
 							 errhint("Valid port numbers are integers between 1 and 65535.")));
 				peer_mux_port = (int) v;
-				continue;		/* not a libpq option */
 			}
-
-			/* Skip FDW meta-options that aren't libpq options */
-			if (strcmp(def->defname, "keep_connections") == 0 ||
-				strcmp(def->defname, "parallel_commit") == 0 ||
-				strcmp(def->defname, "parallel_abort") == 0 ||
-				strcmp(def->defname, "fetch_size") == 0 ||
-				strcmp(def->defname, "batch_size") == 0 ||
-				strcmp(def->defname, "truncatable") == 0 ||
-				strcmp(def->defname, "extensions") == 0 ||
-				strcmp(def->defname, "updatable") == 0 ||
-				strcmp(def->defname, "async_capable") == 0)
-				continue;
-
-			val = defGetString(def);
-			appendStringInfo(&sb, "%s='", def->defname);
-			for (p = val; *p; p++)
-			{
-				if (*p == '\'' || *p == '\\')
-					appendStringInfoChar(&sb, '\\');
-				appendStringInfoChar(&sb, *p);
-			}
-			appendStringInfoChar(&sb, '\'');
-			appendStringInfoChar(&sb, ' ');
 		}
-		appendStringInfo(&sb, "application_name='pg_mux_%s'",
-						 server->servername);
 
-		/*
-		 * Register the server in the multiplexer's remote_conns table.
-		 * The multiplexer will connect lazily via TCP when the first query
-		 * arrives via ConnMuxSubmitQuery.  peer_mux_port=0 means the
-		 * multiplexer will fall back to the local mux_tcp_port GUC.
-		 */
-		conn_id = ConnMuxRegisterServer(server->serverid,
-										server->servername,
-										sb.data,
-										peer_host,
-										peer_mux_port);
-		pfree(sb.data);
-
-		if (conn_id != (uint32) -1)
+		muxconn = PQconnectMux(peer_host, peer_mux_port, server->serverid);
+		if (muxconn && PQstatus(muxconn) == CONNECTION_OK)
 		{
-			MemoryContext old_ctx;
-			MuxConnSentinel *sentinel;
-
-			old_ctx = MemoryContextSwitchTo(CacheMemoryContext);
-			sentinel = MuxConnSentinelCreate(server->serverid,
-											 server->servername);
-			MemoryContextSwitchTo(old_ctx);
-
-			entry->conn = (PGconn *) sentinel;
-
+			entry->conn = muxconn;
 			elog(DEBUG3,
-				 "postgres_fdw: connection to \"%s\" routed through multiplexer (conn_id %u)",
-				 server->servername, conn_id);
-			return;
+				 "postgres_fdw: connection to \"%s\" via multiplexer %s:%d",
+				 server->servername, peer_host, peer_mux_port);
 		}
-
-		/* Registration failed; fall through to direct connect */
-		ereport(WARNING,
-				(errmsg("postgres_fdw: multiplexer unavailable for server \"%s\", using direct connection",
-						server->servername)));
+		else
+		{
+			if (muxconn)
+				PQfinish(muxconn);
+			elog(DEBUG1,
+				 "postgres_fdw: multiplexer unavailable for server \"%s\", using direct connection",
+				 server->servername);
+			entry->conn = connect_pg_server(server, user);
+		}
 	}
-	entry->conn = connect_pg_server(server, user);
 
 	elog(DEBUG3, "new postgres_fdw connection %p for server \"%s\" (user mapping oid %u, userid %u)",
 		 entry->conn, server->servername, user->umid, user->userid);
@@ -575,7 +499,9 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 	 * Register the connection in shared memory for distributed deadlock detection
 	 * Track the mapping: local_pid + server_oid -> remote_backend_pid
 	 */
-	if (entry->conn != NULL && !IS_MUX_CONN(entry->conn))
+	if (entry->conn != NULL &&
+		PQstatus(entry->conn) == CONNECTION_OK &&
+		!PQisMuxConnection(entry->conn))
 	{
 		int remote_backend_pid = PQbackendPID(entry->conn);
 		if (remote_backend_pid > 0)
@@ -768,14 +694,9 @@ disconnect_pg_server(ConnCacheEntry *entry)
 {
 	if (entry->conn != NULL)
 	{
-		if (IS_MUX_CONN(entry->conn))
+		if (PQisMuxConnection(entry->conn))
 		{
-			/*
-			 * This is a multiplexer-routed connection.  The actual TCP
-			 * connection is held by the multiplexer process and persists for
-			 * reuse — we just free the sentinel and return.
-			 */
-			pfree(entry->conn);
+			PQfinish(entry->conn);
 			entry->conn = NULL;
 			return;
 		}
@@ -923,17 +844,6 @@ do_sql_command(PGconn *conn, const char *sql)
 static void
 do_sql_command_entry(ConnCacheEntry *entry, const char *sql)
 {
-	if (IS_MUX_CONN(entry->conn))
-	{
-		char		mux_errmsg[512];
-
-		if (!ConnMuxSendCommand(MUX_CONN_SRVOID(entry->conn), sql,
-								mux_errmsg, sizeof(mux_errmsg)))
-			ereport(ERROR,
-					(errmsg("could not send command to foreign server via multiplexer: %s",
-							mux_errmsg)));
-		return;
-	}
 	do_sql_command(entry->conn, sql);
 }
 
@@ -1080,118 +990,6 @@ GetPrepStmtNumber(PGconn *conn)
 }
 
 /*
- * pgfdw_build_result_from_mux
- *		Deserialise the compact binary result produced by the multiplexer
- *		into a heap-allocated structure usable by the rest of postgres_fdw.
- *
- * The result format (see mux_serialize_result in conn_multiplexer.c):
- *   int32 nfields
- *   int32 ntuples
- *   for each field: NUL-terminated name + int32 type OID
- *   for each tuple, for each field: int32 value_len (-1 = NULL) + bytes
- *
- * We return a plain C struct that exposes the same interface that
- * postgres_fdw uses from PGresult (ntuples, nfields, getvalue, getisnull,
- * ftype), so callers can check IS_MUX_RESULT and branch accordingly.
- */
-typedef struct MuxPGresult
-{
-	uint32		magic;			/* MUX_RESULT_MAGIC – distinguishes from PGresult */
-	int			nfields;
-	int			ntuples;
-	char	  **field_names;
-	Oid		   *field_types;
-	char	 ***values;			/* [tuple][field], NULL entry means SQL NULL */
-	int		  **value_lens;		/* [tuple][field] */
-} MuxPGresult;
-
-static MuxPGresult *
-pgfdw_build_result_from_mux(const char *data, int data_len,
-							int nfields, int ntuples)
-{
-	MuxPGresult *mr;
-	const char *p = data;
-	const char *end = data + data_len;
-	MemoryContext old_ctx;
-
-	old_ctx = MemoryContextSwitchTo(CurrentMemoryContext);
-
-	mr = palloc0(sizeof(MuxPGresult));
-	mr->magic = MUX_RESULT_MAGIC;
-	mr->nfields = nfields;
-	mr->ntuples = ntuples;
-
-	if (nfields > 0)
-	{
-		mr->field_names = (char **) palloc(nfields * sizeof(char *));
-		mr->field_types = (Oid *) palloc(nfields * sizeof(Oid));
-	}
-
-	/* Skip header ints (already parsed by caller) */
-	p += 4;					/* nfields */
-	p += 4;					/* ntuples */
-
-	/* Field descriptors */
-	for (int f = 0; f < nfields && p < end; f++)
-	{
-		size_t		nlen = strnlen(p, end - p);
-
-		mr->field_names[f] = pstrdup(p);
-		p += nlen + 1;			/* name + NUL */
-		if (p + 4 > end)
-			break;
-		memcpy(&mr->field_types[f], p, 4);
-		p += 4;
-	}
-
-	/* Row data */
-	if (ntuples > 0 && nfields > 0)
-	{
-		mr->values = (char ***) palloc(ntuples * sizeof(char **));
-		mr->value_lens = (int **) palloc(ntuples * sizeof(int *));
-
-		for (int t = 0; t < ntuples; t++)
-		{
-			mr->values[t] = (char **) palloc(nfields * sizeof(char *));
-			mr->value_lens[t] = (int *) palloc(nfields * sizeof(int));
-
-			for (int f = 0; f < nfields; f++)
-			{
-				int32		vlen;
-
-				if (p + 4 > end)
-				{
-					mr->values[t][f] = NULL;
-					mr->value_lens[t][f] = -1;
-					continue;
-				}
-				memcpy(&vlen, p, 4);
-				p += 4;
-
-				if (vlen < 0)
-				{
-					/* SQL NULL */
-					mr->values[t][f] = NULL;
-					mr->value_lens[t][f] = -1;
-				}
-				else
-				{
-					mr->values[t][f] = palloc(vlen + 1);
-					if (p + vlen <= end)
-						memcpy(mr->values[t][f], p, vlen);
-					mr->values[t][f][vlen] = '\0';
-					mr->value_lens[t][f] = vlen;
-					p += vlen;
-				}
-			}
-		}
-	}
-
-	MemoryContextSwitchTo(old_ctx);
-	return mr;
-}
-
-/*
  * Submit a query and wait for the result.
  *
  * Since we don't use non-blocking mode, this can't process interrupts while
@@ -1199,13 +997,6 @@ pgfdw_build_result_from_mux(const char *data, int data_len,
  * ignore that for now.
  *
  * Caller is responsible for the error handling on the result.
- *
- * When conn is a MuxConnSentinel (IS_MUX_CONN(conn)), the query is sent to
- * the foreign server via the connection multiplexer instead of the direct
- * libpq path.  The returned PGresult* is actually a MuxPGresult* in that
- * case; callers must use the mux-aware accessor macros
- * (PGFDW_RESULT_NTUPLES, PGFDW_RESULT_GETVALUE, etc.) rather than PQntuples
- * etc. directly when the result might come from the mux path.
  */
 PGresult *
 pgfdw_exec_query(PGconn *conn, const char *query, PgFdwConnState *state)
@@ -1213,38 +1004,6 @@ pgfdw_exec_query(PGconn *conn, const char *query, PgFdwConnState *state)
 	/* First, process a pending asynchronous request, if any. */
 	if (state && state->pendingAreq)
 		process_pending_request(state->pendingAreq);
-
-	/* Multiplexer-routed connection: submit via shm_mq */
-	if (IS_MUX_CONN(conn))
-	{
-		Oid			server_oid = MUX_CONN_SRVOID(conn);
-		char	   *result_buf = palloc(MUX_RESULT_MAXLEN);
-		char		mux_errmsg[512];
-		int			nfields,
-					ntuples;
-		bool		truncated;
-		bool		ok;
-
-		ok = ConnMuxSubmitQuery(server_oid, query,
-								result_buf, MUX_RESULT_MAXLEN,
-								&nfields, &ntuples, &truncated,
-								mux_errmsg, sizeof(mux_errmsg));
-		if (!ok)
-		{
-			pfree(result_buf);
-			/*
-			 * Return NULL so callers can report the error via the
-			 * standard pgfdw_report_error path (which checks for NULL res).
-			 */
-			ereport(ERROR,
-					(errmsg("multiplexer error from foreign server: %s",
-							mux_errmsg)));
-		}
-
-		return (PGresult *)
-			pgfdw_build_result_from_mux(result_buf, MUX_RESULT_MAXLEN,
-										nfields, ntuples);
-	}
 
 	if (!PQsendQuery(conn, query))
 		return NULL;
@@ -1279,17 +1038,6 @@ void
 pgfdw_report_error(int elevel, PGresult *res, PGconn *conn,
 				   bool clear, const char *sql)
 {
-	/*
-	 * For mux-routed connections, the error was already raised in
-	 * pgfdw_exec_query; nothing more to report here.
-	 */
-	if (IS_MUX_CONN(conn))
-	{
-		if (clear && res && IS_MUX_RESULT(res))
-			pfree(res);
-		return;
-	}
-
 	/* If requested, PGresult must be released before leaving this function. */
 	PG_TRY();
 	{
@@ -1575,7 +1323,7 @@ error:
 
 					/* Commit all remote transactions during pre-commit */
 					entry->changing_xact_state = true;
-					if (entry->parallel_commit && !IS_MUX_CONN(entry->conn))
+					if (entry->parallel_commit && !PQisMuxConnection(entry->conn))
 					{
 						do_sql_command_begin(entry->conn, "COMMIT TRANSACTION");
 						pending_entries = lappend(pending_entries, entry);
@@ -1590,19 +1338,11 @@ error:
 						PGresult	*res;
 
 						res = pgfdw_exec_query(entry->conn, "SELECT pg_current_csn()", NULL);
-						if (IS_MUX_RESULT(res))
-						{
-							MuxPGresult *mr = (MuxPGresult *) res;
-
-							if (mr->ntuples > 0 && mr->nfields > 0 &&
-								mr->values[0][0] != NULL)
-								sscanf(mr->values[0][0], "%lu", &csn);
-							pfree(mr);
-						}
-						else if (res && PQresultStatus(res) == PGRES_TUPLES_OK)
+						if (res && PQresultStatus(res) == PGRES_TUPLES_OK &&
+							PQntuples(res) > 0 && PQnfields(res) > 0)
 						{
 							sscanf(PQgetvalue(res, 0, 0), "%lu", &csn);
-							pgfdw_PQclear(res);
+							PQclear(res);
 						}
 
 						if (csn != InvalidCSN)
@@ -1711,19 +1451,8 @@ deallocate_prepared_stmts(ConnCacheEntry *entry)
 
 	if (entry->have_prep_stmt && entry->have_error)
 	{
-		if (IS_MUX_CONN(entry->conn))
-		{
-			char	errmsg[512];
-
-			ConnMuxSendCommand(MUX_CONN_SRVOID(entry->conn),
-							   "DEALLOCATE ALL",
-							   errmsg, sizeof(errmsg));
-		}
-		else
-		{
-			res = PQexec(entry->conn, "DEALLOCATE ALL");
-			PQclear(res);
-		}
+		res = PQexec(entry->conn, "DEALLOCATE ALL");
+		PQclear(res);
 	}
 	entry->have_prep_stmt = false;
 	entry->have_error = false;
@@ -2305,26 +2034,6 @@ pgfdw_abort_cleanup(ConnCacheEntry *entry, bool toplevel)
 
 	/* Assume we might have lost track of prepared statements */
 	entry->have_error = true;
-
-	/*
-	 * For mux-routed connections, send ROLLBACK directly via the mux.
-	 * We can't call PQtransactionStatus on a sentinel, so skip the cancel
-	 * logic and go straight to the abort SQL.
-	 */
-	if (IS_MUX_CONN(entry->conn))
-	{
-		char		sql[100];
-		char		errmsg[512];
-
-		CONSTRUCT_ABORT_COMMAND(sql, entry, toplevel);
-		ConnMuxSendCommand(MUX_CONN_SRVOID(entry->conn), sql,
-						   errmsg, sizeof(errmsg));
-		/* Ignore errors during cleanup */
-		entry->have_prep_stmt = false;
-		entry->have_error = false;
-		entry->changing_xact_state = false;
-		return;
-	}
 
 	/*
 	 * If a command has been submitted to the remote server by using an

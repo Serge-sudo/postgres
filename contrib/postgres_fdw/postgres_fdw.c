@@ -3085,12 +3085,9 @@ postgresExecForeignTruncate(List *rels,
 	{
 		PGresult   *res = pgfdw_exec_query(conn, sql.data, NULL);
 
-		if (!IS_MUX_RESULT(res))
-		{
-			if (PQresultStatus(res) != PGRES_COMMAND_OK)
-				pgfdw_report_error(ERROR, res, conn, true, sql.data);
-			PQclear(res);
-		}
+		if (PQresultStatus(res) != PGRES_COMMAND_OK)
+			pgfdw_report_error(ERROR, res, conn, true, sql.data);
+		PQclear(res);
 	}
 
 	pfree(sql.data);
@@ -3137,12 +3134,9 @@ postgresExecForeignDDL(Oid serverid, const char *sql)
 	{
 		PGresult   *res = pgfdw_exec_query(conn, full_sql.data, NULL);
 
-		if (!IS_MUX_RESULT(res))
-		{
-			if (PQresultStatus(res) != PGRES_COMMAND_OK)
-				pgfdw_report_error(ERROR, res, conn, true, full_sql.data);
-			PQclear(res);
-		}
+		if (PQresultStatus(res) != PGRES_COMMAND_OK)
+			pgfdw_report_error(ERROR, res, conn, true, full_sql.data);
+		PQclear(res);
 	}
 
 	pfree(full_sql.data);

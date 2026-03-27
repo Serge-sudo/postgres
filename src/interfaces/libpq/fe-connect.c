@@ -698,6 +698,90 @@ PQconnectdbParams(const char *const *keywords,
 	return conn;
 }
 
+static uint32 pq_next_mux_slot_id(void);
+
+/*
+ * PQconnectMux
+ *		Establish a direct TCP connection to a peer multiplexer.
+ *
+ * The returned PGconn uses the mux network protocol and relies on libpq's
+ * mux-aware paths for sending queries.  On failure the returned PGconn will
+ * have status CONNECTION_BAD and errorMessage populated.
+ */
+PGconn *
+PQconnectMux(const char *peer_host, int peer_port, Oid server_oid)
+{
+	PGconn	   *conn;
+	const char *host;
+	int			port;
+	char		portstr[16];
+	struct addrinfo hints;
+	struct addrinfo *addrs = NULL;
+	struct addrinfo *ai;
+	pgsocket	sock = PGINVALID_SOCKET;
+	char		sebuf[PG_STRERROR_R_BUFLEN];
+
+	conn = pqMakeEmptyPGconn();
+	if (conn == NULL)
+		return NULL;
+
+	host = (peer_host && peer_host[0] != '\0') ? peer_host : MUX_DEFAULT_PEER_HOST;
+	port = (peer_port > 0 && peer_port <= 65535) ? peer_port : MUX_DEFAULT_TCP_PORT;
+	snprintf(portstr, sizeof(portstr), "%d", port);
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+
+	if (getaddrinfo(host, portstr, &hints, &addrs) != 0)
+	{
+		libpq_append_conn_error(conn, "could not resolve multiplexer address \"%s\"", host);
+		conn->status = CONNECTION_BAD;
+		return conn;
+	}
+
+	for (ai = addrs; ai != NULL; ai = ai->ai_next)
+	{
+		sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+		if (sock == PGINVALID_SOCKET)
+			continue;
+		if (connect(sock, ai->ai_addr, ai->ai_addrlen) == 0)
+			break;
+		closesocket(sock);
+		sock = PGINVALID_SOCKET;
+	}
+
+	freeaddrinfo(addrs);
+
+	if (sock == PGINVALID_SOCKET)
+	{
+		libpq_append_conn_error(conn, "could not connect to multiplexer at %s:%s: %s",
+								host, portstr, SOCK_STRERROR(SOCK_ERRNO, sebuf, sizeof(sebuf)));
+		conn->status = CONNECTION_BAD;
+		return conn;
+	}
+
+	conn->pghost = strdup(host);
+	conn->pgport = strdup(portstr);
+	conn->status = CONNECTION_OK;
+	conn->asyncStatus = PGASYNC_IDLE;
+	conn->xactStatus = PQTRANS_IDLE;
+	conn->client_encoding = PG_SQL_ASCII;
+	conn->std_strings = true;
+	conn->options_valid = true;
+	conn->pversion = PG_PROTOCOL(3, 0);
+	conn->sock = sock;
+	conn->be_pid = 0;
+	conn->be_key = 0;
+	conn->is_mux_conn = true;
+	conn->mux_slot_id = pq_next_mux_slot_id();
+	conn->mux_server_oid = server_oid;
+	conn->mux_peer_port = port;
+	strlcpy(conn->mux_peer_host, host, sizeof(conn->mux_peer_host));
+
+	return conn;
+}
+
 /*
  *		PQpingParams
  *
@@ -760,12 +844,25 @@ PGPing
 PQping(const char *conninfo)
 {
 	PGconn	   *conn = PQconnectStart(conninfo);
-	PGPing		ret;
+PGPing		ret;
 
 	ret = internal_ping(conn);
 	PQfinish(conn);
 
 	return ret;
+}
+
+/*
+ * Multiplexer slot generator for mux connections.
+ */
+static uint32
+pq_next_mux_slot_id(void)
+{
+	uint32		slot = (uint32) (getpid() % MUX_MAX_QUERY_SLOTS);
+
+	if (slot == 0)
+		slot = 1;
+	return slot;
 }
 
 /*
@@ -7106,6 +7203,12 @@ PQstatus(const PGconn *conn)
 	if (!conn)
 		return CONNECTION_BAD;
 	return conn->status;
+}
+
+int
+PQisMuxConnection(const PGconn *conn)
+{
+	return (conn != NULL && conn->is_mux_conn) ? 1 : 0;
 }
 
 PGTransactionStatusType
