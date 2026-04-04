@@ -287,6 +287,10 @@ InitPgFdwOptions(void)
 		{"keep_connections", ForeignServerRelationId, false},
 		{"password_required", UserMappingRelationId, false},
 
+		/* connection multiplexer options */
+		{"mux_port", ForeignServerRelationId, false},
+		{"mux_host", ForeignServerRelationId, false},
+
 		/* sampling is available on both server and table */
 		{"analyze_sampling", ForeignServerRelationId, false},
 		{"analyze_sampling", ForeignTableRelationId, false},

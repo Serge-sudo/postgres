@@ -12,6 +12,7 @@
  */
 #include "postgres.h"
 
+#include <ctype.h>
 #include <limits.h>
 
 #include "access/htup_details.h"
@@ -43,6 +44,7 @@
 #include "optimizer/tlist.h"
 #include "parser/parsetree.h"
 #include "postgres_fdw.h"
+#include "postmaster/conn_multiplexer.h"
 #include "storage/latch.h"
 #include "utils/builtins.h"
 #include "utils/float.h"
@@ -53,7 +55,6 @@
 #include "utils/sampling.h"
 #include "utils/selfuncs.h"
 #include "utils/syscache.h"
-#include "executor/spi.h"
 
 
 PG_MODULE_MAGIC;
@@ -1547,16 +1548,6 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 	table = GetForeignTable(rte->relid);
 	user = GetUserMapping(userid, table->serverid);
 
-	/*
-	 * Get connection to the foreign server.  Connection manager will
-	 * establish new connection if necessary.
-	 */
-	fsstate->conn = GetConnection(user, false, &fsstate->conn_state);
-
-	/* Assign a unique ID for my cursor */
-	fsstate->cursor_number = GetCursorNumber(fsstate->conn);
-	fsstate->cursor_exists = false;
-
 	/* Get private info created by planner functions. */
 	fsstate->query = strVal(list_nth(fsplan->fdw_private,
 									 FdwScanPrivateSelectSql));
@@ -1605,6 +1596,16 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 
 	/* Set the async-capable flag */
 	fsstate->async_capable = node->ss.ps.async_capable;
+
+	/*
+	 * Get connection to the foreign server.  Connection manager will
+	 * establish new connection if necessary.
+	 */
+	fsstate->conn = GetConnection(user, false, &fsstate->conn_state);
+
+	/* Assign a unique ID for my cursor */
+	fsstate->cursor_number = GetCursorNumber(fsstate->conn);
+	fsstate->cursor_exists = false;
 }
 
 /*
@@ -3107,22 +3108,22 @@ postgresExecForeignDDL(Oid serverid, const char *sql)
 	StringInfoData full_sql;
 
 	/*
+	 * Prefix the DDL with SET LOCAL to set the executing_remote_ddl flag
+	 * on the REMOTE server. This prevents infinite recursion by telling
+	 * the remote server not to replicate this DDL further.
+	 */
+	initStringInfo(&full_sql);
+	appendStringInfo(&full_sql,
+					 "SET LOCAL shardgroup.executing_remote_ddl = true; %s",
+					 sql);
+
+	/*
 	 * Get user mapping and connection to the foreign server.
 	 * Connection manager will establish new connection if necessary
 	 * and will participate in 2PC if there are multiple servers involved.
 	 */
 	user = GetUserMapping(GetUserId(), serverid);
 	conn = GetConnection(user, false, NULL);
-
-	/* 
-	 * Prefix the DDL with SET LOCAL to set the executing_remote_ddl flag
-	 * on the REMOTE server. This prevents infinite recursion by telling
-	 * the remote server not to replicate this DDL further.
-	 */
-	initStringInfo(&full_sql);
-	appendStringInfo(&full_sql, 
-					 "SET LOCAL shardgroup.executing_remote_ddl = true; %s",
-					 sql);
 
 	/* Execute the DDL command on the remote server */
 	do_sql_command(conn, full_sql.data);
@@ -4637,6 +4638,8 @@ create_foreign_modify(EState *estate,
 	/* Begin constructing PgFdwModifyState. */
 	fmstate = (PgFdwModifyState *) palloc0(sizeof(PgFdwModifyState));
 	fmstate->rel = rel;
+	fmstate->conn = NULL;
+	fmstate->conn_state = NULL;
 
 	/* Identify which user to do the remote access as. */
 	userid = ExecGetResultRelCheckAsUser(resultRelInfo, estate);
@@ -4645,9 +4648,9 @@ create_foreign_modify(EState *estate,
 	table = GetForeignTable(RelationGetRelid(rel));
 	user = GetUserMapping(userid, table->serverid);
 
-	/* Open connection; report that we'll create a prepared statement. */
-	fmstate->conn = GetConnection(user, true, &fmstate->conn_state);
 	fmstate->p_name = NULL;		/* prepared statement not made yet */
+
+	fmstate->conn = GetConnection(user, true, &fmstate->conn_state);
 
 	/* Set up remote query information. */
 	fmstate->query = query;
@@ -4752,7 +4755,8 @@ execute_foreign_modify(EState *estate,
 		   operation == CMD_DELETE);
 
 	/* First, process a pending asynchronous request, if any. */
-	if (fmstate->conn_state->pendingAreq)
+	if (fmstate->conn_state != NULL &&
+		fmstate->conn_state->pendingAreq)
 		process_pending_request(fmstate->conn_state->pendingAreq);
 
 	/*
@@ -4776,10 +4780,6 @@ execute_foreign_modify(EState *estate,
 		fmstate->num_slots = *numSlots;
 	}
 
-	/* Set up the prepared statement on the remote server, if we didn't yet */
-	if (!fmstate->p_name)
-		prepare_foreign_modify(fmstate);
-
 	/*
 	 * For UPDATE/DELETE, get the ctid that was passed up as a resjunk column
 	 */
@@ -4799,6 +4799,10 @@ execute_foreign_modify(EState *estate,
 
 	/* Convert parameters needed by prepared statement to text form */
 	p_values = convert_prep_stmt_params(fmstate, ctid, slots, *numSlots);
+
+	/* Set up the prepared statement on the remote server, if we didn't yet */
+	if (!fmstate->p_name)
+		prepare_foreign_modify(fmstate);
 
 	/*
 	 * Execute the prepared statement.
@@ -5023,12 +5027,15 @@ finish_foreign_modify(PgFdwModifyState *fmstate)
 {
 	Assert(fmstate != NULL);
 
-	/* If we created a prepared statement, destroy it */
-	deallocate_query(fmstate);
+	if (fmstate->conn != NULL)
+	{
+		/* If we created a prepared statement, destroy it */
+		deallocate_query(fmstate);
 
-	/* Release remote connection */
-	ReleaseConnection(fmstate->conn);
-	fmstate->conn = NULL;
+		/* Release remote connection */
+		ReleaseConnection(fmstate->conn);
+		fmstate->conn = NULL;
+	}
 }
 
 /*

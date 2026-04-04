@@ -1,0 +1,4 @@
+# initializing database system by copying initdb template
+# using temp instance on port 55316 with PID 1908
+not ok 1     - sharding                                   40 ms
+# could not stop postmaster: exit code was 2Bail out!
