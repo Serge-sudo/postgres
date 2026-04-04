@@ -3,6 +3,7 @@
 backend_sources += files(
   'autovacuum.c',
   'auxprocess.c',
+  'conn_multiplexer.c',
   'bgworker.c',
   'bgwriter.c',
   'checkpointer.c',
