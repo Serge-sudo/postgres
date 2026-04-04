@@ -12,6 +12,7 @@
  */
 #include "postgres.h"
 
+#include <ctype.h>
 #include <limits.h>
 
 #include "access/htup_details.h"
@@ -43,6 +44,7 @@
 #include "optimizer/tlist.h"
 #include "parser/parsetree.h"
 #include "postgres_fdw.h"
+#include "postmaster/conn_multiplexer.h"
 #include "storage/latch.h"
 #include "utils/builtins.h"
 #include "utils/float.h"
@@ -66,6 +68,9 @@ PG_MODULE_MAGIC;
 
 /* If no remote estimates, assume a sort costs 20% extra */
 #define DEFAULT_FDW_SORT_MULTIPLIER 1.2
+
+/* Encoded NULL marker in mux tuple payload */
+#define MUX_NULL_VALUE_MARKER UINT32_MAX
 
 /*
  * Indexes of FDW-private information stored in fdw_private lists.
@@ -178,6 +183,11 @@ typedef struct PgFdwScanState
 	MemoryContext temp_cxt;		/* context for per-tuple temporary data */
 
 	int			fetch_size;		/* number of tuples per fetch */
+
+	/* optional one-shot scan path via connection multiplexer */
+	bool		use_mux_query;
+	char		peer_host[256];
+	int			peer_mux_port;
 } PgFdwScanState;
 
 /*
@@ -206,6 +216,13 @@ typedef struct PgFdwModifyState
 	AttrNumber	ctidAttno;		/* attnum of input resjunk ctid column */
 	int			p_nums;			/* number of parameters to transmit */
 	FmgrInfo   *p_flinfo;		/* output conversion functions for them */
+
+	/* optional one-shot modify path via connection multiplexer */
+	Oid			serverid;
+	bool		use_mux_modify;
+	char		server_name[NAMEDATALEN];
+	char		peer_host[256];
+	int			peer_mux_port;
 
 	/* batch operation stuff */
 	int			num_slots;		/* number of slots to insert */
@@ -465,6 +482,7 @@ static bool ec_member_matches_foreign(PlannerInfo *root, RelOptInfo *rel,
 									  void *arg);
 static void create_cursor(ForeignScanState *node);
 static void fetch_more_data(ForeignScanState *node);
+static void fetch_all_data_via_mux(ForeignScanState *node);
 static void close_cursor(PGconn *conn, unsigned int cursor_number,
 						 PgFdwConnState *conn_state);
 static PgFdwModifyState *create_foreign_modify(EState *estate,
@@ -483,6 +501,9 @@ static TupleTableSlot **execute_foreign_modify(EState *estate,
 											   TupleTableSlot **slots,
 											   TupleTableSlot **planSlots,
 											   int *numSlots);
+static char *build_mux_modify_sql(const char *prep_name,
+								  const char **p_values,
+								  int nvalues);
 static void prepare_foreign_modify(PgFdwModifyState *fmstate);
 static const char **convert_prep_stmt_params(PgFdwModifyState *fmstate,
 											 ItemPointer tupleid,
@@ -530,6 +551,8 @@ static HeapTuple make_tuple_from_result_row(PGresult *res,
 											List *retrieved_attrs,
 											ForeignScanState *fsstate,
 											MemoryContext temp_context);
+static inline uint16 mux_get_be16(const unsigned char *p);
+static inline uint32 mux_get_be32(const unsigned char *p);
 static void conversion_error_callback(void *arg);
 static bool foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel,
 							JoinType jointype, RelOptInfo *outerrel, RelOptInfo *innerrel,
@@ -1516,9 +1539,11 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 	RangeTblEntry *rte;
 	Oid			userid;
 	ForeignTable *table;
+	ForeignServer *server;
 	UserMapping *user;
 	int			rtindex;
 	int			numParams;
+	bool		want_mux_query = false;
 
 	/*
 	 * Do nothing in EXPLAIN (no ANALYZE) case.  node->fdw_state stays NULL.
@@ -1547,16 +1572,6 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 	table = GetForeignTable(rte->relid);
 	user = GetUserMapping(userid, table->serverid);
 
-	/*
-	 * Get connection to the foreign server.  Connection manager will
-	 * establish new connection if necessary.
-	 */
-	fsstate->conn = GetConnection(user, false, &fsstate->conn_state);
-
-	/* Assign a unique ID for my cursor */
-	fsstate->cursor_number = GetCursorNumber(fsstate->conn);
-	fsstate->cursor_exists = false;
-
 	/* Get private info created by planner functions. */
 	fsstate->query = strVal(list_nth(fsplan->fdw_private,
 									 FdwScanPrivateSelectSql));
@@ -1564,6 +1579,9 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 												 FdwScanPrivateRetrievedAttrs);
 	fsstate->fetch_size = intVal(list_nth(fsplan->fdw_private,
 										  FdwScanPrivateFetchSize));
+	fsstate->use_mux_query = false;
+	fsstate->peer_host[0] = '\0';
+	fsstate->peer_mux_port = 0;
 
 	/* Create contexts for batches of tuples and per-tuple temp workspace. */
 	fsstate->batch_cxt = AllocSetContextCreate(estate->es_query_cxt,
@@ -1605,6 +1623,58 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 
 	/* Set the async-capable flag */
 	fsstate->async_capable = node->ss.ps.async_capable;
+
+	/*
+	 * For parameter-free scans, execute the full SELECT via mux so DML reads
+	 * use backend->local_mux->remote_mux->worker path.  Detect this before
+	 * opening a libpq connection to avoid remote backend startup/session SQL
+	 * on the non-mux path.
+	 */
+	if (ConnMuxIsAvailable() && numParams == 0)
+	{
+		ListCell   *lc;
+		char	   *server_host = NULL;
+
+		server = GetForeignServer(table->serverid);
+		foreach(lc, server->options)
+		{
+			DefElem    *def = (DefElem *) lfirst(lc);
+
+			if (strcmp(def->defname, "mux_host") == 0)
+				strlcpy(fsstate->peer_host, defGetString(def), sizeof(fsstate->peer_host));
+			else if (strcmp(def->defname, "host") == 0 && fsstate->peer_host[0] == '\0')
+				server_host = defGetString(def);
+			else if (strcmp(def->defname, "mux_port") == 0)
+				fsstate->peer_mux_port = pg_strtoint32(defGetString(def));
+		}
+
+		if (fsstate->peer_host[0] == '\0' && server_host != NULL)
+			strlcpy(fsstate->peer_host, server_host, sizeof(fsstate->peer_host));
+
+		if (fsstate->peer_host[0] != '\0' && fsstate->peer_mux_port > 0)
+			want_mux_query = true;
+	}
+
+	if (want_mux_query)
+	{
+		fsstate->use_mux_query = true;
+		fsstate->conn = NULL;
+		fsstate->conn_state = NULL;
+		fsstate->cursor_number = 0;
+		fsstate->cursor_exists = false;
+	}
+	else
+	{
+		/*
+		 * Get connection to the foreign server.  Connection manager will
+		 * establish new connection if necessary.
+		 */
+		fsstate->conn = GetConnection(user, false, &fsstate->conn_state);
+
+		/* Assign a unique ID for my cursor */
+		fsstate->cursor_number = GetCursorNumber(fsstate->conn);
+		fsstate->cursor_exists = false;
+	}
 }
 
 /*
@@ -1617,6 +1687,20 @@ postgresIterateForeignScan(ForeignScanState *node)
 {
 	PgFdwScanState *fsstate = (PgFdwScanState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+
+	if (fsstate->use_mux_query)
+	{
+		if (fsstate->next_tuple >= fsstate->num_tuples && !fsstate->eof_reached)
+			fetch_all_data_via_mux(node);
+
+		if (fsstate->next_tuple >= fsstate->num_tuples)
+			return ExecClearTuple(slot);
+
+		ExecStoreHeapTuple(fsstate->tuples[fsstate->next_tuple++],
+						   slot,
+						   false);
+		return slot;
+	}
 
 	/*
 	 * In sync mode, if this is the first call after Begin or ReScan, we need
@@ -1663,6 +1747,17 @@ postgresReScanForeignScan(ForeignScanState *node)
 	PgFdwScanState *fsstate = (PgFdwScanState *) node->fdw_state;
 	char		sql[64];
 	PGresult   *res;
+
+	if (fsstate->use_mux_query)
+	{
+		fsstate->next_tuple = 0;
+		if (node->ss.ps.chgParam != NULL)
+		{
+			fsstate->num_tuples = 0;
+			fsstate->eof_reached = false;
+		}
+		return;
+	}
 
 	/* If we haven't created the cursor yet, nothing to do. */
 	if (!fsstate->cursor_exists)
@@ -2471,6 +2566,8 @@ postgresPlanDirectModify(PlannerInfo *root,
 	RangeTblEntry *rte;
 	PgFdwRelationInfo *fpinfo;
 	Relation	rel;
+	ForeignTable *foreign_table;
+	ForeignServer *server;
 	StringInfoData sql;
 	ForeignScan *fscan;
 	List	   *processed_tlist = NIL;
@@ -2557,6 +2654,46 @@ postgresPlanDirectModify(PlannerInfo *root,
 	 * use NoLock here.
 	 */
 	rel = table_open(rte->relid, NoLock);
+
+	/*
+	 * Don't use direct-modify for mux-configured servers. Keep UPDATE/DELETE on
+	 * the regular scan+modify path, where postgres_fdw's mux worker flow is used
+	 * consistently for mux-routed DML.
+	 */
+	if (ConnMuxIsAvailable())
+	{
+		ListCell   *lc;
+
+		foreign_table = GetForeignTable(RelationGetRelid(rel));
+		server = GetForeignServer(foreign_table->serverid);
+
+		if (server->options != NIL)
+		{
+			foreach(lc, server->options)
+			{
+				DefElem    *def = (DefElem *) lfirst(lc);
+
+				if (strcmp(def->defname, "mux_port") == 0)
+				{
+					const char *mux_port_str = defGetString(def);
+					char	   *endptr = NULL;
+					long		mux_port;
+
+					errno = 0;
+					mux_port = strtol(mux_port_str, &endptr, 10);
+					if (errno == 0 &&
+						endptr != mux_port_str &&
+						*endptr == '\0' &&
+						mux_port > 0 &&
+						mux_port <= 65535)
+					{
+						table_close(rel, NoLock);
+						return false;
+					}
+				}
+			}
+		}
+	}
 
 	/*
 	 * Recall the qual clauses that must be evaluated remotely.  (These are
@@ -3104,7 +3241,75 @@ postgresExecForeignDDL(Oid serverid, const char *sql)
 {
 	UserMapping *user;
 	PGconn	   *conn;
+	ForeignServer *server;
 	StringInfoData full_sql;
+	char	   *peer_host = NULL;
+	int			peer_mux_port = 0;
+	char		mux_result[1];
+	char		mux_error[MUX_ERROR_MAX];
+
+	server = GetForeignServer(serverid);
+
+	/*
+	 * Prefix the DDL with SET LOCAL to set the executing_remote_ddl flag
+	 * on the REMOTE server. This prevents infinite recursion by telling
+	 * the remote server not to replicate this DDL further.
+	 */
+	initStringInfo(&full_sql);
+	appendStringInfo(&full_sql,
+					 "SET LOCAL shardgroup.executing_remote_ddl = true; %s",
+					 sql);
+
+	/*
+	 * If connection multiplexer is available and this server has mux settings,
+	 * execute DDL through mux so the remote side is handled by mux workers.
+	 */
+	if (ConnMuxIsAvailable())
+	{
+		ListCell   *lc;
+
+		foreach(lc, server->options)
+		{
+			DefElem    *def = (DefElem *) lfirst(lc);
+
+			if (strcmp(def->defname, "mux_host") == 0)
+				peer_host = defGetString(def);
+			else if (strcmp(def->defname, "host") == 0 && peer_host == NULL)
+				peer_host = defGetString(def);
+			else if (strcmp(def->defname, "mux_port") == 0)
+				peer_mux_port = atoi(defGetString(def));
+		}
+
+		if (peer_host != NULL && peer_mux_port > 0)
+		{
+			TransactionId xid = GetTopTransactionIdIfAny();
+
+			if (ConnMuxSubmitQuery(serverid,
+								   server->servername,
+								   peer_host,
+								   peer_mux_port,
+								   xid,
+								   false,
+								   full_sql.data,
+								   mux_result,
+								   sizeof(mux_result),
+								   NULL,
+								   mux_error,
+								   sizeof(mux_error)) == 0)
+			{
+				pfree(full_sql.data);
+				return;
+			}
+
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+					 errmsg("could not execute DDL via multiplexer on server \"%s\"",
+							server->servername),
+					 errdetail("%s",
+							   mux_error[0] ? mux_error :
+							   "unknown multiplexer error")));
+		}
+	}
 
 	/*
 	 * Get user mapping and connection to the foreign server.
@@ -3113,16 +3318,6 @@ postgresExecForeignDDL(Oid serverid, const char *sql)
 	 */
 	user = GetUserMapping(GetUserId(), serverid);
 	conn = GetConnection(user, false, NULL);
-
-	/* 
-	 * Prefix the DDL with SET LOCAL to set the executing_remote_ddl flag
-	 * on the REMOTE server. This prevents infinite recursion by telling
-	 * the remote server not to replicate this DDL further.
-	 */
-	initStringInfo(&full_sql);
-	appendStringInfo(&full_sql, 
-					 "SET LOCAL shardgroup.executing_remote_ddl = true; %s",
-					 sql);
 
 	/* Execute the DDL command on the remote server */
 	do_sql_command(conn, full_sql.data);
@@ -4526,6 +4721,162 @@ fetch_more_data(ForeignScanState *node)
 	MemoryContextSwitchTo(oldcontext);
 }
 
+static void
+fetch_all_data_via_mux(ForeignScanState *node)
+{
+	PgFdwScanState *fsstate = (PgFdwScanState *) node->fdw_state;
+	MemoryContext oldcontext;
+	char	   *result = NULL;
+	char		error_buf[MUX_ERROR_MAX];
+	int			result_len = 0;
+	const unsigned char *p;
+	const unsigned char *end;
+	uint32		ncols;
+	uint32		nrows;
+	ListCell   *lc;
+	int			row;
+
+	MemoryContextReset(fsstate->batch_cxt);
+	oldcontext = MemoryContextSwitchTo(fsstate->batch_cxt);
+	fsstate->tuples = NULL;
+
+	error_buf[0] = '\0';
+	result = palloc0(MUX_RESULT_MAX + 1);
+	if (ConnMuxSubmitQuery(RelationGetRelid(fsstate->rel),
+						   RelationGetRelationName(fsstate->rel),
+						   fsstate->peer_host,
+						   fsstate->peer_mux_port,
+						   GetTopTransactionIdIfAny(),
+						   true,
+						   fsstate->query,
+						   result,
+						   MUX_RESULT_MAX + 1,
+						   &result_len,
+						   error_buf,
+						   sizeof(error_buf)) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+				 errmsg("could not execute scan via multiplexer"),
+				 errdetail("%s", error_buf[0] ? error_buf : "unknown multiplexer error")));
+
+	if (result_len > MUX_RESULT_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_ERROR),
+				 errmsg("invalid multiplexer result length for foreign scan: %d",
+						result_len)));
+	p = (const unsigned char *) result;
+	end = p + result_len;
+
+	if (end - p < 8)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_ERROR),
+				 errmsg("invalid multiplexer result for foreign scan")));
+
+	ncols = mux_get_be32(p);
+	p += 4;
+	nrows = mux_get_be32(p);
+	p += 4;
+
+	{
+		int			col;
+
+		for (col = 0; col < (int) ncols; col++)
+		{
+			uint16 name_len;
+
+			if (end - p < 2)
+				ereport(ERROR, (errmsg("invalid multiplexer column metadata")));
+			name_len = mux_get_be16(p);
+			p += 2;
+			if (end - p < name_len + 4)
+				ereport(ERROR, (errmsg("invalid multiplexer column metadata length")));
+			p += name_len + 4;
+		}
+	}
+
+	fsstate->tuples = (HeapTuple *) palloc0(sizeof(HeapTuple) * nrows);
+	fsstate->num_tuples = (int) nrows;
+	fsstate->next_tuple = 0;
+
+	for (row = 0; row < (int) nrows; row++)
+	{
+		Datum	   *values;
+		bool	   *nulls;
+		HeapTuple	tuple;
+
+		values = (Datum *) palloc0(sizeof(Datum) * fsstate->tupdesc->natts);
+		nulls = (bool *) palloc(sizeof(bool) * fsstate->tupdesc->natts);
+		{
+			int			attno;
+
+			for (attno = 0; attno < fsstate->tupdesc->natts; attno++)
+				nulls[attno] = true;
+		}
+
+		foreach(lc, fsstate->retrieved_attrs)
+		{
+			int attno = lfirst_int(lc);
+			uint32 value_len;
+			char *value_data = NULL;
+
+			if (end - p < 4)
+				ereport(ERROR, (errmsg("invalid multiplexer row payload")));
+			value_len = mux_get_be32(p);
+			p += 4;
+
+			if (value_len != MUX_NULL_VALUE_MARKER)
+			{
+				if (value_len > (uint32) (end - p))
+					ereport(ERROR, (errmsg("invalid multiplexer value length")));
+				value_data = pnstrdup((const char *) p, value_len);
+				p += value_len;
+			}
+
+			if (attno > 0)
+			{
+				if (value_len == MUX_NULL_VALUE_MARKER)
+				{
+					nulls[attno - 1] = true;
+					values[attno - 1] = (Datum) 0;
+				}
+				else
+				{
+					nulls[attno - 1] = false;
+					values[attno - 1] =
+						InputFunctionCall(&fsstate->attinmeta->attinfuncs[attno - 1],
+										  value_data,
+										  fsstate->attinmeta->attioparams[attno - 1],
+										  fsstate->attinmeta->atttypmods[attno - 1]);
+				}
+			}
+			if (value_data != NULL)
+				pfree(value_data);
+		}
+
+		tuple = heap_form_tuple(fsstate->tupdesc, values, nulls);
+		fsstate->tuples[row] = tuple;
+	}
+
+	fsstate->eof_reached = true;
+	pfree(result);
+	MemoryContextSwitchTo(oldcontext);
+}
+
+static inline uint16
+mux_get_be16(const unsigned char *p)
+{
+	return ((uint16) p[0] << 8) | (uint16) p[1];
+}
+
+static inline uint32
+mux_get_be32(const unsigned char *p)
+{
+	return ((uint32) p[0] << 24) |
+		((uint32) p[1] << 16) |
+		((uint32) p[2] << 8) |
+		(uint32) p[3];
+}
+
 /*
  * Force assorted GUC parameters to settings that ensure that we'll output
  * data values in a form that is unambiguous to the remote server.
@@ -4628,6 +4979,7 @@ create_foreign_modify(EState *estate,
 	TupleDesc	tupdesc = RelationGetDescr(rel);
 	Oid			userid;
 	ForeignTable *table;
+	ForeignServer *server;
 	UserMapping *user;
 	AttrNumber	n_params;
 	Oid			typefnoid;
@@ -4637,17 +4989,65 @@ create_foreign_modify(EState *estate,
 	/* Begin constructing PgFdwModifyState. */
 	fmstate = (PgFdwModifyState *) palloc0(sizeof(PgFdwModifyState));
 	fmstate->rel = rel;
+	fmstate->conn = NULL;
+	fmstate->conn_state = NULL;
 
 	/* Identify which user to do the remote access as. */
 	userid = ExecGetResultRelCheckAsUser(resultRelInfo, estate);
 
 	/* Get info about foreign table. */
 	table = GetForeignTable(RelationGetRelid(rel));
+	server = GetForeignServer(table->serverid);
 	user = GetUserMapping(userid, table->serverid);
 
-	/* Open connection; report that we'll create a prepared statement. */
-	fmstate->conn = GetConnection(user, true, &fmstate->conn_state);
 	fmstate->p_name = NULL;		/* prepared statement not made yet */
+	fmstate->serverid = table->serverid;
+	fmstate->use_mux_modify = false;
+	fmstate->server_name[0] = '\0';
+	fmstate->peer_host[0] = '\0';
+	fmstate->peer_mux_port = 0;
+
+	if (server != NULL)
+	{
+		strlcpy(fmstate->server_name, server->servername,
+				sizeof(fmstate->server_name));
+
+		if (ConnMuxIsAvailable())
+		{
+			char	   *opt_host = NULL;
+			char	   *opt_mux_host = NULL;
+			int			opt_mux_port = 0;
+
+			foreach(lc, server->options)
+			{
+				DefElem    *def = (DefElem *) lfirst(lc);
+
+				if (strcmp(def->defname, "host") == 0)
+					opt_host = defGetString(def);
+				else if (strcmp(def->defname, "mux_host") == 0)
+					opt_mux_host = defGetString(def);
+				else if (strcmp(def->defname, "mux_port") == 0)
+					opt_mux_port = pg_strtoint32(defGetString(def));
+			}
+
+			if (opt_mux_port > 0)
+			{
+				const char *peer = (opt_mux_host && opt_mux_host[0] != '\0') ?
+					opt_mux_host : opt_host;
+
+				if (peer && peer[0] != '\0')
+				{
+					strlcpy(fmstate->peer_host, peer, sizeof(fmstate->peer_host));
+					fmstate->peer_mux_port = opt_mux_port;
+					fmstate->use_mux_modify = true;
+				}
+			}
+		}
+	}
+
+	/* Open libpq connection only when we need non-mux prepared flow. */
+	if (!fmstate->use_mux_modify)
+		fmstate->conn = GetConnection(user, true, &fmstate->conn_state);
 
 	/* Set up remote query information. */
 	fmstate->query = query;
@@ -4744,6 +5144,7 @@ execute_foreign_modify(EState *estate,
 	const char **p_values;
 	PGresult   *res;
 	int			n_rows;
+	int			requested_slots = *numSlots;
 	StringInfoData sql;
 
 	/* The operation should be INSERT, UPDATE, or DELETE */
@@ -4752,7 +5153,8 @@ execute_foreign_modify(EState *estate,
 		   operation == CMD_DELETE);
 
 	/* First, process a pending asynchronous request, if any. */
-	if (fmstate->conn_state->pendingAreq)
+	if (fmstate->conn_state != NULL &&
+		fmstate->conn_state->pendingAreq)
 		process_pending_request(fmstate->conn_state->pendingAreq);
 
 	/*
@@ -4776,10 +5178,6 @@ execute_foreign_modify(EState *estate,
 		fmstate->num_slots = *numSlots;
 	}
 
-	/* Set up the prepared statement on the remote server, if we didn't yet */
-	if (!fmstate->p_name)
-		prepare_foreign_modify(fmstate);
-
 	/*
 	 * For UPDATE/DELETE, get the ctid that was passed up as a resjunk column
 	 */
@@ -4799,6 +5197,113 @@ execute_foreign_modify(EState *estate,
 
 	/* Convert parameters needed by prepared statement to text form */
 	p_values = convert_prep_stmt_params(fmstate, ctid, slots, *numSlots);
+
+	if (fmstate->use_mux_modify)
+	{
+		char		prep_name[NAMEDATALEN];
+		StringInfoData prep_sql;
+		char	   *exec_sql;
+		char		dealloc_sql[NAMEDATALEN + 16];
+		bool		exec_ok = false;
+		const char *exec_errmsg = "unknown multiplexer error";
+		char	   *mux_error;
+		char		mux_dummy_result[1];
+		TransactionId xid = GetTopTransactionIdIfAny();
+		int			param_count = fmstate->p_nums * (*numSlots);
+		uint64		prep_no = (((uint64) GetCurrentTimestamp()) << 16) ^
+			((uint64) GetCurrentCommandId(false)) ^
+			((uint64) xid);
+
+		if (snprintf(prep_name, sizeof(prep_name), "pgsql_fdw_prep_mux_%ld_" UINT64_FORMAT,
+					 (long) MyProcPid,
+					 prep_no) >= sizeof(prep_name))
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("prepared statement name too long for multiplexer DML")));
+
+		initStringInfo(&prep_sql);
+		appendStringInfo(&prep_sql, "PREPARE %s AS %s", prep_name, fmstate->query);
+		exec_sql = build_mux_modify_sql(prep_name, p_values, param_count);
+		snprintf(dealloc_sql, sizeof(dealloc_sql), "DEALLOCATE %s", prep_name);
+
+		mux_error = (char *) palloc0(MUX_ERROR_MAX);
+		if (ConnMuxSubmitQuery(fmstate->serverid,
+							   fmstate->server_name[0] ? fmstate->server_name : NULL,
+							   fmstate->peer_host,
+							   fmstate->peer_mux_port,
+							   xid,
+							   false,
+							   prep_sql.data,
+							   mux_dummy_result,
+							   sizeof(mux_dummy_result),
+							   NULL,
+							   mux_error,
+							   MUX_ERROR_MAX) != 0)
+		{
+			char *err_msg = pstrdup(mux_error[0] ? mux_error :
+								   "unknown multiplexer error");
+			pfree(prep_sql.data);
+			pfree(exec_sql);
+			pfree(mux_error);
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+					 errmsg("could not execute DML via multiplexer on server \"%s\"",
+							fmstate->server_name),
+					 errdetail("%s", err_msg)));
+		}
+
+		if (ConnMuxSubmitQuery(fmstate->serverid,
+							   fmstate->server_name[0] ? fmstate->server_name : NULL,
+							   fmstate->peer_host,
+							   fmstate->peer_mux_port,
+							   xid,
+							   false,
+							   exec_sql,
+							   mux_dummy_result,
+							   sizeof(mux_dummy_result),
+							   NULL,
+							   mux_error,
+							   MUX_ERROR_MAX) == 0)
+			exec_ok = true;
+		else
+			exec_errmsg = pstrdup(mux_error[0] ? mux_error :
+								  "unknown multiplexer error");
+
+		if (ConnMuxSubmitQuery(fmstate->serverid,
+							   fmstate->server_name[0] ? fmstate->server_name : NULL,
+							   fmstate->peer_host,
+							   fmstate->peer_mux_port,
+							   xid,
+							   false,
+							   dealloc_sql,
+							   mux_dummy_result,
+							   sizeof(mux_dummy_result),
+							   NULL,
+							   mux_error,
+							   MUX_ERROR_MAX) != 0)
+			ereport(WARNING,
+					(errmsg("could not deallocate remote prepared statement \"%s\"", prep_name),
+					 errdetail("%s", mux_error[0] ? mux_error :
+							   "unknown multiplexer error")));
+
+		pfree(prep_sql.data);
+		pfree(exec_sql);
+		pfree(mux_error);
+		if (!exec_ok)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_ERROR),
+					 errmsg("could not execute DML via multiplexer on server \"%s\"",
+							fmstate->server_name),
+					 errdetail("%s", exec_errmsg)));
+
+		MemoryContextReset(fmstate->temp_cxt);
+		*numSlots = requested_slots;
+		return slots;
+	}
+
+	/* Set up the prepared statement on the remote server, if we didn't yet */
+	if (!fmstate->p_name)
+		prepare_foreign_modify(fmstate);
 
 	/*
 	 * Execute the prepared statement.
@@ -4845,6 +5350,36 @@ execute_foreign_modify(EState *estate,
 	 * Return NULL if nothing was inserted/updated/deleted on the remote end
 	 */
 	return (n_rows > 0) ? slots : NULL;
+}
+
+static char *
+build_mux_modify_sql(const char *prep_name, const char **p_values, int nvalues)
+{
+	StringInfoData out;
+	int			i;
+
+	initStringInfo(&out);
+	appendStringInfo(&out, "EXECUTE %s(", prep_name);
+
+	for (i = 0; i < nvalues; i++)
+	{
+		if (i > 0)
+			appendStringInfoString(&out, ", ");
+
+		if (p_values[i] == NULL)
+			appendStringInfoString(&out, "NULL");
+		else
+		{
+			char	   *quoted = quote_literal_cstr(p_values[i]);
+
+			appendStringInfoString(&out, quoted);
+			pfree(quoted);
+		}
+	}
+
+	appendStringInfoString(&out, ")");
+
+	return out.data;
 }
 
 /*
@@ -5023,12 +5558,15 @@ finish_foreign_modify(PgFdwModifyState *fmstate)
 {
 	Assert(fmstate != NULL);
 
-	/* If we created a prepared statement, destroy it */
-	deallocate_query(fmstate);
+	if (fmstate->conn != NULL)
+	{
+		/* If we created a prepared statement, destroy it */
+		deallocate_query(fmstate);
 
-	/* Release remote connection */
-	ReleaseConnection(fmstate->conn);
-	fmstate->conn = NULL;
+		/* Release remote connection */
+		ReleaseConnection(fmstate->conn);
+		fmstate->conn = NULL;
+	}
 }
 
 /*

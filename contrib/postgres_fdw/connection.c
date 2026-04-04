@@ -25,6 +25,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postgres_fdw.h"
+#include "postmaster/conn_multiplexer.h"
 #include "storage/fd.h"
 #include "storage/latch.h"
 #include "utils/builtins.h"
@@ -504,16 +505,21 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 		const char **keywords;
 		const char **values;
 		char	   *appname = NULL;
+		char	   *mux_options = NULL;
+		char	   *mux_port_str = NULL;
+		const char *server_mux_host = NULL;
+		const char *server_mux_port = NULL;
 		int			n;
+		ListCell   *lc;
 
 		/*
 		 * Construct connection params from generic options of ForeignServer
 		 * and UserMapping.  (Some of them might not be libpq options, in
-		 * which case we'll just waste a few array slots.)  Add 4 extra slots
+		 * which case we'll just waste a few array slots.)  Add extra slots
 		 * for application_name, fallback_application_name, client_encoding,
-		 * end marker.
+		 * end marker, and optional mux overrides.
 		 */
-		n = list_length(server->options) + list_length(user->options) + 4;
+		n = list_length(server->options) + list_length(user->options) + 8;
 		keywords = (const char **) palloc(n * sizeof(char *));
 		values = (const char **) palloc(n * sizeof(char *));
 
@@ -522,6 +528,117 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 									  keywords + n, values + n);
 		n += ExtractConnectionOptions(user->options,
 									  keywords + n, values + n);
+
+		foreach(lc, server->options)
+		{
+			DefElem    *def = (DefElem *) lfirst(lc);
+
+			if (strcmp(def->defname, "mux_host") == 0)
+				server_mux_host = defGetString(def);
+			else if (strcmp(def->defname, "mux_port") == 0)
+				server_mux_port = defGetString(def);
+		}
+
+		/* If the local connection multiplexer is available, route via it. */
+		if (ConnMuxIsAvailable())
+		{
+			const char *orig_host = NULL;
+			const char *orig_port = NULL;
+			const char *orig_options = NULL;
+			int host_idx = -1;
+			int port_idx = -1;
+			int options_idx = -1;
+			int sslmode_idx = -1;
+			int i;
+
+			for (i = 0; i < n; i++)
+			{
+				if (keywords[i] == NULL)
+					break;
+				if (strcmp(keywords[i], "host") == 0)
+				{
+					orig_host = values[i];
+					host_idx = i;
+				}
+				else if (strcmp(keywords[i], "port") == 0)
+				{
+					orig_port = values[i];
+					port_idx = i;
+				}
+				else if (strcmp(keywords[i], "options") == 0)
+				{
+					orig_options = values[i];
+					options_idx = i;
+				}
+				else if (strcmp(keywords[i], "sslmode") == 0)
+				{
+					sslmode_idx = i;
+				}
+			}
+
+			if (orig_host != NULL && orig_port != NULL)
+			{
+				const char *mux_target_host = orig_host;
+				const char *mux_target_port = orig_port;
+				const char *mux_connect_host = (server_mux_host && *server_mux_host) ?
+				server_mux_host : orig_host;
+				const char *mux_connect_port = (server_mux_port && *server_mux_port) ?
+				server_mux_port : orig_port;
+				bool		direct_mux = (server_mux_port && *server_mux_port);
+
+				if (orig_options != NULL && *orig_options != '\0')
+					mux_options = direct_mux ?
+						psprintf("%s -c mux_target_host=%s -c mux_target_port=%s -c mux_connect_host=%s -c mux_connect_port=%s",
+								 orig_options, mux_target_host, mux_target_port,
+								 mux_connect_host, mux_connect_port) :
+						psprintf("%s -c mux_target_host=%s -c mux_target_port=%s",
+								 orig_options, mux_target_host, mux_target_port);
+				else
+					mux_options = direct_mux ?
+						psprintf("-c mux_target_host=%s -c mux_target_port=%s -c mux_connect_host=%s -c mux_connect_port=%s",
+								 mux_target_host, mux_target_port,
+								 mux_connect_host, mux_connect_port) :
+						psprintf("-c mux_target_host=%s -c mux_target_port=%s",
+								 mux_target_host, mux_target_port);
+
+				if (options_idx >= 0)
+					values[options_idx] = mux_options;
+				else
+				{
+					keywords[n] = "options";
+					values[n] = mux_options;
+					n++;
+				}
+
+				if (host_idx >= 0)
+					values[host_idx] = "localhost";
+				else
+				{
+					keywords[n] = "host";
+					values[n] = "localhost";
+					n++;
+				}
+
+				mux_port_str = psprintf("%d", mux_tcp_port);
+				if (port_idx >= 0)
+					values[port_idx] = mux_port_str;
+				else
+				{
+					keywords[n] = "port";
+					values[n] = mux_port_str;
+					n++;
+				}
+
+				if (sslmode_idx >= 0)
+					values[sslmode_idx] = "disable";
+				else
+				{
+					keywords[n] = "sslmode";
+					values[n] = "disable";
+					n++;
+				}
+			}
+		}
 
 		/*
 		 * Use pgfdw_application_name as application_name if set.
@@ -611,6 +728,10 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 
 		if (appname != NULL)
 			pfree(appname);
+		if (mux_options != NULL)
+			pfree(mux_options);
+		if (mux_port_str != NULL)
+			pfree(mux_port_str);
 		pfree(keywords);
 		pfree(values);
 	}
@@ -630,8 +751,6 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 static void
 disconnect_pg_server(ConnCacheEntry *entry)
 {
-	
-	elog(WARNING, "dis");
 	if (entry->conn != NULL)
 	{
 		ForeignServer *server;
@@ -641,7 +760,9 @@ disconnect_pg_server(ConnCacheEntry *entry)
 		if (server != NULL)
 			FdwConnShmemUnregister(server->servername);
 		else
-			elog(WARNING, "failed to get foreign server for server OID %u during disconnect", entry->serverid);
+			elog(WARNING,
+				 "failed to get foreign server for server OID %u during disconnect",
+				 entry->serverid);
 
 		libpqsrv_disconnect(entry->conn);
 		entry->conn = NULL;
