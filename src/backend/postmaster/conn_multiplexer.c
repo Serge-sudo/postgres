@@ -100,10 +100,10 @@ static MuxCtrlConn mux_ctrl[MUX_MAX_CTRL_CONNS];
 
 /* Worker pool: remote-mux side, one per PG session */
 static MuxWorkerSlot mux_workers[MUX_MAX_WORKERS];
-static int mux_n_workers = 0;t live worker count */
+static int mux_n_workers = 0;	/* live worker count */
 
 /* WaitEventSet user_data encoding */
-#define MUX_EVENT_KIND_SHIFT16
+#define MUX_EVENT_KIND_SHIFT	16
 #define MUX_EVENT(kind, idx) \
 ((void *)(intptr_t)(((kind) << MUX_EVENT_KIND_SHIFT) | (idx)))
 #define MUX_EVENT_KIND(val) \
@@ -742,7 +742,7 @@ if (!mux_parse_startup(ch, &fwd_buf, &fwd_len))
 MUX_LOG("channel %d startup parse failed", ch->channel_id);
 return false;
 }
-pfree(fwd_buf);ly needed the parse side-effects */
+pfree(fwd_buf);					/* only needed the parse side-effects */
 
 /*
  * Open a TCP connection to the remote mux.
@@ -1459,7 +1459,8 @@ return i;
 
 /* No existing worker — need to spawn one */
 if (mux_n_workers >= mux_worker_count || free_slot < 0)
-return -1;it(&mux_workers[free_slot]);
+	return -1;
+mux_worker_init(&mux_workers[free_slot]);
 if (!mux_spawn_worker(&mux_workers[free_slot],
   database, username,
   "127.0.0.1", PostPortNumber))
@@ -1572,7 +1573,7 @@ cc->send_off = 0;
 }
 
 if (MUX_CTRL_HDR_LEN + payload_len > (int) sizeof(cc->send_buf))
-return;'t happen */
+	return;						/* shouldn't happen */
 
 p = cc->send_buf;
 p[0] = type;
