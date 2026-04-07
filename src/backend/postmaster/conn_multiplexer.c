@@ -127,7 +127,7 @@ static bool
 mux_write_all(pgsocket sock, const void *buf, int len)
 {
 const char *p = (const char *) buf;
-intremaining = len;
+	int remaining = len;
 
 while (remaining > 0)
 {
@@ -151,7 +151,7 @@ static bool
 mux_read_all(pgsocket sock, void *buf, int len)
 {
 char   *p = (char *) buf;
-intremaining = len;
+	int remaining = len;
 
 while (remaining > 0)
 {
@@ -218,7 +218,7 @@ static bool
 mux_send_ctrl(pgsocket sock, char type, int32 channel_id,
   const void *payload, int payload_len)
 {
-charhdr[MUX_CTRL_HDR_LEN];
+	char hdr[MUX_CTRL_HDR_LEN];
 
 hdr[0] = type;
 put_be32(hdr + 1, (uint32) channel_id);
@@ -243,7 +243,7 @@ mux_scan_rfq_idle(const char *buf, int len, int *scan_pos_inout)
 static const unsigned char pattern[6] = {
 'Z', 0x00, 0x00, 0x00, 0x05, 'I'
 };
-intpos = *scan_pos_inout;
+	int pos = *scan_pos_inout;
 
 for (int i = 0; i < len; i++)
 {
@@ -280,7 +280,7 @@ return MAXALIGN(sizeof(MuxSharedState));
 void
 ConnMuxShmemInit(void)
 {
-boolfound;
+	bool found;
 
 MuxState = (MuxSharedState *)
 ShmemInitStruct("Connection Multiplexer Data",
@@ -351,12 +351,12 @@ return false;
 static pgsocket
 mux_open_tcp(const char *host, int port)
 {
-pgsocketsock;
+	pgsocket sock;
 struct addrinfo hint;
 struct addrinfo *addrs = NULL;
-charportstr[16];
-intret;
-intone = 1;
+	char portstr[16];
+	int ret;
+	int one = 1;
 
 MemSet(&hint, 0, sizeof(hint));
 hint.ai_family = AF_UNSPEC;
@@ -413,7 +413,7 @@ static void
 ConnMuxSetupListenSocket(void)
 {
 struct sockaddr_in addr;
-intone = 1;
+	int one = 1;
 
 mux_listen_sock = socket(AF_INET, SOCK_STREAM, 0);
 if (mux_listen_sock == PGINVALID_SOCKET)
@@ -546,7 +546,7 @@ mux_parse_startup(MuxChannelSlot *ch,
   char **fwd_buf, int *fwd_len)
 {
 char   *buf = ch->startup_buf;
-uint32proto;
+	uint32 proto;
 char   *ptr;
 char   *end;
 StringInfoData clean_opts;
@@ -687,7 +687,7 @@ MuxChannelSlot *ch = &mux_channels[idx];
 /* First read: get the 4-byte length field */
 if (ch->startup_len == 0)
 {
-intreadn = recv(ch->backend_sock,
+	int readn = recv(ch->backend_sock,
  ch->startup_buf + ch->startup_off,
  4 - ch->startup_off, 0);
 
@@ -710,7 +710,7 @@ return false;
 /* Read remaining bytes */
 if (ch->startup_off < ch->startup_len)
 {
-intreadn = recv(ch->backend_sock,
+	int readn = recv(ch->backend_sock,
  ch->startup_buf + ch->startup_off,
  ch->startup_len - ch->startup_off, 0);
 
@@ -731,11 +731,11 @@ return true;/* not done yet */
 /* Full startup packet received — parse it */
 {
 char   *fwd_buf = NULL;
-intfwd_len = 0;
-pgsocketctrl_sock;
-charconnect_payload[NAMEDATALEN * 2 + 4];
-intcp_len = 0;
-uint16dblen, ulen;
+	int fwd_len = 0;
+	pgsocket ctrl_sock;
+	char connect_payload[NAMEDATALEN * 2 + 4];
+	int cp_len = 0;
+	uint16 dblen, ulen;
 
 if (!mux_parse_startup(ch, &fwd_buf, &fwd_len))
 {
@@ -813,8 +813,8 @@ appendStringInfoChar(&buf, '\0');/* terminator */
 
 /* PG message frame: 'E' + 4-byte length (includes itself) + body */
 {
-charhdr[5];
-uint32msglen = (uint32) buf.len + 4;
+	char hdr[5];
+	uint32 msglen = (uint32) buf.len + 4;
 
 hdr[0] = 'E';
 put_be32(hdr + 1, msglen);
@@ -836,7 +836,7 @@ MuxChannelSlot *ch = &mux_channels[idx];
 /* Read header */
 if (ch->ctrl_hdr_off < MUX_CTRL_HDR_LEN)
 {
-intreadn = recv(ch->ctrl_sock,
+	int readn = recv(ch->ctrl_sock,
  ch->ctrl_hdr + ch->ctrl_hdr_off,
  MUX_CTRL_HDR_LEN - ch->ctrl_hdr_off, 0);
 
@@ -856,9 +856,9 @@ return true;
 
 /* Parse header */
 {
-charmsg_type = ch->ctrl_hdr[0];
+	char msg_type = ch->ctrl_hdr[0];
 /* int32 channel_id = (int32) get_be32(ch->ctrl_hdr + 1); */
-intpayload_len = (int) get_be32(ch->ctrl_hdr + 5);
+	int payload_len = (int) get_be32(ch->ctrl_hdr + 5);
 
 if (payload_len < 0 || payload_len > MUX_CTRL_PAYLOAD_MAX)
 return false;
@@ -874,7 +874,7 @@ ch->ctrl_payload_off = 0;
 /* Read payload */
 if (ch->ctrl_payload_len > 0 && ch->ctrl_payload_off < ch->ctrl_payload_len)
 {
-intreadn = recv(ch->ctrl_sock,
+	int readn = recv(ch->ctrl_sock,
  ch->ctrl_payload_buf + ch->ctrl_payload_off,
  ch->ctrl_payload_len - ch->ctrl_payload_off, 0);
 
@@ -957,7 +957,7 @@ MuxChannelSlot *ch = &mux_channels[idx];
 /* Read header */
 if (ch->ctrl_hdr_off < MUX_CTRL_HDR_LEN)
 {
-intreadn = recv(ch->ctrl_sock,
+	int readn = recv(ch->ctrl_sock,
  ch->ctrl_hdr + ch->ctrl_hdr_off,
  MUX_CTRL_HDR_LEN - ch->ctrl_hdr_off, 0);
 
@@ -976,13 +976,13 @@ if (ch->ctrl_hdr_off < MUX_CTRL_HDR_LEN)
 return true;
 
 {
-charmsg_type = ch->ctrl_hdr[0];
-intpayload_len = (int) get_be32(ch->ctrl_hdr + 5);
+	char msg_type = ch->ctrl_hdr[0];
+	int payload_len = (int) get_be32(ch->ctrl_hdr + 5);
 
 /* consume any (unexpected) payload */
 if (payload_len > 0 && payload_len <= MUX_CTRL_PAYLOAD_MAX)
 {
-chardummy[MUX_CTRL_PAYLOAD_MAX];
+	char dummy[MUX_CTRL_PAYLOAD_MAX];
 
 mux_read_all(ch->ctrl_sock, dummy, payload_len);
 }
@@ -1073,7 +1073,7 @@ return;
 /* Read new data from backend into c2r buffer */
 if ((events & WL_SOCKET_READABLE) && ch->c2r_len < MUX_PROXY_BUF)
 {
-intreadn = recv(ch->backend_sock,
+	int readn = recv(ch->backend_sock,
  ch->c2r_buf + ch->c2r_len,
  MUX_PROXY_BUF - ch->c2r_len, 0);
 
@@ -1180,13 +1180,13 @@ return;
 /* Read data from remote (ctrl_sock) into r2c buffer */
 if ((events & WL_SOCKET_READABLE) && ch->r2c_len < MUX_PROXY_BUF)
 {
-intreadn = recv(ch->ctrl_sock,
+	int readn = recv(ch->ctrl_sock,
  ch->r2c_buf + ch->r2c_len,
  MUX_PROXY_BUF - ch->r2c_len, 0);
 
 if (readn > 0)
 {
-boolfound_rfq;
+	bool found_rfq;
 
 /* Scan new bytes for ReadyForQuery 'I' */
 found_rfq = mux_scan_rfq_idle(ch->r2c_buf + ch->r2c_len,
@@ -1263,13 +1263,13 @@ static bool
 mux_spawn_worker(MuxWorkerSlot *w, const char *database, const char *username,
  const char *pg_host, int pg_port)
 {
-pgsocketsock;
+	pgsocket sock;
 StringInfoData startup;
-uint32proto = MUX_PG_PROTOCOL_V3;
-charlenbuf[4];
-charmsgtype;
-charhdr[4];
-intmsglen;
+	uint32 proto = MUX_PG_PROTOCOL_V3;
+	char lenbuf[4];
+	char msgtype;
+	char hdr[4];
+	int msglen;
 StringInfoData resp_buf;
 
 sock = mux_open_tcp(pg_host, pg_port);
@@ -1295,7 +1295,7 @@ put_be32(startup.data + startup.len - 4 - 4, proto);/* will fix below */
 resetStringInfo(&startup);
 appendBinaryStringInfo(&startup, "\x00\x00\x00\x00", 4);/* length placeholder */
 {
-charproto_bytes[4];
+	char proto_bytes[4];
 put_be32(proto_bytes, proto);
 appendBinaryStringInfo(&startup, proto_bytes, 4);
 }
@@ -1330,7 +1330,7 @@ initStringInfo(&resp_buf);
 
 for (;;)
 {
-charpayloadbuf[8192];
+	char payloadbuf[8192];
 
 if (!mux_read_all(sock, &msgtype, 1))
 goto fail;
@@ -1358,7 +1358,7 @@ if (msgtype == 'R')
 /* Authentication */
 if (msglen >= 4)
 {
-uint32auth_type = get_be32(payloadbuf);
+	uint32 auth_type = get_be32(payloadbuf);
 
 if (auth_type == 0)
 {
@@ -1433,8 +1433,8 @@ return false;
 static int
 mux_find_or_spawn_worker(const char *database, const char *username)
 {
-inti;
-intfree_slot = -1;
+	int i;
+	int free_slot = -1;
 
 /* Find an existing worker for this (db, user) */
 for (i = 0; i < MUX_MAX_WORKERS; i++)
@@ -1499,7 +1499,7 @@ static void
 mux_ctrl_close(int idx)
 {
 MuxCtrlConn *cc = &mux_ctrl[idx];
-intwidx = cc->worker_idx;
+	int widx = cc->worker_idx;
 
 MUX_LOG("ctrl conn %d closing (channel=%d worker=%d)", idx, cc->channel_id, widx);
 
@@ -1593,7 +1593,7 @@ static void
 mux_ctrl_handle_msg(int idx)
 {
 MuxCtrlConn *cc = &mux_ctrl[idx];
-chartype = cc->msg_type;
+	char type = cc->msg_type;
 int32channel_id = cc->channel_id;
 
 MUX_LOG("ctrl %d: msg type='%c' channel=%d payload_len=%d",
@@ -1605,11 +1605,11 @@ case MUX_MSG_CONNECT:
 {
 const char *p = cc->payload_buf;
 const char *end = p + cc->payload_len;
-uint16dblen,
+	uint16 dblen,
 ulen;
-chardatabase[NAMEDATALEN];
-charusername[NAMEDATALEN];
-intwidx;
+	char database[NAMEDATALEN];
+	char username[NAMEDATALEN];
+	int widx;
 
 if (end - p < 4)
 {
@@ -1661,7 +1661,7 @@ break;
 
 case MUX_MSG_TX_BEGIN:
 {
-intwidx = cc->worker_idx;
+	int widx = cc->worker_idx;
 
 if (widx < 0 || widx >= MUX_MAX_WORKERS ||
 mux_workers[widx].worker_sock == PGINVALID_SOCKET)
@@ -1694,7 +1694,7 @@ break;
 
 case MUX_MSG_TX_END:
 {
-intwidx = cc->worker_idx;
+	int widx = cc->worker_idx;
 
 if (widx >= 0 && widx < MUX_MAX_WORKERS &&
 mux_workers[widx].in_tx &&
@@ -1750,7 +1750,7 @@ MuxCtrlConn *cc = &mux_ctrl[idx];
 
 if (cc->state == MCC_IN_TX)
 {
-intwidx = cc->worker_idx;
+	int widx = cc->worker_idx;
 MuxWorkerSlot *w = (widx >= 0) ? &mux_workers[widx] : NULL;
 
 /* Write c2w buffer to worker */
@@ -1779,7 +1779,7 @@ return;
 /* Read from ctrl_sock (frontend data) into c2w buffer */
 if ((events & WL_SOCKET_READABLE) && cc->c2w_len < MUX_PROXY_BUF)
 {
-intreadn = recv(cc->ctrl_sock,
+	int readn = recv(cc->ctrl_sock,
  cc->c2w_buf + cc->c2w_len,
  MUX_PROXY_BUF - cc->c2w_len, 0);
 
@@ -1807,7 +1807,7 @@ return;
 
 if (cc->hdr_off < MUX_CTRL_HDR_LEN)
 {
-intreadn = recv(cc->ctrl_sock,
+	int readn = recv(cc->ctrl_sock,
  cc->hdr_buf + cc->hdr_off,
  MUX_CTRL_HDR_LEN - cc->hdr_off, 0);
 
@@ -1858,7 +1858,7 @@ return;
 
 while (cc->payload_off < cc->payload_len)
 {
-intreadn = recv(cc->ctrl_sock,
+	int readn = recv(cc->ctrl_sock,
  cc->payload_buf + cc->payload_off,
  cc->payload_len - cc->payload_off, 0);
 
@@ -1892,7 +1892,7 @@ static void
 mux_ctrl_worker_event(int idx, uint32 events)
 {
 MuxCtrlConn *cc = &mux_ctrl[idx];
-intwidx = cc->worker_idx;
+	int widx = cc->worker_idx;
 MuxWorkerSlot *w;
 
 if (cc->state != MCC_IN_TX || widx < 0 || widx >= MUX_MAX_WORKERS)
@@ -1928,13 +1928,13 @@ return;
 /* Read from worker_sock into w2c buffer */
 if ((events & WL_SOCKET_READABLE) && cc->w2c_len < MUX_PROXY_BUF)
 {
-intreadn = recv(w->worker_sock,
+	int readn = recv(w->worker_sock,
  cc->w2c_buf + cc->w2c_len,
  MUX_PROXY_BUF - cc->w2c_len, 0);
 
 if (readn > 0)
 {
-boolfound_rfq;
+	bool found_rfq;
 
 found_rfq = mux_scan_rfq_idle(cc->w2c_buf + cc->w2c_len,
   readn,
@@ -1979,7 +1979,7 @@ return;
 static void
 ConnMuxAcceptConn(void)
 {
-pgsocketnew_sock;
+	pgsocket new_sock;
 struct sockaddr_in client_addr;
 socklen_tclient_len = sizeof(client_addr);
 
@@ -2028,9 +2028,9 @@ closesocket(new_sock);
 static void
 ConnMuxClassifyPending(int idx)
 {
-pgsocketsock = mux_pending[idx];
+	pgsocket sock = mux_pending[idx];
 unsigned char peek;
-intnread;
+	int nread;
 
 if (sock == PGINVALID_SOCKET)
 return;
@@ -2059,7 +2059,7 @@ mux_pending_count--;
 if (peek == 0x00)
 {
 /* PG startup packet — allocate a channel slot */
-intchi = mux_channel_alloc(sock);
+	int chi = mux_channel_alloc(sock);
 
 if (chi < 0)
 {
@@ -2073,7 +2073,7 @@ MUX_LOG("pending socket %d classified as channel %d (id=%d)",
 else
 {
 /* Control message — allocate a ctrl conn slot */
-intci = mux_ctrl_alloc(sock);
+	int ci = mux_ctrl_alloc(sock);
 
 if (ci < 0)
 {
@@ -2096,9 +2096,9 @@ for (;;)
 {
 WaitEventSet *wes;
 WaitEventevents[256];
-intn_events;
-inti;
-intwes_size;
+	int n_events;
+	int i;
+	int wes_size;
 
 /* Estimate event set size */
 wes_size = 4 +
@@ -2126,7 +2126,7 @@ AddWaitEventToSet(wes, WL_SOCKET_READABLE, mux_pending[i],
 for (i = 0; i < MUX_MAX_CHANNELS; i++)
 {
 MuxChannelSlot *ch = &mux_channels[i];
-uint32be_mask = 0,
+	uint32 be_mask = 0,
 ctrl_mask = 0;
 
 if (ch->state == MCH_EMPTY)
@@ -2169,9 +2169,9 @@ AddWaitEventToSet(wes, ctrl_mask, ch->ctrl_sock,
 for (i = 0; i < MUX_MAX_CTRL_CONNS; i++)
 {
 MuxCtrlConn *cc = &mux_ctrl[i];
-uint32ctrl_mask = 0,
+	uint32 ctrl_mask = 0,
 worker_mask = 0;
-intwidx;
+	int widx;
 
 if (cc->state == MCC_EMPTY)
 continue;
@@ -2231,8 +2231,8 @@ if (!(ev->events & (WL_SOCKET_READABLE | WL_SOCKET_WRITEABLE)))
 continue;
 
 {
-intkind = MUX_EVENT_KIND(ev->user_data);
-intkidx = MUX_EVENT_IDX(ev->user_data);
+	int kind = MUX_EVENT_KIND(ev->user_data);
+	int kidx = MUX_EVENT_IDX(ev->user_data);
 
 switch (kind)
 {
@@ -2273,7 +2273,7 @@ ConnMuxClassifyPending(i);
 void
 ConnMuxMain(Datum main_arg)
 {
-inti;
+	int i;
 
 pqsignal(SIGTERM, die);
 pqsignal(SIGHUP, SignalHandlerForConfigReload);
