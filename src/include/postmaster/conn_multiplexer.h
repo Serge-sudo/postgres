@@ -112,6 +112,7 @@ typedef struct MuxChannelSlot
 	char			username[NAMEDATALEN];
 	char			target_host[256];		/* mux_target_host from startup */
 	int32			target_port;			/* mux_target_port from startup */
+	int32			target_mux_port;		/* mux_target_mux_port from startup (remote mux port) */
 
 	pgsocket		backend_sock;			/* TCP socket to local backend */
 	pgsocket		ctrl_sock;				/* TCP socket to remote mux */

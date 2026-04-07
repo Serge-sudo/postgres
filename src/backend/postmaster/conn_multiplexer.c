@@ -1284,10 +1284,6 @@ mux_spawn_worker(MuxWorkerSlot *w, const char *database, const char *username,
 
 	/* Build PG v3 startup packet */
 	initStringInfo(&startup);
-	appendBinaryStringInfo(&startup, lenbuf, 4);		 /* placeholder for length */
-	put_be32(startup.data + startup.len - 4 - 4, proto); /* will fix below */
-	/* Actually build it manually */
-	resetStringInfo(&startup);
 	appendBinaryStringInfo(&startup, "\x00\x00\x00\x00", 4); /* length placeholder */
 	{
 		char proto_bytes[4];
@@ -1748,19 +1744,19 @@ mux_ctrl_event(int idx, uint32 events)
 		int widx = cc->worker_idx;
 		MuxWorkerSlot *w = (widx >= 0) ? &mux_workers[widx] : NULL;
 
-		/* Write c2w buffer to worker */
-		if ((events & WL_SOCKET_WRITEABLE) && cc->c2w_len > 0 && w != NULL)
+		/* Write w2c buffer to ctrl_sock (worker→frontend direction) */
+		if ((events & WL_SOCKET_WRITEABLE) && cc->w2c_len > 0)
 		{
-			int written = send(w->worker_sock,
-							   cc->c2w_buf + cc->c2w_off,
-							   cc->c2w_len, 0);
+			int written = send(cc->ctrl_sock,
+							   cc->w2c_buf + cc->w2c_off,
+							   cc->w2c_len, 0);
 
 			if (written > 0)
 			{
-				cc->c2w_off += written;
-				cc->c2w_len -= written;
-				if (cc->c2w_len == 0)
-					cc->c2w_off = 0;
+				cc->w2c_off += written;
+				cc->w2c_len -= written;
+				if (cc->w2c_len == 0)
+					cc->w2c_off = 0;
 			}
 			else if (written == 0 || (errno != EAGAIN && errno != EWOULDBLOCK &&
 									  errno != EINPROGRESS && errno != EALREADY &&
@@ -1897,19 +1893,19 @@ mux_ctrl_worker_event(int idx, uint32 events)
 	if (w->worker_sock == PGINVALID_SOCKET)
 		return;
 
-	/* Write w2c buffer to ctrl_sock */
-	if ((events & WL_SOCKET_WRITEABLE) && cc->w2c_len > 0)
+	/* Write c2w buffer to worker_sock (frontend→worker direction) */
+	if ((events & WL_SOCKET_WRITEABLE) && cc->c2w_len > 0)
 	{
-		int written = send(cc->ctrl_sock,
-						   cc->w2c_buf + cc->w2c_off,
-						   cc->w2c_len, 0);
+		int written = send(w->worker_sock,
+						   cc->c2w_buf + cc->c2w_off,
+						   cc->c2w_len, 0);
 
 		if (written > 0)
 		{
-			cc->w2c_off += written;
-			cc->w2c_len -= written;
-			if (cc->w2c_len == 0)
-				cc->w2c_off = 0;
+			cc->c2w_off += written;
+			cc->c2w_len -= written;
+			if (cc->c2w_len == 0)
+				cc->c2w_off = 0;
 		}
 		else if (written == 0 || (errno != EAGAIN && errno != EWOULDBLOCK &&
 								  errno != EINPROGRESS && errno != EALREADY &&
