@@ -1,16 +1,22 @@
 /*-------------------------------------------------------------------------
  *
  * conn_multiplexer.h
- *		Connection multiplexer: one process per node with N local workers.
+ *		Connection multiplexer: transaction-level connection pool.
  *		Reduces total cluster connections from O(M×N) to O(M+N).
  *
  * Architecture:
- *  - One ConnMuxMain (multiplexer) process per node
- *  - N ConnMuxWorkerMain (SPI worker) processes per node (default 4)
- *  - Backends submit queries via MuxQuerySlot in shared memory + latch signal
- *  - Workers execute queries via SPI and return results via shm_mq
- *  - Inter-node communication via lazy TCP sockets to peer multiplexers
- *  - Transaction affinity: same-transaction queries go to the same worker
+ *  - One ConnMuxMain process per node, listening on mux_tcp_port
+ *  - Local backends connect to the mux instead of directly to the remote PG
+ *  - Mux speaks the PG wire protocol during startup, then becomes a tunnel
+ *  - Workers are persistent PG sessions on the remote node, pooled by
+ *    (database, username).  Multiple backends share workers; each backend
+ *    holds a worker exclusively only while it has an open transaction.
+ *  - Inter-mux protocol: control messages (TX_CONNECT / TX_BEGIN / TX_END /
+ *    TX_DISCONNECT) on each per-backend TCP socket; raw PG bytes tunneled
+ *    during a transaction.
+ *
+ * Control message wire format (all integers big-endian):
+ *   [type 1B][channel_id 4B][payload_len 4B][payload payload_len B]
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
@@ -24,7 +30,6 @@
 #include "libpq/pqcomm.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
-#include "storage/shm_mq.h"
 #include "storage/spin.h"
 #include "utils/timestamp.h"
 
@@ -32,140 +37,177 @@
  * Configuration limits
  * -------------------------------------------------------------------------
  */
-#define MUX_MAX_WORKERS			32		/* max N workers per node */
-#define MUX_DEFAULT_WORKERS		4		/* default worker count */
-#define MUX_MAX_SESSIONS		256		/* max concurrent backend sessions */
-#define MUX_MAX_PEERS			64		/* max peer multiplexer connections */
+#define MUX_MAX_WORKERS			32		/* max worker PG sessions per node */
+#define MUX_DEFAULT_WORKERS		4		/* default worker count GUC */
+#define MUX_MAX_CHANNELS		256		/* max concurrent backend channels */
+#define MUX_MAX_CTRL_CONNS		64		/* max incoming ctrl connections */
 #define MUX_TCP_PORT_DEFAULT	7432	/* default inter-mux TCP port */
-#define MUX_PROTOCOL_VERSION	196608	/* PG v3 protocol for mux clients */
-#define MUX_MQ_SIZE				(128 * 1024)	/* shm_mq ring buffer size */
-#define MUX_QUERY_MAX			8192	/* max query length */
-#define MUX_RESULT_MAX			(256 * 1024)	/* max result size */
-#define MUX_ERROR_MAX			512		/* max error message length */
-#define MUX_CLOCK_SWEEP_MAX		8		/* clock-sweep hand max position */
+#define MUX_PG_PROTOCOL_V3		196608	/* PG v3 startup packet marker */
+#define MUX_CLOCK_SWEEP_MAX		8		/* clock-sweep eviction threshold */
+#define MUX_STARTUP_MAX			8192	/* max PG startup packet bytes */
+#define MUX_PROXY_BUF			32768	/* tunnel data buffer size */
+#define MUX_STARTUP_RESP_MAX	4096	/* max stored startup response bytes */
+#define MUX_CTRL_HDR_LEN		9		/* type(1)+channel_id(4)+payload_len(4) */
+#define MUX_CTRL_PAYLOAD_MAX	(MUX_STARTUP_RESP_MAX + 64)
 
 /* -------------------------------------------------------------------------
- * Inter-mux wire protocol message types (1-byte type tag)
+ * Inter-mux control protocol message types (1-byte type tag, must be != 0
+ * so they are not confused with the first byte of a PG startup packet)
  * -------------------------------------------------------------------------
  */
-#define MUX_MSG_QUERY		'Q'		/* query request */
-#define MUX_MSG_RESULT		'R'		/* query result (data) */
-#define MUX_MSG_ERROR		'E'		/* query result (error) */
-#define MUX_MSG_PING		'P'		/* keepalive ping */
-#define MUX_MSG_PONG		'p'		/* keepalive pong */
-#define MUX_MSG_BEGIN		'B'		/* begin transaction */
-#define MUX_MSG_COMMIT		'C'		/* commit transaction */
-#define MUX_MSG_ABORT		'A'		/* abort transaction */
+#define MUX_MSG_CONNECT			'C'		/* local→remote: request worker for (db,user) */
+#define MUX_MSG_CONNECT_OK		'c'		/* remote→local: worker assigned, startup resp */
+#define MUX_MSG_CONNECT_FAIL	'!'		/* remote→local: no free slot, fall back */
+#define MUX_MSG_DISCONNECT		'D'		/* local→remote: backend fully done */
+#define MUX_MSG_TX_BEGIN		'B'		/* local→remote: claim worker for a transaction */
+#define MUX_MSG_TX_BEGIN_OK		'b'		/* remote→local: worker reserved, tunnel open */
+#define MUX_MSG_TX_BEGIN_WAIT	'w'		/* remote→local: no idle worker, retry later */
+#define MUX_MSG_TX_END			'E'		/* local→remote: transaction done, release */
+#define MUX_MSG_PING			'P'		/* either direction: keepalive */
+#define MUX_MSG_PONG			'p'		/* either direction: keepalive reply */
 
 /* -------------------------------------------------------------------------
- * MuxWorkerSlot — one per local worker process
- *
- * Shared memory layout inside the slot:
- *   [MuxWorkerSlot struct][mq_request_buf][mq_response_buf]
- * The shm_mq structs live at the start of each buffer.
+ * MuxWorkerSlot — one persistent PG session on the remote node.
+ * Managed entirely in process-local memory of ConnMuxMain.
  * -------------------------------------------------------------------------
  */
-typedef enum MuxWorkerPhase
-{
-	MWP_IDLE = 0,				/* waiting for a query */
-	MWP_BUSY,					/* executing a query */
-	MWP_SHUTDOWN,				/* shutting down */
-} MuxWorkerPhase;
-
 typedef struct MuxWorkerSlot
 {
-	pid_t		worker_pid;		/* PID of the worker process, 0 = not started */
-	MuxWorkerPhase phase;
-	int			session_id;		/* which MuxQuerySlot we're handling (-1=none) */
-	TransactionId xid;			/* current transaction XID for affinity */
-	int			use_count;		/* for clock-sweep idle reuse */
-	bool		mq_ready;		/* true once worker has initialized the mqs */
-	slock_t		mutex;			/* protects phase + session_id */
-
-	/* shm_mq ring buffers embedded directly in the slot */
-	char		mq_req_buf[MUX_MQ_SIZE];	/* backend→worker direction */
-	char		mq_resp_buf[MUX_MQ_SIZE];	/* worker→mux direction */
+	pgsocket	worker_sock;					/* TCP socket to PG backend session */
+	char		database[NAMEDATALEN];			/* logged-in database */
+	char		username[NAMEDATALEN];			/* logged-in user */
+	int			connect_cnt;					/* # channels sharing this worker */
+	bool		in_tx;							/* true = exclusively held for a TX */
+	int32		active_channel;				/* channel_id holding the TX, -1 if idle */
+	/* stored PG startup response to replay for newly connected channels */
+	char		startup_resp[MUX_STARTUP_RESP_MAX];
+	int			startup_resp_len;
 } MuxWorkerSlot;
 
 /* -------------------------------------------------------------------------
- * MuxQuerySlot — one per backend that wants the mux to execute a query
+ * MuxChannelState — state machine for a local-mux channel (one per backend)
  * -------------------------------------------------------------------------
  */
-typedef enum MuxQueryStatus
+typedef enum MuxChannelState
 {
-	MQS_FREE = 0,				/* slot available */
-	MQS_PENDING,				/* backend has written query, waiting for mux */
-	MQS_ASSIGNED,				/* mux has assigned a worker */
-	MQS_DONE,					/* result is ready */
-	MQS_ERROR,					/* error has occurred */
-} MuxQueryStatus;
-
-typedef struct MuxQuerySlot
-{
-	MuxQueryStatus status;		/* protected by MuxSharedState.mutex */
-	pid_t		backend_pid;	/* requesting backend's PID */
-	Latch	   *backend_latch;	/* latch to wake backend when done */
-
-	/* routing info */
-	Oid			server_oid;		/* InvalidOid = local; otherwise remote */
-	char		server_name[NAMEDATALEN];	/* foreign server name */
-	int			mux_port;		/* peer mux TCP port for this server */
-	char		peer_host[256]; /* peer mux host */
-
-	/* transaction context */
-	TransactionId xid;			/* transaction XID for affinity */
-	int			assigned_worker; /* worker handling this (-1 = none yet) */
-
-	/* query payload */
-	bool		is_readonly;
-	int			query_len;
-	char		query[MUX_QUERY_MAX];
-
-	/* result payload */
-	int			result_len;
-	char		result_buf[MUX_RESULT_MAX];
-
-	/* error payload */
-	char		error_msg[MUX_ERROR_MAX];
-} MuxQuerySlot;
+	MCH_EMPTY = 0,		/* free slot */
+	MCH_STARTUP,		/* reading PG startup packet from backend */
+	MCH_CONNECTING,		/* sent CONNECT, waiting for CONNECT_OK/FAIL */
+	MCH_READY,			/* connected, between transactions */
+	MCH_TX_PENDING,		/* sent TX_BEGIN, waiting for TX_BEGIN_OK/WAIT */
+	MCH_IN_TX,			/* tunnel mode: raw PG bytes flowing */
+} MuxChannelState;
 
 /* -------------------------------------------------------------------------
- * MuxRemoteConn — one TCP connection to a peer multiplexer
- * Managed with a clock-sweep eviction policy.
+ * MuxChannelSlot — one per backend connected to the local mux side.
+ * Managed entirely in process-local memory of ConnMuxMain.
  * -------------------------------------------------------------------------
  */
-typedef struct MuxRemoteConn
+typedef struct MuxChannelSlot
 {
-	pgsocket	sock;			/* TCP socket to peer mux, PGINVALID_SOCKET = free */
-	char		peer_host[256]; /* peer host */
-	int			peer_port;		/* peer mux_port */
-	TimestampTz last_used;		/* for clock-sweep */
-	int			clock_mark;		/* clock-sweep hand position 0..MUX_CLOCK_SWEEP_MAX */
-	int			pending_session; /* session_id waiting for response, -1 = idle */
-	bool		recv_in_progress; /* partial read in progress */
-	int			recv_total;		/* expected bytes for current message */
-	int			recv_got;		/* bytes received so far */
-	char		recv_buf[MUX_RESULT_MAX + 16]; /* receive buffer */
-} MuxRemoteConn;
+	int32			channel_id;
+	MuxChannelState	state;
+
+	char			database[NAMEDATALEN];
+	char			username[NAMEDATALEN];
+	char			target_host[256];		/* mux_target_host from startup */
+	int32			target_port;			/* mux_target_port from startup */
+
+	pgsocket		backend_sock;			/* TCP socket to local backend */
+	pgsocket		ctrl_sock;				/* TCP socket to remote mux */
+
+	/* startup data: reading PG startup packet from backend */
+	char			startup_buf[MUX_STARTUP_MAX];
+	int				startup_len;			/* total expected length (0 = not yet known) */
+	int				startup_off;			/* bytes read so far */
+
+	/* control response reading (CONNECT_OK/FAIL etc.) */
+	char			ctrl_hdr[MUX_CTRL_HDR_LEN];
+	int				ctrl_hdr_off;			/* bytes of ctrl header read so far */
+	char		   *ctrl_payload_buf;		/* palloc'd, NULL if no payload yet */
+	int				ctrl_payload_len;		/* expected payload length */
+	int				ctrl_payload_off;		/* bytes of payload read so far */
+
+	/* tunnel data buffers */
+	char			c2r_buf[MUX_PROXY_BUF];	/* backend→remote */
+	int				c2r_len;
+	int				c2r_off;
+	char			r2c_buf[MUX_PROXY_BUF];	/* remote→backend */
+	int				r2c_len;
+	int				r2c_off;
+
+	/* ReadyForQuery 'I' scanner state (for TX_END detection) */
+	int				rfq_scan_pos;			/* bytes matched in RFQ 'I' pattern */
+	bool			pending_tx_end;			/* RFQ 'I' seen; need to send TX_END */
+} MuxChannelSlot;
 
 /* -------------------------------------------------------------------------
- * MuxSharedState — global singleton in shared memory
+ * MuxCtrlConnState — state of an incoming control connection (remote side)
+ * -------------------------------------------------------------------------
+ */
+typedef enum MuxCtrlConnState
+{
+	MCC_EMPTY = 0,
+	MCC_READING_HDR,	/* reading 9-byte control message header */
+	MCC_READING_PAYLOAD,/* reading variable-length payload */
+	MCC_IN_TX,			/* tunnel mode: forwarding raw PG bytes */
+} MuxCtrlConnState;
+
+/* -------------------------------------------------------------------------
+ * MuxCtrlConn — one incoming control connection from a peer mux.
+ * Managed entirely in process-local memory of ConnMuxMain.
+ * -------------------------------------------------------------------------
+ */
+typedef struct MuxCtrlConn
+{
+	pgsocket		ctrl_sock;
+	MuxCtrlConnState state;
+
+	/* control message header being read */
+	char			hdr_buf[MUX_CTRL_HDR_LEN];
+	int				hdr_off;
+	char			msg_type;
+	int32			channel_id;
+	int				payload_len;
+	char			payload_buf[MUX_CTRL_PAYLOAD_MAX];
+	int				payload_off;
+
+	/* assigned worker for this channel (set at TX_CONNECT) */
+	int				worker_idx;			/* index into mux_workers[], -1 if none */
+
+	/* database/user for this channel */
+	char			database[NAMEDATALEN];
+	char			username[NAMEDATALEN];
+
+	/* tunnel buffers (used when state == MCC_IN_TX) */
+	char			c2w_buf[MUX_PROXY_BUF];	/* ctrl→worker */
+	int				c2w_len;
+	int				c2w_off;
+	char			w2c_buf[MUX_PROXY_BUF];	/* worker→ctrl */
+	int				w2c_len;
+	int				w2c_off;
+
+	/* ReadyForQuery 'I' scanner state (for TX_END detection on remote side) */
+	int				rfq_scan_pos;
+
+	/* outbound control message write buffer */
+	char			send_buf[MUX_CTRL_HDR_LEN + MUX_CTRL_PAYLOAD_MAX];
+	int				send_len;
+	int				send_off;
+} MuxCtrlConn;
+
+/* -------------------------------------------------------------------------
+ * MuxSharedState — minimal shared-memory singleton.
+ * In the new architecture the heavy data lives in process-local memory of
+ * ConnMuxMain; shared memory is only used so backends can check mux_ready.
  * -------------------------------------------------------------------------
  */
 typedef struct MuxSharedState
 {
-	/* Latch to wake the multiplexer when a new query slot is posted */
-	Latch		mux_latch;
+	Latch		mux_latch;		/* kept for potential future use / compat */
 	pid_t		mux_pid;		/* PID of ConnMuxMain, 0 = not running */
 	bool		mux_ready;		/* true once mux is listening */
-	int			n_workers;		/* current mux_worker_count setting */
-	slock_t		mutex;			/* protects session slots array */
-
-	/* Worker slots — fixed array, one per possible worker */
-	MuxWorkerSlot workers[MUX_MAX_WORKERS];
-
-	/* Session slots — one per backend using the mux */
-	MuxQuerySlot sessions[MUX_MAX_SESSIONS];
+	slock_t		mutex;
 } MuxSharedState;
 
 /* -------------------------------------------------------------------------
@@ -180,26 +222,12 @@ extern void ConnMuxRegister(void);
 extern Size ConnMuxShmemSize(void);
 extern void ConnMuxShmemInit(void);
 
-/* Background worker entry points (registered in InternalBGWorkers[]) */
+/* Background worker entry point */
 extern void ConnMuxMain(Datum main_arg);
-extern void ConnMuxWorkerMain(Datum main_arg);
 
-/* Backend-facing API: submit a query to the mux and wait for result */
+/* Backend-facing checks */
 extern bool ConnMuxIsAvailable(void);
 extern bool ConnMuxIsWorkerProcess(void);
-extern int	ConnMuxSubmitQuery(Oid server_oid,
-							   const char *server_name,
-							   const char *peer_host,
-							   int mux_port,
-							   TransactionId xid,
-							   bool is_readonly,
-							   const char *query,
-							   char *result_buf,
-							   int result_buf_size,
-							   int *result_len,
-							   char *error_buf,
-							   int error_buf_size);
-extern bool ConnMuxAdoptSocket(pgsocket sock);
 
 /* GUC variables */
 extern PGDLLIMPORT int mux_worker_count;

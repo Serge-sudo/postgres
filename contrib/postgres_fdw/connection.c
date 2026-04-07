@@ -507,10 +507,7 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 		char	   *appname = NULL;
 		char	   *mux_options = NULL;
 		char	   *mux_port_str = NULL;
-		const char *server_mux_host = NULL;
-		const char *server_mux_port = NULL;
 		int			n;
-		ListCell   *lc;
 
 		/*
 		 * Construct connection params from generic options of ForeignServer
@@ -529,27 +526,17 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 		n += ExtractConnectionOptions(user->options,
 									  keywords + n, values + n);
 
-		foreach(lc, server->options)
-		{
-			DefElem    *def = (DefElem *) lfirst(lc);
-
-			if (strcmp(def->defname, "mux_host") == 0)
-				server_mux_host = defGetString(def);
-			else if (strcmp(def->defname, "mux_port") == 0)
-				server_mux_port = defGetString(def);
-		}
-
 		/* If the local connection multiplexer is available, route via it. */
 		if (ConnMuxIsAvailable())
 		{
 			const char *orig_host = NULL;
 			const char *orig_port = NULL;
 			const char *orig_options = NULL;
-			int host_idx = -1;
-			int port_idx = -1;
-			int options_idx = -1;
-			int sslmode_idx = -1;
-			int i;
+			int			host_idx = -1;
+			int			port_idx = -1;
+			int			options_idx = -1;
+			int			sslmode_idx = -1;
+			int			i;
 
 			for (i = 0; i < n; i++)
 			{
@@ -578,28 +565,19 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 
 			if (orig_host != NULL && orig_port != NULL)
 			{
-				const char *mux_target_host = orig_host;
-				const char *mux_target_port = orig_port;
-				const char *mux_connect_host = (server_mux_host && *server_mux_host) ?
-				server_mux_host : orig_host;
-				const char *mux_connect_port = (server_mux_port && *server_mux_port) ?
-				server_mux_port : orig_port;
-				bool		direct_mux = (server_mux_port && *server_mux_port);
-
+				/*
+				 * Route through the local mux.  Embed the real target host
+				 * and port in the options string so the mux knows where to
+				 * connect.  The mux_host/mux_port ForeignServer options are
+				 * used by the mux itself (read from pg_foreign_server catalog)
+				 * and do NOT need to be in the startup packet.
+				 */
 				if (orig_options != NULL && *orig_options != '\0')
-					mux_options = direct_mux ?
-						psprintf("%s -c mux_target_host=%s -c mux_target_port=%s -c mux_connect_host=%s -c mux_connect_port=%s",
-								 orig_options, mux_target_host, mux_target_port,
-								 mux_connect_host, mux_connect_port) :
-						psprintf("%s -c mux_target_host=%s -c mux_target_port=%s",
-								 orig_options, mux_target_host, mux_target_port);
+					mux_options = psprintf("%s -c mux_target_host=%s -c mux_target_port=%s",
+										   orig_options, orig_host, orig_port);
 				else
-					mux_options = direct_mux ?
-						psprintf("-c mux_target_host=%s -c mux_target_port=%s -c mux_connect_host=%s -c mux_connect_port=%s",
-								 mux_target_host, mux_target_port,
-								 mux_connect_host, mux_connect_port) :
-						psprintf("-c mux_target_host=%s -c mux_target_port=%s",
-								 mux_target_host, mux_target_port);
+					mux_options = psprintf("-c mux_target_host=%s -c mux_target_port=%s",
+										   orig_host, orig_port);
 
 				if (options_idx >= 0)
 					values[options_idx] = mux_options;
