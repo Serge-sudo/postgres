@@ -402,13 +402,12 @@ mux_open_tcp(const char *host, int port)
 	int ret;
 	int one = 1;
 
-	if (host && is_unixsock_path(host))
+	if (host && host[0] != '\0' && is_unixsock_path(host))
 	{
 		struct sockaddr_un addr;
 		char unix_path[MAXPGPATH];
 
-		UNIXSOCK_PATH(unix_path, port, host);
-		if (strlen(unix_path) >= UNIXSOCK_PATH_BUFLEN)
+		if (UNIXSOCK_PATH(unix_path, port, host) >= UNIXSOCK_PATH_BUFLEN)
 		{
 			elog(WARNING, "connection multiplexer: unix socket path too long: %s",
 				 unix_path);
