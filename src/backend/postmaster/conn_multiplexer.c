@@ -401,16 +401,24 @@ mux_open_tcp(const char *host, int port)
 	char portstr[16];
 	int ret;
 	int one = 1;
+	int pathlen;
 
-	if (host && host[0] != '\0' && is_unixsock_path(host))
+	if (host == NULL || host[0] == '\0')
+	{
+		elog(WARNING, "connection multiplexer: empty host for connection");
+		return PGINVALID_SOCKET;
+	}
+
+	if (is_unixsock_path(host))
 	{
 		struct sockaddr_un addr;
 		char unix_path[MAXPGPATH];
 
-		if (UNIXSOCK_PATH(unix_path, port, host) >= UNIXSOCK_PATH_BUFLEN)
+		pathlen = UNIXSOCK_PATH(unix_path, port, host);
+		if (pathlen >= UNIXSOCK_PATH_BUFLEN)
 		{
 			elog(WARNING, "connection multiplexer: unix socket path too long: %s",
-				 unix_path);
+				 host);
 			return PGINVALID_SOCKET;
 		}
 
