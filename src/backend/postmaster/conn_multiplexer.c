@@ -1076,10 +1076,39 @@ mux_channel_backend_event(int idx, uint32 events)
 			mux_channel_close(idx);
 			return;
 		}
+
+		/*
+		 * If TX_END is pending and the r2c buffer just became empty, send
+		 * TX_END immediately here without waiting for a ctrl_sock event.
+		 * This prevents a stall when the remote mux has already exited
+		 * tunnel mode and won't send any more data on ctrl_sock.
+		 */
+		if (ch->state == MCH_IN_TX && ch->pending_tx_end && ch->r2c_len == 0)
+		{
+			if (!mux_send_ctrl(ch->ctrl_sock, MUX_MSG_TX_END,
+							   ch->channel_id, NULL, 0))
+			{
+				MUX_LOG("channel %d: failed to send TX_END", ch->channel_id);
+				mux_channel_close(idx);
+				return;
+			}
+			ch->pending_tx_end = false;
+			ch->state = MCH_READY;
+			ch->ctrl_hdr_off = 0;
+			ch->c2r_len = 0;
+			ch->c2r_off = 0;
+			MUX_LOG("channel %d: TX_END sent, back to READY", ch->channel_id);
+			return;
+		}
 	}
 
-	/* Read new data from backend into c2r buffer */
-	if ((events & WL_SOCKET_READABLE) && ch->c2r_len < MUX_PROXY_BUF)
+	/*
+	 * Read new data from backend into c2r buffer.
+	 * Skip when TX_END is pending — we must not read (and later forward)
+	 * the next query as tunnel data while the remote is in control mode.
+	 */
+	if ((events & WL_SOCKET_READABLE) && ch->c2r_len < MUX_PROXY_BUF &&
+		!ch->pending_tx_end)
 	{
 		int readn = recv(ch->backend_sock,
 						 ch->c2r_buf + ch->c2r_len,
@@ -1158,8 +1187,14 @@ mux_channel_ctrl_event(int idx, uint32 events)
 
 	if (ch->state == MCH_IN_TX)
 	{
-		/* Write buffered c2r data to remote worker (via ctrl_sock) */
-		if ((events & WL_SOCKET_WRITEABLE) && ch->c2r_len > 0)
+		/*
+		 * Write buffered c2r data to remote worker (via ctrl_sock).
+		 * Stop forwarding once TX_END is pending — the remote has already
+		 * exited tunnel mode and would misinterpret any further bytes as a
+		 * control message.
+		 */
+		if ((events & WL_SOCKET_WRITEABLE) && ch->c2r_len > 0 &&
+			!ch->pending_tx_end)
 		{
 			int written = send(ch->ctrl_sock,
 							   ch->c2r_buf + ch->c2r_off,
@@ -2160,7 +2195,13 @@ ConnMuxEventLoop(void)
 					be_mask = WL_SOCKET_READABLE;
 				else if (ch->state == MCH_IN_TX || ch->state == MCH_READY)
 				{
-					if (ch->c2r_len < MUX_PROXY_BUF)
+					/*
+					 * Don't read from the backend while TX_END is pending.
+					 * The next query must not be buffered until we finish the
+					 * current transaction handshake with the remote mux.
+					 */
+					if (ch->c2r_len < MUX_PROXY_BUF &&
+						!(ch->state == MCH_IN_TX && ch->pending_tx_end))
 						be_mask |= WL_SOCKET_READABLE;
 					if (ch->r2c_len > 0)
 						be_mask |= WL_SOCKET_WRITEABLE;
@@ -2178,7 +2219,8 @@ ConnMuxEventLoop(void)
 				{
 					if (ch->r2c_len < MUX_PROXY_BUF)
 						ctrl_mask |= WL_SOCKET_READABLE;
-					if (ch->c2r_len > 0)
+					/* Don't request writable for c2r when tx_end is pending */
+					if (ch->c2r_len > 0 && !ch->pending_tx_end)
 						ctrl_mask |= WL_SOCKET_WRITEABLE;
 				}
 				if (ctrl_mask)
