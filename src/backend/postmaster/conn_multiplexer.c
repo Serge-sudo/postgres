@@ -2201,9 +2201,6 @@ ConnMuxEventLoop(void)
 			if (cc->ctrl_sock != PGINVALID_SOCKET)
 			{
 				ctrl_mask = WL_SOCKET_READABLE;
-				if (cc->state == MCC_IN_TX && !cc->rfq_detected &&
-					cc->c2w_len < MUX_PROXY_BUF)
-					ctrl_mask |= WL_SOCKET_READABLE;
 				if (cc->w2c_len > 0)
 					ctrl_mask |= WL_SOCKET_WRITEABLE;
 				if (ctrl_mask)
