@@ -63,7 +63,7 @@
 #include "utils/wait_event.h"
 
 #ifndef MULTIPLEXER_LOG_LEVEL
-#define MULTIPLEXER_LOG_LEVEL WARNING
+#define MULTIPLEXER_LOG_LEVEL DEBUG1
 #endif
 
 #define MUX_LOG(fmt, ...)          \
@@ -2273,14 +2273,7 @@ ConnMuxEventLoop(void)
 		int i;
 		int wes_size;
 
-		/*
-		 * Exit cleanly on fast shutdown. Avoid FATAL "terminating background
-		 * worker" noise by handling ProcDiePending directly.
-		 */
-		if (ProcDiePending)
-			proc_exit(0);
 		CHECK_FOR_INTERRUPTS();
-
 		/* Estimate event set size */
 		wes_size = 4 +
 				   MUX_MAX_PENDING +

@@ -597,11 +597,9 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 					 */
 					elog(WARNING,
 						 "postgres_fdw: server \"%s\" has no mux_port option; "
-						 "falling back to local mux_tcp_port=%d "
-						 "(routing may be incorrect for remote nodes with a "
-						 "different mux port)",
-						 server->servername, mux_tcp_port);
-					remote_mux_port_str = psprintf("%d", mux_tcp_port);
+						 "falling back to backend spawn",
+						 server->servername);
+					goto no_mux_set;
 				}
 
 				if (orig_options != NULL && *orig_options != '\0')
@@ -651,6 +649,7 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 				}
 			}
 		}
+no_mux_set:
 
 		/*
 		 * Use pgfdw_application_name as application_name if set.

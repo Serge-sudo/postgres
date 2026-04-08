@@ -3456,7 +3456,7 @@ struct config_int ConfigureNamesInt[] =
 			NULL
 		},
 		&mux_worker_count,
-		MUX_DEFAULT_WORKERS, 0, MUX_MAX_WORKERS,
+		0, 0, MUX_MAX_WORKERS,
 		NULL, NULL, NULL
 	},
 

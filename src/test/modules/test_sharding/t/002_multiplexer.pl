@@ -130,12 +130,10 @@ is($node2->safe_psql('postgres', "SELECT count(*) FROM t1;"),
 is($node3->safe_psql('postgres', "SELECT count(*) FROM t1;"),
 	'3', 'node3 sees deletes from all nodes');
 
+$node1->safe_psql('postgres', "ALTER SHARD GROUP group1 RESHARD;");
+
 is($node1->safe_psql('postgres',
 	"SELECT string_agg(a::text, ',' ORDER BY a) FROM t1;"),
 	'1,3,102', 'remaining rows are consistent after writes from every node');
-
-$node1->stop;
-$node2->stop;
-$node3->stop;
 
 done_testing();
