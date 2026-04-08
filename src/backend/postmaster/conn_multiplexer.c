@@ -76,16 +76,10 @@
  */
 int mux_worker_count = MUX_DEFAULT_WORKERS;
 int mux_tcp_port = MUX_TCP_PORT_DEFAULT;
-char *mux_pg_host = NULL;
 
 static const char *
 mux_select_pg_host(char *buf, size_t buflen)
 {
-	const char *host = mux_pg_host;
-
-	if (host && host[0] != '\0')
-		return host;
-
 	if (Unix_socket_directories && Unix_socket_directories[0] != '\0')
 	{
 		const char *start = Unix_socket_directories;
@@ -104,6 +98,32 @@ mux_select_pg_host(char *buf, size_t buflen)
 				len = buflen - 1;
 			memcpy(buf, start, len);
 			buf[len] = '\0';
+			return buf;
+		}
+	}
+
+	if (ListenAddresses && ListenAddresses[0] != '\0')
+	{
+		const char *start = ListenAddresses;
+		const char *end;
+		size_t len;
+
+		while (*start && isspace((unsigned char) *start))
+			start++;
+		end = strchr(start, ',');
+		len = end ? (size_t)(end - start) : strlen(start);
+		while (len > 0 && isspace((unsigned char) start[len - 1]))
+			len--;
+		if (len > 0)
+		{
+			if (len >= buflen)
+				len = buflen - 1;
+			memcpy(buf, start, len);
+			buf[len] = '\0';
+			if (strcmp(buf, "*") == 0 || strcmp(buf, "0.0.0.0") == 0)
+				return "127.0.0.1";
+			if (strcmp(buf, "::") == 0)
+				return "::1";
 			return buf;
 		}
 	}
