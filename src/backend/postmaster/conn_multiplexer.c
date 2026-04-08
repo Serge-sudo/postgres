@@ -71,7 +71,6 @@
  * GUC variables
  * -------------------------------------------------------------------------
  */
-bool enable_multiplexer = true;
 int mux_worker_count = MUX_DEFAULT_WORKERS;
 int mux_tcp_port = MUX_TCP_PORT_DEFAULT;
 
@@ -279,12 +278,17 @@ mux_scan_rfq_idle(const char *buf, int len, int *scan_pos_inout)
 
 Size ConnMuxShmemSize(void)
 {
+	if (mux_worker_count <= 0)
+		return 0;
 	return MAXALIGN(sizeof(MuxSharedState));
 }
 
 void ConnMuxShmemInit(void)
 {
 	bool found;
+
+	if (mux_worker_count <= 0)
+		return;
 
 	MuxState = (MuxSharedState *)
 		ShmemInitStruct("Connection Multiplexer Data",
@@ -308,7 +312,7 @@ void ConnMuxRegister(void)
 {
 	BackgroundWorker bgw;
 
-	if (!enable_multiplexer || mux_worker_count <= 0)
+	if (mux_worker_count <= 0)
 		return;
 
 	memset(&bgw, 0, sizeof(bgw));
@@ -331,7 +335,7 @@ void ConnMuxRegister(void)
 
 bool ConnMuxIsAvailable(void)
 {
-	if (!enable_multiplexer)
+	if (mux_worker_count <= 0)
 		return false;
 	if (MuxState == NULL)
 		return false;

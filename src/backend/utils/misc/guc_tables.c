@@ -108,7 +108,6 @@ extern bool ignore_checksum_failure;
 extern bool ignore_invalid_pages;
 
 /* Connection multiplexer GUCs (defined in conn_multiplexer.c) */
-extern bool enable_multiplexer;
 extern int	mux_worker_count;
 extern int	mux_tcp_port;
 
@@ -2061,16 +2060,6 @@ struct config_bool ConfigureNamesBool[] =
 		},
 		&sync_replication_slots,
 		false,
-		NULL, NULL, NULL
-	},
-
-	{
-		{"enable_multiplexer", PGC_POSTMASTER, CONN_AUTH_SETTINGS,
-			gettext_noop("Enables the connection multiplexer background worker."),
-			gettext_noop("When disabled, postgres_fdw connections bypass the multiplexer and connect directly."),
-		},
-		&enable_multiplexer,
-		true,
 		NULL, NULL, NULL
 	},
 
