@@ -76,7 +76,7 @@
  */
 int mux_worker_count = MUX_DEFAULT_WORKERS;
 int mux_tcp_port = MUX_TCP_PORT_DEFAULT;
-char *mux_pg_host = "";
+char *mux_pg_host = NULL;
 
 static const char *
 mux_select_pg_host(char *buf, size_t buflen)
