@@ -190,6 +190,7 @@ typedef struct MuxCtrlConn
 
 	/* ReadyForQuery 'I' scanner state (for TX_END detection on remote side) */
 	int				rfq_scan_pos;
+	bool			rfq_detected;	/* RFQ 'I' seen; flush w2c_buf before exiting tunnel */
 
 	/* outbound control message write buffer */
 	char			send_buf[MUX_CTRL_HDR_LEN + MUX_CTRL_PAYLOAD_MAX];

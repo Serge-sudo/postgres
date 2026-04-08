@@ -1495,6 +1495,7 @@ mux_ctrl_init(MuxCtrlConn *cc)
 	cc->w2c_len = 0;
 	cc->w2c_off = 0;
 	cc->rfq_scan_pos = 0;
+	cc->rfq_detected = false;
 	cc->send_len = 0;
 	cc->send_off = 0;
 }
@@ -1754,9 +1755,6 @@ mux_ctrl_event(int idx, uint32 events)
 
 	if (cc->state == MCC_IN_TX)
 	{
-		int widx = cc->worker_idx;
-		MuxWorkerSlot *w = (widx >= 0) ? &mux_workers[widx] : NULL;
-
 		/* Write w2c buffer to ctrl_sock (worker→frontend direction) */
 		if ((events & WL_SOCKET_WRITEABLE) && cc->w2c_len > 0)
 		{
@@ -1780,27 +1778,46 @@ mux_ctrl_event(int idx, uint32 events)
 			}
 		}
 
-		/* Read from ctrl_sock (frontend data) into c2w buffer */
-		if ((events & WL_SOCKET_READABLE) && cc->c2w_len < MUX_PROXY_BUF)
+		/*
+		 * If RFQ was detected and w2c_buf is now empty, exit tunnel mode.
+		 * The local mux will have received the RFQ and will send TX_END as
+		 * the next control message on ctrl_sock.
+		 */
+		if (cc->rfq_detected && cc->w2c_len == 0)
 		{
-			int readn = recv(cc->ctrl_sock,
-							 cc->c2w_buf + cc->c2w_len,
-							 MUX_PROXY_BUF - cc->c2w_len, 0);
-
-			if (readn > 0)
-				cc->c2w_len += readn;
-			else if (readn == 0)
-			{
-				mux_ctrl_close(idx);
-				return;
-			}
-			else if (errno != EAGAIN && errno != EWOULDBLOCK)
-			{
-				mux_ctrl_close(idx);
-				return;
-			}
+			MUX_LOG("ctrl %d: w2c flushed after RFQ, exiting tunnel", idx);
+			cc->rfq_detected = false;
+			cc->rfq_scan_pos = 0;
+			cc->state = MCC_READING_HDR;
+			cc->hdr_off = 0;
+			/* Fall through to control-message reading below */
 		}
-		return;
+		else
+		{
+			/* Still in tunnel mode: read frontend data into c2w buffer */
+			if (!cc->rfq_detected &&
+				(events & WL_SOCKET_READABLE) &&
+				cc->c2w_len < MUX_PROXY_BUF)
+			{
+				int readn = recv(cc->ctrl_sock,
+								 cc->c2w_buf + cc->c2w_len,
+								 MUX_PROXY_BUF - cc->c2w_len, 0);
+
+				if (readn > 0)
+					cc->c2w_len += readn;
+				else if (readn == 0)
+				{
+					mux_ctrl_close(idx);
+					return;
+				}
+				else if (errno != EAGAIN && errno != EWOULDBLOCK)
+				{
+					mux_ctrl_close(idx);
+					return;
+				}
+			}
+			return;
+		}
 	}
 
 	/* Control mode: read messages */
@@ -1948,19 +1965,20 @@ mux_ctrl_worker_event(int idx, uint32 events)
 			if (found_rfq)
 			{
 				/*
-				 * Transaction ended on the worker side.  Exit tunnel mode
-				 * after flushing w2c; the next bytes from ctrl_sock will be
-				 * the TX_END control message.
+				 * Transaction ended on the worker side.  Set rfq_detected
+				 * and release the worker's in_tx flag, but do NOT change
+				 * state yet — we must first flush w2c_buf (including the
+				 * RFQ bytes) to ctrl_sock so the local mux can detect the
+				 * transaction end and send TX_END.  mux_ctrl_event will
+				 * transition to MCC_READING_HDR once w2c_buf is empty.
 				 */
-				MUX_LOG("ctrl %d: worker RFQ 'I' detected, exiting tunnel", idx);
-				/* Release the worker's in_tx flag preemptively */
+				MUX_LOG("ctrl %d: worker RFQ 'I' detected, pending tunnel exit", idx);
 				if (w->in_tx && w->active_channel == cc->channel_id)
 				{
 					w->in_tx = false;
 					w->active_channel = -1;
 				}
-				cc->state = MCC_READING_HDR;
-				cc->hdr_off = 0;
+				cc->rfq_detected = true;
 			}
 		}
 		else if (readn == 0)
@@ -2183,7 +2201,8 @@ ConnMuxEventLoop(void)
 			if (cc->ctrl_sock != PGINVALID_SOCKET)
 			{
 				ctrl_mask = WL_SOCKET_READABLE;
-				if (cc->state == MCC_IN_TX && cc->c2w_len < MUX_PROXY_BUF)
+				if (cc->state == MCC_IN_TX && !cc->rfq_detected &&
+					cc->c2w_len < MUX_PROXY_BUF)
 					ctrl_mask |= WL_SOCKET_READABLE;
 				if (cc->w2c_len > 0)
 					ctrl_mask |= WL_SOCKET_WRITEABLE;
@@ -2197,7 +2216,7 @@ ConnMuxEventLoop(void)
 				widx >= 0 && widx < MUX_MAX_WORKERS &&
 				mux_workers[widx].worker_sock != PGINVALID_SOCKET)
 			{
-				if (cc->w2c_len < MUX_PROXY_BUF)
+				if (cc->w2c_len < MUX_PROXY_BUF && !cc->rfq_detected)
 					worker_mask |= WL_SOCKET_READABLE;
 				if (cc->c2w_len > 0)
 					worker_mask |= WL_SOCKET_WRITEABLE;
