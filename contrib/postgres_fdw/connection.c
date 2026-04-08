@@ -588,7 +588,21 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 				}
 
 				if (remote_mux_port_str == NULL || *remote_mux_port_str == '\0')
+				{
+					/*
+					 * No mux_port configured for this server.  Fall back to
+					 * the local mux_tcp_port GUC, which only works correctly
+					 * if all nodes use the same mux port.  Add mux_port to
+					 * the ForeignServer definition to avoid this fallback.
+					 */
+					elog(WARNING,
+						 "postgres_fdw: server \"%s\" has no mux_port option; "
+						 "falling back to local mux_tcp_port=%d "
+						 "(routing may be incorrect for remote nodes with a "
+						 "different mux port)",
+						 server->servername, mux_tcp_port);
 					remote_mux_port_str = psprintf("%d", mux_tcp_port);
+				}
 
 				if (orig_options != NULL && *orig_options != '\0')
 					mux_options = psprintf("%s -c mux_target_host=%s -c mux_target_port=%s -c mux_target_mux_port=%s",
