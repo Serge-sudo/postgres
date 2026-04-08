@@ -411,11 +411,11 @@ mux_open_tcp(const char *host, int port)
 	if (is_unixsock_path(host))
 	{
 		struct sockaddr_un addr;
-		char unix_path[MAXPGPATH];
+		char unix_socket_path[MAXPGPATH];
 		int pathlen;
 
-		pathlen = UNIXSOCK_PATH(unix_path, port, host);
-		if (pathlen < 0 || pathlen >= UNIXSOCK_PATH_BUFLEN)
+		pathlen = UNIXSOCK_PATH(unix_socket_path, port, host);
+		if (pathlen < 0 || pathlen >= (int) sizeof(addr.sun_path))
 		{
 			elog(WARNING, "connection multiplexer: unix socket path too long: %s",
 				 host);
@@ -428,7 +428,7 @@ mux_open_tcp(const char *host, int port)
 
 		MemSet(&addr, 0, sizeof(addr));
 		addr.sun_family = AF_UNIX;
-		strlcpy(addr.sun_path, unix_path, sizeof(addr.sun_path));
+		strlcpy(addr.sun_path, unix_socket_path, sizeof(addr.sun_path));
 
 		if (connect(sock, (struct sockaddr *) &addr, sizeof(addr)) < 0)
 		{
