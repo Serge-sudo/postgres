@@ -110,6 +110,7 @@ extern bool ignore_invalid_pages;
 /* Connection multiplexer GUCs (defined in conn_multiplexer.c) */
 extern int	mux_worker_count;
 extern int	mux_tcp_port;
+extern char *mux_pg_host;
 
 #ifdef TRACE_SYNCSCAN
 extern bool trace_syncscan;
@@ -4794,6 +4795,16 @@ struct config_string ConfigureNamesString[] =
 		&restrict_nonsystem_relation_kind_string,
 		"",
 		check_restrict_nonsystem_relation_kind, assign_restrict_nonsystem_relation_kind, NULL
+	},
+
+	{
+		{"mux_pg_host", PGC_POSTMASTER, CONN_AUTH_SETTINGS,
+			gettext_noop("Sets the host or Unix socket directory used for multiplexer worker connections."),
+			gettext_noop("If empty, the first entry from unix_socket_directories is used."),
+		},
+		&mux_pg_host,
+		"",
+		NULL, NULL, NULL
 	},
 
 	/* End-of-list marker */

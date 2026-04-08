@@ -234,5 +234,6 @@ extern bool ConnMuxIsWorkerProcess(void);
 /* GUC variables */
 extern PGDLLIMPORT int mux_worker_count;
 extern PGDLLIMPORT int mux_tcp_port;
+extern PGDLLIMPORT char *mux_pg_host;
 
 #endif							/* CONN_MULTIPLEXER_H */

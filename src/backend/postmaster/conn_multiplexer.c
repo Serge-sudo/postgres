@@ -32,16 +32,19 @@
  */
 #include "postgres.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/types.h>
 #include <unistd.h>
 
 #include "lib/stringinfo.h"
+#include "libpq/pqcomm.h"
 #include "miscadmin.h"
 #include "tcop/tcopprot.h"	
 #include "port.h"
@@ -73,6 +76,40 @@
  */
 int mux_worker_count = MUX_DEFAULT_WORKERS;
 int mux_tcp_port = MUX_TCP_PORT_DEFAULT;
+char *mux_pg_host = "";
+
+static const char *
+mux_select_pg_host(char *buf, size_t buflen)
+{
+	const char *host = mux_pg_host;
+
+	if (host && host[0] != '\0')
+		return host;
+
+	if (Unix_socket_directories && Unix_socket_directories[0] != '\0')
+	{
+		const char *start = Unix_socket_directories;
+		const char *end;
+		size_t len;
+
+		while (*start && isspace((unsigned char) *start))
+			start++;
+		end = strchr(start, ',');
+		len = end ? (size_t)(end - start) : strlen(start);
+		while (len > 0 && isspace((unsigned char) start[len - 1]))
+			len--;
+		if (len > 0)
+		{
+			if (len >= buflen)
+				len = buflen - 1;
+			memcpy(buf, start, len);
+			buf[len] = '\0';
+			return buf;
+		}
+	}
+
+	return "127.0.0.1";
+}
 
 /* -------------------------------------------------------------------------
  * Shared state pointer (set once at shmem init)
@@ -364,6 +401,48 @@ mux_open_tcp(const char *host, int port)
 	char portstr[16];
 	int ret;
 	int one = 1;
+
+	if (host && is_unixsock_path(host))
+	{
+		struct sockaddr_un addr;
+		char unix_path[MAXPGPATH];
+
+		UNIXSOCK_PATH(unix_path, port, host);
+		if (strlen(unix_path) >= UNIXSOCK_PATH_BUFLEN)
+		{
+			elog(WARNING, "connection multiplexer: unix socket path too long: %s",
+				 unix_path);
+			return PGINVALID_SOCKET;
+		}
+
+		sock = socket(AF_UNIX, SOCK_STREAM, 0);
+		if (sock == PGINVALID_SOCKET)
+			return PGINVALID_SOCKET;
+
+		MemSet(&addr, 0, sizeof(addr));
+		addr.sun_family = AF_UNIX;
+		strlcpy(addr.sun_path, unix_path, sizeof(addr.sun_path));
+
+		if (connect(sock, (struct sockaddr *) &addr, sizeof(addr)) < 0)
+		{
+			closesocket(sock);
+			return PGINVALID_SOCKET;
+		}
+
+		if (!pg_set_noblock(sock))
+		{
+			closesocket(sock);
+			return PGINVALID_SOCKET;
+		}
+
+		if (fcntl(sock, F_SETFD, FD_CLOEXEC) < 0)
+		{
+			closesocket(sock);
+			return PGINVALID_SOCKET;
+		}
+
+		return sock;
+	}
 
 	MemSet(&hint, 0, sizeof(hint));
 	hint.ai_family = AF_UNSPEC;
@@ -1481,6 +1560,8 @@ mux_find_or_spawn_worker(const char *database, const char *username)
 {
 	int i;
 	int free_slot = -1;
+	char pg_host_buf[MAXPGPATH];
+	const char *pg_host = NULL;
 
 	/* Find an existing worker for this (db, user) */
 	for (i = 0; i < MUX_MAX_WORKERS; i++)
@@ -1507,9 +1588,10 @@ mux_find_or_spawn_worker(const char *database, const char *username)
 	if (mux_n_workers >= mux_worker_count || free_slot < 0)
 		return -1;
 	mux_worker_init(&mux_workers[free_slot]);
+	pg_host = mux_select_pg_host(pg_host_buf, sizeof(pg_host_buf));
 	if (!mux_spawn_worker(&mux_workers[free_slot],
 						  database, username,
-						  "127.0.0.1", PostPortNumber))
+						  pg_host, PostPortNumber))
 		return -1;
 
 	return free_slot;
