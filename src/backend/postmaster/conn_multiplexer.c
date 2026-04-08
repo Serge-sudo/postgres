@@ -1561,7 +1561,7 @@ mux_find_or_spawn_worker(const char *database, const char *username)
 	int i;
 	int free_slot = -1;
 	char pg_host_buf[MAXPGPATH];
-	const char *pg_host = NULL;
+	const char *pg_host;
 
 	/* Find an existing worker for this (db, user) */
 	for (i = 0; i < MUX_MAX_WORKERS; i++)
