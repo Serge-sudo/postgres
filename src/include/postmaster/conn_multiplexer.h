@@ -232,6 +232,7 @@ extern bool ConnMuxIsAvailable(void);
 extern bool ConnMuxIsWorkerProcess(void);
 
 /* GUC variables */
+extern PGDLLIMPORT bool enable_multiplexer;
 extern PGDLLIMPORT int mux_worker_count;
 extern PGDLLIMPORT int mux_tcp_port;
 

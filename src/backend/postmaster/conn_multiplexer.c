@@ -71,6 +71,7 @@
  * GUC variables
  * -------------------------------------------------------------------------
  */
+bool enable_multiplexer = true;
 int mux_worker_count = MUX_DEFAULT_WORKERS;
 int mux_tcp_port = MUX_TCP_PORT_DEFAULT;
 
@@ -307,7 +308,7 @@ void ConnMuxRegister(void)
 {
 	BackgroundWorker bgw;
 
-	if (mux_worker_count <= 0)
+	if (!enable_multiplexer || mux_worker_count <= 0)
 		return;
 
 	memset(&bgw, 0, sizeof(bgw));
@@ -330,6 +331,8 @@ void ConnMuxRegister(void)
 
 bool ConnMuxIsAvailable(void)
 {
+	if (!enable_multiplexer)
+		return false;
 	if (MuxState == NULL)
 		return false;
 	return MuxState->mux_ready;
@@ -2156,6 +2159,9 @@ ConnMuxEventLoop(void)
 		int n_events;
 		int i;
 		int wes_size;
+
+		/* Check for SIGTERM / ProcDiePending set by die() handler */
+		CHECK_FOR_INTERRUPTS();
 
 		/* Estimate event set size */
 		wes_size = 4 +
