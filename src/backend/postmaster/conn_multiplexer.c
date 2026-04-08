@@ -2273,7 +2273,12 @@ ConnMuxEventLoop(void)
 		int i;
 		int wes_size;
 
-		/* Check for SIGTERM / ProcDiePending set by die() handler */
+		/*
+		 * Exit cleanly on fast shutdown. Avoid FATAL "terminating background
+		 * worker" noise by handling ProcDiePending directly.
+		 */
+		if (ProcDiePending)
+			proc_exit(0);
 		CHECK_FOR_INTERRUPTS();
 
 		/* Estimate event set size */
