@@ -566,18 +566,38 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 			if (orig_host != NULL && orig_port != NULL)
 			{
 				/*
-				 * Route through the local mux.  Embed the real target host
-				 * and port in the options string so the mux knows where to
-				 * connect.  The mux_host/mux_port ForeignServer options are
-				 * used by the mux itself (read from pg_foreign_server catalog)
-				 * and do NOT need to be in the startup packet.
+				 * Route through the local mux.  Embed the real target host,
+				 * port, and remote mux port in the options string so the mux
+				 * knows where to connect.  mux_target_mux_port is the TCP
+				 * port of the remote node's multiplexer (from the mux_port
+				 * ForeignServer option); the local mux uses it to open the
+				 * inter-mux control connection.
 				 */
+				const char *remote_mux_port_str = NULL;
+				ListCell   *opt_lc;
+
+				foreach(opt_lc, server->options)
+				{
+					DefElem *def = (DefElem *) lfirst(opt_lc);
+
+					if (strcmp(def->defname, "mux_port") == 0)
+					{
+						remote_mux_port_str = defGetString(def);
+						break;
+					}
+				}
+
+				if (remote_mux_port_str == NULL || *remote_mux_port_str == '\0')
+					remote_mux_port_str = psprintf("%d", mux_tcp_port);
+
 				if (orig_options != NULL && *orig_options != '\0')
-					mux_options = psprintf("%s -c mux_target_host=%s -c mux_target_port=%s",
-										   orig_options, orig_host, orig_port);
+					mux_options = psprintf("%s -c mux_target_host=%s -c mux_target_port=%s -c mux_target_mux_port=%s",
+										   orig_options, orig_host, orig_port,
+										   remote_mux_port_str);
 				else
-					mux_options = psprintf("-c mux_target_host=%s -c mux_target_port=%s",
-										   orig_host, orig_port);
+					mux_options = psprintf("-c mux_target_host=%s -c mux_target_port=%s -c mux_target_mux_port=%s",
+										   orig_host, orig_port,
+										   remote_mux_port_str);
 
 				if (options_idx >= 0)
 					values[options_idx] = mux_options;

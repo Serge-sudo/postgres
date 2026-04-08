@@ -140,6 +140,11 @@ mux_write_all(pgsocket sock, const void *buf, int len)
 		{
 			if (errno == EINTR)
 				continue;
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+			{
+				pg_usleep(1000);
+				continue;
+			}
 			return false;
 		}
 		p += n;
@@ -456,6 +461,7 @@ mux_channel_init(MuxChannelSlot *ch)
 	ch->username[0] = '\0';
 	ch->target_host[0] = '\0';
 	ch->target_port = 0;
+	ch->target_mux_port = 0;
 	ch->backend_sock = PGINVALID_SOCKET;
 	ch->ctrl_sock = PGINVALID_SOCKET;
 	ch->startup_len = 0;
@@ -614,6 +620,8 @@ mux_parse_startup(MuxChannelSlot *ch,
 					strlcpy(ch->target_host, next + 16, sizeof(ch->target_host));
 				else if (strncmp(next, "mux_target_port=", 16) == 0)
 					ch->target_port = atoi(next + 16);
+				else if (strncmp(next, "mux_target_mux_port=", 20) == 0)
+					ch->target_mux_port = atoi(next + 20);
 				else
 				{
 					/* keep other -c options */
@@ -627,6 +635,8 @@ mux_parse_startup(MuxChannelSlot *ch,
 				strlcpy(ch->target_host, tok + 18, sizeof(ch->target_host));
 			else if (strncmp(tok, "-cmux_target_port=", 18) == 0)
 				ch->target_port = atoi(tok + 18);
+			else if (strncmp(tok, "-cmux_target_mux_port=", 22) == 0)
+				ch->target_mux_port = atoi(tok + 22);
 			else
 			{
 				if (clean_opts.len > 0)
@@ -731,6 +741,7 @@ mux_channel_read_startup(int idx)
 		char connect_payload[NAMEDATALEN * 2 + 4];
 		int cp_len = 0;
 		uint16 dblen, userlen;
+		int remote_mux_port;
 
 		if (!mux_parse_startup(ch, &fwd_buf, &fwd_len))
 		{
@@ -741,13 +752,15 @@ mux_channel_read_startup(int idx)
 
 		/*
 		 * Open a TCP connection to the remote mux.
-		 * Target: ch->target_host at mux_tcp_port (the remote mux port).
+		 * Use target_mux_port if provided via mux_target_mux_port startup
+		 * option; fall back to the local mux_tcp_port GUC otherwise.
 		 */
-		ctrl_sock = mux_open_tcp(ch->target_host, mux_tcp_port);
+		remote_mux_port = (ch->target_mux_port > 0) ? ch->target_mux_port : mux_tcp_port;
+		ctrl_sock = mux_open_tcp(ch->target_host, remote_mux_port);
 		if (ctrl_sock == PGINVALID_SOCKET)
 		{
 			MUX_LOG("channel %d: cannot connect to remote mux at %s:%d",
-					ch->channel_id, ch->target_host, mux_tcp_port);
+					ch->channel_id, ch->target_host, remote_mux_port);
 			return false;
 		}
 		ch->ctrl_sock = ctrl_sock;
@@ -779,7 +792,7 @@ mux_channel_read_startup(int idx)
 		ch->state = MCH_CONNECTING;
 		MUX_LOG("channel %d: sent CONNECT for db=%s user=%s to %s:%d",
 				ch->channel_id, ch->database, ch->username,
-				ch->target_host, mux_tcp_port);
+				ch->target_host, remote_mux_port);
 	}
 	return true;
 }
@@ -1609,7 +1622,7 @@ mux_ctrl_handle_msg(int idx)
 		}
 		dblen = get_be16(p);
 		p += 2;
-		if (end - p < dblen + 2)
+		if (end - p < dblen + 2 || dblen >= NAMEDATALEN)
 		{
 			mux_ctrl_queue_send(cc, MUX_MSG_CONNECT_FAIL, channel_id, NULL, 0);
 			break;
@@ -1620,7 +1633,7 @@ mux_ctrl_handle_msg(int idx)
 
 		userlen = get_be16(p);
 		p += 2;
-		if (end - p < userlen)
+		if (end - p < userlen || userlen >= NAMEDATALEN)
 		{
 			mux_ctrl_queue_send(cc, MUX_MSG_CONNECT_FAIL, channel_id, NULL, 0);
 			break;
