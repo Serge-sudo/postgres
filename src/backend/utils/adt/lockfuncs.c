@@ -15,6 +15,7 @@
 #include "access/htup_details.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "storage/dist_deadlock.h"
 #include "storage/predicate_internals.h"
 #include "utils/array.h"
 #include "utils/builtins.h"

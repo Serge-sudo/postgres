@@ -15,6 +15,7 @@ include $(top_builddir)/src/Makefile.global
 OBJS = \
 	condition_variable.o \
 	deadlock.o \
+	dist_deadlock.o \
 	lmgr.o \
 	lock.o \
 	lwlock.o \
