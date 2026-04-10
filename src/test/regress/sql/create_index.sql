@@ -1044,10 +1044,10 @@ REINDEX TABLE CONCURRENTLY concur_reindex_part_index; -- error
 -- Partitioned index with no leaves
 REINDEX TABLE concur_reindex_part_index_10; -- error
 REINDEX TABLE CONCURRENTLY concur_reindex_part_index_10; -- error
--- Cannot run in a transaction block
+-- Can now run in a transaction block
 BEGIN;
 REINDEX INDEX concur_reindex_part_index;
-ROLLBACK;
+COMMIT;
 -- Helper functions to track changes of relfilenodes in a partition tree.
 -- Create a table tracking the relfilenode state.
 CREATE OR REPLACE FUNCTION create_relfilenode_part(relname text, indname text)
@@ -1097,10 +1097,10 @@ REINDEX INDEX CONCURRENTLY concur_reindex_part; -- error
 -- Partitioned with no leaves
 REINDEX INDEX concur_reindex_part_10; -- error
 REINDEX INDEX CONCURRENTLY concur_reindex_part_10; -- error
--- Cannot run in a transaction block
+-- Can now run in a transaction block
 BEGIN;
 REINDEX TABLE concur_reindex_part;
-ROLLBACK;
+COMMIT;
 -- Check that expected relfilenodes are changed, non-concurrent case.
 -- Note that the partition tree changes of the *indexes* need to be checked.
 SELECT create_relfilenode_part('reindex_index_status', 'concur_reindex_part_index');

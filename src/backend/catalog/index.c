@@ -3908,6 +3908,16 @@ reindex_relation(const ReindexStmt *stmt, Oid relid, int flags,
 	/* if relation is gone, leave */
 	if (!rel)
 		return false;
+	
+	/*
+	 * TODO: if foreign table and if it is partition of distribution table, or worldwide table.
+	 * run ddl on node where the partition is located, and skip reindexing on coordinator.
+	 * ALSO note that we can not run reindex inside transaction block
+	 */
+	 if (rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE && 0)
+	 {
+		// TODO:
+	 }
 
 	/*
 	 * Partitioned tables should never get processed here, as they have no
