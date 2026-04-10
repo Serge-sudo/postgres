@@ -1206,6 +1206,7 @@ CREATE VIEW pg_stat_multiplexer AS
 CREATE VIEW pg_stat_multiplexer_workers AS
     SELECT
         S.worker_id,
+        S.pid,
         S.state,
         S.in_tx,
         S.active_channel_id,

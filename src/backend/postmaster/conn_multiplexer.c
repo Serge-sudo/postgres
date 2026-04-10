@@ -1421,6 +1421,7 @@ static void
 mux_worker_init(MuxWorkerSlot *w)
 {
 	w->worker_sock = PGINVALID_SOCKET;
+	w->worker_pid = 0;
 	w->database[0] = '\0';
 	w->username[0] = '\0';
 	w->connect_cnt = 0;
@@ -1559,7 +1560,13 @@ mux_spawn_worker(MuxWorkerSlot *w, const char *database, const char *username,
 			/* ReadyForQuery — startup complete */
 			break;
 		}
-		/* Skip S (ParameterStatus), K (BackendKeyData), N (NoticeResponse) */
+		else if (msgtype == 'K')
+		{
+			/* BackendKeyData: pid + cancel key */
+			if (msglen >= 8)
+				w->worker_pid = (pid_t) get_be32(payloadbuf);
+		}
+		/* Skip S (ParameterStatus) and N (NoticeResponse) */
 	}
 
 	/* Store the startup response for replay */
@@ -2528,6 +2535,7 @@ ConnMuxPublishStats(void)
 			continue;
 
 		ws->valid = true;
+		ws->worker_pid = w->worker_pid;
 		ws->in_tx = w->in_tx;
 		ws->active_channel = w->active_channel;
 		ws->connect_cnt = w->connect_cnt;
