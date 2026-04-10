@@ -217,9 +217,8 @@ GetUserMapping(Oid userid, Oid serverid)
 	}
 
 	if (!HeapTupleIsValid(tp))
-	{
+	{	
 		ForeignServer *server = GetForeignServer(serverid);
-
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("user mapping not found for user \"%s\", server \"%s\"",

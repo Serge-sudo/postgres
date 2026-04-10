@@ -106,7 +106,7 @@ is($result, 'sg_test', 'Shard group created on node1');
 ###############################################################################
 
 $node1->safe_psql('postgres', qq[
-	CREATE TABLE users (
+	CREATE WORLDWIDE TABLE users (
 		id integer PRIMARY KEY,
 		username text NOT NULL,
 		email text
@@ -158,7 +158,7 @@ $node1->safe_psql('postgres', qq[
 		customer_id integer NOT NULL,
 		region text NOT NULL,
 		amount numeric(10,2)
-	) PARTITION BY LIST(region) SHARD GROUP sg_test;
+	) DISTRIBUTED BY LIST(region) SHARD GROUP sg_test;
 ]);
 
 # Verify parent table exists on all nodes
