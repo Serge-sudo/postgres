@@ -3,6 +3,7 @@
 backend_sources += files(
   'condition_variable.c',
   'deadlock.c',
+  'dist_deadlock.c',
   'lmgr.c',
   'lock.c',
   'lwlock.c',

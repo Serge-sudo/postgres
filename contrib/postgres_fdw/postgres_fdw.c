@@ -18,6 +18,7 @@
 #include "access/sysattr.h"
 #include "access/table.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_foreign_server.h"
 #include "catalog/pg_opfamily.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
@@ -51,6 +52,8 @@
 #include "utils/rel.h"
 #include "utils/sampling.h"
 #include "utils/selfuncs.h"
+#include "utils/syscache.h"
+#include "executor/spi.h"
 
 PG_MODULE_MAGIC;
 
@@ -3115,6 +3118,317 @@ postgresExecForeignDDL(Oid serverid, const char *sql)
 	 */
 }
 
+/*
+ * postgres_connections
+ *		Return information about active postgres_fdw connections
+ *
+ * This function iterates over the connection cache and returns mappings
+ * between local backends and remote backend PIDs. This is used by the
+ * distributed deadlock detection system to track FDW connection dependencies.
+ *
+ * Returns a set of rows with columns:
+ *   cluster_name text, local_pid int, remote_backend_pid int
+ */
+PG_FUNCTION_INFO_V1(postgres_connections);
+
+Datum
+postgres_connections(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore;
+	MemoryContext per_query_ctx;
+	MemoryContext oldcontext;
+
+	/* check to see if caller supports us returning a tuplestore */
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+	if (!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("materialize mode required, but it is not allowed in this context")));
+
+	/* Build a tuple descriptor for our result type */
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+	oldcontext = MemoryContextSwitchTo(per_query_ctx);
+
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+
+	MemoryContextSwitchTo(oldcontext);
+
+	/* Iterate over shared memory FDW connections and return mappings */
+	{
+		HASH_SEQ_STATUS scan;
+		char		cluster_name[NAMEDATALEN];
+		int			local_pid;
+		int			remote_backend_pid;
+
+		/* Get iterator for shared memory connection tracking */
+		if (FdwConnShmemGetIterator(&scan))
+		{
+			while (FdwConnShmemGetNext(&scan, cluster_name, &local_pid, &remote_backend_pid))
+			{
+				Datum		values[3];
+				bool		nulls[3];
+
+				memset(nulls, 0, sizeof(nulls));
+
+				/* Build tuple: (cluster_name, local_pid, remote_backend_pid) */
+				values[0] = CStringGetTextDatum(cluster_name);
+				values[1] = Int32GetDatum(local_pid);
+				values[2] = Int32GetDatum(remote_backend_pid);
+
+				tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+			}
+			
+			FdwConnShmemGetIteratorFinish();
+		}
+	}
+
+	return (Datum) 0;
+}
+
+/*
+ * postgres_fdw_get_locks
+ *		Query pg_locks on a remote server and return lock wait information
+ *
+ * This function is used by the distributed deadlock detection system to
+ * query lock information from remote PostgreSQL servers. It uses the
+ * postgres_fdw connection infrastructure to execute a query on the remote
+ * server.
+ *
+ * Returns a set of rows with columns:
+ *   waiter_pid int, blocker_pid int, waiter_xid int, blocker_xid int,
+ *   object_oid oid, lock_mode text
+ */
+PG_FUNCTION_INFO_V1(postgres_fdw_get_locks);
+
+Datum
+postgres_fdw_get_locks(PG_FUNCTION_ARGS)
+{
+	Oid			serverid = PG_GETARG_OID(0);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore;
+	MemoryContext per_query_ctx;
+	MemoryContext oldcontext;
+	UserMapping *user;
+	PGconn	   *conn;
+	PGresult   *res;
+	StringInfoData sql;
+	int			i;
+
+	/* check to see if caller supports us returning a tuplestore */
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+	if (!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("materialize mode required, but it is not allowed in this context")));
+
+	/* Build a tuple descriptor for our result type */
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+	oldcontext = MemoryContextSwitchTo(per_query_ctx);
+
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+
+	MemoryContextSwitchTo(oldcontext);
+
+	/* Get connection to the foreign server */
+	user = GetUserMapping(GetUserId(), serverid);
+	conn = GetConnection(user, false, NULL);
+
+	/* Construct the query to get lock waits from the remote server */
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "SELECT "
+					 "  blocked.pid AS waiter_pid, "
+					 "  blocking.pid AS blocker_pid, "
+					 "  COALESCE(blocked.transactionid::text::int, 0) AS waiter_xid, "
+					 "  COALESCE(blocking.transactionid::text::int, 0) AS blocker_xid, "
+					 "  COALESCE(blocked.relation, 0) AS object_oid, "
+					 "  blocked.mode AS lock_mode "
+					 "FROM pg_locks blocked "
+					 "JOIN pg_locks blocking ON ("
+					 "  blocked.locktype = blocking.locktype AND "
+					 "  blocked.database = blocking.database AND "
+					 "  blocked.relation = blocking.relation AND "
+					 "  blocked.pid != blocking.pid AND "
+					 "  NOT blocked.granted AND blocking.granted"
+					 ")");
+
+	/* Execute the query on the remote server */
+	res = pgfdw_exec_query(conn, sql.data, NULL);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		pgfdw_report_error(ERROR, res, conn, false, sql.data);
+	}
+
+	/* Process results and add to tuplestore */
+	for (i = 0; i < PQntuples(res); i++)
+	{
+		Datum		values[6];
+		bool		nulls[6];
+		int			waiter_pid;
+		int			blocker_pid;
+		int			waiter_xid;
+		int			blocker_xid;
+		Oid			object_oid;
+		char	   *lock_mode;
+
+		memset(nulls, 0, sizeof(nulls));
+
+		/* Extract values from PGresult */
+		waiter_pid = atoi(PQgetvalue(res, i, 0));
+		blocker_pid = atoi(PQgetvalue(res, i, 1));
+		waiter_xid = atoi(PQgetvalue(res, i, 2));
+		blocker_xid = atoi(PQgetvalue(res, i, 3));
+		object_oid = (Oid) atoi(PQgetvalue(res, i, 4));
+		lock_mode = PQgetvalue(res, i, 5);
+
+		/* Build tuple */
+		values[0] = Int32GetDatum(waiter_pid);
+		values[1] = Int32GetDatum(blocker_pid);
+		values[2] = Int32GetDatum(waiter_xid);
+		values[3] = Int32GetDatum(blocker_xid);
+		values[4] = ObjectIdGetDatum(object_oid);
+		values[5] = CStringGetTextDatum(lock_mode);
+
+		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+	}
+
+	PQclear(res);
+	pfree(sql.data);
+
+	return (Datum) 0;
+}
+
+/*
+ * postgres_fdw_connections
+ *		Query postgres_connections() on a remote server to get FDW connection mappings
+ *
+ * This function is used by the distributed deadlock detection system to
+ * query FDW connection information from remote PostgreSQL servers. It uses the
+ * postgres_fdw connection infrastructure to execute a query on the remote
+ * server that calls postgres_connections().
+ *
+ * Returns a set of rows with columns:
+ *   cluster_name text, local_pid int, remote_backend_pid int
+ */
+PG_FUNCTION_INFO_V1(postgres_fdw_connections);
+
+Datum
+postgres_fdw_connections(PG_FUNCTION_ARGS)
+{
+	Oid			serverid = PG_GETARG_OID(0);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore;
+	MemoryContext per_query_ctx;
+	MemoryContext oldcontext;
+	UserMapping *user;
+	PGconn	   *conn;
+	PGresult   *res;
+	StringInfoData sql;
+	int			i;
+
+	/* check to see if caller supports us returning a tuplestore */
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+	if (!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("materialize mode required, but it is not allowed in this context")));
+
+	/* Build a tuple descriptor for our result type */
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+	oldcontext = MemoryContextSwitchTo(per_query_ctx);
+
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+
+	MemoryContextSwitchTo(oldcontext);
+
+	/* Get user mapping and connection */
+	user = GetUserMapping(GetUserId(), serverid);
+	conn = GetConnection(user, false, NULL);
+
+	/*
+	 * Build SQL query to call postgres_connections() on the remote server.
+	 * This function returns the FDW connections that exist on that remote server.
+	 */
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "SELECT cluster_name, local_pid, remote_backend_pid "
+					 "FROM public.postgres_connections()");
+
+	/* Execute the query on the remote server */
+	res = pgfdw_exec_query(conn, sql.data, NULL);
+
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		pgfdw_report_error(ERROR, res, conn, false, sql.data);
+	}
+
+	/* Process the result tuples */
+	for (i = 0; i < PQntuples(res); i++)
+	{
+		Datum		values[3];
+		bool		nulls[3];
+
+		memset(values, 0, sizeof(values));
+		memset(nulls, 0, sizeof(nulls));
+
+		/* cluster_name */
+		if (PQgetisnull(res, i, 0))
+			nulls[0] = true;
+		else
+			values[0] = CStringGetTextDatum(PQgetvalue(res, i, 0));
+
+		/* local_pid */
+		if (PQgetisnull(res, i, 1))
+			nulls[1] = true;
+		else
+			values[1] = Int32GetDatum(atoi(PQgetvalue(res, i, 1)));
+
+		/* remote_backend_pid */
+		if (PQgetisnull(res, i, 2))
+			nulls[2] = true;
+		else
+			values[2] = Int32GetDatum(atoi(PQgetvalue(res, i, 2)));
+
+		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+	}
+
+	PQclear(res);
+	pfree(sql.data);
+
+	return (Datum) 0;
+}
+
 #define IS_LOCAL(oid)   ((oid) == InvalidOid)
 #define IS_FOREIGN(oid) ((oid) != InvalidOid)
 
@@ -3331,10 +3645,12 @@ stream_foreign_to_foreign(Oid src_serverid,
     }
 
     if (len < -1)
+	{
         ereport(ERROR,
                 (errmsg("COPY OUT aborted: %s",
                         PQerrorMessage(src_conn))));
-						
+	}
+					
 	while ((res = PQgetResult(src_conn)) != NULL)
 		PQclear(res);
 
