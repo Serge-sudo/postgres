@@ -122,6 +122,9 @@ CATALOG(pg_class,1259,RelationRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(83,Relat
 	/* link to original rel during table rewrite; otherwise 0 */
 	Oid			relrewrite BKI_DEFAULT(0) BKI_LOOKUP_OPT(pg_class);
 
+	/* shard group id; 0 if not in a shard group */
+	Oid			relsgid BKI_DEFAULT(0);
+
 	/* all Xids < this are frozen in this rel */
 	TransactionId relfrozenxid BKI_DEFAULT(3);	/* FirstNormalTransactionId */
 
