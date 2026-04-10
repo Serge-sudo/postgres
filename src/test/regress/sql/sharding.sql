@@ -62,6 +62,32 @@ SELECT relname, relkind, relsgid, relispartition FROM pg_class WHERE relname IN 
 \d test_idx_worldwide
 \d test_idx_distribute
 
+-- Test new features: DROP TABLE on shard group tables
+-- This should replicate to all shard members
+DROP TABLE IF EXISTS test_t_distribute_1;
+SELECT * FROM pg_class WHERE relname = 'test_t_distribute_1';
+
+-- Test CREATE INDEX CONCURRENTLY rejection on shard group tables
+-- This should fail with an error message
+CREATE INDEX CONCURRENTLY idx_test ON test_t_worldwide(a);
+
+-- Test CREATE INDEX on shard group tables (non-concurrent)
+-- This should replicate to all shard members
+CREATE INDEX idx_test ON test_t_worldwide(a);
+SELECT * FROM pg_class WHERE relname = 'idx_test';
+
+-- Test REINDEX on shard group tables
+-- This should replicate to all shard members
+REINDEX TABLE test_t_worldwide;
+
+-- Test REINDEX CONCURRENTLY rejection on shard group tables
+-- This should fail with an error message
+REINDEX TABLE CONCURRENTLY test_t_worldwide;
+
+-- Clean up
+DROP TABLE test_t_worldwide;
+DROP TABLE test_t_distribute;
+
 SELECT * FROM pg_shardgroups;
 SELECT * FROM pg_shardmembers;
 DROP SHARD GROUP sg_test_2;

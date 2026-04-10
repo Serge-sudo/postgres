@@ -40,6 +40,7 @@
 #include "catalog/storage.h"
 #include "commands/async.h"
 #include "commands/event_trigger.h"
+#include "commands/shardgroupcmds.h"
 #include "commands/tablespace.h"
 #include "commands/trigger.h"
 #include "commands/user.h"
@@ -1161,6 +1162,18 @@ struct config_bool ConfigureNamesBool[] =
 		&ignore_invalid_pages,
 		false,
 		NULL, NULL, NULL
+	},
+	{
+		{"shardgroup.executing_remote_ddl", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Indicates DDL is being executed from a remote shard member."),
+			gettext_noop("This flag is set automatically by postgres_fdw when executing "
+						 "DDL on remote shard members to prevent infinite recursion "
+						 "in DDL replication. Should not be set manually."),
+			GUC_NOT_IN_SAMPLE | GUC_NO_SHOW_ALL | GUC_NO_RESET_ALL
+		},
+		&executing_remote_ddl,
+		false,
+		check_executing_remote_ddl, NULL, NULL
 	},
 	{
 		{"full_page_writes", PGC_SIGHUP, WAL_SETTINGS,
