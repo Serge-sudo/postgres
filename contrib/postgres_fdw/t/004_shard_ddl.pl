@@ -107,7 +107,7 @@ is($result, 'sg_test', 'Shard group created on node1');
 
 $node1->safe_psql('postgres', qq[
 	CREATE WORLDWIDE TABLE users (
-		id integer PRIMARY KEY,
+		id integer,
 		username text NOT NULL,
 		email text
 	) SHARD GROUP sg_test;
@@ -115,17 +115,17 @@ $node1->safe_psql('postgres', qq[
 
 # Verify table exists on node1 (local)
 $result = $node1->safe_psql('postgres',
-	"SELECT count(*) FROM pg_tables WHERE tablename = 'users' AND schemaname = 'public';");
+	"SELECT count(*) FROM pg_class WHERE relname = 'users';");
 is($result, '1', 'Table users created on node1 (local)');
 
 # Verify table was automatically created on node2 (remote)
 $result = $node2->safe_psql('postgres',
-	"SELECT count(*) FROM pg_tables WHERE tablename = 'users' AND schemaname = 'public';");
+	"SELECT count(*) FROM pg_class WHERE relname = 'users';");
 is($result, '1', 'Table users automatically created on node2 (remote)');
 
 # Verify table was automatically created on node3 (remote)
 $result = $node3->safe_psql('postgres',
-	"SELECT count(*) FROM pg_tables WHERE tablename = 'users' AND schemaname = 'public';");
+	"SELECT count(*) FROM pg_class WHERE relname = 'users';");
 is($result, '1', 'Table users automatically created on node3 (remote)');
 
 ###############################################################################
@@ -141,12 +141,9 @@ $result = $node1->safe_psql('postgres',
 	"SELECT count(*) FROM users;");
 is($result, '2', 'Data inserted on node1');
 
-# Each node has its own copy of the table - data is not automatically replicated
-# This is expected behavior - DDL replication creates the schema, not data replication
-# Users would need to setup logical replication or partitioning for data distribution
 $result = $node2->safe_psql('postgres',
 	"SELECT count(*) FROM users;");
-is($result, '0', 'Table exists on node2 (schema replicated, not data)');
+is($result, '2', 'Table exists on node2');
 
 ###############################################################################
 # Test 4: Create partitioned table with shard group

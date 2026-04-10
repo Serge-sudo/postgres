@@ -119,8 +119,23 @@ pg_clock_gettime_ns(void)
 	return now;
 }
 
+static inline instr_time
+pg_clock_gettime_ns_csn(void)
+{
+	instr_time	now;
+	struct timespec tmp;
+
+	clock_gettime(CLOCK_REALTIME, &tmp);
+	now.ticks = tmp.tv_sec * NS_PER_S + tmp.tv_nsec;
+
+	return now;
+}
+
 #define INSTR_TIME_SET_CURRENT(t) \
 	((t) = pg_clock_gettime_ns())
+
+#define INSTR_TIME_SET_CURRENT_CSN(t) \
+	((t) = pg_clock_gettime_ns_csn())
 
 #define INSTR_TIME_GET_NANOSEC(t) \
 	((int64) (t).ticks)

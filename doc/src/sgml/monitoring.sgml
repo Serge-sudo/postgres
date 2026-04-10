@@ -362,17 +362,27 @@ postgres   27093  0.0  0.0  30096  2752 ?        Ss   11:34   0:00 postgres: ser
      <row>
       <entry><structname>pg_stat_gssapi</structname><indexterm><primary>pg_stat_gssapi</primary></indexterm></entry>
       <entry>One row per connection (regular and replication), showing information about
-       GSSAPI authentication and encryption used on this connection.
-       See <link linkend="monitoring-pg-stat-gssapi-view">
-       <structname>pg_stat_gssapi</structname></link> for details.
-      </entry>
-     </row>
+        GSSAPI authentication and encryption used on this connection.
+        See <link linkend="monitoring-pg-stat-gssapi-view">
+        <structname>pg_stat_gssapi</structname></link> for details.
+       </entry>
+      </row>
 
-     <row>
-      <entry><structname>pg_stat_progress_analyze</structname><indexterm><primary>pg_stat_progress_analyze</primary></indexterm></entry>
-      <entry>One row for each backend (including autovacuum worker processes) running
-       <command>ANALYZE</command>, showing current progress.
-       See <xref linkend="analyze-progress-reporting"/>.
+      <row>
+       <entry><structname>pg_stat_multiplexer</structname><indexterm><primary>pg_stat_multiplexer</primary></indexterm></entry>
+       <entry>One row showing real-time state for the connection multiplexer.</entry>
+      </row>
+
+      <row>
+       <entry><structname>pg_stat_multiplexer_workers</structname><indexterm><primary>pg_stat_multiplexer_workers</primary></indexterm></entry>
+       <entry>One row per active connection multiplexer worker, showing real-time worker state.</entry>
+      </row>
+
+      <row>
+       <entry><structname>pg_stat_progress_analyze</structname><indexterm><primary>pg_stat_progress_analyze</primary></indexterm></entry>
+       <entry>One row for each backend (including autovacuum worker processes) running
+        <command>ANALYZE</command>, showing current progress.
+        See <xref linkend="analyze-progress-reporting"/>.
       </entry>
      </row>
 

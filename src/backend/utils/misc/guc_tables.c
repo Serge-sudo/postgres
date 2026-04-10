@@ -90,6 +90,7 @@
 #include "utils/plancache.h"
 #include "utils/ps_status.h"
 #include "utils/xml.h"
+#include "postmaster/conn_multiplexer.h"
 
 /* This value is normally passed in from the Makefile */
 #ifndef PG_KRB_SRVTAB
@@ -105,6 +106,10 @@ extern char *default_tablespace;
 extern char *temp_tablespaces;
 extern bool ignore_checksum_failure;
 extern bool ignore_invalid_pages;
+
+/* Connection multiplexer GUCs (defined in conn_multiplexer.c) */
+extern int	mux_worker_count;
+extern int	mux_tcp_port;
 
 #ifdef TRACE_SYNCSCAN
 extern bool trace_syncscan;
@@ -3443,6 +3448,26 @@ struct config_int ConfigureNamesInt[] =
 		&autovacuum_max_workers,
 		3, 1, MAX_BACKENDS,
 		check_autovacuum_max_workers, NULL, NULL
+	},
+
+	{
+		{"mux_worker_count", PGC_POSTMASTER, CONN_AUTH_SETTINGS,
+			gettext_noop("Sets the number of local worker processes in the connection multiplexer."),
+			NULL
+		},
+		&mux_worker_count,
+		0, 0, MUX_MAX_WORKERS,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"mux_tcp_port", PGC_POSTMASTER, CONN_AUTH_TCP,
+			gettext_noop("Sets the TCP port used for inter-node multiplexer communication."),
+			NULL
+		},
+		&mux_tcp_port,
+		MUX_TCP_PORT_DEFAULT, 1024, 65535,
+		NULL, NULL, NULL
 	},
 
 	{

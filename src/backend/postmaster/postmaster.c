@@ -104,6 +104,7 @@
 #include "postmaster/autovacuum.h"
 #include "postmaster/auxprocess.h"
 #include "postmaster/bgworker_internals.h"
+#include "postmaster/conn_multiplexer.h"
 #include "postmaster/pgarch.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/syslogger.h"
@@ -122,6 +123,7 @@
 #include "utils/pidfile.h"
 #include "utils/timestamp.h"
 #include "utils/varlena.h"
+#include "postmaster/conn_multiplexer.h"
 
 #ifdef EXEC_BACKEND
 #include "storage/pg_shmem.h"
@@ -906,6 +908,11 @@ PostmasterMain(int argc, char *argv[])
 	 * before any modules had a chance to take the background worker slots.
 	 */
 	ApplyLauncherRegister();
+
+	/*
+	 * Register the connection multiplexer.
+	 */
+	ConnMuxRegister();
 
 	/*
 	 * process any libraries that should be preloaded at postmaster start

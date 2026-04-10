@@ -701,7 +701,7 @@ GenerateCSN(bool locked, CSN assign)
 	Assert(get_csnlog_status() || csn_snapshot_defer_time > 0);
 
 	/* TODO: create some macro that add small random shift to current time. */
-	INSTR_TIME_SET_CURRENT(current_time);
+	INSTR_TIME_SET_CURRENT_CSN(current_time);
 	csn = (CSN) INSTR_TIME_GET_NANOSEC(current_time) + (int64) (csn_time_shift * 1E9);
 
 	if(assign != InvalidCSN && csn < assign)
