@@ -70,6 +70,8 @@
 	ereport(MULTIPLEXER_LOG_LEVEL, \
 			(errmsg_internal("multiplexer: " fmt, ##__VA_ARGS__)))
 
+#define MUX_BACKEND_KEYDATA_LEN 8
+
 /* -------------------------------------------------------------------------
  * GUC variables
  * -------------------------------------------------------------------------
@@ -1563,7 +1565,7 @@ mux_spawn_worker(MuxWorkerSlot *w, const char *database, const char *username,
 		else if (msgtype == 'K')
 		{
 			/* BackendKeyData: pid + cancel key */
-			if (msglen == 8)
+			if (msglen == MUX_BACKEND_KEYDATA_LEN)
 				w->worker_pid = get_be32(payloadbuf);
 			else
 				elog(WARNING,
