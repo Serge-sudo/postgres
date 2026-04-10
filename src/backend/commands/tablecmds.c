@@ -1567,7 +1567,7 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 								switch (nodeTag(&aconst->val.node))
 								{
 									case T_Integer:
-										appendStringInfo(partition_bounds, "%ld", 
+										appendStringInfo(partition_bounds, "%d", 
 														castNode(Integer, &aconst->val.node)->ival);
 										break;
 									case T_Float:
@@ -2100,7 +2100,8 @@ RemoveRelations(DropStmt *drop)
 		 * If this table belongs to a shard group, replicate DROP to shard members.
 		 * Skip replication if we're executing DDL from a remote server to prevent infinite recursion.
 		 */
-		if ((drop->removeType == OBJECT_TABLE || drop->removeType == OBJECT_FOREIGN_TABLE) && !executing_remote_ddl)
+		if ((drop->removeType == OBJECT_TABLE || drop->removeType == OBJECT_FOREIGN_TABLE ||
+			 drop->removeType == OBJECT_INDEX) && !executing_remote_ddl)
 		{
 			HeapTuple	tuple;
 			Form_pg_class classForm;
@@ -2111,7 +2112,7 @@ RemoveRelations(DropStmt *drop)
 			{
 				classForm = (Form_pg_class) GETSTRUCT(tuple);
 				sgid = classForm->relsgid;
-				
+						
 				/* If this table belongs to a shard group, replicate the DROP */
 				if (OidIsValid(sgid))
 				{
@@ -2120,6 +2121,15 @@ RemoveRelations(DropStmt *drop)
 					List	   *members;
 					ListCell   *lc;
 					StringInfoData drop_sql;
+					
+					/*
+					 * Check if table belongs to a shard group and reject CONCURRENTLY option
+					 */
+					if (drop->concurrent)
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg("DROP CONCURRENTLY is not supported on shard group tables/indices"),
+								errhint("Remove CONCURRENTLY option.")));
 					
 					/* Null check for namespace name */
 					if (nspname == NULL)
@@ -2131,8 +2141,9 @@ RemoveRelations(DropStmt *drop)
 					members = get_shardgroup_members(sgid);
 					
 					initStringInfo(&drop_sql);
-					appendStringInfo(&drop_sql, "%s TABLE IF EXISTS %s.%s",
+					appendStringInfo(&drop_sql, "%s %s IF EXISTS %s.%s",
 									drop->removeType == OBJECT_TABLE ? "DROP FOREIGN" : "DROP",
+									drop->removeType == OBJECT_INDEX ? "INDEX" : "TABLE",
 									 quote_identifier(nspname),
 									 quote_identifier(relname));
 					
@@ -2143,7 +2154,7 @@ RemoveRelations(DropStmt *drop)
 						appendStringInfoString(&drop_sql, " RESTRICT");
 					
 					ereport(DEBUG1,
-							(errmsg("replicating DROP TABLE to shard members"),
+							(errmsg("replicating DROP TABLE/INDEX to shard members"),
 							 errdetail("Table: %s.%s, Shard Group: %u",
 									   nspname, relname, sgid)));
 					
@@ -2158,7 +2169,8 @@ RemoveRelations(DropStmt *drop)
 						if (fdwroutine->ExecForeignDDL != NULL)
 						{
 							ereport(DEBUG1,
-									(errmsg("executing DROP TABLE on shard member \"%s\"",
+									(errmsg("executing DROP %s on shard member \"%s\"",
+											drop->removeType == OBJECT_INDEX ? "INDEX" : "TABLE",
 											server->servername)));
 							
 							fdwroutine->ExecForeignDDL(serveroid, drop_sql.data);
@@ -2166,7 +2178,7 @@ RemoveRelations(DropStmt *drop)
 						else
 						{
 							ereport(NOTICE,
-									(errmsg("table should be dropped on shard member \"%s\"",
+									(errmsg("table/index should be dropped on shard member \"%s\"",
 											server->servername),
 									 errdetail("Execute: %s", drop_sql.data),
 									 errhint("The FDW for this server does not support automatic DDL execution.")));
@@ -18305,7 +18317,8 @@ RangeVarCallbackMaintainsTable(const RangeVar *relation,
 	if (!relkind)
 		return;
 	if (relkind != RELKIND_RELATION && relkind != RELKIND_TOASTVALUE &&
-		relkind != RELKIND_MATVIEW && relkind != RELKIND_PARTITIONED_TABLE)
+		relkind != RELKIND_MATVIEW && relkind != RELKIND_PARTITIONED_TABLE &&
+		relkind != RELKIND_FOREIGN_TABLE)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not a table or materialized view", relation->relname)));

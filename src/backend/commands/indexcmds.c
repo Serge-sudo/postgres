@@ -2863,9 +2863,8 @@ ReindexIndex(const ReindexStmt *stmt, const ReindexParams *params, bool isTopLev
 	/*
 	 * If the index belongs to a shard group table, replicate REINDEX to shard members.
 	 * Skip replication if we're executing DDL from a remote server to prevent infinite recursion.
-	 * TODO: reindex does not work inside a transaction block, so we should consider adding a new API to the FDW to support this kind of cross-shard DDL replication in a more robust way.
 	 */
-	if (relkind == RELKIND_PARTITIONED_INDEX && 0)
+	if (relkind == RELKIND_PARTITIONED_INDEX && !executing_remote_ddl)
 	{
 		HeapTuple	tuple;
 		Form_pg_class classForm;
@@ -3107,9 +3106,8 @@ ReindexTable(const ReindexStmt *stmt, const ReindexParams *params, bool isTopLev
 	 * If the table belongs to a shard group, replicate the REINDEX
 	 * to all shard members.
 	 * Skip replication if we're executing DDL from a remote server to prevent infinite recursion.
-	 * TODO: reindex does not work inside a transaction block, so we should consider adding a new API to the FDW to support this kind of cross-shard DDL replication in a more robust way.
 	 */
-	if (get_rel_relkind(heapOid) == RELKIND_PARTITIONED_TABLE && 0)
+	if (get_rel_relkind(heapOid) == RELKIND_PARTITIONED_TABLE && !executing_remote_ddl)
 	{
 		HeapTuple	tuple;
 		Form_pg_class classForm;

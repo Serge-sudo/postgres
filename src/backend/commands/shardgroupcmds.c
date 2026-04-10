@@ -358,28 +358,6 @@ AlterShardGroup(AlterShardGroupStmt *stmt)
 							 errmsg("invalid member state \"%s\"", statestr),
 							 errhint("Valid states are: up, down, readonly")));
 			}
-			else if (strcmp(defel->defname, "skip_sync") == 0)
-			{
-				/*
-				 * The skip_sync option is internal-only and is used to prevent
-				 * infinite recursion during metadata synchronization to remote
-				 * shard members. When adding a new shard member, we need to sync
-				 * metadata to it, but we don't want the remote member to recursively
-				 * sync back to us.
-				 * 
-				 * This option should not be used manually as it will skip important
-				 * synchronization steps. It's automatically added by the
-				 * SyncShardGroupMetadataToMember function.
-				 */
-				char	   *skip_sync_str = defGetString(defel);
-				if (strcmp(skip_sync_str, "true") == 0 || strcmp(skip_sync_str, "1") == 0)
-				{
-					stmt->skip_sync = true;
-					ereport(DEBUG1,
-							(errmsg("skip_sync option enabled for ALTER SHARD GROUP ADD MEMBER"),
-							 errhint("This option is for internal use to prevent metadata sync recursion.")));
-				}
-			}
 			else
 				ereport(WARNING,
 						(errmsg("unrecognized option: %s", defel->defname)));
@@ -422,7 +400,7 @@ AlterShardGroup(AlterShardGroupStmt *stmt)
 		
 		/* Sync shard group metadata and members info to the new shard member */
 		/* Skip this if skip_sync is true to prevent infinite recursion */
-		if (!stmt->skip_sync)
+		if (!executing_remote_ddl)
 		{
 			SyncShardGroupMetadataToMember(sgoid, srvoid);
 			
@@ -566,56 +544,60 @@ AlterShardGroup(AlterShardGroupStmt *stmt)
 		}
 		
 		table_close(rel, RowExclusiveLock);
-		
-		/* Get all members before deletion to notify them */
-		all_members = get_shardgroup_members(sgoid);
-		
-		/* Build DDL to drop member from shard group on remote servers */
-		initStringInfo(&drop_ddl);
-		appendStringInfo(&drop_ddl,
-						 "ALTER SHARD GROUP %s DROP MEMBER %s",
-						 quote_identifier(sgname),
-						 quote_identifier(stmt->servername));
-		
-		/* Notify all OTHER members to delete this server from their metadata */
-		foreach(lc, all_members)
+
+		if (!executing_remote_ddl)
 		{
-			Oid			member_srvoid = lfirst_oid(lc);
+			/* Get all members before deletion to notify them */
+			all_members = get_shardgroup_members(sgoid);
 			
-			/* Skip the server being removed */
-			if (member_srvoid == srvoid)
-				continue;
+			/* Build DDL to drop member from shard group on remote servers */
+			initStringInfo(&drop_ddl);
+			appendStringInfo(&drop_ddl,
+							"ALTER SHARD GROUP %s DROP MEMBER %s",
+							quote_identifier(sgname),
+							quote_identifier(stmt->servername));
 			
-			ereport(DEBUG1,
-					(errmsg("notifying shard member about DROP MEMBER"),
-					 errdetail("Executing on server %u: %s",
-							   member_srvoid, drop_ddl.data)));
+			/* Notify all OTHER members to delete this server from their metadata */
+			foreach(lc, all_members)
+			{
+				Oid			member_srvoid = lfirst_oid(lc);
+				
+				/* Skip the server being removed */
+				if (member_srvoid == srvoid)
+					continue;
+				
+				ereport(DEBUG1,
+						(errmsg("notifying shard member about DROP MEMBER"),
+						errdetail("Executing on server %u: %s",
+								member_srvoid, drop_ddl.data)));
+				
+				ExecuteDDLOnRemoteServer(member_srvoid, drop_ddl.data);
+			}
 			
-			ExecuteDDLOnRemoteServer(member_srvoid, drop_ddl.data);
-		}
+			/* Send message to the server being removed to clean up its metadata */
+			{
+				StringInfoData drop_sg_ddl;
+				
+				/* 
+				* On the removed server, we should drop the shard group itself
+				* (not just the membership). This will CASCADE and drop all 
+				* tables associated with the shard group on that server.
+				*/
+				initStringInfo(&drop_sg_ddl);
+				appendStringInfo(&drop_sg_ddl,
+								"DROP SHARD GROUP IF EXISTS %s CASCADE",
+								quote_identifier(sgname));
+				
+				ereport(DEBUG1,
+						(errmsg("instructing removed server to drop shard group"),
+						errdetail("Executing on server %u: %s",
+								srvoid, drop_sg_ddl.data)));
+				
+				ExecuteDDLOnRemoteServer(srvoid, drop_sg_ddl.data);
+				
+				pfree(drop_sg_ddl.data);
+			}
 		
-		/* Send message to the server being removed to clean up its metadata */
-		{
-			StringInfoData drop_sg_ddl;
-			
-			/* 
-			 * On the removed server, we should drop the shard group itself
-			 * (not just the membership). This will CASCADE and drop all 
-			 * tables associated with the shard group on that server.
-			 */
-			initStringInfo(&drop_sg_ddl);
-			appendStringInfo(&drop_sg_ddl,
-							 "DROP SHARD GROUP IF EXISTS %s CASCADE",
-							 quote_identifier(sgname));
-			
-			ereport(DEBUG1,
-					(errmsg("instructing removed server to drop shard group"),
-					 errdetail("Executing on server %u: %s",
-							   srvoid, drop_sg_ddl.data)));
-			
-			ExecuteDDLOnRemoteServer(srvoid, drop_sg_ddl.data);
-			
-			pfree(drop_sg_ddl.data);
 		}
 		
 		/* Perform deletion via dependency system */
@@ -1369,7 +1351,7 @@ SyncShardGroupMetadataToMember(Oid sgid, Oid newsrvoid)
 		 * and gets passed through the WITH clause syntax.
 		 */
 		appendStringInfo(&ddl,
-						 "ALTER SHARD GROUP %s ADD MEMBER IF NOT EXISTS %s WITH (skip_sync 'true');",
+						 "ALTER SHARD GROUP %s ADD MEMBER IF NOT EXISTS %s;",
 						 quote_identifier(sgname),
 						 quote_identifier(member_server->servername));
 		
@@ -1384,7 +1366,7 @@ SyncShardGroupMetadataToMember(Oid sgid, Oid newsrvoid)
 	{
 		resetStringInfo(&ddl);
 		appendStringInfo(&ddl,
-						 "ALTER SHARD GROUP %s ADD MEMBER IF NOT EXISTS %s WITH (skip_sync 'true');",
+						 "ALTER SHARD GROUP %s ADD MEMBER IF NOT EXISTS %s;",
 						 quote_identifier(sgname),
 						 quote_identifier(cluster_name));
 		ExecuteDDLOnRemoteServer(newsrvoid, ddl.data);
@@ -1482,7 +1464,7 @@ NotifyExistingMembersAboutNewMember(Oid sgid, Oid newsrvoid)
 		 * unnecessary distributed operations.
 		 */
 		appendStringInfo(&ddl,
-						 "ALTER SHARD GROUP %s ADD MEMBER IF NOT EXISTS %s WITH (skip_sync 'true');",
+						 "ALTER SHARD GROUP %s ADD MEMBER IF NOT EXISTS %s;",
 						 quote_identifier(sgname),
 						 quote_identifier(newserver->servername));
 		
