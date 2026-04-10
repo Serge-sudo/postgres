@@ -400,6 +400,8 @@ static void postgresExplainDirectModify(ForeignScanState *node,
 static void postgresExecForeignTruncate(List *rels,
 										DropBehavior behavior,
 										bool restart_seqs);
+static void postgresExecForeignDDL(Oid serverid,
+								   const char *sql);
 static bool postgresAnalyzeForeignTable(Relation relation,
 										AcquireSampleRowsFunc *func,
 										BlockNumber *totalpages);
@@ -591,6 +593,9 @@ postgres_fdw_handler(PG_FUNCTION_ARGS)
 
 	/* Support function for TRUNCATE */
 	routine->ExecForeignTruncate = postgresExecForeignTruncate;
+
+	/* Support function for DDL execution */
+	routine->ExecForeignDDL = postgresExecForeignDDL;
 
 	/* Support functions for ANALYZE */
 	routine->AnalyzeForeignTable = postgresAnalyzeForeignTable;
@@ -3067,6 +3072,38 @@ postgresExecForeignTruncate(List *rels,
 	do_sql_command(conn, sql.data);
 
 	pfree(sql.data);
+}
+
+/*
+ * postgresExecForeignDDL
+ *		Execute DDL command on a remote PostgreSQL server
+ *
+ * This function is called to execute DDL statements on a foreign server.
+ * It uses the existing postgres_fdw connection infrastructure and participates
+ * in 2PC transactions if enabled.
+ */
+static void
+postgresExecForeignDDL(Oid serverid, const char *sql)
+{
+	UserMapping *user;
+	PGconn	   *conn;
+
+	/*
+	 * Get user mapping and connection to the foreign server.
+	 * Connection manager will establish new connection if necessary
+	 * and will participate in 2PC if there are multiple servers involved.
+	 */
+	user = GetUserMapping(GetUserId(), serverid);
+	conn = GetConnection(user, false, NULL);
+
+	/* Execute the DDL command on the remote server */
+	do_sql_command(conn, sql);
+
+	/*
+	 * Note: Connection is not explicitly released here.
+	 * The connection manager will handle it and will use 2PC
+	 * if there are multiple foreign servers in the transaction.
+	 */
 }
 
 /*
