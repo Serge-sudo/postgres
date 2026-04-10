@@ -1563,8 +1563,8 @@ mux_spawn_worker(MuxWorkerSlot *w, const char *database, const char *username,
 		else if (msgtype == 'K')
 		{
 			/* BackendKeyData: pid + cancel key */
-			if (msglen >= 8)
-				w->worker_pid = (int32) get_be32(payloadbuf);
+			if (msglen == 8)
+				w->worker_pid = get_be32(payloadbuf);
 			else
 				elog(WARNING,
 					 "connection multiplexer: worker: malformed BackendKeyData (len=%d)",
