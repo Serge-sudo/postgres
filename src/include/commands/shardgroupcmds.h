@@ -25,5 +25,6 @@ extern void AlterTableSetShardGroup(AlterTableSetShardGroupStmt *stmt);
 extern Oid get_shardgroup_oid(const char *sgname, bool missing_ok);
 extern Oid get_database_default_shardgroup(Oid dbid);
 extern void SetRelationShardGroup(Oid relid, Oid sgid);
+extern List *get_shardgroup_members(Oid sgid);
 
 #endif							/* SHARDGROUPCMDS_H */
