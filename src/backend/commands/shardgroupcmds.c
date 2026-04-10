@@ -438,3 +438,40 @@ SetRelationShardGroup(Oid relid, Oid sgid)
 	/* Invalidate relcache entry */
 	CacheInvalidateRelcacheByRelid(relid);
 }
+
+/*
+ * Helper function to get list of shard members for a shard group
+ * Returns a list of server OIDs (as Datum)
+ */
+List *
+get_shardgroup_members(Oid sgid)
+{
+	List	   *members = NIL;
+	Relation	rel;
+	SysScanDesc scan;
+	ScanKeyData key[1];
+	HeapTuple	tuple;
+	
+	if (!OidIsValid(sgid))
+		return NIL;
+	
+	rel = table_open(ShardMemberRelationId, AccessShareLock);
+	
+	ScanKeyInit(&key[0],
+				Anum_pg_shardmembers_sgid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(sgid));
+	
+	scan = systable_beginscan(rel, InvalidOid, false, NULL, 1, key);
+	
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Form_pg_shardmembers memberForm = (Form_pg_shardmembers) GETSTRUCT(tuple);
+		members = lappend_oid(members, memberForm->srvid);
+	}
+	
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	
+	return members;
+}
