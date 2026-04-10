@@ -70,7 +70,7 @@
 	ereport(MULTIPLEXER_LOG_LEVEL, \
 			(errmsg_internal("multiplexer: " fmt, ##__VA_ARGS__)))
 
-#define MUX_BACKEND_KEYDATA_LEN 8
+#define MUX_BACKEND_KEYDATA_LEN 8	/* BackendKeyData payload: pid(4) + key(4) */
 
 /* -------------------------------------------------------------------------
  * GUC variables
