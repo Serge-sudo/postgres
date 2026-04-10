@@ -769,7 +769,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 	RANGE READ REAL REASSIGN RECHECK RECURSIVE REF_P REFERENCES REFERENCING
 	REFRESH REINDEX RELATIVE_P RELEASE RENAME REPEATABLE REPLACE REPLICA
-	RESET RESTART RESTRICT RETURN RETURNING RETURNS REVOKE RIGHT ROLE ROLLBACK ROLLUP
+	RESET RESHARD RESTART RESTRICT RETURN RETURNING RETURNS REVOKE RIGHT ROLE ROLLBACK ROLLUP
 	ROUTINE ROUTINES ROW ROWS RULE
 
 	SAVEPOINT SCALAR SCHEMA SCHEMAS SCROLL SEARCH SECOND_P SECURITY SELECT
@@ -11604,6 +11604,30 @@ AlterShardGroupStmt:
 					n->skip_sync = false;
 					$$ = (Node *) n;
 				}
+			| ALTER SHARD GROUP_P name RESHARD
+				{
+					AlterShardGroupStmt *n = makeNode(AlterShardGroupStmt);
+
+					n->sgname = $4;
+					n->action = "RESHARD";
+					n->servername = NULL;
+					n->options = NIL;
+					n->if_not_exists = false;
+					n->skip_sync = false;
+					$$ = (Node *) n;
+				}
+			| ALTER SHARD GROUP_P name DETACH name
+				{
+					AlterShardGroupStmt *n = makeNode(AlterShardGroupStmt);
+
+					n->sgname = $4;
+					n->action = "DETACH";
+					n->servername = $6;
+					n->options = NIL;
+					n->if_not_exists = false;
+					n->skip_sync = false;
+					$$ = (Node *) n;
+				}
 		;
 
 
@@ -17968,6 +17992,7 @@ unreserved_keyword:
 			| REPLACE
 			| REPLICA
 			| RESET
+			| RESHARD
 			| RESTART
 			| RESTRICT
 			| RETURN
@@ -18601,6 +18626,7 @@ bare_label_keyword:
 			| REPLACE
 			| REPLICA
 			| RESET
+			| RESHARD
 			| RESTART
 			| RESTRICT
 			| RETURN

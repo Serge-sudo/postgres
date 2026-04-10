@@ -56,6 +56,7 @@ extern List *find_all_inheritors(Oid parentrelId, LOCKMODE lockmode,
 								 List **numparents);
 extern bool has_subclass(Oid relationId);
 extern bool has_superclass(Oid relationId);
+extern Oid get_parent_rel_oid(Oid relid);
 extern bool typeInheritsFrom(Oid subclassTypeId, Oid superclassTypeId);
 extern void StoreSingleInheritance(Oid relationId, Oid parentOid,
 								   int32 seqNumber);

@@ -32,6 +32,12 @@ typedef void (*GetForeignPaths_function) (PlannerInfo *root,
 										  RelOptInfo *baserel,
 										  Oid foreigntableid);
 
+typedef void (*ExecCopyStream_function) (Oid src_serverid,
+                       Oid dst_serverid,
+                       const char *src_nsp,
+                       const char *src_rel,
+                       const char *dst_nsp,
+                       const char *dst_rel);
 typedef ForeignScan *(*GetForeignPlan_function) (PlannerInfo *root,
 												 RelOptInfo *baserel,
 												 Oid foreigntableid,
@@ -267,6 +273,7 @@ typedef struct FdwRoutine
 
 	/* Support functions for DDL execution */
 	ExecForeignDDL_function ExecForeignDDL;
+	ExecCopyStream_function ExecCopyStream;
 
 	/* Support functions for parallelism under Gather node */
 	IsForeignScanParallelSafe_function IsForeignScanParallelSafe;
