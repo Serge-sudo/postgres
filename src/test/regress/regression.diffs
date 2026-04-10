@@ -1,6 +1,6 @@
-diff -U3 /home/runner/work/postgres/postgres/src/test/regress/expected/sharding.out /home/runner/work/postgres/postgres/src/test/regress/results/sharding.out
---- /home/runner/work/postgres/postgres/src/test/regress/expected/sharding.out	2026-04-10 09:40:11.107076279 +0000
-+++ /home/runner/work/postgres/postgres/src/test/regress/results/sharding.out	2026-04-10 09:48:52.108186171 +0000
+diff -U3 /workspaces/postgres/src/test/regress/expected/sharding.out /workspaces/postgres/src/test/regress/results/sharding.out
+--- /workspaces/postgres/src/test/regress/expected/sharding.out	2026-03-27 11:58:34.637376862 +0000
++++ /workspaces/postgres/src/test/regress/results/sharding.out	2026-04-04 12:38:21.075845556 +0000
 @@ -46,7 +46,7 @@
  SELECT * FROM pg_shardgroups;
    oid  | sgname  | sgowner | sgoptions 
@@ -10,7 +10,7 @@ diff -U3 /home/runner/work/postgres/postgres/src/test/regress/expected/sharding.
  (1 row)
  
  -- -- Test error message
-@@ -55,7 +55,7 @@
+@@ -55,64 +55,57 @@
  SELECT * FROM pg_shardgroups;
    oid  | sgname  | sgowner | sgoptions 
  -------+---------+---------+-----------
@@ -19,14 +19,21 @@ diff -U3 /home/runner/work/postgres/postgres/src/test/regress/expected/sharding.
  (1 row)
  
  ALTER DATABASE regression SET DEFAULT SHARD GROUP sg_test;
-@@ -65,54 +65,47 @@
-      5 | postgres   |     10 |        6 | c              | f             | t            | f              |           -1 |          734 |          1 |          1663 |             0 | C.UTF-8    | C.UTF-8  |           |             |                | 
-      1 | template1  |     10 |        6 | c              | t             | t            | f              |           -1 |          734 |          1 |          1663 |             0 | C.UTF-8    | C.UTF-8  |           |             |                | {=c/runner,runner=CTc/runner}
-      4 | template0  |     10 |        6 | c              | t             | f            | f              |           -1 |          734 |          1 |          1663 |             0 | C.UTF-8    | C.UTF-8  |           |             |                | {=c/runner,runner=CTc/runner}
+ SELECT * FROM pg_database;
+-  oid  |  datname   | datdba | encoding | datlocprovider | datistemplate | datallowconn | dathasloginevt | datconnlimit | datfrozenxid | datminmxid | dattablespace | datshardgroup | datcollate | datctype | datlocale | daticurules | datcollversion |            datacl             
+--------+------------+--------+----------+----------------+---------------+--------------+----------------+--------------+--------------+------------+---------------+---------------+------------+----------+-----------+-------------+----------------+-------------------------------
+-     5 | postgres   |     10 |        6 | c              | f             | t            | f              |           -1 |          734 |          1 |          1663 |             0 | C.UTF-8    | C.UTF-8  |           |             |                | 
+-     1 | template1  |     10 |        6 | c              | t             | t            | f              |           -1 |          734 |          1 |          1663 |             0 | C.UTF-8    | C.UTF-8  |           |             |                | {=c/runner,runner=CTc/runner}
+-     4 | template0  |     10 |        6 | c              | t             | f            | f              |           -1 |          734 |          1 |          1663 |             0 | C.UTF-8    | C.UTF-8  |           |             |                | {=c/runner,runner=CTc/runner}
 - 16384 | testdb     |     10 |        6 | c              | f             | t            | f              |           -1 |          734 |          1 |          1663 |         16450 | C.UTF-8    | C.UTF-8  |           |             |                | 
 - 16483 | regression |     10 |        6 | c              | f             | t            | f              |           -1 |          734 |          1 |          1663 |         16491 | C.UTF-8    | C.UTF-8  |           |             |                | 
 -(5 rows)
-+ 16384 | regression |     10 |        6 | c              | f             | t            | f              |           -1 |          734 |          1 |          1663 |         16395 | C.UTF-8    | C.UTF-8  |           |             |                | 
++  oid  |  datname   | datdba | encoding | datlocprovider | datistemplate | datallowconn | dathasloginevt | datconnlimit | datfrozenxid | datminmxid | dattablespace | datshardgroup | datcollate  |  datctype   | datlocale | daticurules | datcollversion |            datacl             
++-------+------------+--------+----------+----------------+---------------+--------------+----------------+--------------+--------------+------------+---------------+---------------+-------------+-------------+-----------+-------------+----------------+-------------------------------
++     5 | postgres   |     10 |        6 | c              | f             | t            | f              |           -1 |          734 |          1 |          1663 |             0 | en_US.UTF-8 | en_US.UTF-8 |           |             | 2.39           | 
++     1 | template1  |     10 |        6 | c              | t             | t            | f              |           -1 |          734 |          1 |          1663 |             0 | en_US.UTF-8 | en_US.UTF-8 |           |             | 2.39           | {=c/vscode,vscode=CTc/vscode}
++     4 | template0  |     10 |        6 | c              | t             | f            | f              |           -1 |          734 |          1 |          1663 |             0 | en_US.UTF-8 | en_US.UTF-8 |           |             |                | {=c/vscode,vscode=CTc/vscode}
++ 16384 | regression |     10 |        6 | c              | f             | t            | f              |           -1 |          734 |          1 |          1663 |         16395 | en_US.UTF-8 | en_US.UTF-8 |           |             | 2.39           | 
 +(4 rows)
  
  -- ALTER DATABASE ... SET SHARD GROUP
@@ -34,7 +41,7 @@ diff -U3 /home/runner/work/postgres/postgres/src/test/regress/expected/sharding.
      FOREIGN DATA WRAPPER postgres_fdw
      OPTIONS (host 'localhost', dbname 'regression', port '5432');
  ALTER SHARD GROUP sg_test ADD MEMBER server1;
-+ERROR:  user mapping not found for user "runner", server "server1"
++ERROR:  user mapping not found for user "vscode", server "server1"
  SELECT * FROM pg_foreign_server;
    oid  | srvname | srvowner | srvfdw | srvtype | srvversion | srvacl |                  srvoptions                  
  -------+---------+----------+--------+---------+------------+--------+----------------------------------------------
@@ -136,9 +143,9 @@ diff -U3 /home/runner/work/postgres/postgres/src/test/regress/expected/sharding.
 +                       List of relations
 + Schema |        Name         |         Type          | Owner  
 +--------+---------------------+-----------------------+--------
-+ public | test_t_distribute   | distributed table     | runner
-+ public | test_t_distribute_1 | distributed partition | runner
-+ public | test_t_worldwide    | worldwide table       | runner
++ public | test_t_distribute   | distributed table     | vscode
++ public | test_t_distribute_1 | distributed partition | vscode
++ public | test_t_worldwide    | worldwide table       | vscode
 +(3 rows)
  
  -- Test \d command to verify detailed table type display

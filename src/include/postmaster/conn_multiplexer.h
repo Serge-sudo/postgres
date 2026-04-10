@@ -198,6 +198,33 @@ typedef struct MuxCtrlConn
 	int				send_off;
 } MuxCtrlConn;
 
+typedef struct MuxWorkerStats
+{
+	bool		valid;
+	bool		in_tx;
+	int32		active_channel;
+	int32		connect_cnt;
+	char		database[NAMEDATALEN];
+	char		username[NAMEDATALEN];
+} MuxWorkerStats;
+
+typedef struct MuxStatsSnapshot
+{
+	pid_t		mux_pid;
+	bool		mux_ready;
+	int32		mux_pending_count;
+	int32		mux_channel_count;
+	int32		mux_channel_startup;
+	int32		mux_channel_connecting;
+	int32		mux_channel_ready;
+	int32		mux_channel_tx_pending;
+	int32		mux_channel_in_tx;
+	int32		mux_ctrl_count;
+	int32		mux_n_workers;
+	int32		mux_workers_in_tx;
+	MuxWorkerStats workers[MUX_MAX_WORKERS];
+} MuxStatsSnapshot;
+
 /* -------------------------------------------------------------------------
  * MuxSharedState — minimal shared-memory singleton.
  * In the new architecture the heavy data lives in process-local memory of
@@ -210,6 +237,7 @@ typedef struct MuxSharedState
 	pid_t		mux_pid;		/* PID of ConnMuxMain, 0 = not running */
 	bool		mux_ready;		/* true once mux is listening */
 	slock_t		mutex;
+	MuxStatsSnapshot stats;
 } MuxSharedState;
 
 /* -------------------------------------------------------------------------
@@ -230,6 +258,7 @@ extern void ConnMuxMain(Datum main_arg);
 /* Backend-facing checks */
 extern bool ConnMuxIsAvailable(void);
 extern bool ConnMuxIsWorkerProcess(void);
+extern bool ConnMuxGetStatsSnapshot(MuxStatsSnapshot *snapshot);
 
 /* GUC variables */
 extern PGDLLIMPORT int mux_worker_count;

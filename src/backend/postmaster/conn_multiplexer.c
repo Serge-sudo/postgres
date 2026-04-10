@@ -160,6 +160,8 @@ static MuxCtrlConn mux_ctrl[MUX_MAX_CTRL_CONNS];
 static MuxWorkerSlot mux_workers[MUX_MAX_WORKERS];
 static int mux_n_workers = 0; /* live worker count */
 
+static void ConnMuxPublishStats(void);
+
 /* WaitEventSet user_data encoding */
 #define MUX_EVENT_KIND_SHIFT 16
 #define MUX_EVENT(kind, idx) \
@@ -358,6 +360,7 @@ void ConnMuxShmemInit(void)
 		SpinLockInit(&MuxState->mutex);
 		MuxState->mux_pid = 0;
 		MuxState->mux_ready = false;
+		MemSet(&MuxState->stats, 0, sizeof(MuxState->stats));
 	}
 }
 
@@ -406,6 +409,21 @@ bool ConnMuxIsAvailable(void)
 bool ConnMuxIsWorkerProcess(void)
 {
 	return false;
+}
+
+bool
+ConnMuxGetStatsSnapshot(MuxStatsSnapshot *snapshot)
+{
+	if (snapshot == NULL)
+		return false;
+	if (mux_worker_count <= 0 || MuxState == NULL)
+		return false;
+
+	SpinLockAcquire(&MuxState->mutex);
+	memcpy(snapshot, &MuxState->stats, sizeof(*snapshot));
+	SpinLockRelease(&MuxState->mutex);
+
+	return true;
 }
 
 /* =========================================================================
@@ -2265,6 +2283,8 @@ ConnMuxClassifyPending(int idx)
 static void
 ConnMuxEventLoop(void)
 {
+	ConnMuxPublishStats();
+
 	for (;;)
 	{
 		WaitEventSet *wes;
@@ -2442,7 +2462,84 @@ ConnMuxEventLoop(void)
 			if (mux_pending[i] != PGINVALID_SOCKET)
 				ConnMuxClassifyPending(i);
 		}
+
+		ConnMuxPublishStats();
 	}
+}
+
+static void
+ConnMuxPublishStats(void)
+{
+	MuxStatsSnapshot snapshot;
+	int i;
+
+	if (MuxState == NULL)
+		return;
+
+	MemSet(&snapshot, 0, sizeof(snapshot));
+
+	snapshot.mux_pid = MuxState->mux_pid;
+	snapshot.mux_ready = MuxState->mux_ready;
+	snapshot.mux_pending_count = mux_pending_count;
+	snapshot.mux_n_workers = mux_n_workers;
+
+	for (i = 0; i < MUX_MAX_CHANNELS; i++)
+	{
+		MuxChannelSlot *ch = &mux_channels[i];
+
+		if (ch->state == MCH_EMPTY)
+			continue;
+
+		snapshot.mux_channel_count++;
+		switch (ch->state)
+		{
+			case MCH_STARTUP:
+				snapshot.mux_channel_startup++;
+				break;
+			case MCH_CONNECTING:
+				snapshot.mux_channel_connecting++;
+				break;
+			case MCH_READY:
+				snapshot.mux_channel_ready++;
+				break;
+			case MCH_TX_PENDING:
+				snapshot.mux_channel_tx_pending++;
+				break;
+			case MCH_IN_TX:
+				snapshot.mux_channel_in_tx++;
+				break;
+			case MCH_EMPTY:
+				break;
+		}
+	}
+
+	for (i = 0; i < MUX_MAX_CTRL_CONNS; i++)
+	{
+		if (mux_ctrl[i].state != MCC_EMPTY)
+			snapshot.mux_ctrl_count++;
+	}
+
+	for (i = 0; i < MUX_MAX_WORKERS; i++)
+	{
+		MuxWorkerSlot *w = &mux_workers[i];
+		MuxWorkerStats *ws = &snapshot.workers[i];
+
+		if (w->worker_sock == PGINVALID_SOCKET)
+			continue;
+
+		ws->valid = true;
+		ws->in_tx = w->in_tx;
+		ws->active_channel = w->active_channel;
+		ws->connect_cnt = w->connect_cnt;
+		strlcpy(ws->database, w->database, sizeof(ws->database));
+		strlcpy(ws->username, w->username, sizeof(ws->username));
+		if (w->in_tx)
+			snapshot.mux_workers_in_tx++;
+	}
+
+	SpinLockAcquire(&MuxState->mutex);
+	memcpy(&MuxState->stats, &snapshot, sizeof(snapshot));
+	SpinLockRelease(&MuxState->mutex);
 }
 
 /* =========================================================================
@@ -2481,6 +2578,7 @@ void ConnMuxMain(Datum main_arg)
 	ConnMuxSetupListenSocket();
 
 	MuxState->mux_ready = true;
+	ConnMuxPublishStats();
 
 	elog(LOG, "connection multiplexer started on TCP port %d",
 		 mux_tcp_port);
@@ -2492,6 +2590,7 @@ void ConnMuxMain(Datum main_arg)
 	/* Cleanup */
 	MuxState->mux_ready = false;
 	MuxState->mux_pid = 0;
+	ConnMuxPublishStats();
 	DisownLatch(&MuxState->mux_latch);
 
 	if (mux_listen_sock != PGINVALID_SOCKET)
