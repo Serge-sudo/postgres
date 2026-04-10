@@ -5,6 +5,7 @@ OBJS = \
 	$(WIN32RES) \
 	connection.o \
 	deparse.o \
+	fdw_shmem.o \
 	option.o \
 	postgres_fdw.o \
 	shippable.o
@@ -14,7 +15,7 @@ PG_CPPFLAGS = -I$(libpq_srcdir)
 SHLIB_LINK_INTERNAL = $(libpq)
 
 EXTENSION = postgres_fdw
-DATA = postgres_fdw--1.0.sql postgres_fdw--1.0--1.1.sql
+DATA = postgres_fdw--1.0.sql postgres_fdw--1.0--1.1.sql postgres_fdw--1.1--1.2.sql
 
 # REGRESS = postgres_fdw query_cancel
 
