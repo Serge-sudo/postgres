@@ -27,6 +27,8 @@ endif
 EXTRADEFS = '-DHOST_TUPLE="$(host_tuple)"' \
 	'-DSHELLPROG="$(SHELL)"'
 
+EXTRA_INSTALL = contrib/postgres_fdw
+
 ##
 ## Prepare for tests
 ##

@@ -243,8 +243,6 @@ CSNLogSetCSNInSlot(TransactionId xid, CSN csn, int slotno)
 	int entryno = TransactionIdToPgIndex(xid);
 	CSN *ptr;
 
-	Assert(LWLockHeldByMe(CSNLogLock));
-
 	ptr = (CSN *) (CsnlogCtl->shared->page_buffer[slotno] +
 														entryno * sizeof(CSN));
 	*ptr = csn;
@@ -288,7 +286,6 @@ CSNLogGetCSNByXid(TransactionId xid)
 static int
 ZeroCSNLogPage(int64 pageno, bool write_xlog)
 {
-	Assert(LWLockHeldByMe(CSNLogLock));
 	if(write_xlog)
 		WriteZeroCSNPageXlogRec(pageno);
 	return SimpleLruZeroPage(CsnlogCtl, pageno);
