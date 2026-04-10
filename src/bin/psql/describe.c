@@ -1574,6 +1574,7 @@ describeOneTableDetails(const char *schemaname,
 		char		relpersistence;
 		char		relreplident;
 		char	   *relam;
+		Oid			relsgid;
 	}			tableinfo;
 	bool		show_column_details = false;
 
@@ -1593,7 +1594,7 @@ describeOneTableDetails(const char *schemaname,
 						  "c.relhastriggers, c.relrowsecurity, c.relforcerowsecurity, "
 						  "false AS relhasoids, c.relispartition, %s, c.reltablespace, "
 						  "CASE WHEN c.reloftype = 0 THEN '' ELSE c.reloftype::pg_catalog.regtype::pg_catalog.text END, "
-						  "c.relpersistence, c.relreplident, am.amname\n"
+						  "c.relpersistence, c.relreplident, am.amname, c.relsgid\n"
 						  "FROM pg_catalog.pg_class c\n "
 						  "LEFT JOIN pg_catalog.pg_class tc ON (c.reltoastrelid = tc.oid)\n"
 						  "LEFT JOIN pg_catalog.pg_am am ON (c.relam = am.oid)\n"
@@ -1611,7 +1612,7 @@ describeOneTableDetails(const char *schemaname,
 						  "c.relhastriggers, c.relrowsecurity, c.relforcerowsecurity, "
 						  "c.relhasoids, c.relispartition, %s, c.reltablespace, "
 						  "CASE WHEN c.reloftype = 0 THEN '' ELSE c.reloftype::pg_catalog.regtype::pg_catalog.text END, "
-						  "c.relpersistence, c.relreplident\n"
+						  "c.relpersistence, c.relreplident, c.relsgid\n"
 						  "FROM pg_catalog.pg_class c\n "
 						  "LEFT JOIN pg_catalog.pg_class tc ON (c.reltoastrelid = tc.oid)\n"
 						  "WHERE c.oid = '%s';",
@@ -1628,7 +1629,7 @@ describeOneTableDetails(const char *schemaname,
 						  "c.relhastriggers, c.relrowsecurity, c.relforcerowsecurity, "
 						  "c.relhasoids, false as relispartition, %s, c.reltablespace, "
 						  "CASE WHEN c.reloftype = 0 THEN '' ELSE c.reloftype::pg_catalog.regtype::pg_catalog.text END, "
-						  "c.relpersistence, c.relreplident\n"
+						  "c.relpersistence, c.relreplident, c.relsgid\n"
 						  "FROM pg_catalog.pg_class c\n "
 						  "LEFT JOIN pg_catalog.pg_class tc ON (c.reltoastrelid = tc.oid)\n"
 						  "WHERE c.oid = '%s';",
@@ -1645,7 +1646,7 @@ describeOneTableDetails(const char *schemaname,
 						  "c.relhastriggers, false, false, c.relhasoids, "
 						  "false as relispartition, %s, c.reltablespace, "
 						  "CASE WHEN c.reloftype = 0 THEN '' ELSE c.reloftype::pg_catalog.regtype::pg_catalog.text END, "
-						  "c.relpersistence, c.relreplident\n"
+						  "c.relpersistence, c.relreplident, c.relsgid\n"
 						  "FROM pg_catalog.pg_class c\n "
 						  "LEFT JOIN pg_catalog.pg_class tc ON (c.reltoastrelid = tc.oid)\n"
 						  "WHERE c.oid = '%s';",
@@ -1662,7 +1663,7 @@ describeOneTableDetails(const char *schemaname,
 						  "c.relhastriggers, false, false, c.relhasoids, "
 						  "false as relispartition, %s, c.reltablespace, "
 						  "CASE WHEN c.reloftype = 0 THEN '' ELSE c.reloftype::pg_catalog.regtype::pg_catalog.text END, "
-						  "c.relpersistence\n"
+						  "c.relpersistence, 0::oid as relsgid\n"
 						  "FROM pg_catalog.pg_class c\n "
 						  "LEFT JOIN pg_catalog.pg_class tc ON (c.reltoastrelid = tc.oid)\n"
 						  "WHERE c.oid = '%s';",
@@ -1699,13 +1700,22 @@ describeOneTableDetails(const char *schemaname,
 	tableinfo.reloftype = (strcmp(PQgetvalue(res, 0, 11), "") != 0) ?
 		pg_strdup(PQgetvalue(res, 0, 11)) : NULL;
 	tableinfo.relpersistence = *(PQgetvalue(res, 0, 12));
-	tableinfo.relreplident = (pset.sversion >= 90400) ?
-		*(PQgetvalue(res, 0, 13)) : 'd';
-	if (pset.sversion >= 120000)
-		tableinfo.relam = PQgetisnull(res, 0, 14) ?
-			(char *) NULL : pg_strdup(PQgetvalue(res, 0, 14));
+	if (pset.sversion >= 90400)
+	{
+		tableinfo.relreplident = *(PQgetvalue(res, 0, 13));
+		if (pset.sversion >= 120000)
+			tableinfo.relam = PQgetisnull(res, 0, 14) ?
+				(char *) NULL : pg_strdup(PQgetvalue(res, 0, 14));
+		else
+			tableinfo.relam = NULL;
+		tableinfo.relsgid = atooid(PQgetvalue(res, 0, pset.sversion >= 120000 ? 15 : 14));
+	}
 	else
+	{
+		tableinfo.relreplident = 'd';
 		tableinfo.relam = NULL;
+		tableinfo.relsgid = atooid(PQgetvalue(res, 0, 13));
+	}
 	PQclear(res);
 	res = NULL;
 
@@ -1958,7 +1968,19 @@ describeOneTableDetails(const char *schemaname,
 	switch (tableinfo.relkind)
 	{
 		case RELKIND_RELATION:
-			if (tableinfo.relpersistence == 'u')
+			if (tableinfo.relsgid != 0)
+			{
+				if (tableinfo.ispartition)
+					printfPQExpBuffer(&title, _("Distributed partition \"%s.%s\""),
+									  schemaname, relationname);
+				else if (tableinfo.relpersistence == 'u')
+					printfPQExpBuffer(&title, _("Unlogged worldwide table \"%s.%s\""),
+									  schemaname, relationname);
+				else
+					printfPQExpBuffer(&title, _("Worldwide table \"%s.%s\""),
+									  schemaname, relationname);
+			}
+			else if (tableinfo.relpersistence == 'u')
 				printfPQExpBuffer(&title, _("Unlogged table \"%s.%s\""),
 								  schemaname, relationname);
 			else
@@ -1978,7 +2000,60 @@ describeOneTableDetails(const char *schemaname,
 								  schemaname, relationname);
 			break;
 		case RELKIND_INDEX:
-			if (tableinfo.relpersistence == 'u')
+			if (tableinfo.relsgid != 0)
+			{
+				/* Need to check parent table type to determine index type */
+				PQExpBufferData tmpbuf2;
+				PGresult *tmpres;
+				bool is_partition_index = false;
+				bool is_partitioned_table = false;
+				
+				initPQExpBuffer(&tmpbuf2);
+				printfPQExpBuffer(&tmpbuf2,
+								  "SELECT p.relispartition, p.relkind "
+								  "FROM pg_catalog.pg_index i "
+								  "JOIN pg_catalog.pg_class p ON i.indrelid = p.oid "
+								  "WHERE i.indexrelid = '%s';", oid);
+				tmpres = PSQLexec(tmpbuf2.data);
+				if (tmpres && PQntuples(tmpres) > 0)
+				{
+					is_partition_index = strcmp(PQgetvalue(tmpres, 0, 0), "t") == 0;
+					is_partitioned_table = *(PQgetvalue(tmpres, 0, 1)) == RELKIND_PARTITIONED_TABLE;
+				}
+				if (tmpres)
+					PQclear(tmpres);
+				termPQExpBuffer(&tmpbuf2);
+				
+				if (is_partition_index)
+				{
+					if (tableinfo.relpersistence == 'u')
+						printfPQExpBuffer(&title, _("Unlogged distributed partition index \"%s.%s\""),
+										  schemaname, relationname);
+					else
+						printfPQExpBuffer(&title, _("Distributed partition index \"%s.%s\""),
+										  schemaname, relationname);
+				}
+				else if (is_partitioned_table)
+				{
+					if (tableinfo.relpersistence == 'u')
+						printfPQExpBuffer(&title, _("Unlogged distributed index \"%s.%s\""),
+										  schemaname, relationname);
+					else
+						printfPQExpBuffer(&title, _("Distributed index \"%s.%s\""),
+										  schemaname, relationname);
+				}
+				else
+				{
+					/* Parent is a worldwide table (regular table with relsgid) */
+					if (tableinfo.relpersistence == 'u')
+						printfPQExpBuffer(&title, _("Unlogged worldwide index \"%s.%s\""),
+										  schemaname, relationname);
+					else
+						printfPQExpBuffer(&title, _("Worldwide index \"%s.%s\""),
+										  schemaname, relationname);
+				}
+			}
+			else if (tableinfo.relpersistence == 'u')
 				printfPQExpBuffer(&title, _("Unlogged index \"%s.%s\""),
 								  schemaname, relationname);
 			else
@@ -1986,7 +2061,17 @@ describeOneTableDetails(const char *schemaname,
 								  schemaname, relationname);
 			break;
 		case RELKIND_PARTITIONED_INDEX:
-			if (tableinfo.relpersistence == 'u')
+			if (tableinfo.relsgid != 0)
+			{
+				/* Partitioned indexes can only be on partitioned tables, so this is always "distributed index" */
+				if (tableinfo.relpersistence == 'u')
+					printfPQExpBuffer(&title, _("Unlogged distributed index \"%s.%s\""),
+									  schemaname, relationname);
+				else
+					printfPQExpBuffer(&title, _("Distributed index \"%s.%s\""),
+									  schemaname, relationname);
+			}
+			else if (tableinfo.relpersistence == 'u')
 				printfPQExpBuffer(&title, _("Unlogged partitioned index \"%s.%s\""),
 								  schemaname, relationname);
 			else
@@ -2006,7 +2091,16 @@ describeOneTableDetails(const char *schemaname,
 							  schemaname, relationname);
 			break;
 		case RELKIND_PARTITIONED_TABLE:
-			if (tableinfo.relpersistence == 'u')
+			if (tableinfo.relsgid != 0)
+			{
+				if (tableinfo.relpersistence == 'u')
+					printfPQExpBuffer(&title, _("Unlogged distributed table \"%s.%s\""),
+									  schemaname, relationname);
+				else
+					printfPQExpBuffer(&title, _("Distributed table \"%s.%s\""),
+									  schemaname, relationname);
+			}
+			else if (tableinfo.relpersistence == 'u')
 				printfPQExpBuffer(&title, _("Unlogged partitioned table \"%s.%s\""),
 								  schemaname, relationname);
 			else
@@ -3930,28 +4024,44 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
 	printfPQExpBuffer(&buf,
 					  "SELECT n.nspname as \"%s\",\n"
 					  "  c.relname as \"%s\",\n"
-					  "  CASE c.relkind"
-					  " WHEN " CppAsString2(RELKIND_RELATION) " THEN '%s'"
-					  " WHEN " CppAsString2(RELKIND_VIEW) " THEN '%s'"
-					  " WHEN " CppAsString2(RELKIND_MATVIEW) " THEN '%s'"
-					  " WHEN " CppAsString2(RELKIND_INDEX) " THEN '%s'"
-					  " WHEN " CppAsString2(RELKIND_SEQUENCE) " THEN '%s'"
-					  " WHEN " CppAsString2(RELKIND_TOASTVALUE) " THEN '%s'"
-					  " WHEN " CppAsString2(RELKIND_FOREIGN_TABLE) " THEN '%s'"
-					  " WHEN " CppAsString2(RELKIND_PARTITIONED_TABLE) " THEN '%s'"
-					  " WHEN " CppAsString2(RELKIND_PARTITIONED_INDEX) " THEN '%s'"
+					  "  CASE"
+					  " WHEN c.relkind = " CppAsString2(RELKIND_RELATION) " AND c.relsgid != 0 AND c.relispartition THEN '%s'"
+					  " WHEN c.relkind = " CppAsString2(RELKIND_RELATION) " AND c.relsgid != 0 THEN '%s'"
+					  " WHEN c.relkind = " CppAsString2(RELKIND_RELATION) " THEN '%s'"
+					  " WHEN c.relkind = " CppAsString2(RELKIND_VIEW) " THEN '%s'"
+					  " WHEN c.relkind = " CppAsString2(RELKIND_MATVIEW) " THEN '%s'"
+					  " WHEN c.relkind = " CppAsString2(RELKIND_INDEX) " THEN"
+					  " CASE WHEN c.relsgid != 0 THEN"
+					  " CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_index idx JOIN pg_catalog.pg_class p ON idx.indrelid = p.oid WHERE idx.indexrelid = c.oid AND p.relispartition) THEN '%s'"
+					  " WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_index idx JOIN pg_catalog.pg_class p ON idx.indrelid = p.oid WHERE idx.indexrelid = c.oid AND p.relkind = " CppAsString2(RELKIND_PARTITIONED_TABLE) ") THEN '%s'"
+					  " ELSE '%s' END"
+					  " ELSE '%s' END"
+					  " WHEN c.relkind = " CppAsString2(RELKIND_SEQUENCE) " THEN '%s'"
+					  " WHEN c.relkind = " CppAsString2(RELKIND_TOASTVALUE) " THEN '%s'"
+					  " WHEN c.relkind = " CppAsString2(RELKIND_FOREIGN_TABLE) " THEN '%s'"
+					  " WHEN c.relkind = " CppAsString2(RELKIND_PARTITIONED_TABLE) " AND c.relsgid != 0 THEN '%s'"
+					  " WHEN c.relkind = " CppAsString2(RELKIND_PARTITIONED_TABLE) " THEN '%s'"
+					  " WHEN c.relkind = " CppAsString2(RELKIND_PARTITIONED_INDEX) " AND c.relsgid != 0 THEN '%s'"
+					  " WHEN c.relkind = " CppAsString2(RELKIND_PARTITIONED_INDEX) " THEN '%s'"
 					  " END as \"%s\",\n"
 					  "  pg_catalog.pg_get_userbyid(c.relowner) as \"%s\"",
 					  gettext_noop("Schema"),
 					  gettext_noop("Name"),
+					  gettext_noop("distributed partition"),
+					  gettext_noop("worldwide table"),
 					  gettext_noop("table"),
 					  gettext_noop("view"),
 					  gettext_noop("materialized view"),
+					  gettext_noop("distributed partition index"),
+					  gettext_noop("distributed index"),
+					  gettext_noop("worldwide index"),
 					  gettext_noop("index"),
 					  gettext_noop("sequence"),
 					  gettext_noop("TOAST table"),
 					  gettext_noop("foreign table"),
+					  gettext_noop("distributed table"),
 					  gettext_noop("partitioned table"),
+					  gettext_noop("distributed index"),
 					  gettext_noop("partitioned index"),
 					  gettext_noop("Type"),
 					  gettext_noop("Owner"));
