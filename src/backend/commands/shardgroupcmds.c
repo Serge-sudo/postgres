@@ -13,6 +13,7 @@
  */
 #include "postgres.h"
 
+#include "executor/spi.h"
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
@@ -29,14 +30,18 @@
 #include "catalog/pg_partitioned_table.h"
 #include "catalog/pg_shdepend.h"
 #include "catalog/pg_shardgroups.h"
+#include "catalog/pg_inherits.h"
 #include "catalog/pg_shardmembers.h"
+#include "catalog/partition.h"
 #include "commands/dbcommands.h"
+#include "common/hashfn.h"
 #include "commands/defrem.h"
 #include "commands/shardgroupcmds.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
 #include "miscadmin.h"
 #include "partitioning/partdefs.h"
+#include "partitioning/partdesc.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -46,7 +51,8 @@
 #include "utils/rel.h"
 #include "utils/ruleutils.h"
 #include "utils/syscache.h"
-
+#include "foreign/foreign.h"
+			  
 /* Helper functions */
 extern Oid get_shardgroup_oid(const char *sgname, bool missing_ok);
 extern Oid get_database_default_shardgroup(Oid dbid);
@@ -58,6 +64,56 @@ static void SyncShardGroupMetadataToMember(Oid sgid, Oid newsrvoid);
 static void NotifyExistingMembersAboutNewMember(Oid sgid, Oid newsrvoid);
 static void ExecuteDDLOnRemoteServer(Oid serveroid, const char *sql);
 
+/* Consistent hashing functions */
+static uint32 hash_string_to_uint32(const char *str);
+static void ReshardShardGroup(Oid sgid);
+static void DetachShardMember(Oid sgid, Oid srvoid);
+
+/* Helper functions for partition migration */
+static void MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgid);
+static Oid FindPartitionHostMember(Oid partitionOid, Oid sgid);
+static List *GetShardGroupPartitions(Oid sgid);
+static char *PartitionBoundsSpecToString(PartitionBoundSpec *partbound);
+static void CopyFileToRemoteFDW(Oid src_serverid, Oid dest_serverid, const char *src_nspname, const char *src_relname, const char *dest_nspname, const char *dest_relname);
+
+/* Number of virtual nodes per shard member for consistent hashing */
+#define VIRTUAL_NODES_PER_MEMBER 150
+/* Maximum length for virtual node key strings */
+#define VNODE_KEY_MAX_LEN 512
+
+/*
+ * CopyFileToRemoteFDW
+ *		Use FDW routine hook if available; otherwise fallback to direct libpq copy
+ */
+static void
+CopyFileToRemoteFDW(Oid src_serverid, Oid dest_serverid, const char *src_nspname, const char *src_relname, const char *dest_nspname, const char *dest_relname)
+{
+	FdwRoutine *fdwroutine;
+	ForeignServer * server;
+	ForeignDataWrapper * fdw;
+	
+	if (src_serverid == InvalidOid)
+	{
+		server = GetForeignServer(dest_serverid);
+		fdw = GetForeignDataWrapper(server->fdwid);
+
+		/* Get the FDW routine */
+		fdwroutine = GetFdwRoutine(fdw->fdwhandler);
+	}
+	else
+	{
+		server = GetForeignServer(src_serverid);
+		fdw = GetForeignDataWrapper(server->fdwid);
+
+		/* Get the FDW routine */
+		fdwroutine = GetFdwRoutine(fdw->fdwhandler);
+	}
+
+	if (fdwroutine != NULL && fdwroutine->ExecCopyStream != NULL)
+	{
+		fdwroutine->ExecCopyStream(src_serverid, dest_serverid, src_nspname, src_relname, dest_nspname, dest_relname);
+	}
+}
 
 /*
  * CREATE SHARD GROUP
@@ -329,7 +385,6 @@ AlterShardGroup(AlterShardGroupStmt *stmt)
 		/* Check if any foreign tables in this shard group depend on this member */
 		{
 			Relation	classrel;
-			Relation	ftrel;
 			SysScanDesc scan;
 			ScanKeyData key[1];
 			HeapTuple	classtuple;
@@ -444,6 +499,25 @@ AlterShardGroup(AlterShardGroupStmt *stmt)
 		}
 		
 		ObjectAddressSet(address, ShardMemberRelationId, memberoid);
+	}
+	else if (strcmp(stmt->action, "RESHARD") == 0)
+	{
+		/* Redistribute partitions across shard members using consistent hashing */
+		ReshardShardGroup(sgoid);
+		ObjectAddressSet(address, ShardGroupRelationId, sgoid);
+	}
+	else if (strcmp(stmt->action, "DETACH") == 0)
+	{
+		/* Move all real tables from specified member to other members */
+		/* if it is our local node */
+		if (strcmp(stmt->servername, cluster_name) == 0)
+		{
+			srvoid = InvalidOid; /* will be set below */
+		}
+		else
+			srvoid = get_foreign_server_oid(stmt->servername, false);
+		DetachShardMember(sgoid, srvoid);
+		ObjectAddressSet(address, ShardMemberRelationId, InvalidOid);
 	}
 	else
 	{
@@ -614,6 +688,117 @@ ExecuteDDLOnRemoteServer(Oid serveroid, const char *sql)
 }
 
 /*
+ * PartitionBoundsSpecToString
+ *		Deparse a PartitionBoundSpec into a FOR VALUES clause.
+ *
+ * Caller must pfree the returned string.
+ */
+static char *
+PartitionBoundsSpecToString(PartitionBoundSpec *partbound)
+{
+	StringInfo partition_bounds;
+	char * result;
+
+	Assert(partbound != NULL);
+
+	partition_bounds = makeStringInfo();
+
+	if (partbound->is_default)
+	{
+		appendStringInfoString(partition_bounds, "DEFAULT");
+	}
+	else
+	{
+		switch (partbound->strategy)
+		{
+			case PARTITION_STRATEGY_HASH:
+				appendStringInfo(partition_bounds,
+								 "FOR VALUES WITH (modulus %d, remainder %d)",
+								 partbound->modulus, partbound->remainder);
+				break;
+
+			case PARTITION_STRATEGY_LIST:
+				{
+					ListCell   *cell;
+					const char *sep = "";
+
+					appendStringInfoString(partition_bounds, "FOR VALUES IN (");
+					foreach(cell, partbound->listdatums)
+					{
+						A_Const    *aconst = lfirst(cell);
+
+						appendStringInfoString(partition_bounds, sep);
+
+						if (aconst->isnull)
+						{
+							appendStringInfoString(partition_bounds, "NULL");
+						}
+						else
+						{
+							switch (nodeTag(&aconst->val.node))
+							{
+								case T_Integer:
+									appendStringInfo(partition_bounds, "%d",
+													 castNode(Integer, &aconst->val.node)->ival);
+									break;
+								case T_Float:
+									appendStringInfoString(partition_bounds,
+														   castNode(Float, &aconst->val.node)->fval);
+									break;
+								case T_Boolean:
+									appendStringInfoString(partition_bounds,
+														   castNode(Boolean, &aconst->val.node)->boolval ? "true" : "false");
+									break;
+								case T_String:
+									appendStringInfo(partition_bounds, "'%s'",
+													 castNode(String, &aconst->val.node)->sval);
+									break;
+								case T_BitString:
+									appendStringInfo(partition_bounds, "B'%s'",
+													 castNode(BitString, &aconst->val.node)->bsval);
+									break;
+								default:
+									elog(ERROR, "unrecognized node type in partition bound: %d",
+										 (int) nodeTag(&aconst->val.node));
+									break;
+							}
+						}
+
+						sep = ", ";
+					}
+					appendStringInfoChar(partition_bounds, ')');
+				}
+				break;
+
+			case PARTITION_STRATEGY_RANGE:
+				{
+					char	   *lower_str;
+					char	   *upper_str;
+
+					lower_str = deparse_expression((Node *) partbound->lowerdatums,
+												   NIL, false, false);
+					upper_str = deparse_expression((Node *) partbound->upperdatums,
+												   NIL, false, false);
+					appendStringInfo(partition_bounds, "FOR VALUES FROM (%s) TO (%s)",
+									 lower_str, upper_str);
+					pfree(lower_str);
+					pfree(upper_str);
+				}
+				break;
+
+			default:
+				elog(ERROR, "unrecognized partition strategy: %d",
+					 (int) partbound->strategy);
+				break;
+		}
+	}
+
+	result = pstrdup(partition_bounds->data);
+	destroyStringInfo(partition_bounds);
+	return result;
+}
+
+/*
  * SyncTablesOnNewShardMember
  *		Create tables on a newly added shard member
  *
@@ -670,16 +855,17 @@ SyncTablesOnNewShardMember(Oid sgid, Oid newsrvoid)
 	{
 		Form_pg_class classForm = (Form_pg_class) GETSTRUCT(tuple);
 		Oid			relid = classForm->oid;
+		Oid			parentRelid;
 		Relation	rel;
 		char	   *relname;
 		char	   *nspname;
 		TupleDesc	tupdesc;
 		StringInfoData ddl;
 		int			i;
-		bool		is_worldwide;
 		bool		is_partition;
 		bool		is_partitioned;
 		bool		is_foreign_table;
+		PartitionBoundSpec *partbound = NULL;
 
 		/* Skip non-table relations */
 		if (classForm->relkind != RELKIND_RELATION &&
@@ -693,6 +879,7 @@ SyncTablesOnNewShardMember(Oid sgid, Oid newsrvoid)
 
 		/* Open the relation */
 		rel = table_open(relid, AccessShareLock);
+		
 		relname = RelationGetRelationName(rel);
 		nspname = get_namespace_name(RelationGetNamespace(rel));
 		tupdesc = RelationGetDescr(rel);
@@ -706,7 +893,8 @@ SyncTablesOnNewShardMember(Oid sgid, Oid newsrvoid)
 
 		if (is_partition)
 		{
-			char * cluster_;
+			char * cluster_ = NULL;
+			Relation	parentRel;
 
 			/* partition of distributed table on foreign server */
 			if (is_foreign_table)
@@ -739,31 +927,32 @@ SyncTablesOnNewShardMember(Oid sgid, Oid newsrvoid)
 			 * For partitions of distributed tables: create foreign table
 			 * on new member pointing to the partition on the local server
 			 */
-			appendStringInfo(&ddl, "CREATE FOREIGN TABLE IF NOT EXISTS %s.%s (",
+			appendStringInfo(&ddl, "CREATE FOREIGN TABLE IF NOT EXISTS %s.%s ",
 							 quote_identifier(nspname),
 							 quote_identifier(relname));
-
-			/* Add column definitions */
-			for (i = 0; i < tupdesc->natts; i++)
+			
+			/* add PARTITION OF clause */
+			parentRelid = get_parent_rel_oid(relid);
+			
+			parentRel = table_open(parentRelid, AccessShareLock);
+			
+			appendStringInfo(&ddl, "PARTITION OF %s.%s ",
+								quote_identifier(get_namespace_name(RelationGetNamespace(parentRel))),
+								quote_identifier(RelationGetRelationName(parentRel)));
+						
+			partbound = RelationGetPartitionBoundSpec(parentRel, relid);
+			
 			{
-				Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+				char *partition_bounds = PartitionBoundsSpecToString(partbound);
 
-				if (attr->attisdropped)
-					continue;
-
-				if (i > 0)
-					appendStringInfoString(&ddl, ", ");
-
-				appendStringInfo(&ddl, "%s %s",
-								 quote_identifier(NameStr(attr->attname)),
-								 format_type_with_typemod(attr->atttypid, attr->atttypmod));
-
-				if (attr->attnotnull)
-					appendStringInfoString(&ddl, " NOT NULL");
+				appendStringInfo(&ddl, "%s ", partition_bounds);
+				pfree(partition_bounds);
 			}
-
-			appendStringInfo(&ddl, ") SERVER %s",
-							 quote_identifier(cluster_));
+	
+			table_close(parentRel, AccessShareLock);
+							 
+			appendStringInfo(&ddl, "SERVER %s ",
+					quote_identifier(cluster_));
 
 			ereport(DEBUG1,
 					(errmsg("creating foreign table for partition \"%s.%s\" on shard member \"%s\"",
@@ -830,7 +1019,7 @@ SyncTablesOnNewShardMember(Oid sgid, Oid newsrvoid)
 			HeapTuple	fttuple;
 			Form_pg_foreign_table ftform;
 			ForeignServer *target_server;
-			char * cluster_;
+			char * cluster_ = NULL;
 			
 			Assert(!is_partition && !is_partitioned);
 			
@@ -1148,4 +1337,706 @@ NotifyExistingMembersAboutNewMember(Oid sgid, Oid newsrvoid)
 	ereport(DEBUG1,
 			(errmsg("successfully notified existing members about new shard member \"%s\"",
 					newserver->servername)));
+}
+
+/*
+ * hash_string_to_uint32
+ *		Simple hash function to convert a string to a 32-bit unsigned integer
+ *
+ */
+static uint32
+hash_string_to_uint32(const char *str)
+{	
+	return string_hash(str, strlen(str) + 1);
+}
+
+/*
+ * GetPartitionTargetMember
+ *		Determine which shard member should host a partition using consistent hashing
+ *
+ * Uses ring hashing: each member is placed on a hash ring multiple times
+ * (virtual nodes), and the partition is assigned to the member whose
+ * virtual node is closest in the ring.
+ *
+ * If exclude_member is valid, that member will be excluded from consideration,
+ * which is useful during DETACH operations to ensure partitions aren't assigned
+ * to the member being detached.
+ *
+ * Returns the OID of the foreign server that should host the partition.
+ */
+Oid
+GetPartitionTargetMember(Oid sgid, const char *partition_name, Oid *exclude_member, bool *found)
+{
+	Relation	memberrel;
+	SysScanDesc scan;
+	ScanKeyData key[1];
+	HeapTuple	tuple;
+	List	   *members = NIL;
+	ListCell   *lc;
+	uint32		partition_hash;
+	uint32		min_distance = UINT32_MAX;
+	Oid			target_member = InvalidOid;
+	
+	*found = false;
+	
+	/* Get all shard members */
+	memberrel = table_open(ShardMemberRelationId, AccessShareLock);
+	
+	ScanKeyInit(&key[0],
+				Anum_pg_shardmembers_sgid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(sgid));
+	
+	scan = systable_beginscan(memberrel, ShardMemberSgidSrvidIndexId, true,
+							  NULL, 1, key);
+	
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Form_pg_shardmembers smform = (Form_pg_shardmembers) GETSTRUCT(tuple);
+		members = lappend_oid(members, smform->srvid);
+	}
+	
+	/* add itself as a member (local server is represented by InvalidOid) */
+	members = lappend_oid(members, InvalidOid);
+	
+	systable_endscan(scan);
+	table_close(memberrel, AccessShareLock);
+	
+	/* Hash the partition name */
+	partition_hash = hash_string_to_uint32(partition_name);
+	
+	/* Find the closest virtual node using ring hashing */
+	foreach(lc, members)
+	{
+		Oid			serveroid = lfirst_oid(lc);
+		ForeignServer *server;
+		int			i;
+		char * server_name;
+		
+		/* Skip the excluded member if specified */
+		if (exclude_member && serveroid == *exclude_member)
+			continue;
+			
+		*found = true;
+
+		if (serveroid == InvalidOid)
+		{
+			/* Local server - use cluster_name */
+			extern char *cluster_name;
+			if (!cluster_name || cluster_name[0] == '\0')
+				elog(ERROR, "cluster_name is not set, cannot use local server as shard member");
+			server_name = cluster_name;
+		}
+		else
+		{
+			/* Get foreign server name */
+			server = GetForeignServer(serveroid);
+			server_name = server->servername;
+		}
+		
+		/* Create multiple virtual nodes for this member */
+		for (i = 0; i < VIRTUAL_NODES_PER_MEMBER; i++)
+		{
+			char		vnode_key[VNODE_KEY_MAX_LEN];
+			uint32		vnode_hash;
+			uint32		distance;
+			
+			/* 
+			 * Create virtual node identifier using underscore separator
+			 * to avoid conflicts with potential colons in server names
+			 */
+			snprintf(vnode_key, sizeof(vnode_key), "%s_%d", 
+					 server_name, i);
+			
+			vnode_hash = hash_string_to_uint32(vnode_key);
+			
+			/* 
+			 * Calculate distance on the ring (clockwise from partition to vnode)
+			 * Handle wraparound correctly to avoid overflow.
+			 * Use uint64_t for intermediate calculation to prevent overflow.
+			 */
+			if (vnode_hash >= partition_hash)
+				distance = vnode_hash - partition_hash;
+			else
+			{
+				/* Calculate wraparound distance using uint64_t to avoid overflow */
+				uint64_t wrap_distance = (uint64_t)UINT32_MAX - partition_hash + vnode_hash + 1;
+				distance = (uint32_t)wrap_distance;
+			}
+			
+			/* Track the closest virtual node */
+			if (distance < min_distance)
+			{
+				min_distance = distance;
+				target_member = serveroid;
+			}
+		}
+	}
+	
+	list_free(members);
+	
+	return target_member;
+}
+
+/*
+ * GetShardGroupPartitions
+ *		Get all partition OIDs that belong to tables in the shard group
+ *
+ * Returns a list of partition relation OIDs
+ */
+static List *
+GetShardGroupPartitions(Oid sgid)
+{
+	Relation	classrel;
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	List	   *partitions = NIL;
+	
+	/* Scan pg_class for partitions in this shard group */
+	classrel = table_open(RelationRelationId, AccessShareLock);
+	scan = systable_beginscan(classrel, InvalidOid, false, NULL, 0, NULL);
+	
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Form_pg_class classform = (Form_pg_class) GETSTRUCT(tuple);
+		
+		/* Only interested in partition tables */
+		if (classform->relkind != RELKIND_RELATION &&
+			classform->relkind != RELKIND_FOREIGN_TABLE)
+			continue;
+		
+		/* Check if this relation belongs to our shard group */
+		if (classform->relsgid == sgid)
+		{
+			/* Check if this is a partition (has a parent) */
+			if (classform->relispartition)
+			{
+				partitions = lappend_oid(partitions, classform->oid);
+			}
+		}
+	}
+	
+	systable_endscan(scan);
+	table_close(classrel, AccessShareLock);
+	
+	return partitions;
+}
+
+/*
+ * FindPartitionHostMember
+ *		Find which shard member currently hosts the real table for a partition
+ *
+ * Returns the member OID that hosts the real table for the partition:
+ * - If the partition is a real table on the local server, returns the server OID
+ *   representing the local cluster in the shard group
+ * - If the partition is a foreign table on the local server, returns the server OID
+ *   that the foreign table points to (where the real table is hosted)
+ * - Returns InvalidOid if unable to determine the host
+ */
+static Oid
+FindPartitionHostMember(Oid partitionOid, Oid sgid)
+{
+	Relation	rel;
+	Oid			result = InvalidOid;
+	extern char *cluster_name;
+	
+	/* Open the relation */
+	rel = table_open(partitionOid, AccessShareLock);
+	
+	if (rel->rd_rel->relkind == RELKIND_RELATION)
+	{
+		/* This is a real table on the local server */
+		result = InvalidOid; /* Default to InvalidOid */
+	}
+	else if (rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
+	{
+		/* This is a foreign table - get the server it points to */
+		ForeignTable *ft = GetForeignTable(partitionOid);
+		result = ft->serverid;
+	}
+	
+	table_close(rel, AccessShareLock);
+	
+	return result;
+}
+
+/*
+ * MigratePartitionToMember
+ *		Migrate a partition from one member to another
+ *
+ * Steps:
+ * 1. Copy data from source to destination using foreign table access
+ * 2. Drop the real table on source
+ * 3. Create foreign table on source pointing to destination
+ * 4. Update foreign tables on other members to point to destination
+ */
+static void
+MigratePartitionToMember(Oid partitionOid, Oid fromServer, Oid toServer, Oid sgid)
+{
+	Relation	rel;
+	char	   *relname;
+	char	   *nspname;
+	char*			toServerName;
+	char*			fromServerName;
+	StringInfoData ddl;
+	Relation	parent;
+	char	   *parentname;
+	char	   *parentnspname;
+	List	   *members;
+	ListCell   *lc;
+	extern char *cluster_name;
+	PartitionBoundSpec * partbound;
+	char	   *partition_bounds;
+	
+	/* Open the partition relation */
+	rel = table_open(partitionOid, AccessShareLock);
+	relname = pstrdup(RelationGetRelationName(rel));
+	nspname = get_namespace_name(RelationGetNamespace(rel));
+	
+	/* Get parent table info */
+	if (rel->rd_rel->relispartition)
+	{
+		Oid parentOid = get_partition_parent(partitionOid, false);
+		parent = table_open(parentOid, AccessShareLock);
+		parentname = pstrdup(RelationGetRelationName(parent));
+		parentnspname = get_namespace_name(RelationGetNamespace(parent));
+		partbound = RelationGetPartitionBoundSpec(parent, partitionOid);
+		table_close(parent, AccessShareLock);
+	}
+	else
+	{
+		table_close(rel, AccessShareLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("relation \"%s\" is not a partition", relname)));
+	}
+	
+	table_close(rel, AccessShareLock);
+	
+	if (toServer == InvalidOid)
+	{
+		toServerName = cluster_name;
+	}
+	else
+	{
+		ForeignServer *toSrv = GetForeignServer(toServer);
+		toServerName = toSrv->servername;
+	}
+	
+	if (fromServer == InvalidOid)
+	{
+		fromServerName = cluster_name;
+	}
+	else
+	{
+		ForeignServer *fromSrv = GetForeignServer(fromServer);
+		fromServerName = fromSrv->servername;
+	}
+	
+	initStringInfo(&ddl);
+	
+	ereport(NOTICE,
+			(errmsg("migrating partition \"%s.%s\" from \"%s\" to \"%s\"",
+					nspname, relname, fromServerName, toServerName)));
+	
+	/*
+	 * Step 1: Create real table on destination and stream data
+	 */
+	partition_bounds = PartitionBoundsSpecToString(partbound);
+	
+	
+	if (toServer != InvalidOid)
+	{
+		char * copy_relname;
+		/* Detach partition from parent to allow creating real table */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl,
+						"ALTER TABLE %s.%s DETACH PARTITION %s.%s;",
+						quote_identifier(parentnspname),
+						quote_identifier(parentname),
+						quote_identifier(nspname),
+						quote_identifier(relname));
+		ExecuteDDLOnRemoteServer(toServer, ddl.data);
+		
+		/* Create the partition structure on destination */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, 
+						"CREATE TABLE IF NOT EXISTS %s.%s_temp PARTITION OF %s.%s %s WITH (no_rel_sync = true);",
+						quote_identifier(nspname),
+						quote_identifier(relname),
+						quote_identifier(parentnspname),
+						quote_identifier(parentname),
+						partition_bounds);
+		ExecuteDDLOnRemoteServer(toServer, ddl.data);
+			
+		/* Copy data */
+		copy_relname = psprintf("%s_temp", quote_identifier(relname));
+		CopyFileToRemoteFDW(fromServer, toServer, nspname, relname, nspname, copy_relname);
+		
+		/* Drop temporary foreign table */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, "DROP FOREIGN TABLE %s.%s;",
+						quote_identifier(nspname),
+						quote_identifier(relname));
+		
+		ExecuteDDLOnRemoteServer(toServer, ddl.data);
+		
+		/* Rename temp table to actual partition name */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl,
+						"ALTER TABLE %s.%s_temp RENAME TO %s;",
+						quote_identifier(nspname),
+						quote_identifier(relname),
+						quote_identifier(relname));
+		
+		ExecuteDDLOnRemoteServer(toServer, ddl.data);	
+	}
+	else
+	{
+		char * copy_relname;
+		/* use SPI */
+		SPI_connect();
+		
+		/* Detach partition from parent to allow creating real table */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl,
+						"ALTER TABLE %s.%s DETACH PARTITION %s.%s;",
+						quote_identifier(parentnspname),
+						quote_identifier(parentname),
+						quote_identifier(nspname),
+						quote_identifier(relname));
+		SPI_execute(ddl.data, false, 0);
+		
+		/* Create the partition structure on destination */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, 
+						"CREATE TABLE IF NOT EXISTS %s.%s_temp PARTITION OF %s.%s %s WITH (no_rel_sync = true);",
+						quote_identifier(nspname),
+						quote_identifier(relname),
+						quote_identifier(parentnspname),
+						quote_identifier(parentname),
+						partition_bounds);
+		SPI_execute(ddl.data, false, 0);
+
+		/* Copy data */
+		copy_relname = psprintf("%s_temp", quote_identifier(relname));
+		CopyFileToRemoteFDW(fromServer, toServer, nspname, relname, nspname, copy_relname);
+		
+		/* Drop temporary foreign table */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, "DROP FOREIGN TABLE %s.%s;",
+						quote_identifier(nspname),
+						quote_identifier(relname));
+		
+		SPI_execute(ddl.data, false, 0);
+		
+		/* Rename temp table to actual partition name */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl,
+						"ALTER TABLE %s.%s_temp RENAME TO %s;",
+						quote_identifier(nspname),
+						quote_identifier(relname),
+						quote_identifier(relname));
+		
+		SPI_execute(ddl.data, false, 0);
+		
+		SPI_finish();
+	}
+	
+	/*
+	 * Step 2: Drop real table on source and create foreign table
+	 */
+	if (fromServer != InvalidOid)
+	{
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, "DROP TABLE IF EXISTS %s.%s CASCADE;",
+						quote_identifier(nspname),
+						quote_identifier(relname));
+		
+		ExecuteDDLOnRemoteServer(fromServer, ddl.data);
+		
+		/* Create foreign table on source pointing to destination */
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, 
+						"CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s SERVER %s;",
+						quote_identifier(nspname),
+						quote_identifier(relname),
+						quote_identifier(parentnspname),
+						quote_identifier(parentname),
+						partition_bounds,
+						quote_identifier(toServerName));
+		
+		ExecuteDDLOnRemoteServer(fromServer, ddl.data);
+	}
+	else
+	{
+		/* use SPI */
+		SPI_connect();
+		
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, "DROP TABLE IF EXISTS %s.%s CASCADE;",
+						quote_identifier(nspname),
+						quote_identifier(relname));
+		
+		SPI_execute(ddl.data, false, 0);
+
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl, 
+						"CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s SERVER %s;",
+						quote_identifier(nspname),
+						quote_identifier(relname),
+						quote_identifier(parentnspname),
+						quote_identifier(parentname),
+						partition_bounds,
+						quote_identifier(toServerName));
+						
+		SPI_execute(ddl.data, false, 0);
+		
+		SPI_finish();	
+	}
+
+	/*
+	 * Step 3: Update foreign tables on all other members
+	 */
+	members = get_shardgroup_members(sgid);
+	members = lappend_oid(members, InvalidOid); /* include local server */
+	foreach(lc, members)
+	{
+		Oid serveroid = lfirst_oid(lc);
+		
+		/* Skip source and destination */
+		if (serveroid == fromServer || serveroid == toServer)
+			continue;
+		
+		if (serveroid == InvalidOid)
+		{
+			/* use SPI */
+			SPI_connect();
+			
+			/* Drop and recreate foreign table pointing to destination */
+			resetStringInfo(&ddl);
+			appendStringInfo(&ddl, "DROP FOREIGN TABLE IF EXISTS %s.%s CASCADE;",
+							 quote_identifier(nspname),
+							 quote_identifier(relname));
+			
+			SPI_execute(ddl.data, false, 0);
+			
+			resetStringInfo(&ddl);
+			appendStringInfo(&ddl, 
+							 "CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s SERVER %s;",
+							 quote_identifier(nspname),
+							 quote_identifier(relname),
+							 quote_identifier(parentnspname),
+							 quote_identifier(parentname),
+							 partition_bounds,
+							 quote_identifier(toServerName));
+		
+			SPI_execute(ddl.data, false, 0);
+			
+			SPI_finish();
+		}
+		else
+		{
+			/* Drop and recreate foreign table pointing to destination */
+			resetStringInfo(&ddl);
+			appendStringInfo(&ddl, "DROP FOREIGN TABLE IF EXISTS %s.%s CASCADE;",
+							quote_identifier(nspname),
+							quote_identifier(relname));
+			
+			ExecuteDDLOnRemoteServer(serveroid, ddl.data);
+			
+			resetStringInfo(&ddl);
+			appendStringInfo(&ddl, 
+							"CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s SERVER %s;",
+							quote_identifier(nspname),
+							quote_identifier(relname),
+							quote_identifier(parentnspname),
+							quote_identifier(parentname),
+							partition_bounds,
+							quote_identifier(toServerName));
+		
+			
+			ExecuteDDLOnRemoteServer(serveroid, ddl.data);
+		}
+	}
+	
+	list_free(members);
+	pfree(ddl.data);
+	pfree(relname);
+	pfree(nspname);
+	pfree(parentname);
+	pfree(partition_bounds);
+	pfree(parentnspname);
+	
+	ereport(DEBUG1,
+			(errmsg("successfully migrated partition \"%s.%s\" to \"%s\"",
+					nspname, relname, toServerName)));
+}
+
+/*
+ * ReshardShardGroup
+ *		Redistribute partitions across shard members using consistent hashing
+ *
+ * This command moves partitions that are currently real tables to their
+ * correct positions according to consistent hashing. Partitions that are
+ * already on the correct member are left alone.
+ */
+static void
+ReshardShardGroup(Oid sgid)
+{
+	List	   *partitions;
+	ListCell   *lc;
+	int			moved_count = 0;
+	int			total_count = 0;
+	
+	ereport(NOTICE,
+			(errmsg("resharding shard group partitions using consistent hashing")));
+	
+	/* Get all partitions in the shard group */
+	partitions = GetShardGroupPartitions(sgid);
+	
+	if (partitions == NIL)
+	{
+		ereport(NOTICE,
+				(errmsg("no partitions found in shard group")));
+		return;
+	}
+	
+	/* For each partition, check if it's on the correct member */
+	foreach(lc, partitions)
+	{
+		Oid			partitionOid = lfirst_oid(lc);
+		Relation	rel;
+		char	   *relname;
+		Oid			currentHost;
+		Oid			targetHost;
+		bool		found;
+		
+		total_count++;
+		
+		/* Get partition name */
+		rel = table_open(partitionOid, AccessShareLock);
+		relname = pstrdup(RelationGetRelationName(rel));
+		table_close(rel, AccessShareLock);
+		
+		/* Find current host */
+		currentHost = FindPartitionHostMember(partitionOid, sgid);
+		
+		/* Determine target host using consistent hashing */
+		targetHost = GetPartitionTargetMember(sgid, relname, NULL, &found);
+		
+		if (!found)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("could not determine target member for partition \"%s\"", relname)));
+		}
+		
+		/* If partition is on wrong member, migrate it */
+		if (currentHost != targetHost)
+		{
+			MigratePartitionToMember(partitionOid, currentHost, targetHost, sgid);
+			moved_count++;
+		}
+		
+		pfree(relname);
+	}
+	
+	list_free(partitions);
+	
+	ereport(WARNING,
+			(errmsg("reshard complete: %d of %d partitions migrated",
+					moved_count, total_count)));
+}
+
+/*
+ * DetachShardMember
+ *		Move all real tables from a shard member to other members
+ *
+ * After this operation, the specified member will only have foreign table
+ * references, allowing it to be safely dropped from the shard group.
+ */
+static void
+DetachShardMember(Oid sgid, Oid srvoid)
+{
+	List	   *partitions;
+	ListCell   *lc;
+	int			moved_count = 0;
+	int			total_count = 0;
+	ForeignServer *server = NULL;
+	
+	if (OidIsValid(srvoid))
+		server = GetForeignServer(srvoid);
+	
+	ereport(NOTICE,
+			(errmsg("detaching shard member \"%s\" - moving all partitions to other members",
+					server ? server->servername : "local server")));
+	
+	/* Get all partitions in the shard group */
+	partitions = GetShardGroupPartitions(sgid);
+	
+	if (partitions == NIL)
+	{
+		ereport(NOTICE,
+				(errmsg("no partitions found in shard group")));
+		return;
+	}
+	
+	/* For each partition, check if it's hosted on the member being detached */
+	foreach(lc, partitions)
+	{
+		Oid			partitionOid = lfirst_oid(lc);
+		Relation	rel;
+		char	   *relname;
+		Oid			currentHost;
+		Oid			targetHost;
+		bool		found;
+		
+		/* Get partition name */
+		rel = table_open(partitionOid, AccessShareLock);
+		relname = pstrdup(RelationGetRelationName(rel));
+		table_close(rel, AccessShareLock);
+		
+		/* Find current host */
+		currentHost = FindPartitionHostMember(partitionOid, sgid);
+
+		/* Only process partitions hosted on the member being detached */
+		if (currentHost == srvoid)
+		{
+			total_count++;
+			
+			/* 
+			 * Determine target host using consistent hashing,
+			 * excluding the member being detached to ensure we find
+			 * a different target.
+			 */
+			targetHost = GetPartitionTargetMember(sgid, relname, &srvoid, &found);
+			if (!found)
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("could not determine target member for partition \"%s\"", relname)));
+			}
+			
+			/* Migrate the partition */
+			MigratePartitionToMember(partitionOid, currentHost, targetHost, sgid);
+			moved_count++;
+		}
+		
+		pfree(relname);
+	}
+	
+	list_free(partitions);
+	
+	if (total_count == 0)
+	{
+		ereport(NOTICE,
+				(errmsg("member \"%s\" had no partitions to detach", server->servername)));
+	}
+	else
+	{
+		ereport(NOTICE,
+				(errmsg("detach complete: %d partitions moved from \"%s\"",
+						moved_count, server->servername)));
+	}
 }

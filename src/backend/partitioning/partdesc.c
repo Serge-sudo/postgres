@@ -109,6 +109,123 @@ RelationGetPartitionDesc(Relation rel, bool omit_detached)
 	return RelationBuildPartitionDesc(rel, omit_detached);
 }
 
+PartitionBoundSpec *
+RelationGetPartitionBoundSpec(Relation rel, Oid inhrelid)
+{
+	PartitionDesc partdesc;
+	PartitionBoundInfo boundinfo = NULL;
+	List	   *inhoids;
+	Oid		   *oids = NULL;
+	bool	   *is_leaf = NULL;
+	bool		detached_exist;
+	bool		is_omit;
+	TransactionId detached_xmin;
+	ListCell   *cell;
+	int			i,
+				nparts;
+	bool		retried = false;
+	PartitionKey key = RelationGetPartitionKey(rel);
+	MemoryContext new_pdcxt;
+	MemoryContext oldcxt;
+	int		   *mapping;
+
+retry:;
+	HeapTuple	tuple;
+	PartitionBoundSpec *boundspec = NULL;
+
+	/* Try fetching the tuple from the catcache, for speed. */
+	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(inhrelid));
+	if (HeapTupleIsValid(tuple))
+	{
+		Datum		datum;
+		bool		isnull;
+
+		datum = SysCacheGetAttr(RELOID, tuple,
+								Anum_pg_class_relpartbound,
+								&isnull);
+		if (!isnull)
+			boundspec = stringToNode(TextDatumGetCString(datum));
+		ReleaseSysCache(tuple);
+	}
+
+	/*
+	* Two problems are possible here.  First, a concurrent ATTACH
+	* PARTITION might be in the process of adding a new partition, but
+	* the syscache doesn't have it, or its copy of it does not yet have
+	* its relpartbound set.  We cannot just AcceptInvalidationMessages(),
+	* because the other process might have already removed itself from
+	* the ProcArray but not yet added its invalidation messages to the
+	* shared queue.  We solve this problem by reading pg_class directly
+	* for the desired tuple.
+	*
+	* If the partition recently detached is also dropped, we get no tuple
+	* from the scan.  In that case, we also retry, and next time through
+	* here, we don't see that partition anymore.
+	*
+	* The other problem is that DETACH CONCURRENTLY is in the process of
+	* removing a partition, which happens in two steps: first it marks it
+	* as "detach pending", commits, then unsets relpartbound.  If
+	* find_inheritance_children_extended included that partition but we
+	* below we see that DETACH CONCURRENTLY has reset relpartbound for
+	* it, we'd see an inconsistent view.  (The inconsistency is seen
+	* because table_open below reads invalidation messages.)  We protect
+	* against this by retrying find_inheritance_children_extended().
+	*/
+	if (boundspec == NULL)
+	{
+		Relation	pg_class;
+		SysScanDesc scan;
+		ScanKeyData key[1];
+
+		pg_class = table_open(RelationRelationId, AccessShareLock);
+		ScanKeyInit(&key[0],
+					Anum_pg_class_oid,
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(inhrelid));
+		scan = systable_beginscan(pg_class, ClassOidIndexId, true,
+									NULL, 1, key);
+
+		/*
+		 * We could get one tuple from the scan (the normal case), or zero
+		 * tuples if the table has been dropped meanwhile.
+		 */
+		tuple = systable_getnext(scan);
+		if (HeapTupleIsValid(tuple))
+		{
+			Datum		datum;
+			bool		isnull;
+
+			datum = heap_getattr(tuple, Anum_pg_class_relpartbound,
+									RelationGetDescr(pg_class), &isnull);
+			if (!isnull)
+				boundspec = stringToNode(TextDatumGetCString(datum));
+		}
+		systable_endscan(scan);
+		table_close(pg_class, AccessShareLock);
+
+		/*
+		 * If we still don't get a relpartbound value (either because
+		 * boundspec is null or because there was no tuple), then it must
+		 * be because of DETACH CONCURRENTLY.  Restart from the top, as
+		 * explained above.  We only do this once, for two reasons: first,
+		 * only one DETACH CONCURRENTLY session could affect us at a time,
+		 * since each of them would have to wait for the snapshot under
+		 * which this is running; and second, to avoid possible infinite
+		 * loops in case of catalog corruption.
+		 *
+		 * Note that the current memory context is short-lived enough, so
+		 * we needn't worry about memory leaks here.
+		 */
+		if (!boundspec && !retried)
+		{
+			AcceptInvalidationMessages();
+			retried = true;
+			goto retry;
+		}
+	}
+
+	return boundspec;
+}
 /*
  * RelationBuildPartitionDesc
  *		Form rel's partition descriptor, and store in relcache entry
@@ -505,4 +622,10 @@ get_default_oid_from_partdesc(PartitionDesc partdesc)
 		return partdesc->oids[partdesc->boundinfo->default_index];
 
 	return InvalidOid;
+}
+
+PartitionBoundInfo
+get_rel_partition_boundinfo(PartitionDesc partdesc)
+{
+	return partdesc->boundinfo;
 }

@@ -29,6 +29,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/appendinfo.h"
+#include "common/file_utils.h"
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/inherit.h"
@@ -402,9 +403,16 @@ static void postgresExecForeignTruncate(List *rels,
 										bool restart_seqs);
 static void postgresExecForeignDDL(Oid serverid,
 								   const char *sql);
+static void
+postgresExecCopyStream(Oid src_serverid,
+                       Oid dst_serverid,
+                       const char *src_nsp,
+                       const char *src_rel,
+                       const char *dst_nsp,
+                       const char *dst_rel);
 static bool postgresAnalyzeForeignTable(Relation relation,
-										AcquireSampleRowsFunc *func,
-										BlockNumber *totalpages);
+	AcquireSampleRowsFunc *func,
+	BlockNumber *totalpages);
 static List *postgresImportForeignSchema(ImportForeignSchemaStmt *stmt,
 										 Oid serverOid);
 static void postgresGetForeignJoinPaths(PlannerInfo *root,
@@ -596,6 +604,7 @@ postgres_fdw_handler(PG_FUNCTION_ARGS)
 
 	/* Support function for DDL execution */
 	routine->ExecForeignDDL = postgresExecForeignDDL;
+	routine->ExecCopyStream = postgresExecCopyStream;
 
 	/* Support functions for ANALYZE */
 	routine->AnalyzeForeignTable = postgresAnalyzeForeignTable;
@@ -3105,6 +3114,273 @@ postgresExecForeignDDL(Oid serverid, const char *sql)
 	 * if there are multiple foreign servers in the transaction.
 	 */
 }
+
+#define IS_LOCAL(oid)   ((oid) == InvalidOid)
+#define IS_FOREIGN(oid) ((oid) != InvalidOid)
+
+static void
+get_backend_tempfile(char *path, size_t len)
+{
+    File file;
+    const char *relpath;
+
+    file = OpenTemporaryFile(false);
+    if (file < 0)
+        ereport(ERROR,
+                (errmsg("could not create temporary file")));
+
+    relpath = FilePathName(file);
+
+    /*
+     * COPY requires absolute path, FilePathName() is relative to DataDir
+     */
+    snprintf(path, len, "%s/%s", DataDir, relpath);
+
+    FileClose(file);
+}
+
+
+static void
+stream_local_to_foreign_via_file(Oid dst_serverid,
+                                 const char *src_nsp,
+                                 const char *src_rel,
+                                 const char *dst_nsp,
+                                 const char *dst_rel)
+{
+    char         temp_path[MAXPGPATH];
+    UserMapping *dst_user;
+    PGconn      *dst_conn;
+    PGresult    *res;
+    FILE        *fp;
+    char         buf[8192];
+    StringInfo   cmd;
+
+    /* Create absolute backend temp file */
+    get_backend_tempfile(temp_path, sizeof(temp_path));
+
+    /* Local COPY TO file (ABSOLUTE PATH) */
+    SPI_connect();
+    SPI_execute(psprintf("COPY %s.%s TO '%s' WITH (FORMAT CSV, HEADER)",
+                         quote_identifier(src_nsp),
+                         quote_identifier(src_rel),
+                         temp_path),
+                false, 0);
+    SPI_finish();
+
+    fp = AllocateFile(temp_path, "r");
+    if (!fp)
+        ereport(ERROR,
+                (errmsg("could not open temp file \"%s\"", temp_path)));
+
+    /* Foreign COPY FROM STDIN */
+    dst_user = GetUserMapping(GetUserId(), dst_serverid);
+    dst_conn = GetConnection(dst_user, false, NULL);
+
+    cmd = makeStringInfo();
+    appendStringInfo(cmd,
+                     "COPY %s.%s FROM STDIN WITH (FORMAT CSV, HEADER)",
+                     quote_identifier(dst_nsp),
+                     quote_identifier(dst_rel));
+
+    res = PQexec(dst_conn, cmd->data);
+    if (!res || PQresultStatus(res) != PGRES_COPY_IN)
+        ereport(ERROR,
+                (errmsg("COPY FROM STDIN failed: %s",
+                        PQerrorMessage(dst_conn))));
+    PQclear(res);
+
+    while (fgets(buf, sizeof(buf), fp) != NULL)
+    {
+        if (PQputCopyData(dst_conn, buf, strlen(buf)) != 1)
+            ereport(ERROR,
+                    (errmsg("COPY failed: %s",
+                            PQerrorMessage(dst_conn))));
+    }
+
+    FreeFile(fp);
+    PQputCopyEnd(dst_conn, NULL);
+
+    while ((res = PQgetResult(dst_conn)) != NULL)
+        PQclear(res);
+
+    destroyStringInfo(cmd);
+}
+
+
+static void
+stream_foreign_to_local_via_file(Oid src_serverid,
+                                 const char *src_nsp,
+                                 const char *src_rel,
+                                 const char *dst_nsp,
+                                 const char *dst_rel)
+{
+    char         temp_path[MAXPGPATH];
+    UserMapping *src_user;
+    PGconn      *src_conn;
+    PGresult    *res;
+    FILE        *fp;
+    char        *buf;
+    int          len;
+    StringInfo   cmd;
+
+    get_backend_tempfile(temp_path, sizeof(temp_path));
+
+    fp = AllocateFile(temp_path, "w");
+    if (!fp)
+        ereport(ERROR,
+                (errmsg("could not open temp file \"%s\"", temp_path)));
+
+    /* Foreign COPY TO STDOUT */
+    src_user = GetUserMapping(GetUserId(), src_serverid);
+    src_conn = GetConnection(src_user, false, NULL);
+
+    cmd = makeStringInfo();
+    appendStringInfo(cmd,
+                     "COPY %s.%s TO STDOUT WITH (FORMAT CSV, HEADER)",
+                     quote_identifier(src_nsp),
+                     quote_identifier(src_rel));
+
+    res = PQexec(src_conn, cmd->data);
+    if (!res || PQresultStatus(res) != PGRES_COPY_OUT)
+        ereport(ERROR,
+                (errmsg("COPY TO STDOUT failed: %s",
+                        PQerrorMessage(src_conn))));
+    PQclear(res);
+
+    while ((len = PQgetCopyData(src_conn, &buf, 0)) > 0)
+    {
+        fwrite(buf, 1, len, fp);
+        PQfreemem(buf);
+    }
+	
+	while ((res = PQgetResult(src_conn)) != NULL)
+		PQclear(res);
+	
+    FreeFile(fp);
+
+    /* Local COPY FROM file */
+    SPI_connect();
+    SPI_execute(psprintf("COPY %s.%s FROM '%s' WITH (FORMAT CSV, HEADER)",
+                         quote_identifier(dst_nsp),
+                         quote_identifier(dst_rel),
+                         temp_path),
+                false, 0);
+    SPI_finish();
+
+    destroyStringInfo(cmd);
+}
+
+static void
+stream_foreign_to_foreign(Oid src_serverid,
+                          Oid dst_serverid,
+                          const char *src_nsp,
+                          const char *src_rel,
+                          const char *dst_nsp,
+                          const char *dst_rel)
+{
+    UserMapping *src_user;
+    UserMapping *dst_user;
+    PGconn      *src_conn;
+    PGconn      *dst_conn;
+    PGresult    *res;
+    StringInfo   cmd;
+    char        *buf;
+    int          len;
+
+    src_user = GetUserMapping(GetUserId(), src_serverid);
+    dst_user = GetUserMapping(GetUserId(), dst_serverid);
+
+    src_conn = GetConnection(src_user, false, NULL);
+    dst_conn = GetConnection(dst_user, false, NULL);
+
+    /* COPY TO STDOUT (source) */
+    cmd = makeStringInfo();
+    appendStringInfo(cmd,
+                     "COPY %s.%s TO STDOUT WITH (FORMAT CSV, HEADER)",
+                     quote_identifier(src_nsp),
+                     quote_identifier(src_rel));
+
+    res = PQexec(src_conn, cmd->data);
+    if (!res || PQresultStatus(res) != PGRES_COPY_OUT)
+        ereport(ERROR,
+                (errmsg("COPY TO STDOUT failed: %s",
+                        PQerrorMessage(src_conn))));
+    PQclear(res);
+    resetStringInfo(cmd);
+
+    /* COPY FROM STDIN (destination) */
+    appendStringInfo(cmd,
+                     "COPY %s.%s FROM STDIN WITH (FORMAT CSV, HEADER)",
+                     quote_identifier(dst_nsp),
+                     quote_identifier(dst_rel));
+
+    res = PQexec(dst_conn, cmd->data);
+    if (!res || PQresultStatus(res) != PGRES_COPY_IN)
+        ereport(ERROR,
+                (errmsg("COPY FROM STDIN failed: %s",
+                        PQerrorMessage(dst_conn))));
+    PQclear(res);
+
+    while ((len = PQgetCopyData(src_conn, &buf, 0)) > 0)
+    {
+        if (PQputCopyData(dst_conn, buf, len) != 1)
+            ereport(ERROR,
+                    (errmsg("COPY forwarding failed: %s",
+                            PQerrorMessage(dst_conn))));
+        PQfreemem(buf);
+    }
+
+    if (len < -1)
+        ereport(ERROR,
+                (errmsg("COPY OUT aborted: %s",
+                        PQerrorMessage(src_conn))));
+						
+	while ((res = PQgetResult(src_conn)) != NULL)
+		PQclear(res);
+
+    if (PQputCopyEnd(dst_conn, NULL) != 1)
+        ereport(ERROR,
+                (errmsg("COPY END failed: %s",
+                        PQerrorMessage(dst_conn))));
+
+    while ((res = PQgetResult(dst_conn)) != NULL)
+    {
+        if (PQresultStatus(res) != PGRES_COMMAND_OK)
+            ereport(ERROR,
+                    (errmsg("COPY failed: %s",
+                            PQerrorMessage(dst_conn))));
+        PQclear(res);
+    }
+
+    destroyStringInfo(cmd);
+}
+
+static void
+postgresExecCopyStream(Oid src_serverid,
+                       Oid dst_serverid,
+                       const char *src_nsp,
+                       const char *src_rel,
+                       const char *dst_nsp,
+                       const char *dst_rel)
+{
+    if (IS_LOCAL(src_serverid) && IS_LOCAL(dst_serverid))
+        ereport(ERROR,
+                (errmsg("both source and destination cannot be local")));
+
+    if (IS_FOREIGN(src_serverid) && IS_FOREIGN(dst_serverid))
+        stream_foreign_to_foreign(src_serverid, dst_serverid,
+                                  src_nsp, src_rel,
+                                  dst_nsp, dst_rel);
+    else if (IS_LOCAL(src_serverid))
+        stream_local_to_foreign_via_file(dst_serverid,
+                                         src_nsp, src_rel,
+                                         dst_nsp, dst_rel);
+    else
+        stream_foreign_to_local_via_file(src_serverid,
+                                         src_nsp, src_rel,
+                                         dst_nsp, dst_rel);
+}
+
 
 /*
  * estimate_path_cost_size

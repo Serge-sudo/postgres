@@ -158,6 +158,15 @@ static relopt_bool boolRelOpts[] =
 	},
 	{
 		{
+			"no_rel_sync",
+			"Turns off shard relation synchronization",
+			RELOPT_KIND_HEAP | RELOPT_KIND_PARTITIONED,
+			ShareUpdateExclusiveLock
+		},
+		false,
+	},
+	{
+		{
 			"deduplicate_items",
 			"Enables \"deduplicate items\" feature for this btree index",
 			RELOPT_KIND_BTREE,
@@ -1879,6 +1888,8 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		offsetof(StdRdOptions, parallel_workers)},
 		{"vacuum_index_cleanup", RELOPT_TYPE_ENUM,
 		offsetof(StdRdOptions, vacuum_index_cleanup)},
+		{"no_rel_sync", RELOPT_TYPE_BOOL,
+		offsetof(StdRdOptions, noRelSync)},
 		{"vacuum_truncate", RELOPT_TYPE_BOOL,
 		offsetof(StdRdOptions, vacuum_truncate)}
 	};
