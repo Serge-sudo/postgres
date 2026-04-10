@@ -286,7 +286,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 		AlterFdwStmt AlterForeignServerStmt AlterGroupStmt
 		AlterObjectDependsStmt AlterObjectSchemaStmt AlterOwnerStmt
 		AlterOperatorStmt AlterShardGroupStmt AlterTypeStmt AlterSeqStmt AlterSystemStmt AlterTableStmt
-		AlterTableSetShardGroupStmt AlterTblSpcStmt AlterExtensionStmt AlterExtensionContentsStmt
+		AlterTblSpcStmt AlterExtensionStmt AlterExtensionContentsStmt
 		AlterCompositeTypeStmt AlterUserMappingStmt
 		AlterRoleStmt AlterRoleSetStmt AlterPolicyStmt AlterStatsStmt
 		AlterDefaultPrivilegesStmt DefACLAction
@@ -1021,7 +1021,6 @@ stmt:
 			| AlterSeqStmt
 			| AlterSystemStmt
 			| AlterTableStmt
-			| AlterTableSetShardGroupStmt
 			| AlterTblSpcStmt
 			| AlterCompositeTypeStmt
 			| AlterPublicationStmt
@@ -11553,21 +11552,6 @@ AlterShardGroupStmt:
 					n->action = "DROP";
 					n->servername = $7;
 					n->options = NIL;
-					$$ = (Node *) n;
-				}
-		;
-
-/*****************************************************************************
- *		ALTER TABLE SET SHARD GROUP Statement
- * ----------------------
- */
-AlterTableSetShardGroupStmt:
-			ALTER TABLE relation_expr SET SHARD GROUP_P name
-				{
-					AlterTableSetShardGroupStmt *n = makeNode(AlterTableSetShardGroupStmt);
-
-					n->relation = $3;
-					n->sgname = $7;
 					$$ = (Node *) n;
 				}
 		;
