@@ -159,6 +159,8 @@ extern void process_pending_request(AsyncRequest *areq);
 typedef struct ConnCacheEntry ConnCacheEntry;
 extern PGconn *GetConnection(UserMapping *user, bool will_prep_stmt,
 							 PgFdwConnState **state);
+extern PGconn *GetConnectionUncached(UserMapping *user);
+extern void DisconnectConnectionUncached(PGconn *conn);
 extern void ReleaseConnection(PGconn *conn);
 extern unsigned int GetCursorNumber(PGconn *conn);
 extern unsigned int GetPrepStmtNumber(PGconn *conn);
@@ -267,6 +269,7 @@ extern void FdwConnShmemInit(void);
 extern void FdwConnShmemRegister(const char *cluster_name, int remote_backend_pid);
 extern void FdwConnShmemUnregister(const char *cluster_name);
 extern void FdwConnShmemUnregisterAll(void);
+extern void FdwConnShmemCleanupStaleEntries(void);
 extern bool FdwConnShmemGetIterator(HASH_SEQ_STATUS *status);
 extern void
 FdwConnShmemGetIteratorFinish(void);

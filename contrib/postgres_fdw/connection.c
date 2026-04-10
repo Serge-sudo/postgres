@@ -25,6 +25,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postgres_fdw.h"
+#include "postmaster/conn_multiplexer.h"
 #include "storage/fd.h"
 #include "storage/latch.h"
 #include "utils/builtins.h"
@@ -144,7 +145,7 @@ PG_FUNCTION_INFO_V1(postgres_fdw_disconnect_all);
 
 /* prototypes of private functions */
 static void make_new_connection(ConnCacheEntry *entry, UserMapping *user);
-static PGconn *connect_pg_server(ForeignServer *server, UserMapping *user);
+static PGconn *connect_pg_server(ForeignServer *server, UserMapping *user, bool try_mux);
 static void disconnect_pg_server(ConnCacheEntry *entry);
 static void check_conn_params(const char **keywords, const char **values, UserMapping *user);
 static void configure_remote_session(PGconn *conn);
@@ -373,6 +374,29 @@ GetConnection(UserMapping *user, bool will_prep_stmt, PgFdwConnState **state)
 }
 
 /*
+ * Establish an uncached one-off connection for diagnostic queries.
+ *
+ * Unlike GetConnection(), this bypasses the per-user-mapping cache and does
+ * not participate in postgres_fdw transaction state management.
+ */
+PGconn *
+GetConnectionUncached(UserMapping *user)
+{
+	ForeignServer *server = GetForeignServer(user->serverid);
+	return connect_pg_server(server, user, false);
+}
+
+/*
+ * Close an uncached one-off connection created by GetConnectionUncached().
+ */
+void
+DisconnectConnectionUncached(PGconn *conn)
+{
+	if (conn != NULL)
+		libpqsrv_disconnect(conn);
+}
+
+/*
  * Reset all transient state fields in the cached connection entry and
  * establish new connection to the remote server.
  */
@@ -430,7 +454,7 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 	}
 
 	/* Now try to make the connection */
-	entry->conn = connect_pg_server(server, user);
+	entry->conn = connect_pg_server(server, user, true);
 
 	elog(DEBUG3, "new postgres_fdw connection %p for server \"%s\" (user mapping oid %u, userid %u)",
 		 entry->conn, server->servername, user->umid, user->userid);
@@ -492,7 +516,7 @@ pgfdw_security_check(const char **keywords, const char **values, UserMapping *us
  * Connect to remote server using specified server and user mapping properties.
  */
 static PGconn *
-connect_pg_server(ForeignServer *server, UserMapping *user)
+connect_pg_server(ForeignServer *server, UserMapping *user, bool try_mux)
 {
 	PGconn	   *volatile conn = NULL;
 
@@ -504,16 +528,18 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 		const char **keywords;
 		const char **values;
 		char	   *appname = NULL;
+		char	   *mux_options = NULL;
+		char	   *mux_port_str = NULL;
 		int			n;
 
 		/*
 		 * Construct connection params from generic options of ForeignServer
 		 * and UserMapping.  (Some of them might not be libpq options, in
-		 * which case we'll just waste a few array slots.)  Add 4 extra slots
+		 * which case we'll just waste a few array slots.)  Add extra slots
 		 * for application_name, fallback_application_name, client_encoding,
-		 * end marker.
+		 * end marker, and optional mux overrides.
 		 */
-		n = list_length(server->options) + list_length(user->options) + 4;
+		n = list_length(server->options) + list_length(user->options) + 8;
 		keywords = (const char **) palloc(n * sizeof(char *));
 		values = (const char **) palloc(n * sizeof(char *));
 
@@ -522,6 +548,131 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 									  keywords + n, values + n);
 		n += ExtractConnectionOptions(user->options,
 									  keywords + n, values + n);
+
+		/* If the local connection multiplexer is available, route via it. */
+		if (ConnMuxIsAvailable() && try_mux)
+		{
+			const char *orig_host = NULL;
+			const char *orig_port = NULL;
+			const char *orig_options = NULL;
+			int			host_idx = -1;
+			int			port_idx = -1;
+			int			options_idx = -1;
+			int			sslmode_idx = -1;
+			int			i;
+
+			for (i = 0; i < n; i++)
+			{
+				if (keywords[i] == NULL)
+					break;
+				if (strcmp(keywords[i], "host") == 0)
+				{
+					orig_host = values[i];
+					host_idx = i;
+				}
+				else if (strcmp(keywords[i], "port") == 0)
+				{
+					orig_port = values[i];
+					port_idx = i;
+				}
+				else if (strcmp(keywords[i], "options") == 0)
+				{
+					orig_options = values[i];
+					options_idx = i;
+				}
+				else if (strcmp(keywords[i], "sslmode") == 0)
+				{
+					sslmode_idx = i;
+				}
+			}
+
+			if (orig_host != NULL && orig_port != NULL)
+			{
+				/*
+				 * Route through the local mux.  Embed the real target host,
+				 * port, and remote mux port in the options string so the mux
+				 * knows where to connect.  mux_target_mux_port is the TCP
+				 * port of the remote node's multiplexer (from the mux_port
+				 * ForeignServer option); the local mux uses it to open the
+				 * inter-mux control connection.
+				 */
+				const char *remote_mux_port_str = NULL;
+				ListCell   *opt_lc;
+
+				foreach(opt_lc, server->options)
+				{
+					DefElem *def = (DefElem *) lfirst(opt_lc);
+
+					if (strcmp(def->defname, "mux_port") == 0)
+					{
+						remote_mux_port_str = defGetString(def);
+						break;
+					}
+				}
+
+				if (remote_mux_port_str == NULL || *remote_mux_port_str == '\0')
+				{
+					/*
+					 * No mux_port configured for this server.  Fall back to
+					 * the local mux_tcp_port GUC, which only works correctly
+					 * if all nodes use the same mux port.  Add mux_port to
+					 * the ForeignServer definition to avoid this fallback.
+					 */
+					elog(WARNING,
+						 "postgres_fdw: server \"%s\" has no mux_port option; "
+						 "falling back to backend spawn",
+						 server->servername);
+					goto no_mux_set;
+				}
+
+				if (orig_options != NULL && *orig_options != '\0')
+					mux_options = psprintf("%s -c mux_target_host=%s -c mux_target_port=%s -c mux_target_mux_port=%s",
+										   orig_options, orig_host, orig_port,
+										   remote_mux_port_str);
+				else
+					mux_options = psprintf("-c mux_target_host=%s -c mux_target_port=%s -c mux_target_mux_port=%s",
+										   orig_host, orig_port,
+										   remote_mux_port_str);
+
+				if (options_idx >= 0)
+					values[options_idx] = mux_options;
+				else
+				{
+					keywords[n] = "options";
+					values[n] = mux_options;
+					n++;
+				}
+
+				if (host_idx >= 0)
+					values[host_idx] = "localhost";
+				else
+				{
+					keywords[n] = "host";
+					values[n] = "localhost";
+					n++;
+				}
+
+				mux_port_str = psprintf("%d", mux_tcp_port);
+				if (port_idx >= 0)
+					values[port_idx] = mux_port_str;
+				else
+				{
+					keywords[n] = "port";
+					values[n] = mux_port_str;
+					n++;
+				}
+
+				if (sslmode_idx >= 0)
+					values[sslmode_idx] = "disable";
+				else
+				{
+					keywords[n] = "sslmode";
+					values[n] = "disable";
+					n++;
+				}
+			}
+		}
+no_mux_set:
 
 		/*
 		 * Use pgfdw_application_name as application_name if set.
@@ -596,6 +747,7 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 									   false,	/* expand_dbname */
 									   pgfdw_we_connect);
 
+
 		if (!conn || PQstatus(conn) != CONNECTION_OK)
 			ereport(ERROR,
 					(errcode(ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION),
@@ -611,6 +763,10 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 
 		if (appname != NULL)
 			pfree(appname);
+		if (mux_options != NULL)
+			pfree(mux_options);
+		if (mux_port_str != NULL)
+			pfree(mux_port_str);
 		pfree(keywords);
 		pfree(values);
 	}
@@ -630,8 +786,6 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 static void
 disconnect_pg_server(ConnCacheEntry *entry)
 {
-	
-	elog(WARNING, "dis");
 	if (entry->conn != NULL)
 	{
 		ForeignServer *server;
@@ -641,7 +795,9 @@ disconnect_pg_server(ConnCacheEntry *entry)
 		if (server != NULL)
 			FdwConnShmemUnregister(server->servername);
 		else
-			elog(WARNING, "failed to get foreign server for server OID %u during disconnect", entry->serverid);
+			elog(WARNING,
+				 "failed to get foreign server for server OID %u during disconnect",
+				 entry->serverid);
 
 		libpqsrv_disconnect(entry->conn);
 		entry->conn = NULL;
