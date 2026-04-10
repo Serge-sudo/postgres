@@ -54,6 +54,8 @@ extern void SetRelationShardGroup(Oid relid, Oid sgid);
 
 /* Forward declaration of helper function for syncing tables on new shard member */
 static void SyncTablesOnNewShardMember(Oid sgid, Oid newsrvoid);
+static void SyncShardGroupMetadataToMember(Oid sgid, Oid newsrvoid);
+static void NotifyExistingMembersAboutNewMember(Oid sgid, Oid newsrvoid);
 static void ExecuteDDLOnRemoteServer(Oid serveroid, const char *sql);
 
 
@@ -81,9 +83,18 @@ CreateShardGroup(CreateShardGroupStmt *stmt)
 	
 	/* Check if shard group already exists */
 	if (OidIsValid(get_shardgroup_oid(stmt->sgname, true)))
+	{
+		if (stmt->if_not_exists)
+		{
+			ereport(NOTICE,
+					(errmsg("shard group \"%s\" already exists, skipping",
+							stmt->sgname)));
+			return InvalidObjectAddress;
+		}
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
 				 errmsg("shard group \"%s\" already exists", stmt->sgname)));
+	}
 	
 	/* Build the tuple */
 	memset(values, 0, sizeof(values));
@@ -190,6 +201,13 @@ AlterShardGroup(AlterShardGroupStmt *stmt)
 			{
 				systable_endscan(scan);
 				table_close(memberrel, AccessShareLock);
+				if (stmt->if_not_exists)
+				{
+					ereport(NOTICE,
+							(errmsg("server \"%s\" is already a member of shard group \"%s\", skipping",
+									stmt->servername, stmt->sgname)));
+					return InvalidObjectAddress;
+				}
 				ereport(ERROR,
 						(errcode(ERRCODE_DUPLICATE_OBJECT),
 						 errmsg("server \"%s\" is already a member of shard group \"%s\"",
@@ -221,6 +239,28 @@ AlterShardGroup(AlterShardGroupStmt *stmt)
 							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 							 errmsg("invalid member state \"%s\"", statestr),
 							 errhint("Valid states are: up, down, readonly")));
+			}
+			else if (strcmp(defel->defname, "skip_sync") == 0)
+			{
+				/*
+				 * The skip_sync option is internal-only and is used to prevent
+				 * infinite recursion during metadata synchronization to remote
+				 * shard members. When adding a new shard member, we need to sync
+				 * metadata to it, but we don't want the remote member to recursively
+				 * sync back to us.
+				 * 
+				 * This option should not be used manually as it will skip important
+				 * synchronization steps. It's automatically added by the
+				 * SyncShardGroupMetadataToMember function.
+				 */
+				char	   *skip_sync_str = defGetString(defel);
+				if (strcmp(skip_sync_str, "true") == 0 || strcmp(skip_sync_str, "1") == 0)
+				{
+					stmt->skip_sync = true;
+					ereport(DEBUG1,
+							(errmsg("skip_sync option enabled for ALTER SHARD GROUP ADD MEMBER"),
+							 errhint("This option is for internal use to prevent metadata sync recursion.")));
+				}
 			}
 			else
 				ereport(WARNING,
@@ -262,8 +302,18 @@ AlterShardGroup(AlterShardGroupStmt *stmt)
 		
 		table_close(rel, RowExclusiveLock);
 		
-		/* Sync existing tables to the new shard member */
-		SyncTablesOnNewShardMember(sgoid, srvoid);
+		/* Sync shard group metadata and members info to the new shard member */
+		/* Skip this if skip_sync is true to prevent infinite recursion */
+		if (!stmt->skip_sync)
+		{
+			SyncShardGroupMetadataToMember(sgoid, srvoid);
+			
+			/* Sync existing tables to the new shard member */
+			SyncTablesOnNewShardMember(sgoid, srvoid);
+			
+			/* Notify existing members about the new member */
+			NotifyExistingMembersAboutNewMember(sgoid, srvoid);
+		}
 		
 		ObjectAddressSet(address, ShardMemberRelationId, memberoid);
 	}
@@ -863,4 +913,239 @@ SyncTablesOnNewShardMember(Oid sgid, Oid newsrvoid)
 	}
 
 	list_free(processed_tables);
+}
+
+/*
+ * SyncShardGroupMetadataToMember
+ *		Sync shard group and member information to a newly added shard member
+ *
+ * When a new shard member is added to a shard group, this function ensures
+ * the shard group metadata and all member information is replicated to the 
+ * new member, so it knows the full layout of the shard group.
+ *
+ * This creates the shard group if it doesn't exist on the remote server,
+ * and adds all shard members (including itself) to pg_shardmembers on the
+ * remote server.
+ */
+static void
+SyncShardGroupMetadataToMember(Oid sgid, Oid newsrvoid)
+{
+	HeapTuple	sgtuple;
+	Form_pg_shardgroups sgform;
+	char	   *sgname;
+	Relation	memberrel;
+	SysScanDesc scan;
+	ScanKeyData key[1];
+	HeapTuple	tuple;
+	StringInfoData ddl;
+	ForeignServer *server;
+	List	   *member_servers = NIL;
+	ListCell   *lc;
+
+	/* Get the shard group name and details */
+	sgtuple = SearchSysCache1(SHARDGROUPOID, ObjectIdGetDatum(sgid));
+	if (!HeapTupleIsValid(sgtuple))
+		elog(ERROR, "cache lookup failed for shard group %u", sgid);
+	
+	sgform = (Form_pg_shardgroups) GETSTRUCT(sgtuple);
+	sgname = NameStr(sgform->sgname);
+	
+	/* Get the foreign server name for logging */
+	server = GetForeignServer(newsrvoid);
+	
+	ereport(DEBUG1,
+			(errmsg("syncing shard group metadata \"%s\" to member \"%s\"",
+					sgname, server->servername)));
+	
+	initStringInfo(&ddl);
+	
+	/*
+	 * Step 1: Create the shard group on the remote server if it doesn't exist
+	 * Use proper DDL command instead of direct catalog insert
+	 */
+	appendStringInfo(&ddl, "CREATE SHARD GROUP IF NOT EXISTS %s;",
+					 quote_identifier(sgname));
+	
+	ExecuteDDLOnRemoteServer(newsrvoid, ddl.data);
+	
+	/*
+	 * Step 2: Get all current shard members in this shard group
+	 */
+	memberrel = table_open(ShardMemberRelationId, AccessShareLock);
+	
+	ScanKeyInit(&key[0],
+				Anum_pg_shardmembers_sgid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(sgid));
+	
+	scan = systable_beginscan(memberrel, ShardMemberSgidSrvidIndexId, true,
+							  NULL, 1, key);
+	
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Form_pg_shardmembers smform = (Form_pg_shardmembers) GETSTRUCT(tuple);
+		ForeignServer *member_server = GetForeignServer(smform->srvid);
+		
+		/* Store member information */
+		member_servers = lappend(member_servers, member_server);
+	}
+	
+	systable_endscan(scan);
+	table_close(memberrel, AccessShareLock);
+	
+	/*
+	 * Step 3: Sync all shard members to the new member's pg_shardmembers
+	 * Use proper DDL command instead of direct catalog insert
+	 * 
+	 * IMPORTANT: We use the internal skip_sync option here to prevent
+	 * the remote server from triggering SyncShardGroupMetadataToMember again,
+	 * which would cause infinite distributed recursion.
+	 */
+	foreach(lc, member_servers)
+	{
+		ForeignServer *member_server = (ForeignServer *) lfirst(lc);
+		
+		/* Reset DDL buffer */
+		resetStringInfo(&ddl);
+		
+		/* 
+		 * Use ALTER SHARD GROUP ADD MEMBER command with skip_sync option
+		 * to prevent recursion. The skip_sync option is internal-only
+		 * and gets passed through the WITH clause syntax.
+		 */
+		appendStringInfo(&ddl,
+						 "ALTER SHARD GROUP %s ADD MEMBER IF NOT EXISTS %s WITH (skip_sync 'true');",
+						 quote_identifier(sgname),
+						 quote_identifier(member_server->servername));
+		
+		ExecuteDDLOnRemoteServer(newsrvoid, ddl.data);
+		
+		ereport(DEBUG1,
+				(errmsg("synced shard member \"%s\" info to shard member \"%s\"",
+						member_server->servername, server->servername)));
+	}
+
+	/* Add itself as a member */
+	{
+		resetStringInfo(&ddl);
+		appendStringInfo(&ddl,
+						 "ALTER SHARD GROUP %s ADD MEMBER IF NOT EXISTS %s WITH (skip_sync 'true');",
+						 quote_identifier(sgname),
+						 quote_identifier(cluster_name));
+		ExecuteDDLOnRemoteServer(newsrvoid, ddl.data);
+		
+		ereport(DEBUG1,
+				(errmsg("added self as shard member \"%s\" to shard group \"%s\" on member \"%s\"",
+						cluster_name, sgname, server->servername)));
+	}
+	
+	ereport(DEBUG1,
+			(errmsg("successfully synced shard group \"%s\" with %d member(s) to shard member \"%s\"",
+					sgname, list_length(member_servers), server->servername)));
+	
+	/* Cleanup */
+	pfree(ddl.data);
+	list_free(member_servers);
+	ReleaseSysCache(sgtuple);
+}
+
+/*
+ * NotifyExistingMembersAboutNewMember
+ *		Notify all existing shard members about a newly added shard member
+ *
+ * When a new shard member is added to a shard group, this function informs
+ * all existing shard members about the new member so they can update their
+ * local catalogs to include information about the new member.
+ *
+ * This complements SyncShardGroupMetadataToMember which syncs TO the new member.
+ * This function syncs FROM the new member information TO all existing members.
+ */
+static void
+NotifyExistingMembersAboutNewMember(Oid sgid, Oid newsrvoid)
+{
+	Relation	memberrel;
+	SysScanDesc scan;
+	ScanKeyData key[1];
+	HeapTuple	tuple;
+	ForeignServer *newserver;
+	StringInfoData ddl;
+	HeapTuple	sgtuple;
+	Form_pg_shardgroups sgform;
+	char	   *sgname;
+	
+	/* Get the shard group name */
+	sgtuple = SearchSysCache1(SHARDGROUPOID, ObjectIdGetDatum(sgid));
+	if (!HeapTupleIsValid(sgtuple))
+		elog(ERROR, "cache lookup failed for shard group %u", sgid);
+	
+	sgform = (Form_pg_shardgroups) GETSTRUCT(sgtuple);
+	sgname = NameStr(sgform->sgname);
+	
+	/* Get the new server information */
+	newserver = GetForeignServer(newsrvoid);
+	
+	ereport(DEBUG1,
+			(errmsg("notifying existing members about new shard member \"%s\" in shard group \"%s\"",
+					newserver->servername, sgname)));
+	
+	initStringInfo(&ddl);
+	
+	/*
+	 * Iterate through all existing shard members (excluding the new one)
+	 * and notify them about the new member
+	 */
+	memberrel = table_open(ShardMemberRelationId, AccessShareLock);
+	
+	ScanKeyInit(&key[0],
+				Anum_pg_shardmembers_sgid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(sgid));
+	
+	scan = systable_beginscan(memberrel, ShardMemberSgidSrvidIndexId, true,
+							  NULL, 1, key);
+	
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Form_pg_shardmembers smform = (Form_pg_shardmembers) GETSTRUCT(tuple);
+		ForeignServer *existing_server;
+		
+		/* Skip the newly added member itself */
+		if (smform->srvid == newsrvoid)
+			continue;
+		
+		existing_server = GetForeignServer(smform->srvid);
+		
+		/* Reset DDL buffer */
+		resetStringInfo(&ddl);
+		
+		/*
+		 * Execute ALTER SHARD GROUP ADD MEMBER on the existing member
+		 * to add information about the new member to its catalog.
+		 * 
+		 * Use skip_sync option to prevent the existing member from
+		 * triggering its own sync operations, which would cause
+		 * unnecessary distributed operations.
+		 */
+		appendStringInfo(&ddl,
+						 "ALTER SHARD GROUP %s ADD MEMBER IF NOT EXISTS %s WITH (skip_sync 'true');",
+						 quote_identifier(sgname),
+						 quote_identifier(newserver->servername));
+		
+		ExecuteDDLOnRemoteServer(smform->srvid, ddl.data);
+		
+		ereport(DEBUG1,
+				(errmsg("notified shard member \"%s\" about new member \"%s\"",
+						existing_server->servername, newserver->servername)));
+	}
+	
+	systable_endscan(scan);
+	table_close(memberrel, AccessShareLock);
+	
+	/* Cleanup */
+	pfree(ddl.data);
+	ReleaseSysCache(sgtuple);
+	
+	ereport(DEBUG1,
+			(errmsg("successfully notified existing members about new shard member \"%s\"",
+					newserver->servername)));
 }
