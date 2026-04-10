@@ -74,7 +74,7 @@
 typedef struct MuxWorkerSlot
 {
 	pgsocket	worker_sock;					/* TCP socket to PG backend session */
-	pid_t		worker_pid;						/* PID of PG backend session */
+	int32		worker_pid;						/* PID of PG backend session */
 	char		database[NAMEDATALEN];			/* logged-in database */
 	char		username[NAMEDATALEN];			/* logged-in user */
 	int			connect_cnt;					/* # channels sharing this worker */
@@ -202,7 +202,7 @@ typedef struct MuxCtrlConn
 typedef struct MuxWorkerStats
 {
 	bool		valid;
-	pid_t		worker_pid;
+	int32		worker_pid;
 	bool		in_tx;
 	int32		active_channel;
 	int32		connect_cnt;

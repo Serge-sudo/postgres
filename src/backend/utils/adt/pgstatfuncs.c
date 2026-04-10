@@ -360,7 +360,7 @@ pg_stat_get_multiplexer_workers(PG_FUNCTION_ARGS)
 			continue;
 
 		values[0] = Int32GetDatum(i + 1);
-		if (worker->worker_pid > 0)
+		if (worker->worker_pid != 0)
 			values[1] = Int32GetDatum(worker->worker_pid);
 		else
 			nulls[1] = true;
