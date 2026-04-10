@@ -8,7 +8,7 @@ use warnings;
 
 use PostgreSQL::Test::Utils;
 use PostgreSQL::Test::Cluster;
-use Test::More tests => 10;
+use Test::More tests => 13;
 
 # Create three nodes to simulate a sharded cluster
 my $node1 = PostgreSQL::Test::Cluster->new("node1");
@@ -190,7 +190,30 @@ $result = $node3->safe_psql('postgres',
 	"SELECT customer_name FROM customers WHERE customer_id = 1");
 is($result, 'Alice', 'Can read correct data from foreign table on node3');
 
+# Verify that information about all shard members is consistent on nodes
+$result = $node3->safe_psql('postgres', qq[
+	SELECT COUNT(*) 
+	FROM pg_shardmembers sm
+	JOIN pg_shardgroups sg ON sm.sgid = sg.oid
+	WHERE sg.sgname = 'sg_foreign_test'
+]);
+is($result, '2', 'Shard members information is consistent on node3');
 
+$result = $node2->safe_psql('postgres', qq[
+	SELECT COUNT(*) 
+	FROM pg_shardmembers sm
+	JOIN pg_shardgroups sg ON sm.sgid = sg.oid
+	WHERE sg.sgname = 'sg_foreign_test'
+]);
+is($result, '2', 'Shard members information is consistent on node2');
+
+$result = $node1->safe_psql('postgres', qq[
+	SELECT COUNT(*) 
+	FROM pg_shardmembers sm
+	JOIN pg_shardgroups sg ON sm.sgid = sg.oid
+	WHERE sg.sgname = 'sg_foreign_test'
+]);
+is($result, '2', 'Shard members information is consistent on node1');
 
 ###############################################################################
 # Cleanup
