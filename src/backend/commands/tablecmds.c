@@ -1326,16 +1326,19 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 			* For partitions: create partitions on remote servers with PARTITION OF
 			* For regular tables: create tables on remote servers
 			*/
-			if (stmt->partbound != NULL)
+			if (!executing_remote_ddl)
 			{
-				/* For partitions, pass parent OID and bound spec */
-				Oid parentId = linitial_oid(inheritOids);
-				CreateTablesOnShardMembers(relationId, sgid, true, parentId, stmt->partbound);
-			}
-			else
-			{
-				/* For regular tables, no parent or bound */
-				CreateTablesOnShardMembers(relationId, sgid, false, InvalidOid, NULL);
+				if (stmt->partbound != NULL)
+				{
+					/* For partitions, pass parent OID and bound spec */
+					Oid parentId = linitial_oid(inheritOids);
+					CreateTablesOnShardMembers(relationId, sgid, true, parentId, stmt->partbound);
+				}
+				else
+				{
+					/* For regular tables, no parent or bound */
+					CreateTablesOnShardMembers(relationId, sgid, false, InvalidOid, NULL);
+				}
 			}
 		}
 	}
@@ -1345,8 +1348,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 		Oid			sgid = get_shardgroup_oid(stmt->shardgroup, false);
 		SetRelationShardGroup(relationId, sgid);
 	}
-	else if (stmt->partbound != NULL && OidIsValid(rel->rd_rel->relsgid) && rel->rd_rel->relkind != RELKIND_FOREIGN_TABLE &&
-	(!(rel->rd_options && ((StdRdOptions *) rel->rd_options)->noRelSync)))
+	else if (stmt->partbound != NULL && OidIsValid(rel->rd_rel->relsgid) && rel->rd_rel->relkind != RELKIND_FOREIGN_TABLE && !executing_remote_ddl)
 	{
 		/*
 		 * For partitions that inherit shard group from parent:

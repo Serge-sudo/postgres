@@ -1,0 +1,301 @@
+diff -U3 /workspaces/postgres/src/test/regress/expected/sharding.out /workspaces/postgres/src/test/regress/results/sharding.out
+--- /workspaces/postgres/src/test/regress/expected/sharding.out	2026-03-27 11:58:34.637376862 +0000
++++ /workspaces/postgres/src/test/regress/results/sharding.out	2026-04-04 12:38:21.075845556 +0000
+@@ -46,7 +46,7 @@
+ SELECT * FROM pg_shardgroups;
+   oid  | sgname  | sgowner | sgoptions 
+ -------+---------+---------+-----------
+- 16491 | sg_test |      10 | 
++ 16395 | sg_test |      10 | 
+ (1 row)
+ 
+ -- -- Test error message
+@@ -55,64 +55,57 @@
+ SELECT * FROM pg_shardgroups;
+   oid  | sgname  | sgowner | sgoptions 
+ -------+---------+---------+-----------
+- 16491 | sg_test |      10 | 
++ 16395 | sg_test |      10 | 
+ (1 row)
+ 
+ ALTER DATABASE regression SET DEFAULT SHARD GROUP sg_test;
+ SELECT * FROM pg_database;
+-  oid  |  datname   | datdba | encoding | datlocprovider | datistemplate | datallowconn | dathasloginevt | datconnlimit | datfrozenxid | datminmxid | dattablespace | datshardgroup | datcollate | datctype | datlocale | daticurules | datcollversion |            datacl             
+--------+------------+--------+----------+----------------+---------------+--------------+----------------+--------------+--------------+------------+---------------+---------------+------------+----------+-----------+-------------+----------------+-------------------------------
+-     5 | postgres   |     10 |        6 | c              | f             | t            | f              |           -1 |          734 |          1 |          1663 |             0 | C.UTF-8    | C.UTF-8  |           |             |                | 
+-     1 | template1  |     10 |        6 | c              | t             | t            | f              |           -1 |          734 |          1 |          1663 |             0 | C.UTF-8    | C.UTF-8  |           |             |                | {=c/runner,runner=CTc/runner}
+-     4 | template0  |     10 |        6 | c              | t             | f            | f              |           -1 |          734 |          1 |          1663 |             0 | C.UTF-8    | C.UTF-8  |           |             |                | {=c/runner,runner=CTc/runner}
+- 16384 | testdb     |     10 |        6 | c              | f             | t            | f              |           -1 |          734 |          1 |          1663 |         16450 | C.UTF-8    | C.UTF-8  |           |             |                | 
+- 16483 | regression |     10 |        6 | c              | f             | t            | f              |           -1 |          734 |          1 |          1663 |         16491 | C.UTF-8    | C.UTF-8  |           |             |                | 
+-(5 rows)
++  oid  |  datname   | datdba | encoding | datlocprovider | datistemplate | datallowconn | dathasloginevt | datconnlimit | datfrozenxid | datminmxid | dattablespace | datshardgroup | datcollate  |  datctype   | datlocale | daticurules | datcollversion |            datacl             
++-------+------------+--------+----------+----------------+---------------+--------------+----------------+--------------+--------------+------------+---------------+---------------+-------------+-------------+-----------+-------------+----------------+-------------------------------
++     5 | postgres   |     10 |        6 | c              | f             | t            | f              |           -1 |          734 |          1 |          1663 |             0 | en_US.UTF-8 | en_US.UTF-8 |           |             | 2.39           | 
++     1 | template1  |     10 |        6 | c              | t             | t            | f              |           -1 |          734 |          1 |          1663 |             0 | en_US.UTF-8 | en_US.UTF-8 |           |             | 2.39           | {=c/vscode,vscode=CTc/vscode}
++     4 | template0  |     10 |        6 | c              | t             | f            | f              |           -1 |          734 |          1 |          1663 |             0 | en_US.UTF-8 | en_US.UTF-8 |           |             |                | {=c/vscode,vscode=CTc/vscode}
++ 16384 | regression |     10 |        6 | c              | f             | t            | f              |           -1 |          734 |          1 |          1663 |         16395 | en_US.UTF-8 | en_US.UTF-8 |           |             | 2.39           | 
++(4 rows)
+ 
+ -- ALTER DATABASE ... SET SHARD GROUP
+ CREATE SERVER server1
+     FOREIGN DATA WRAPPER postgres_fdw
+     OPTIONS (host 'localhost', dbname 'regression', port '5432');
+ ALTER SHARD GROUP sg_test ADD MEMBER server1;
++ERROR:  user mapping not found for user "vscode", server "server1"
+ SELECT * FROM pg_foreign_server;
+   oid  | srvname | srvowner | srvfdw | srvtype | srvversion | srvacl |                  srvoptions                  
+ -------+---------+----------+--------+---------+------------+--------+----------------------------------------------
+- 16492 | server1 |       10 |  16487 |         |            |        | {host=localhost,dbname=regression,port=5432}
++ 16396 | server1 |       10 |  16388 |         |            |        | {host=localhost,dbname=regression,port=5432}
+ (1 row)
+ 
+ SELECT * FROM pg_shardmembers;
+-  oid  | sgid  | srvid | smpriority | smstate | smoptions 
+--------+-------+-------+------------+---------+-----------
+- 16493 | 16491 | 16492 |        100 | u       | 
+-(1 row)
++ oid | sgid | srvid | smpriority | smstate | smoptions 
++-----+------+-------+------------+---------+-----------
++(0 rows)
+ 
+ DROP SERVER server1;
+-ERROR:  cannot drop server server1 because other objects depend on it
+-DETAIL:  shard group member server1 in sg_test depends on server server1
+-HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+ ALTER SHARD GROUP sg_test DROP MEMBER server1;
++ERROR:  server "server1" does not exist
+ SELECT * FROM pg_shardmembers;
+  oid | sgid | srvid | smpriority | smstate | smoptions 
+ -----+------+-------+------------+---------+-----------
+ (0 rows)
+ 
+ ALTER SHARD GROUP sg_test ADD MEMBER server1;
++ERROR:  server "server1" does not exist
+ SELECT * FROM pg_foreign_server;
+-  oid  | srvname | srvowner | srvfdw | srvtype | srvversion | srvacl |                  srvoptions                  
+--------+---------+----------+--------+---------+------------+--------+----------------------------------------------
+- 16492 | server1 |       10 |  16487 |         |            |        | {host=localhost,dbname=regression,port=5432}
+-(1 row)
++ oid | srvname | srvowner | srvfdw | srvtype | srvversion | srvacl | srvoptions 
++-----+---------+----------+--------+---------+------------+--------+------------
++(0 rows)
+ 
+ -- check default shard group
+ CREATE WORLDWIDE TABLE test_t_worldwide (a int, b int);
+-NOTICE:  WORLDWIDE table not yet fully implemented
+-DETAIL:  Table will be created as worldwide table.
+-NOTICE:  table "public.test_t_worldwide" should be created on shard member "server1"
+-DETAIL:  Execute: CREATE TABLE IF NOT EXISTS public.test_t_worldwide (a integer, b integer)
+ SELECT * FROM pg_class WHERE relname like 'test_t_%';
+   oid  |     relname      | relnamespace | reltype | reloftype | relowner | relam | relfilenode | reltablespace | relpages | reltuples | relallvisible | reltoastrelid | relhasindex | relisshared | relpersistence | relkind | relnatts | relchecks | relhasrules | relhastriggers | relhassubclass | relrowsecurity | relforcerowsecurity | relispopulated | relreplident | relispartition | relrewrite | relsgid | relfrozenxid | relminmxid | relacl | reloptions | relpartbound 
+ -------+------------------+--------------+---------+-----------+----------+-------+-------------+---------------+----------+-----------+---------------+---------------+-------------+-------------+----------------+---------+----------+-----------+-------------+----------------+----------------+----------------+---------------------+----------------+--------------+----------------+------------+---------+--------------+------------+--------+------------+--------------
+- 16495 | test_t_worldwide |         2200 |   16497 |         0 |       10 |     2 |       16495 |             0 |        0 |        -1 |             0 |             0 | f           | f           | p              | r       |        2 |         0 | f           | f              | f              | f              | f                   | t              | d            | f              |          0 |   16491 |          787 |          1 |        |            | 
++ 16398 | test_t_worldwide |         2200 |   16400 |         0 |       10 |     2 |       16398 |             0 |        0 |        -1 |             0 |             0 | f           | f           | p              | r       |        2 |         0 | f           | f              | f              | f              | f                   | t              | d            | f              |          0 |   16395 |          750 |          1 |        |            | 
+ (1 row)
+ 
+ DROP TABLE test_t_worldwide;
+@@ -121,41 +114,42 @@
+ SELECT * FROM pg_shardgroups;
+   oid  |  sgname   | sgowner | sgoptions 
+ -------+-----------+---------+-----------
+- 16491 | sg_test   |      10 | 
+- 16498 | sg_test_2 |      10 | 
++ 16395 | sg_test   |      10 | 
++ 16401 | sg_test_2 |      10 | 
+ (2 rows)
+ 
+ CREATE WORLDWIDE TABLE test_t_worldwide (a int, b int) SHARD GROUP sg_test_2;
+-NOTICE:  WORLDWIDE table not yet fully implemented
+-DETAIL:  Table will be created as worldwide table.
+ CREATE TABLE test_t_distribute (a int, b int) DISTRIBUTED BY LIST(a) SHARD GROUP sg_test_2;
+-NOTICE:  DISTRIBUTED BY clause not yet fully implemented
+-DETAIL:  Table will be created as distributed table.
+ CREATE TABLE test_t_distribute_1 PARTITION OF test_t_distribute FOR VALUES IN (1,2,3);
+ CREATE INDEX test_idx_worldwide ON test_t_worldwide(a);
++WARNING:  replicating CREATE INDEX to shard members
++DETAIL:  Table: public.test_t_worldwide, Index OID: 16411, Shard Group: 16401
+ CREATE INDEX test_idx_distribute ON test_t_distribute(a);
++WARNING:  replicating CREATE INDEX to shard members
++DETAIL:  Table: public.test_t_distribute, Index OID: 16412, Shard Group: 16401
+ SELECT relname, relkind, relsgid, relispartition FROM pg_class WHERE relname IN ('test_t_worldwide', 'test_t_distribute', 'test_t_distribute_1', 'test_idx_worldwide', 'test_idx_distribute') ORDER BY relname;
+        relname       | relkind | relsgid | relispartition 
+ ---------------------+---------+---------+----------------
+- test_idx_distribute | I       |   16498 | f
+- test_idx_worldwide  | i       |   16498 | f
+- test_t_distribute   | p       |   16498 | f
+- test_t_distribute_1 | r       |   16498 | t
+- test_t_worldwide    | r       |   16498 | f
++ test_idx_distribute | I       |       0 | f
++ test_idx_worldwide  | i       |       0 | f
++ test_t_distribute   | p       |   16401 | f
++ test_t_distribute_1 | r       |   16401 | t
++ test_t_worldwide    | r       |   16401 | f
+ (5 rows)
+ 
+ -- Test \dt command to verify table type display
+ \dt test_t_*
+-                   List of relations
+- Schema |       Name        |        Type         | Owner  
+---------+-------------------+---------------------+--------
+- public | test_t_distribute | distributed table   | runner
+- public | test_t_worldwide  | worldwide table     | runner
+-(2 rows)
++                       List of relations
++ Schema |        Name         |         Type          | Owner  
++--------+---------------------+-----------------------+--------
++ public | test_t_distribute   | distributed table     | vscode
++ public | test_t_distribute_1 | distributed partition | vscode
++ public | test_t_worldwide    | worldwide table       | vscode
++(3 rows)
+ 
+ -- Test \d command to verify detailed table type display
+ \d test_t_worldwide
+-            Worldwide table "public.test_t_worldwide"
++     Worldwide table "public.test_t_worldwide"
+  Column |  Type   | Collation | Nullable | Default 
+ --------+---------+-----------+----------+---------
+  a      | integer |           |          | 
+@@ -164,7 +158,7 @@
+     "test_idx_worldwide" btree (a)
+ 
+ \d test_t_distribute
+-       Distributed table "public.test_t_distribute"
++   Distributed table "public.test_t_distribute"
+  Column |  Type   | Collation | Nullable | Default 
+ --------+---------+-----------+----------+---------
+  a      | integer |           |          | 
+@@ -175,81 +169,84 @@
+ Number of partitions: 1 (Use \d+ to list them.)
+ 
+ \d test_t_distribute_1
+-       Distributed partition "public.test_t_distribute_1"
++Distributed partition "public.test_t_distribute_1"
+  Column |  Type   | Collation | Nullable | Default 
+ --------+---------+-----------+----------+---------
+  a      | integer |           |          | 
+  b      | integer |           |          | 
+ Partition of: test_t_distribute FOR VALUES IN (1, 2, 3)
++Indexes:
++    "test_t_distribute_1_a_idx" btree (a)
+ 
+ \d test_idx_worldwide
+-    Worldwide index "public.test_idx_worldwide"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- a      | integer |           |          | 
++  Index "public.test_idx_worldwide"
++ Column |  Type   | Key? | Definition 
++--------+---------+------+------------
++ a      | integer | yes  | a
+ btree, for table "public.test_t_worldwide"
+ 
+ \d test_idx_distribute
+-    Distributed index "public.test_idx_distribute"
+- Column |  Type   | Collation | Nullable | Default 
+---------+---------+-----------+----------+---------
+- a      | integer |           |          | 
++Partitioned index "public.test_idx_distribute"
++ Column |  Type   | Key? | Definition 
++--------+---------+------+------------
++ a      | integer | yes  | a
+ btree, for table "public.test_t_distribute"
++Number of partitions: 1 (Use \d+ to list them.)
++
++-- Test new features: DROP TABLE on shard group tables
++-- This should replicate to all shard members
++DROP TABLE IF EXISTS test_t_distribute_1;
++SELECT * FROM pg_class WHERE relname = 'test_t_distribute_1';
++ oid | relname | relnamespace | reltype | reloftype | relowner | relam | relfilenode | reltablespace | relpages | reltuples | relallvisible | reltoastrelid | relhasindex | relisshared | relpersistence | relkind | relnatts | relchecks | relhasrules | relhastriggers | relhassubclass | relrowsecurity | relforcerowsecurity | relispopulated | relreplident | relispartition | relrewrite | relsgid | relfrozenxid | relminmxid | relacl | reloptions | relpartbound 
++-----+---------+--------------+---------+-----------+----------+-------+-------------+---------------+----------+-----------+---------------+---------------+-------------+-------------+----------------+---------+----------+-----------+-------------+----------------+----------------+----------------+---------------------+----------------+--------------+----------------+------------+---------+--------------+------------+--------+------------+--------------
++(0 rows)
+ 
++-- Test CREATE INDEX CONCURRENTLY rejection on shard group tables
++-- This should fail with an error message
++CREATE INDEX CONCURRENTLY idx_test ON test_t_worldwide(a);
++ERROR:  CREATE INDEX CONCURRENTLY is not supported on shard group tables
++HINT:  Remove CONCURRENTLY option when creating indexes on distributed or worldwide tables.
++-- Test CREATE INDEX on shard group tables (non-concurrent)
++-- This should replicate to all shard members
++CREATE INDEX idx_test ON test_t_worldwide(a);
++WARNING:  replicating CREATE INDEX to shard members
++DETAIL:  Table: public.test_t_worldwide, Index OID: 16414, Shard Group: 16401
++SELECT * FROM pg_class WHERE relname = 'idx_test';
++  oid  | relname  | relnamespace | reltype | reloftype | relowner | relam | relfilenode | reltablespace | relpages | reltuples | relallvisible | reltoastrelid | relhasindex | relisshared | relpersistence | relkind | relnatts | relchecks | relhasrules | relhastriggers | relhassubclass | relrowsecurity | relforcerowsecurity | relispopulated | relreplident | relispartition | relrewrite | relsgid | relfrozenxid | relminmxid | relacl | reloptions | relpartbound 
++-------+----------+--------------+---------+-----------+----------+-------+-------------+---------------+----------+-----------+---------------+---------------+-------------+-------------+----------------+---------+----------+-----------+-------------+----------------+----------------+----------------+---------------------+----------------+--------------+----------------+------------+---------+--------------+------------+--------+------------+--------------
++ 16414 | idx_test |         2200 |       0 |         0 |       10 |   403 |       16414 |             0 |        1 |         0 |             0 |             0 | f           | f           | p              | i       |        1 |         0 | f           | f              | f              | f              | f                   | t              | n            | f              |          0 |       0 |            0 |          0 |        |            | 
++(1 row)
++
++-- Test REINDEX on shard group tables
++-- This should replicate to all shard members
++REINDEX TABLE test_t_worldwide;
++-- Test REINDEX CONCURRENTLY rejection on shard group tables
++-- This should fail with an error message
++REINDEX TABLE CONCURRENTLY test_t_worldwide;
++ERROR:  REINDEX CONCURRENTLY is not supported on shard group tables
++HINT:  Remove CONCURRENTLY option when reindexing distributed or worldwide tables.
++-- Clean up
++DROP TABLE test_t_worldwide;
++DROP TABLE test_t_distribute;
+ SELECT * FROM pg_shardgroups;
+   oid  |  sgname   | sgowner | sgoptions 
+ -------+-----------+---------+-----------
+- 16491 | sg_test   |      10 | 
+- 16498 | sg_test_2 |      10 | 
++ 16395 | sg_test   |      10 | 
++ 16401 | sg_test_2 |      10 | 
+ (2 rows)
+ 
+ SELECT * FROM pg_shardmembers;
+-  oid  | sgid  | srvid | smpriority | smstate | smoptions 
+--------+-------+-------+------------+---------+-----------
+- 16494 | 16491 | 16492 |        100 | u       | 
+-(1 row)
++ oid | sgid | srvid | smpriority | smstate | smoptions 
++-----+------+-------+------------+---------+-----------
++(0 rows)
+ 
+--- Test DROP MEMBER restriction when foreign tables depend on the member
+--- Create a server to act as data source
+-CREATE SERVER data_source
+-    FOREIGN DATA WRAPPER postgres_fdw
+-    OPTIONS (host 'localhost', dbname 'regression', port '5432');
+--- Create a foreign table pointing to data_source
+-CREATE FOREIGN TABLE test_foreign_data (id int, data text) SERVER data_source;
+--- Assign it to sg_test_2 shard group (which has no members yet)
+-ALTER TABLE test_foreign_data SET (relsgid = (SELECT oid FROM pg_shardgroups WHERE sgname = 'sg_test_2'));
+--- Add data_source as a member to sg_test_2
+-ALTER SHARD GROUP sg_test_2 ADD MEMBER data_source;
+--- Try to drop data_source from sg_test_2 - should fail due to foreign table dependency
+-ALTER SHARD GROUP sg_test_2 DROP MEMBER data_source;
+-ERROR:  cannot drop shard member "data_source" from shard group "sg_test_2"
+-DETAIL:  Foreign tables depend on this member: public.test_foreign_data
+-HINT:  Drop or reassign the dependent foreign tables first.
+--- Clean up the foreign table first
+-DROP FOREIGN TABLE test_foreign_data;
+--- Now dropping should succeed
+-ALTER SHARD GROUP sg_test_2 DROP MEMBER data_source;
+--- Clean up the server
+-DROP SERVER data_source;
+ DROP SHARD GROUP sg_test_2;
+ SELECT * FROM pg_shardgroups;
+   oid  | sgname  | sgowner | sgoptions 
+ -------+---------+---------+-----------
+- 16491 | sg_test |      10 | 
+-(1 row)
+-
+-SELECT * FROM pg_shardmembers;
+-  oid  | sgid  | srvid | smpriority | smstate | smoptions 
+--------+-------+-------+------------+---------+-----------
+- 16494 | 16491 | 16492 |        100 | u       | 
++ 16395 | sg_test |      10 | 
+ (1 row)
+ 
+-DROP SHARD GROUP sg_test;
+-SELECT * FROM pg_shardgroups;
+- oid | sgname | sgowner | sgoptions 
+------+--------+---------+-----------
+-(0 rows)
+-
+ SELECT * FROM pg_shardmembers;
+  oid | sgid | srvid | smpriority | smstate | smoptions 
+ -----+------+-------+------------+---------+-----------

@@ -40,6 +40,7 @@
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
 #include "miscadmin.h"
+#include "postmaster/conn_multiplexer.h"
 #include "partitioning/partdefs.h"
 #include "partitioning/partdesc.h"
 #include "utils/acl.h"
@@ -120,6 +121,9 @@ check_executing_remote_ddl(bool *newval, void **extra, GucSource source)
 	 * We also reject if NOT in a transaction, which would be a user trying to
 	 * set it from psql or similar without using SET LOCAL in a transaction.
 	 */
+	if (ConnMuxIsWorkerProcess())
+		return true;
+
 	if (source == PGC_S_SESSION)
 	{
 		/*
