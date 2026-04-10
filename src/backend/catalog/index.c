@@ -33,10 +33,12 @@
 #include "access/visibilitymap.h"
 #include "access/xact.h"
 #include "bootstrap/bootstrap.h"
+#include "commands/shardgroupcmds.h"
 #include "catalog/binary_upgrade.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/heap.h"
+#include "foreign/fdwapi.h"
 #include "catalog/index.h"
 #include "catalog/objectaccess.h"
 #include "catalog/partition.h"
@@ -48,6 +50,7 @@
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_tablespace.h"
+#include "foreign/foreign.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
 #include "catalog/storage.h"
@@ -3910,14 +3913,67 @@ reindex_relation(const ReindexStmt *stmt, Oid relid, int flags,
 		return false;
 	
 	/*
-	 * TODO: if foreign table and if it is partition of distribution table, or worldwide table.
-	 * run ddl on node where the partition is located, and skip reindexing on coordinator.
-	 * ALSO note that we can not run reindex inside transaction block
+ 	 * If this is a foreign table partition or worldwide table,
+	 * replicate REINDEX to the remote server where the partition physically exists.
+	 * Skip replication if we're executing DDL from a remote server to prevent infinite recursion.
 	 */
-	 if (rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE && 0)
-	 {
-		// TODO:
-	 }
+	if (rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE && !executing_remote_ddl)
+	{					
+		/* Check if parent table belongs to a shard group */
+		if (OidIsValid(rel->rd_rel->relsgid))
+		{
+			ForeignTable *ftable = GetForeignTable(relid);
+			ForeignServer *server = GetForeignServer(ftable->serverid);
+			ForeignDataWrapper *fdw = GetForeignDataWrapper(server->fdwid);
+			FdwRoutine *fdwroutine = GetFdwRoutine(fdw->fdwhandler);
+			StringInfoData reindex_sql;
+			char *relname = NameStr(rel->rd_rel->relname);
+			char *nspname = get_namespace_name(RelationGetNamespace(rel));
+			
+			/* Null check for namespace name */
+			if (nspname == NULL)
+			{
+				table_close(rel, ShareLock);
+				elog(ERROR, "cache lookup failed for namespace %u", 
+						RelationGetNamespace(rel));
+			}
+			
+			/* Build REINDEX TABLE command */
+			initStringInfo(&reindex_sql);
+			appendStringInfo(&reindex_sql, "REINDEX TABLE %s.%s",
+								quote_identifier(nspname),
+								quote_identifier(relname));
+			
+			ereport(DEBUG1,
+					(errmsg("replicating REINDEX to remote server for foreign table partition"),
+						errdetail("Partition: %s.%s, Server: %s",
+								nspname, relname, server->servername)));
+			
+			/* Execute on the remote server where partition physically exists */
+			if (fdwroutine->ExecForeignDDL != NULL)
+			{
+				fdwroutine->ExecForeignDDL(ftable->serverid, reindex_sql.data);
+				
+				ereport(DEBUG1,
+						(errmsg("executed REINDEX on remote server \"%s\"",
+								server->servername)));
+			}
+			else
+			{
+				ereport(NOTICE,
+						(errmsg("partition should be reindexed on remote server \"%s\"",
+								server->servername),
+							errdetail("Execute: %s", reindex_sql.data),
+							errhint("The FDW for this server does not support automatic DDL execution.")));
+			}
+			
+			pfree(reindex_sql.data);
+			table_close(rel, NoLock);
+			
+			/* Return true since we handled the reindex via remote execution */
+			return true;
+		}
+	}
 
 	/*
 	 * Partitioned tables should never get processed here, as they have no
