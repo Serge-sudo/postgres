@@ -1,4 +1,7 @@
 # initializing database system by copying initdb template
-# using temp instance on port 55316 with PID 1908
-not ok 1     - sharding                                   40 ms
-# could not stop postmaster: exit code was 2Bail out!
+# using temp instance on port 55316 with PID 13479
+not ok 1     - sharding                                   39 ms
+1..1
+# 1 of 1 tests failed.
+# The differences that caused some tests to fail can be viewed in the file "/home/runner/work/postgres/postgres/src/test/regress/regression.diffs".
+# A copy of the test summary that you see above is saved in the file "/home/runner/work/postgres/postgres/src/test/regress/regression.out".
