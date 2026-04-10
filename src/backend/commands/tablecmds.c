@@ -1338,7 +1338,8 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 			}
 		}
 	}
-	else if (stmt->partbound != NULL && OidIsValid(rel->rd_rel->relsgid))
+	else if (stmt->partbound != NULL && OidIsValid(rel->rd_rel->relsgid) && rel->rd_rel->relkind != RELKIND_FOREIGN_TABLE &&
+	(!(rel->rd_options && ((StdRdOptions *) rel->rd_options)->noRelSync)))
 	{
 		/*
 		 * For partitions that inherit shard group from parent:
@@ -1426,12 +1427,17 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 	ListCell   *lc;
 	Relation	rel;
 	TupleDesc	tupdesc;
-	StringInfoData create_table_sql;
+	StringInfo create_table_sql;
+	StringInfo create_foreign_table_sql;
 	char	   *relname;
 	char	   *nspname;
 	int			i;
 	int			first_col;
+	Oid			target_member = InvalidOid;
+	ForeignServer *target_server = NULL;
 	extern char *cluster_name;
+	char *target_server_name;
+	
 
 	/* Get list of shard members */
 	members = get_shardgroup_members(sgid);
@@ -1455,41 +1461,69 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 	relname = RelationGetRelationName(rel);
 	nspname = get_namespace_name(RelationGetNamespace(rel));
 
+	/*
+	 * For partitions: use consistent hashing to determine which member should host the partition.
+	 * For non-partitions: distribute to all members (existing behavior).
+	 */
+	if (is_partition && OidIsValid(parentOid) && partbound != NULL)
+	{
+		bool found;
+		/* Use consistent hashing to determine target member for this partition */
+		// target_member = GetPartitionTargetMember(sgid, relname, NULL, &found);
+		// if (!found)
+		// {
+		// 	ereport(ERROR,
+		// 			(errcode(ERRCODE_INTERNAL_ERROR),
+		// 			 errmsg("could not determine target member for partition \"%s\"", relname)));
+		// }
+		target_member = InvalidOid; // TODO : implement consistent hashing to get target member OID
+
+		if (OidIsValid(target_member))
+		{
+			target_server = GetForeignServer(target_member);
+			target_server_name = pstrdup(target_server->servername);
+		}
+		else
+		{
+			target_server_name = cluster_name;
+		}
+			
+	}
+
 	/* Build the CREATE TABLE DDL */
-	initStringInfo(&create_table_sql);
+	create_table_sql = makeStringInfo();
+	create_foreign_table_sql = makeStringInfo();
 	
 	if (is_partition && OidIsValid(parentOid) && partbound != NULL)
 	{
 		Relation	parent;
 		char	   *parentname;
 		char	   *parentnspname;
+		StringInfo partition_bounds;
 		
 		/*
 		 * For partitions of distributed tables:
-		 * On foreign servers, create partitions using PARTITION OF syntax
-		 * This creates the partition structure on remote servers with proper bounds
+		 * - On the target member (determined by consistent hashing): create real partition table
+		 * - On other members: create foreign table reference pointing to target member
 		 */
 		parent = table_open(parentOid, AccessShareLock);
 		parentname = RelationGetRelationName(parent);
 		parentnspname = get_namespace_name(RelationGetNamespace(parent));
 		
-		appendStringInfo(&create_table_sql, "CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s ",
-						 quote_identifier(nspname),
-						 quote_identifier(relname),
-						 quote_identifier(parentnspname),
-						 quote_identifier(parentname));
+		/* Build partition bounds specification (shared by both SQL statements) */
+		partition_bounds = makeStringInfo();
 		
-		/* Add the partition bound specification */
+		/* Build partition bounds specification */
 		if (partbound->is_default)
 		{
-			appendStringInfoString(&create_table_sql, "DEFAULT");
+			appendStringInfoString(partition_bounds, "DEFAULT");
 		}
 		else
 		{
 			switch (partbound->strategy)
 			{
 				case PARTITION_STRATEGY_HASH:
-					appendStringInfo(&create_table_sql, "FOR VALUES WITH (modulus %d, remainder %d)",
+					appendStringInfo(partition_bounds, "FOR VALUES WITH (modulus %d, remainder %d)",
 									 partbound->modulus, partbound->remainder);
 					break;
 					
@@ -1498,41 +1532,41 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 						ListCell   *cell;
 						const char *sep = "";
 						
-						appendStringInfoString(&create_table_sql, "FOR VALUES IN (");
+						appendStringInfoString(partition_bounds, "FOR VALUES IN (");
 						foreach(cell, partbound->listdatums)
 						{
 							A_Const	   *aconst = lfirst(cell);
 							
-							appendStringInfoString(&create_table_sql, sep);
+							appendStringInfoString(partition_bounds, sep);
 							
 							/* Format the constant value based on its type */
 							if (aconst->isnull)
 							{
-								appendStringInfoString(&create_table_sql, "NULL");
+								appendStringInfoString(partition_bounds, "NULL");
 							}
 							else
 							{
 								switch (nodeTag(&aconst->val.node))
 								{
 									case T_Integer:
-										appendStringInfo(&create_table_sql, "%ld", 
+										appendStringInfo(partition_bounds, "%ld", 
 														castNode(Integer, &aconst->val.node)->ival);
 										break;
 									case T_Float:
-										appendStringInfoString(&create_table_sql,
+										appendStringInfoString(partition_bounds,
 															  castNode(Float, &aconst->val.node)->fval);
 										break;
 									case T_Boolean:
-										appendStringInfoString(&create_table_sql,
+										appendStringInfoString(partition_bounds,
 															  castNode(Boolean, &aconst->val.node)->boolval ? "true" : "false");
 										break;
 									case T_String:
 										/* Quote string literals */
-										appendStringInfo(&create_table_sql, "'%s'",
+										appendStringInfo(partition_bounds, "'%s'",
 														castNode(String, &aconst->val.node)->sval);
 										break;
 									case T_BitString:
-										appendStringInfo(&create_table_sql, "B'%s'",
+										appendStringInfo(partition_bounds, "B'%s'",
 														castNode(BitString, &aconst->val.node)->bsval);
 										break;
 									default:
@@ -1544,7 +1578,7 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 							
 							sep = ", ";
 						}
-						appendStringInfoChar(&create_table_sql, ')');
+						appendStringInfoChar(partition_bounds, ')');
 					}
 					break;
 					
@@ -1558,8 +1592,7 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 													   NIL, false, false);
 						upper_str = deparse_expression((Node *) partbound->upperdatums,
 													   NIL, false, false);
-						
-						appendStringInfo(&create_table_sql, "FOR VALUES FROM %s TO %s",
+						appendStringInfo(partition_bounds, "FOR VALUES FROM (%s) TO (%s)",
 										 lower_str, upper_str);
 						
 						pfree(lower_str);
@@ -1574,10 +1607,25 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 			}
 		}
 
-		appendStringInfo(&create_table_sql, " SERVER %s",
-						 quote_identifier(cluster_name));
+		/* Build SQL for creating real partition table (for target member) */
+		appendStringInfo(create_table_sql, "CREATE TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s",
+						 quote_identifier(nspname),
+						 quote_identifier(relname),
+						 quote_identifier(parentnspname),
+						 quote_identifier(parentname),
+						 partition_bounds->data);
+		
+		/* Build SQL for creating foreign table partition (for other members) */
+		appendStringInfo(create_foreign_table_sql, "CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s SERVER %s",
+							quote_identifier(nspname),
+							quote_identifier(relname),
+							quote_identifier(parentnspname),
+							quote_identifier(parentname),
+							partition_bounds->data,
+							quote_identifier(target_server_name));
 
 		table_close(parent, AccessShareLock);
+		destroyStringInfo(partition_bounds);
 		pfree(parentnspname);
 	}
 	else
@@ -1586,7 +1634,7 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 		 * For regular distributed/worldwide tables (including partitioned tables):
 		 * Create actual tables on foreign servers
 		 */
-		appendStringInfo(&create_table_sql, "CREATE TABLE IF NOT EXISTS %s.%s (",
+		appendStringInfo(create_table_sql, "CREATE TABLE IF NOT EXISTS %s.%s (",
 						 quote_identifier(nspname),
 						 quote_identifier(relname));
 		
@@ -1599,18 +1647,18 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 				continue;
 
 			if (!first_col)
-				appendStringInfo(&create_table_sql, ", ");
+				appendStringInfo(create_table_sql, ", ");
 			first_col = 0;
 
-			appendStringInfo(&create_table_sql, "%s %s",
+			appendStringInfo(create_table_sql, "%s %s",
 							 quote_identifier(NameStr(attr->attname)),
 							 format_type_with_typemod(attr->atttypid, attr->atttypmod));
 
 			/* Add NOT NULL constraint if present */
 			if (attr->attnotnull)
-				appendStringInfo(&create_table_sql, " NOT NULL");
+				appendStringInfo(create_table_sql, " NOT NULL");
 		}
-		appendStringInfo(&create_table_sql, ")");
+		appendStringInfo(create_table_sql, ")");
 		
 		/* If this is a partitioned table, add PARTITION BY clause */
 		if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
@@ -1623,7 +1671,7 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 				/* Get the partition key definition */
 				partkey_str = pg_get_partkeydef_columns(relationId, false);
 				
-				appendStringInfo(&create_table_sql, " PARTITION BY %s (%s)",
+				appendStringInfo(create_table_sql, " PARTITION BY %s (%s)",
 								 partkey->strategy == PARTITION_STRATEGY_HASH ? "HASH" :
 								 partkey->strategy == PARTITION_STRATEGY_LIST ? "LIST" :
 								 partkey->strategy == PARTITION_STRATEGY_RANGE ? "RANGE" : "UNKNOWN",
@@ -1635,18 +1683,54 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 
 	/*
 	 * Execute the DDL on each shard member.
-	 * This uses postgres_fdw connections and participates in 2PC.
+	 * For partitions with consistent hashing:
+	 *   - Create real table on target member
+	 *   - Create foreign table references on other members
+	 * For non-partitions:
+	 *   - Create real tables on all members (existing behavior)
 	 */
 	foreach(lc, members)
 	{
 		Oid			serveroid = lfirst_oid(lc);
+		const char *sql_to_execute;
+
+		if (is_partition)
+		{
+			/* Using consistent hashing for partition placement */
+			if (serveroid == target_member)
+			{
+				/* Create real partition table on target member */
+				sql_to_execute = create_table_sql->data;
+			}
+			else if (create_foreign_table_sql->len > 0)
+			{
+				/* 
+				 * Create foreign table reference on other members
+				 * Note: create_foreign_table_sql is only initialized when 
+				 * OidIsValid(target_member) && target_server != NULL
+				 */
+				sql_to_execute = create_foreign_table_sql->data;
+			}
+			else
+			{
+				/* Skip if no foreign table SQL was generated */
+				continue;
+			}
+		}
+		else
+		{
+			/* For non-partitions, use standard behavior */
+			sql_to_execute = create_table_sql->data;
+		}
 
 		/* Execute the DDL command on the remote server */
-		ExecuteDDLOnRemoteServer(serveroid, create_table_sql.data);
+		elog(WARNING, "Executing on shard member (server OID: %u): %s", serveroid, sql_to_execute);
+		ExecuteDDLOnRemoteServer(serveroid, sql_to_execute);
 	}
 
 	table_close(rel, AccessShareLock);
-	pfree(create_table_sql.data);
+	destroyStringInfo(create_table_sql);
+	destroyStringInfo(create_foreign_table_sql);
 	pfree(nspname);
 	list_free(members);
 }

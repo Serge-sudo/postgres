@@ -27,4 +27,7 @@ extern Oid get_database_default_shardgroup(Oid dbid);
 extern void SetRelationShardGroup(Oid relid, Oid sgid);
 extern List *get_shardgroup_members(Oid sgid);
 
+/* Consistent hashing for partition placement */
+extern Oid GetPartitionTargetMember(Oid sgid, const char *partition_name, Oid *exclude_member, bool *found);
+
 #endif							/* SHARDGROUPCMDS_H */
