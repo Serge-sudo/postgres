@@ -2720,10 +2720,6 @@ CreateCommandTag(Node *parsetree)
 			tag = AlterObjectTypeCommandTag(((AlterTableStmt *) parsetree)->objtype);
 			break;
 
-		case T_AlterTableSetShardGroupStmt:
-			tag = CMDTAG_ALTER_TABLE;
-			break;
-
 		case T_AlterDomainStmt:
 			tag = CMDTAG_ALTER_DOMAIN;
 			break;

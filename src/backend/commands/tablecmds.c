@@ -751,6 +751,13 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	else
 		partitioned = false;
 
+	if (stmt->shardgroup && !(stmt->is_distributed || stmt->is_worldwide))
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				 errmsg("SHARD GROUP can only be used on DISTRIBUTED or WORLDWIDE tables")));
+	}
+
 	/*
 	 * Look up the namespace in which we are supposed to create the relation,
 	 * check we have permission to create there, lock it against concurrent
@@ -1280,7 +1287,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	 * Handle sharding-related features: distributed tables, worldwide tables,
 	 * and shard group assignment.
 	 */
-	if (stmt->is_distributed || stmt->is_worldwide || stmt->shardgroup)
+	if (stmt->is_distributed || stmt->is_worldwide)
 	{
 		Oid			sgid = InvalidOid;
 		
@@ -1307,28 +1314,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 								get_database_name(MyDatabaseId)),
 						 errhint("Use ALTER DATABASE SET DEFAULT SHARD GROUP or specify SHARD GROUP explicitly.")));
 		}
-		
-		/* Handle distributed tables */
-		if (stmt->is_distributed)
-		{
-			/* Distributed tables are created as partitioned tables */
-			/* TODO: Validate distribution columns exist */
-			/* TODO: Store distribution key metadata */
-			/* TODO: Create distribution key similar to partition key */
-			ereport(NOTICE,
-					(errmsg("DISTRIBUTED BY clause not yet fully implemented"),
-					 errdetail("Table will be created as distributed table.")));
-		}
-		
-		/* Handle worldwide tables */
-		if (stmt->is_worldwide)
-		{
-			/* TODO: Validate table is suitable for worldwide replication */
-			ereport(NOTICE,
-					(errmsg("WORLDWIDE table not yet fully implemented"),
-					 errdetail("Table will be created as worldwide table.")));
-		}
-		
+	
 		/* Set the shard group for the relation */
 		if (OidIsValid(sgid))
 		{
@@ -1487,7 +1473,7 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 		parentname = RelationGetRelationName(parent);
 		parentnspname = get_namespace_name(RelationGetNamespace(parent));
 		
-		appendStringInfo(&create_table_sql, "CREATE TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s ",
+		appendStringInfo(&create_table_sql, "CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s ",
 						 quote_identifier(nspname),
 						 quote_identifier(relname),
 						 quote_identifier(parentnspname),
@@ -1587,7 +1573,10 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 					break;
 			}
 		}
-		
+
+		appendStringInfo(&create_table_sql, " SERVER %s",
+						 quote_identifier(cluster_name));
+
 		table_close(parent, AccessShareLock);
 		pfree(parentnspname);
 	}

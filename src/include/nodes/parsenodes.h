@@ -4259,15 +4259,4 @@ typedef struct AlterShardGroupStmt
 	List	   *options;		/* list of DefElem nodes (for ADD) */
 } AlterShardGroupStmt;
 
-/* ----------------------
- *		ALTER TABLE SET SHARD GROUP Statement
- * ----------------------
- */
-typedef struct AlterTableSetShardGroupStmt
-{
-	NodeTag		type;
-	RangeVar   *relation;		/* table name */
-	char	   *sgname;			/* shard group name */
-} AlterTableSetShardGroupStmt;
-
 #endif							/* PARSENODES_H */
