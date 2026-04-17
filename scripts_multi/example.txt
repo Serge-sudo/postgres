@@ -1,0 +1,43 @@
+./setup_fdw_cluster.sh --config cluster.conf --node node1 --all
+
+./setup_bench_tables.sh \
+  --host 127.0.0.1 \
+  --port 5432 \
+  --db postgres \
+  --user vscode \
+  --nodes node2,node3,node4 \
+  --drop \
+  --partitions 128 \
+  --scale 1000000 \
+  --shardgroup group1 \
+  --local-name part_accounts \
+  --distributed-name dist_accounts
+
+
+./run_mixed_pgbench.sh \
+  --host 127.0.0.1  \
+  --port 5432 \
+  --db postgres \
+  --user vscode \
+  --clients 32 \
+  --jobs 32 \
+  --mode mixed \
+  --read-ratio 0.7 \
+  --time 60 \
+  --scale 1000000 \
+  --local-factor 0.7 \
+  --report-latencies \
+  --output oltp_results.tsv
+
+
+./run_olap_compare.sh \
+  --host 127.0.0.1  \
+  --port 5432 \
+  --db postgres \
+  --user vscode \
+  --local-name part_accounts \
+  --distributed-name dist_accounts \
+  --repeats 5 \
+  --warmup 1 \
+  --query-set heavy \
+  --output olap_results.tsv
