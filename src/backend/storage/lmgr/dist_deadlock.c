@@ -178,7 +178,7 @@ CollectLocalLockGraph(void)
 					edges[numEdges].lockOid = waitLock->tag.locktag_field1;
 					edges[numEdges].lockMode = proc->waitLockMode;
 					
-					elog(DEBUG2, "Local edge: waiter(%s,%d) -> blocker(%s,%d) on lock %u mode %d",
+					elog(DEBUG1, "Local edge: waiter(%s,%d) -> blocker(%s,%d) on lock %u mode %d",
 						 edges[numEdges].waiter.cluster_name,
 						 edges[numEdges].waiter.backendPid,
 						 edges[numEdges].blocker.cluster_name,
@@ -314,7 +314,7 @@ QueryRemoteLockGraph(const char *cluster_name)
 			/* For simplicity, we'll use a placeholder for lock mode */
 			graph->edges[i].lockMode = AccessExclusiveLock;
 			
-			elog(DEBUG2, "Remote edge from %s: waiter(%s,%d) -> blocker(%s,%d) on lock %u mode %d",
+			elog(DEBUG1, "Remote edge from %s: waiter(%s,%d) -> blocker(%s,%d) on lock %u mode %d",
 				 cluster_name,
 				 graph->edges[i].waiter.cluster_name,
 				 graph->edges[i].waiter.backendPid,
@@ -455,7 +455,7 @@ QueryRemoteFdwConnections(const char *cluster_name)
 			graph->edges[i].lockOid = 0;
 			graph->edges[i].lockMode = 0;
 			
-			elog(DEBUG2, "FDW edge from %s: waiter(%s,%d) -> blocker(%s,%d)",
+			elog(DEBUG1, "FDW edge from %s: waiter(%s,%d) -> blocker(%s,%d)",
 				 cluster_name,
 				 graph->edges[i].waiter.cluster_name,
 				 graph->edges[i].waiter.backendPid,
@@ -571,7 +571,7 @@ CollectFdwConnectionDependencies(void)
 			graph->edges[i].lockOid = InvalidOid;
 			graph->edges[i].lockMode = 0;
 			
-			elog(DEBUG2, "FDW edge: waiter(%s,%d) -> blocker(%s,%d)",
+			elog(DEBUG1, "FDW edge: waiter(%s,%d) -> blocker(%s,%d)",
 				 graph->edges[i].waiter.cluster_name,
 				 graph->edges[i].waiter.backendPid,
 				 graph->edges[i].blocker.cluster_name,
@@ -613,7 +613,7 @@ MergeLockGraphs(DistLockGraph **graphs, int numGraphs)
 	{
 		for (j = 0; j < graphs[i]->numEdges; j++)
 		{
-			elog(DEBUG2, "Merging edge: waiter(%s,%d) -> blocker(%s,%d)",
+			elog(DEBUG1, "Merging edge: waiter(%s,%d) -> blocker(%s,%d)",
 				 graphs[i]->edges[j].waiter.cluster_name,
 				 graphs[i]->edges[j].waiter.backendPid,
 				 graphs[i]->edges[j].blocker.cluster_name,
@@ -808,6 +808,10 @@ PerformGlobalDistributedDeadlockCheck(void)
 	SysScanDesc scan;
 	HeapTuple	tuple;
 
+	/*Unlock partitions of lwlock */
+	for (i = 0; i < NUM_LOCK_PARTITIONS; i++)
+		LWLockRelease(LockHashPartitionLockByIndex(i));
+
 	/*
 	 * Scan pg_shardgroups to get all shard groups, then collect all their
 	 * members
@@ -916,6 +920,10 @@ PerformGlobalDistributedDeadlockCheck(void)
 	/* Clean up lists */
 	list_free(allServers);
 	list_free_deep(uniqueClusterNames);
+
+	/* lock back */
+	for (i = 0; i < NUM_LOCK_PARTITIONS; i++)
+		LWLockAcquire(LockHashPartitionLockByIndex(i), LW_EXCLUSIVE);
 
 	return result;
 }

@@ -145,7 +145,7 @@ PG_FUNCTION_INFO_V1(postgres_fdw_disconnect_all);
 
 /* prototypes of private functions */
 static void make_new_connection(ConnCacheEntry *entry, UserMapping *user);
-static PGconn *connect_pg_server(ForeignServer *server, UserMapping *user);
+static PGconn *connect_pg_server(ForeignServer *server, UserMapping *user, bool try_mux);
 static void disconnect_pg_server(ConnCacheEntry *entry);
 static void check_conn_params(const char **keywords, const char **values, UserMapping *user);
 static void configure_remote_session(PGconn *conn);
@@ -374,6 +374,29 @@ GetConnection(UserMapping *user, bool will_prep_stmt, PgFdwConnState **state)
 }
 
 /*
+ * Establish an uncached one-off connection for diagnostic queries.
+ *
+ * Unlike GetConnection(), this bypasses the per-user-mapping cache and does
+ * not participate in postgres_fdw transaction state management.
+ */
+PGconn *
+GetConnectionUncached(UserMapping *user)
+{
+	ForeignServer *server = GetForeignServer(user->serverid);
+	return connect_pg_server(server, user, false);
+}
+
+/*
+ * Close an uncached one-off connection created by GetConnectionUncached().
+ */
+void
+DisconnectConnectionUncached(PGconn *conn)
+{
+	if (conn != NULL)
+		libpqsrv_disconnect(conn);
+}
+
+/*
  * Reset all transient state fields in the cached connection entry and
  * establish new connection to the remote server.
  */
@@ -431,7 +454,7 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 	}
 
 	/* Now try to make the connection */
-	entry->conn = connect_pg_server(server, user);
+	entry->conn = connect_pg_server(server, user, true);
 
 	elog(DEBUG3, "new postgres_fdw connection %p for server \"%s\" (user mapping oid %u, userid %u)",
 		 entry->conn, server->servername, user->umid, user->userid);
@@ -493,7 +516,7 @@ pgfdw_security_check(const char **keywords, const char **values, UserMapping *us
  * Connect to remote server using specified server and user mapping properties.
  */
 static PGconn *
-connect_pg_server(ForeignServer *server, UserMapping *user)
+connect_pg_server(ForeignServer *server, UserMapping *user, bool try_mux)
 {
 	PGconn	   *volatile conn = NULL;
 
@@ -527,7 +550,7 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 									  keywords + n, values + n);
 
 		/* If the local connection multiplexer is available, route via it. */
-		if (ConnMuxIsAvailable())
+		if (ConnMuxIsAvailable() && try_mux)
 		{
 			const char *orig_host = NULL;
 			const char *orig_port = NULL;
@@ -723,6 +746,7 @@ no_mux_set:
 		conn = libpqsrv_connect_params(keywords, values,
 									   false,	/* expand_dbname */
 									   pgfdw_we_connect);
+
 
 		if (!conn || PQstatus(conn) != CONNECTION_OK)
 			ereport(ERROR,

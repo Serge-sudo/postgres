@@ -38,7 +38,6 @@
  * -------------------------------------------------------------------------
  */
 #define MUX_MAX_WORKERS			32		/* max worker PG sessions per node */
-#define MUX_DEFAULT_WORKERS		4		/* default worker count GUC */
 #define MUX_MAX_CHANNELS		256		/* max concurrent backend channels */
 #define MUX_MAX_CTRL_CONNS		64		/* max incoming ctrl connections */
 #define MUX_TCP_PORT_DEFAULT	7432	/* default inter-mux TCP port */

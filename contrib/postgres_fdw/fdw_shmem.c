@@ -19,6 +19,7 @@
 #include "postgres_fdw.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
+#include "storage/procarray.h"
 #include "storage/shmem.h"
 #include "utils/hsearch.h"
 #include "miscadmin.h"
@@ -183,6 +184,39 @@ FdwConnShmemUnregisterAll(void)
 }
 
 /*
+ * Remove stale rows whose local_pid no longer maps to an active backend.
+ */
+void
+FdwConnShmemCleanupStaleEntries(void)
+{
+	HASH_SEQ_STATUS status;
+	FdwConnShmemEntry *entry;
+	FdwConnShmemKey stale_keys[FDWCONN_SHMEM_ENTRIES];
+	int			stale_count = 0;
+
+	if (!FdwConnShmemHash)
+		return;
+
+	LWLockAcquire(&fdw_conn_shmem_state->lock, LW_EXCLUSIVE);
+
+	hash_seq_init(&status, FdwConnShmemHash);
+	while ((entry = (FdwConnShmemEntry *) hash_seq_search(&status)) != NULL)
+	{
+		if (entry->key.local_pid <= 0 ||
+			BackendPidGetProc(entry->key.local_pid) == NULL)
+		{
+			if (stale_count < FDWCONN_SHMEM_ENTRIES)
+				stale_keys[stale_count++] = entry->key;
+		}
+	}
+
+	for (int i = 0; i < stale_count; i++)
+		hash_search(FdwConnShmemHash, &stale_keys[i], HASH_REMOVE, NULL);
+
+	LWLockRelease(&fdw_conn_shmem_state->lock);
+}
+
+/*
  * Get iterator for shared memory FDW connections
  * Returns true if iteration can proceed, false if hash table not initialized
  */
@@ -201,7 +235,6 @@ void
 FdwConnShmemGetIteratorFinish(void)
 {
 	LWLockRelease(&fdw_conn_shmem_state->lock);
-	return true;
 }
 
 /*
@@ -213,15 +246,19 @@ FdwConnShmemGetNext(HASH_SEQ_STATUS *status, char *cluster_name,
 {
 	FdwConnShmemEntry *entry;
 
-	entry = (FdwConnShmemEntry *) hash_seq_search(status);
-	
-	if (entry == NULL)
-		return false;
+	while ((entry = (FdwConnShmemEntry *) hash_seq_search(status)) != NULL)
+	{
+		if (entry->key.local_pid <= 0 ||
+			BackendPidGetProc(entry->key.local_pid) == NULL)
+			continue;
 
-	strncpy(cluster_name, entry->key.cluster_name, NAMEDATALEN);
-	*local_pid = entry->key.local_pid;
-	*remote_backend_pid = entry->remote_backend_pid;
-	return true;
+		strncpy(cluster_name, entry->key.cluster_name, NAMEDATALEN);
+		*local_pid = entry->key.local_pid;
+		*remote_backend_pid = entry->remote_backend_pid;
+		return true;
+	}
+
+	return false;
 }
 
 /*

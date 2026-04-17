@@ -76,7 +76,7 @@
  * GUC variables
  * -------------------------------------------------------------------------
  */
-int mux_worker_count = MUX_DEFAULT_WORKERS;
+int mux_worker_count = 0;
 int mux_tcp_port = MUX_TCP_PORT_DEFAULT;
 
 static const char *

@@ -3190,6 +3190,9 @@ postgres_connections(PG_FUNCTION_ARGS)
 		int			local_pid;
 		int			remote_backend_pid;
 
+		/* Opportunistically clean up stale rows before reading mappings. */
+		FdwConnShmemCleanupStaleEntries();
+
 		/* Get iterator for shared memory connection tracking */
 		if (FdwConnShmemGetIterator(&scan))
 		{
@@ -3271,7 +3274,31 @@ postgres_fdw_get_locks(PG_FUNCTION_ARGS)
 
 	/* Get connection to the foreign server */
 	user = GetUserMapping(GetUserId(), serverid);
-	conn = GetConnection(user, false, NULL);
+	conn = NULL;
+
+	PG_TRY();
+	{
+		conn = GetConnectionUncached(user);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata = CopyErrorData();
+
+		FlushErrorState();
+		if (edata != NULL && edata->message != NULL)
+			ereport(WARNING,
+					(errmsg("postgres_fdw_get_locks: failed to open diagnostic connection to server OID %u",
+							serverid),
+					 errdetail_internal("%s", edata->message)));
+		else
+			ereport(WARNING,
+					(errmsg("postgres_fdw_get_locks: failed to open diagnostic connection to server OID %u",
+							serverid)));
+		if (edata)
+			FreeErrorData(edata);
+		return (Datum) 0;
+	}
+	PG_END_TRY();
 
 	/* Construct the query to get lock waits from the remote server */
 	initStringInfo(&sql);
@@ -3294,9 +3321,18 @@ postgres_fdw_get_locks(PG_FUNCTION_ARGS)
 
 	/* Execute the query on the remote server */
 	res = pgfdw_exec_query(conn, sql.data, NULL);
-	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+
+	if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
-		pgfdw_report_error(ERROR, res, conn, false, sql.data);
+		if (res != NULL)
+			PQclear(res);
+		pfree(sql.data);
+		DisconnectConnectionUncached(conn);
+		ereport(WARNING,
+				(errmsg("postgres_fdw_get_locks: failed to query remote lock graph on server OID %u",
+						serverid),
+				 errdetail_internal("%s", pchomp(PQerrorMessage(conn)))));
+		PG_RETURN_DATUM((Datum) 0);
 	}
 
 	/* Process results and add to tuplestore */
@@ -3334,6 +3370,7 @@ postgres_fdw_get_locks(PG_FUNCTION_ARGS)
 
 	PQclear(res);
 	pfree(sql.data);
+	DisconnectConnectionUncached(conn);
 
 	return (Datum) 0;
 }
@@ -3393,7 +3430,30 @@ postgres_fdw_connections(PG_FUNCTION_ARGS)
 
 	/* Get user mapping and connection */
 	user = GetUserMapping(GetUserId(), serverid);
-	conn = GetConnection(user, false, NULL);
+	conn = NULL;
+	PG_TRY();
+	{
+		conn = GetConnectionUncached(user);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata = CopyErrorData();
+
+		FlushErrorState();
+		if (edata != NULL && edata->message != NULL)
+			ereport(WARNING,
+					(errmsg("postgres_fdw_connections: failed to open diagnostic connection to server OID %u",
+							serverid),
+					 errdetail_internal("%s", edata->message)));
+		else
+			ereport(WARNING,
+					(errmsg("postgres_fdw_connections: failed to open diagnostic connection to server OID %u",
+							serverid)));
+		if (edata)
+			FreeErrorData(edata);
+		return (Datum) 0;
+	}
+	PG_END_TRY();
 
 	/*
 	 * Build SQL query to call postgres_connections() on the remote server.
@@ -3407,9 +3467,17 @@ postgres_fdw_connections(PG_FUNCTION_ARGS)
 	/* Execute the query on the remote server */
 	res = pgfdw_exec_query(conn, sql.data, NULL);
 
-	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
-		pgfdw_report_error(ERROR, res, conn, false, sql.data);
+		if (res != NULL)
+			PQclear(res);
+		pfree(sql.data);
+		DisconnectConnectionUncached(conn);
+		ereport(WARNING,
+				(errmsg("postgres_fdw_connections: failed to query remote FDW connections on server OID %u",
+						serverid),
+				 errdetail_internal("%s", pchomp(PQerrorMessage(conn)))));
+		PG_RETURN_DATUM((Datum) 0);
 	}
 
 	/* Process the result tuples */
@@ -3444,6 +3512,7 @@ postgres_fdw_connections(PG_FUNCTION_ARGS)
 
 	PQclear(res);
 	pfree(sql.data);
+	DisconnectConnectionUncached(conn);
 
 	return (Datum) 0;
 }

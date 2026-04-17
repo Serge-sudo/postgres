@@ -1752,7 +1752,7 @@ CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
 		}
 
 		/* Execute the DDL command on the remote server */
-		elog(WARNING, "Executing on shard member (server OID: %u): %s", serveroid, sql_to_execute);
+		elog(DEBUG1, "Executing on shard member (server OID: %u): %s", serveroid, sql_to_execute);
 		ExecuteDDLOnRemoteServer(serveroid, sql_to_execute);
 	}
 
