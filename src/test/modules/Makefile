@@ -7,6 +7,7 @@ include $(top_builddir)/src/Makefile.global
 SUBDIRS = \
 		  brin \
 		  commit_ts \
+		  csnsnapshot \
 		  delay_execution \
 		  dummy_index_am \
 		  dummy_seclabel \
@@ -35,6 +36,7 @@ SUBDIRS = \
 		  test_regex \
 		  test_resowner \
 		  test_rls_hooks \
+		  test_sharding \
 		  test_shm_mq \
 		  test_slru \
 		  test_tidstore \

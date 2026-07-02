@@ -29,6 +29,7 @@
 #include "access/commit_ts.h"
 #include "access/gin.h"
 #include "access/slru.h"
+#include "access/csn_snapshot.h"
 #include "access/toast_compression.h"
 #include "access/twophase.h"
 #include "access/xlog_internal.h"
@@ -39,6 +40,7 @@
 #include "catalog/storage.h"
 #include "commands/async.h"
 #include "commands/event_trigger.h"
+#include "commands/shardgroupcmds.h"
 #include "commands/tablespace.h"
 #include "commands/trigger.h"
 #include "commands/user.h"
@@ -88,6 +90,7 @@
 #include "utils/plancache.h"
 #include "utils/ps_status.h"
 #include "utils/xml.h"
+#include "postmaster/conn_multiplexer.h"
 
 /* This value is normally passed in from the Makefile */
 #ifndef PG_KRB_SRVTAB
@@ -103,6 +106,10 @@ extern char *default_tablespace;
 extern char *temp_tablespaces;
 extern bool ignore_checksum_failure;
 extern bool ignore_invalid_pages;
+
+/* Connection multiplexer GUCs (defined in conn_multiplexer.c) */
+extern int	mux_worker_count;
+extern int	mux_tcp_port;
 
 #ifdef TRACE_SYNCSCAN
 extern bool trace_syncscan;
@@ -1057,6 +1064,24 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"enable_csn_snapshot", PGC_POSTMASTER, RESOURCES_MEM,
+			gettext_noop("Enable csn-base snapshot."),
+			gettext_noop("Used to achieve REPEATABLE READ isolation level for postgres_fdw transactions.")
+		},
+		&enable_csn_snapshot,
+		true,
+		NULL, NULL, NULL
+	},
+	{
+		{"enable_csn_wal", PGC_POSTMASTER, RESOURCES_MEM,
+			gettext_noop("Enable csn-wal record."),
+			gettext_noop("Used to enable csn-wal record")
+		},
+		&enable_csn_wal,
+		true,
+		NULL, NULL, NULL
+	},
+	{
 		{"ssl", PGC_SIGHUP, CONN_AUTH_SSL,
 			gettext_noop("Enables SSL connections."),
 			NULL
@@ -1142,6 +1167,18 @@ struct config_bool ConfigureNamesBool[] =
 		&ignore_invalid_pages,
 		false,
 		NULL, NULL, NULL
+	},
+	{
+		{"shardgroup.executing_remote_ddl", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Indicates DDL is being executed from a remote shard member."),
+			gettext_noop("This flag is set automatically by postgres_fdw when executing "
+						 "DDL on remote shard members to prevent infinite recursion "
+						 "in DDL replication. Should not be set manually."),
+			GUC_NOT_IN_SAMPLE | GUC_NO_SHOW_ALL | GUC_NO_RESET_ALL
+		},
+		&executing_remote_ddl,
+		false,
+		check_executing_remote_ddl, NULL, NULL
 	},
 	{
 		{"full_page_writes", PGC_SIGHUP, WAL_SETTINGS,
@@ -3254,7 +3291,24 @@ struct config_int ConfigureNamesInt[] =
 		NAMEDATALEN - 1, NAMEDATALEN - 1, NAMEDATALEN - 1,
 		NULL, NULL, NULL
 	},
-
+	{
+		{"csn_snapshot_defer_time", PGC_POSTMASTER, REPLICATION_PRIMARY,
+			gettext_noop("Minimal age of records which allowed to be vacuumed, in seconds."),
+			NULL
+		},
+		&csn_snapshot_defer_time,
+		0, 0, INT_MAX,
+		NULL, NULL, NULL
+	},
+	{
+		{"csn_time_shift", PGC_USERSET, RESOURCES_MEM,
+			gettext_noop("Do the time shift in the CSN generator."),
+			gettext_noop("Used for debug purposes.")
+		},
+		&csn_time_shift,
+		0, INT_MIN, INT_MAX,
+		NULL, NULL, NULL
+	},
 	{
 		{"block_size", PGC_INTERNAL, PRESET_OPTIONS,
 			gettext_noop("Shows the size of a disk block."),
@@ -3394,6 +3448,26 @@ struct config_int ConfigureNamesInt[] =
 		&autovacuum_max_workers,
 		3, 1, MAX_BACKENDS,
 		check_autovacuum_max_workers, NULL, NULL
+	},
+
+	{
+		{"mux_worker_count", PGC_POSTMASTER, CONN_AUTH_SETTINGS,
+			gettext_noop("Sets the number of local worker processes in the connection multiplexer."),
+			NULL
+		},
+		&mux_worker_count,
+		0, 0, MUX_MAX_WORKERS,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"mux_tcp_port", PGC_POSTMASTER, CONN_AUTH_TCP,
+			gettext_noop("Sets the TCP port used for inter-node multiplexer communication."),
+			NULL
+		},
+		&mux_tcp_port,
+		MUX_TCP_PORT_DEFAULT, 1024, 65535,
+		NULL, NULL, NULL
 	},
 
 	{

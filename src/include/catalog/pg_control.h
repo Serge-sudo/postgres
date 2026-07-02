@@ -62,6 +62,8 @@ typedef struct CheckPoint
 	 * set to InvalidTransactionId.
 	 */
 	TransactionId oldestActiveXid;
+
+	uint64 oldestUsedCSN;
 } CheckPoint;
 
 /* XLOG info values for XLOG rmgr */
@@ -183,6 +185,7 @@ typedef struct ControlFileData
 	int			max_prepared_xacts;
 	int			max_locks_per_xact;
 	bool		track_commit_timestamp;
+	bool		enable_csn_snapshot;
 
 	/*
 	 * This data is used to check for hardware-architecture compatibility of

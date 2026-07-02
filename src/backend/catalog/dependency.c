@@ -54,6 +54,8 @@
 #include "catalog/pg_publication_namespace.h"
 #include "catalog/pg_publication_rel.h"
 #include "catalog/pg_rewrite.h"
+#include "catalog/pg_shardgroups.h"
+#include "catalog/pg_shardmembers.h"
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_subscription.h"
 #include "catalog/pg_tablespace.h"
@@ -1464,6 +1466,8 @@ doDeletion(const ObjectAddress *object, int flags)
 		case EventTriggerRelationId:
 		case TransformRelationId:
 		case AuthMemRelationId:
+		case ShardGroupRelationId:
+		case ShardMemberRelationId:
 			DropObjectById(object);
 			break;
 

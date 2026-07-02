@@ -156,8 +156,11 @@ extern void reset_transmission_modes(int nestlevel);
 extern void process_pending_request(AsyncRequest *areq);
 
 /* in connection.c */
+typedef struct ConnCacheEntry ConnCacheEntry;
 extern PGconn *GetConnection(UserMapping *user, bool will_prep_stmt,
 							 PgFdwConnState **state);
+extern PGconn *GetConnectionUncached(UserMapping *user);
+extern void DisconnectConnectionUncached(PGconn *conn);
 extern void ReleaseConnection(PGconn *conn);
 extern unsigned int GetCursorNumber(PGconn *conn);
 extern unsigned int GetPrepStmtNumber(PGconn *conn);
@@ -167,6 +170,8 @@ extern PGresult *pgfdw_exec_query(PGconn *conn, const char *query,
 								  PgFdwConnState *state);
 extern void pgfdw_report_error(int elevel, PGresult *res, PGconn *conn,
 							   bool clear, const char *sql);
+extern bool GetConnectionHashIterator(HASH_SEQ_STATUS *scan);
+extern bool GetConnCacheEntryInfo(void *entry_ptr, Oid *serverid, int *remote_backend_pid);
 
 /* in option.c */
 extern int	ExtractConnectionOptions(List *defelems,
@@ -255,5 +260,21 @@ extern const char *get_jointype_name(JoinType jointype);
 /* in shippable.c */
 extern bool is_builtin(Oid objectId);
 extern bool is_shippable(Oid objectId, Oid classId, PgFdwRelationInfo *fpinfo);
+
+extern bool UseCSNSnapshots;
+
+/* in fdw_shmem.c */
+extern Size FdwConnShmemSize(void);
+extern void FdwConnShmemInit(void);
+extern void FdwConnShmemRegister(const char *cluster_name, int remote_backend_pid);
+extern void FdwConnShmemUnregister(const char *cluster_name);
+extern void FdwConnShmemUnregisterAll(void);
+extern void FdwConnShmemCleanupStaleEntries(void);
+extern bool FdwConnShmemGetIterator(HASH_SEQ_STATUS *status);
+extern void
+FdwConnShmemGetIteratorFinish(void);
+extern bool FdwConnShmemGetNext(HASH_SEQ_STATUS *status, char *cluster_name,
+								int *local_pid, int *remote_backend_pid);
+extern void FdwConnShmemOnProcExit(void);
 
 #endif							/* POSTGRES_FDW_H */

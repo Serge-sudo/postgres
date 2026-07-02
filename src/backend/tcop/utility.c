@@ -48,6 +48,7 @@
 #include "commands/schemacmds.h"
 #include "commands/seclabel.h"
 #include "commands/sequence.h"
+#include "commands/shardgroupcmds.h"
 #include "commands/subscriptioncmds.h"
 #include "commands/tablecmds.h"
 #include "commands/tablespace.h"
@@ -147,6 +148,7 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_AlterOpFamilyStmt:
 		case T_AlterOperatorStmt:
 		case T_AlterOwnerStmt:
+		case T_AlterShardGroupStmt:
 		case T_AlterPolicyStmt:
 		case T_AlterPublicationStmt:
 		case T_AlterRoleSetStmt:
@@ -183,6 +185,7 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_CreateRoleStmt:
 		case T_CreateSchemaStmt:
 		case T_CreateSeqStmt:
+		case T_CreateShardGroupStmt:
 		case T_CreateStatsStmt:
 		case T_CreateStmt:
 		case T_CreateSubscriptionStmt:
@@ -1595,6 +1598,14 @@ ProcessUtilitySlow(ParseState *pstate,
 				address = CreateForeignServer((CreateForeignServerStmt *) parsetree);
 				break;
 
+			case T_CreateShardGroupStmt:
+				address = CreateShardGroup((CreateShardGroupStmt *) parsetree);
+				break;
+
+			case T_AlterShardGroupStmt:
+				address = AlterShardGroup((AlterShardGroupStmt *) parsetree);
+				break;
+
 			case T_AlterForeignServerStmt:
 				address = AlterForeignServer((AlterForeignServerStmt *) parsetree);
 				break;
@@ -2514,8 +2525,16 @@ CreateCommandTag(Node *parsetree)
 			tag = CMDTAG_CREATE_SERVER;
 			break;
 
+		case T_CreateShardGroupStmt:
+			tag = CMDTAG_CREATE_SHARD_GROUP;
+			break;
+
 		case T_AlterForeignServerStmt:
 			tag = CMDTAG_ALTER_SERVER;
+			break;
+
+		case T_AlterShardGroupStmt:
+			tag = CMDTAG_ALTER_SHARD_GROUP;
 			break;
 
 		case T_CreateUserMappingStmt:
@@ -2642,6 +2661,9 @@ CreateCommandTag(Node *parsetree)
 					break;
 				case OBJECT_PUBLICATION:
 					tag = CMDTAG_DROP_PUBLICATION;
+					break;
+				case OBJECT_SHARD_GROUP:
+					tag = CMDTAG_DROP_SHARD_GROUP;
 					break;
 				case OBJECT_STATISTIC_EXT:
 					tag = CMDTAG_DROP_STATISTICS;

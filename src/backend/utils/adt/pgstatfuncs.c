@@ -25,6 +25,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/bgworker.h"
+#include "postmaster/conn_multiplexer.h"
 #include "replication/logicallauncher.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
@@ -288,6 +289,100 @@ pg_stat_get_progress_info(PG_FUNCTION_ARGS)
 			nulls[2] = true;
 			for (i = 0; i < PGSTAT_NUM_PROGRESS_PARAM; i++)
 				nulls[i + 3] = true;
+		}
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+
+	return (Datum) 0;
+}
+
+Datum
+pg_stat_get_multiplexer(PG_FUNCTION_ARGS)
+{
+#define PG_STAT_GET_MULTIPLEXER_COLS 14
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	MuxStatsSnapshot snapshot;
+	Datum		values[PG_STAT_GET_MULTIPLEXER_COLS] = {0};
+	bool		nulls[PG_STAT_GET_MULTIPLEXER_COLS] = {0};
+	bool		have_stats;
+
+	have_stats = ConnMuxGetStatsSnapshot(&snapshot);
+	if (!have_stats)
+		MemSet(&snapshot, 0, sizeof(snapshot));
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	if (snapshot.mux_pid != 0)
+		values[0] = Int32GetDatum(snapshot.mux_pid);
+	else
+		nulls[0] = true;
+	values[1] = BoolGetDatum(snapshot.mux_ready);
+	values[2] = BoolGetDatum(mux_worker_count > 0);
+	values[3] = Int32GetDatum(mux_worker_count);
+	values[4] = Int32GetDatum(snapshot.mux_pending_count);
+	values[5] = Int32GetDatum(snapshot.mux_channel_count);
+	values[6] = Int32GetDatum(snapshot.mux_channel_startup);
+	values[7] = Int32GetDatum(snapshot.mux_channel_connecting);
+	values[8] = Int32GetDatum(snapshot.mux_channel_ready);
+	values[9] = Int32GetDatum(snapshot.mux_channel_tx_pending);
+	values[10] = Int32GetDatum(snapshot.mux_channel_in_tx);
+	values[11] = Int32GetDatum(snapshot.mux_ctrl_count);
+	values[12] = Int32GetDatum(snapshot.mux_n_workers);
+	values[13] = Int32GetDatum(snapshot.mux_workers_in_tx);
+
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+
+	return (Datum) 0;
+}
+
+Datum
+pg_stat_get_multiplexer_workers(PG_FUNCTION_ARGS)
+{
+#define PG_STAT_GET_MULTIPLEXER_WORKERS_COLS 8
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	MuxStatsSnapshot snapshot;
+	bool		can_view_names = has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_STATS);
+	int			i;
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	if (!ConnMuxGetStatsSnapshot(&snapshot))
+		return (Datum) 0;
+
+	for (i = 0; i < MUX_MAX_WORKERS; i++)
+	{
+		MuxWorkerStats *worker = &snapshot.workers[i];
+		Datum		values[PG_STAT_GET_MULTIPLEXER_WORKERS_COLS] = {0};
+		bool		nulls[PG_STAT_GET_MULTIPLEXER_WORKERS_COLS] = {0};
+
+		if (!worker->valid)
+			continue;
+
+		values[0] = Int32GetDatum(i + 1);
+		if (worker->worker_pid != 0)
+			values[1] = Int32GetDatum(worker->worker_pid);
+		else
+			nulls[1] = true;
+		values[2] = CStringGetTextDatum(worker->in_tx ? "in_tx" : "idle");
+		values[3] = BoolGetDatum(worker->in_tx);
+		if (worker->active_channel >= 0)
+			values[4] = Int32GetDatum(worker->active_channel);
+		else
+			nulls[4] = true;
+		values[5] = Int32GetDatum(worker->connect_cnt);
+
+		if (can_view_names)
+		{
+			values[6] = DirectFunctionCall1(namein,
+											CStringGetDatum(worker->database));
+			values[7] = DirectFunctionCall1(namein,
+											CStringGetDatum(worker->username));
+		}
+		else
+		{
+			nulls[6] = true;
+			nulls[7] = true;
 		}
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);

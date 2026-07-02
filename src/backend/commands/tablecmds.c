@@ -47,6 +47,7 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_publication_rel.h"
 #include "catalog/pg_rewrite.h"
+#include "catalog/pg_shardgroups.h"
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_trigger.h"
@@ -56,9 +57,11 @@
 #include "catalog/toasting.h"
 #include "commands/cluster.h"
 #include "commands/comment.h"
+#include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
 #include "commands/sequence.h"
+#include "commands/shardgroupcmds.h"
 #include "commands/tablecmds.h"
 #include "commands/tablespace.h"
 #include "commands/trigger.h"
@@ -66,6 +69,7 @@
 #include "commands/user.h"
 #include "commands/vacuum.h"
 #include "executor/executor.h"
+#include "executor/spi.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
 #include "miscadmin.h"
@@ -105,6 +109,8 @@
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/typcache.h"
+#include "catalog/pg_user_mapping.h"
+#include "utils/guc.h"
 #include "utils/usercontext.h"
 
 /*
@@ -673,6 +679,8 @@ static List *GetParentedForeignKeyRefs(Relation partition);
 static void ATDetachCheckNoForeignKeyRefs(Relation partition);
 static char GetAttributeCompression(Oid atttypid, const char *compression);
 static char GetAttributeStorage(Oid atttypid, const char *storagemode);
+static void CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
+									   Oid parentOid, PartitionBoundSpec *partbound);
 
 
 /* ----------------------------------------------------------------
@@ -743,6 +751,13 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	}
 	else
 		partitioned = false;
+
+	if (stmt->shardgroup && !(stmt->is_distributed || stmt->is_worldwide || relkind == RELKIND_FOREIGN_TABLE))
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				 errmsg("SHARD GROUP can only be used on DISTRIBUTED or WORLDWIDE tables")));
+	}
 
 	/*
 	 * Look up the namespace in which we are supposed to create the relation,
@@ -1269,6 +1284,80 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 		AddRelationNewConstraints(rel, NIL, stmt->constraints,
 								  true, true, false, queryString);
 
+	/*
+	 * Handle sharding-related features: distributed tables, worldwide tables,
+	 * and shard group assignment.
+	 */
+	if (stmt->is_distributed || stmt->is_worldwide)
+	{
+		Oid			sgid = InvalidOid;
+		
+		/* Validate that distributed/worldwide flags are mutually exclusive */
+		if (stmt->is_distributed && stmt->is_worldwide)
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("table cannot be both DISTRIBUTED and WORLDWIDE")));
+		
+		/* Determine the shard group OID */
+		if (stmt->shardgroup)
+		{
+			/* Explicit shard group specified */
+			sgid = get_shardgroup_oid(stmt->shardgroup, false);
+		}
+		else
+		{
+			/* Use database default shard group */
+			sgid = get_database_default_shardgroup(MyDatabaseId);
+			if (!OidIsValid(sgid))
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_OBJECT),
+						 errmsg("no default shard group set for database \"%s\"",
+								get_database_name(MyDatabaseId)),
+						 errhint("Use ALTER DATABASE SET DEFAULT SHARD GROUP or specify SHARD GROUP explicitly.")));
+		}
+	
+		/* Set the shard group for the relation */
+		if (OidIsValid(sgid))
+		{
+			SetRelationShardGroup(relationId, sgid);
+			
+			/*
+			* Create tables on shard members (foreign servers)
+			* For partitions: create partitions on remote servers with PARTITION OF
+			* For regular tables: create tables on remote servers
+			*/
+			if (!executing_remote_ddl)
+			{
+				if (stmt->partbound != NULL)
+				{
+					/* For partitions, pass parent OID and bound spec */
+					Oid parentId = linitial_oid(inheritOids);
+					CreateTablesOnShardMembers(relationId, sgid, true, parentId, stmt->partbound);
+				}
+				else
+				{
+					/* For regular tables, no parent or bound */
+					CreateTablesOnShardMembers(relationId, sgid, false, InvalidOid, NULL);
+				}
+			}
+		}
+	}
+	else if (rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE && stmt->shardgroup)
+	{
+		/* For foreign tables with SHARD GROUP, just set the shard group but don't create tables on members */
+		Oid			sgid = get_shardgroup_oid(stmt->shardgroup, false);
+		SetRelationShardGroup(relationId, sgid);
+	}
+	else if (stmt->partbound != NULL && OidIsValid(rel->rd_rel->relsgid) && rel->rd_rel->relkind != RELKIND_FOREIGN_TABLE && !executing_remote_ddl)
+	{
+		/*
+		 * For partitions that inherit shard group from parent:
+		 * Also create tables on shard members
+		 */
+		Oid parentId = linitial_oid(inheritOids);
+		CreateTablesOnShardMembers(relationId, rel->rd_rel->relsgid, true, parentId, stmt->partbound);
+	}
+
 	ObjectAddressSet(address, RelationRelationId, relationId);
 
 	/*
@@ -1278,6 +1367,401 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	relation_close(rel, NoLock);
 
 	return address;
+}
+
+/*
+ * ExecuteDDLOnRemoteServer
+ *		Execute DDL command on a remote server using FDW callback
+ *
+ * This function uses the ExecForeignDDL callback if available in the FDW.
+ * For postgres_fdw, this will use the existing connection infrastructure
+ * and participate in 2PC transactions automatically.
+ */
+static void
+ExecuteDDLOnRemoteServer(Oid serveroid, const char *sql)
+{
+	ForeignServer *server;
+	ForeignDataWrapper *fdw;
+	FdwRoutine *fdwroutine;
+
+	/* Get server and FDW information */
+	server = GetForeignServer(serveroid);
+	fdw = GetForeignDataWrapper(server->fdwid);
+
+	/* Get the FDW routine */
+	fdwroutine = GetFdwRoutine(fdw->fdwhandler);
+
+	/* Check if FDW supports DDL execution */
+	if (fdwroutine->ExecForeignDDL != NULL)
+	{
+		/* Execute DDL using FDW callback - this participates in 2PC */
+		fdwroutine->ExecForeignDDL(serveroid, sql);
+		
+		ereport(DEBUG1,
+				(errmsg("executed DDL on foreign server \"%s\" using FDW callback",
+						server->servername)));
+	}
+	else
+	{
+		/* FDW doesn't support DDL execution, show NOTICE */
+		ereport(NOTICE,
+				(errmsg("table should be created on shard member \"%s\"",
+						server->servername),
+				 errdetail("Execute: %s", sql),
+				 errhint("The FDW for this server does not support automatic DDL execution. "
+						 "Execute this DDL manually on the remote server.")));
+	}
+}
+
+/*
+ * CreateTablesOnShardMembers
+ *		Create tables on foreign servers (shard members) after table creation
+ *
+ * For regular tables: creates tables on remote servers
+ * For partitions of distributed tables: creates partitions on remote servers using
+ * CREATE TABLE ... PARTITION OF syntax with the partition bound specification
+ *
+ * This function executes CREATE TABLE/PARTITION OF commands on remote servers
+ * using postgres_fdw connections. The implementation:
+ * 1. For non-partition tables: CREATE TABLE on each remote server
+ * 2. For partitions: CREATE TABLE ... PARTITION OF on each remote server
+ *
+ * Uses cluster_name GUC as the unique identifier for this server in the cluster.
+ */
+static void
+CreateTablesOnShardMembers(Oid relationId, Oid sgid, bool is_partition,
+							Oid parentOid, PartitionBoundSpec *partbound)
+{
+	List	   *members;
+	ListCell   *lc;
+	Relation	rel;
+	TupleDesc	tupdesc;
+	StringInfo create_table_sql;
+	StringInfo create_foreign_table_sql;
+	char	   *relname;
+	char	   *nspname;
+	char	   *sgname;
+	int			i;
+	int			first_col;
+	Oid			target_member = InvalidOid;
+	ForeignServer *target_server = NULL;
+	extern char *cluster_name;
+	char *target_server_name;
+	HeapTuple	sgtuple;
+	Form_pg_shardgroups sgform;
+	
+
+	/* Get list of shard members */
+	members = get_shardgroup_members(sgid);
+	if (members == NIL)
+		return;	/* No members, nothing to do */
+
+	/* Get the shard group name */
+	sgtuple = SearchSysCache1(SHARDGROUPOID, ObjectIdGetDatum(sgid));
+	if (!HeapTupleIsValid(sgtuple))
+		elog(ERROR, "cache lookup failed for shard group %u", sgid);
+	
+	sgform = (Form_pg_shardgroups) GETSTRUCT(sgtuple);
+	sgname = pstrdup(NameStr(sgform->sgname));
+	ReleaseSysCache(sgtuple);
+
+	/* Check if cluster_name is set - required for creating foreign tables on remote servers */
+	if (!cluster_name || cluster_name[0] == '\0')
+	{
+		ereport(WARNING,
+				(errcode(ERRCODE_CONFIG_FILE_ERROR),
+				 errmsg("cluster_name is not set, cannot create tables on remote shard members"),
+				 errhint("Set cluster_name in postgresql.conf to enable automatic table creation on shard members.")));
+		list_free(members);
+		return;
+	}
+
+	/* Open the relation to get its structure */
+	rel = table_open(relationId, AccessShareLock);
+	tupdesc = RelationGetDescr(rel);
+	relname = RelationGetRelationName(rel);
+	nspname = get_namespace_name(RelationGetNamespace(rel));
+
+	/*
+	 * For partitions: use consistent hashing to determine which member should host the partition.
+	 * For non-partitions: distribute to all members (existing behavior).
+	 */
+	{
+		bool found;
+		/* Use consistent hashing to determine target member for this partition */
+		// target_member = GetPartitionTargetMember(sgid, relname, NULL, &found);
+		// if (!found)
+		// {
+		// 	ereport(ERROR,
+		// 			(errcode(ERRCODE_INTERNAL_ERROR),
+		// 			 errmsg("could not determine target member for partition \"%s\"", relname)));
+		// }
+		target_member = InvalidOid; // TODO : implement consistent hashing to get target member OID
+
+		if (OidIsValid(target_member))
+		{
+			target_server = GetForeignServer(target_member);
+			target_server_name = pstrdup(target_server->servername);
+		}
+		else
+		{
+			target_server_name = cluster_name;
+		}
+			
+	}
+
+	/* Build the CREATE TABLE DDL */
+	create_table_sql = makeStringInfo();
+	create_foreign_table_sql = makeStringInfo();
+	
+	if (is_partition && OidIsValid(parentOid) && partbound != NULL)
+	{
+		Relation	parent;
+		char	   *parentname;
+		char	   *parentnspname;
+		StringInfo partition_bounds;
+		
+		/*
+		 * For partitions of distributed tables:
+		 * - On the target member (determined by consistent hashing): create real partition table
+		 * - On other members: create foreign table reference pointing to target member
+		 */
+		parent = table_open(parentOid, AccessShareLock);
+		parentname = RelationGetRelationName(parent);
+		parentnspname = get_namespace_name(RelationGetNamespace(parent));
+		
+		/* Build partition bounds specification (shared by both SQL statements) */
+		partition_bounds = makeStringInfo();
+		
+		/* Build partition bounds specification */
+		if (partbound->is_default)
+		{
+			appendStringInfoString(partition_bounds, "DEFAULT");
+		}
+		else
+		{
+			switch (partbound->strategy)
+			{
+				case PARTITION_STRATEGY_HASH:
+					appendStringInfo(partition_bounds, "FOR VALUES WITH (modulus %d, remainder %d)",
+									 partbound->modulus, partbound->remainder);
+					break;
+					
+				case PARTITION_STRATEGY_LIST:
+					{
+						ListCell   *cell;
+						const char *sep = "";
+						
+						appendStringInfoString(partition_bounds, "FOR VALUES IN (");
+						foreach(cell, partbound->listdatums)
+						{
+							A_Const	   *aconst = lfirst(cell);
+							
+							appendStringInfoString(partition_bounds, sep);
+							
+							/* Format the constant value based on its type */
+							if (aconst->isnull)
+							{
+								appendStringInfoString(partition_bounds, "NULL");
+							}
+							else
+							{
+								switch (nodeTag(&aconst->val.node))
+								{
+									case T_Integer:
+										appendStringInfo(partition_bounds, "%d", 
+														castNode(Integer, &aconst->val.node)->ival);
+										break;
+									case T_Float:
+										appendStringInfoString(partition_bounds,
+															  castNode(Float, &aconst->val.node)->fval);
+										break;
+									case T_Boolean:
+										appendStringInfoString(partition_bounds,
+															  castNode(Boolean, &aconst->val.node)->boolval ? "true" : "false");
+										break;
+									case T_String:
+										/* Quote string literals */
+										appendStringInfo(partition_bounds, "'%s'",
+														castNode(String, &aconst->val.node)->sval);
+										break;
+									case T_BitString:
+										appendStringInfo(partition_bounds, "B'%s'",
+														castNode(BitString, &aconst->val.node)->bsval);
+										break;
+									default:
+										elog(ERROR, "unrecognized node type in partition bound: %d",
+											 (int) nodeTag(&aconst->val.node));
+										break;
+								}
+							}
+							
+							sep = ", ";
+						}
+						appendStringInfoChar(partition_bounds, ')');
+					}
+					break;
+					
+				case PARTITION_STRATEGY_RANGE:
+					{
+						char	   *lower_str;
+						char	   *upper_str;
+						
+						/* Deparse lower and upper bounds lists */
+						lower_str = deparse_expression((Node *) partbound->lowerdatums,
+													   NIL, false, false);
+						upper_str = deparse_expression((Node *) partbound->upperdatums,
+													   NIL, false, false);
+						appendStringInfo(partition_bounds, "FOR VALUES FROM (%s) TO (%s)",
+										 lower_str, upper_str);
+						
+						pfree(lower_str);
+						pfree(upper_str);
+					}
+					break;
+					
+				default:
+					elog(ERROR, "unrecognized partition strategy: %d",
+						 (int) partbound->strategy);
+					break;
+			}
+		}
+
+		/* Build SQL for creating real partition table (for target member) */
+		/* Note: Partitions inherit relsgid from parent, so no SHARD GROUP clause needed */
+		appendStringInfo(create_table_sql, "CREATE TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s",
+						 quote_identifier(nspname),
+						 quote_identifier(relname),
+						 quote_identifier(parentnspname),
+						 quote_identifier(parentname),
+						 partition_bounds->data);
+		
+		/* Build SQL for creating foreign table partition (for other members) */
+		appendStringInfo(create_foreign_table_sql, "CREATE FOREIGN TABLE IF NOT EXISTS %s.%s PARTITION OF %s.%s %s SERVER %s",
+							quote_identifier(nspname),
+							quote_identifier(relname),
+							quote_identifier(parentnspname),
+							quote_identifier(parentname),
+							partition_bounds->data,
+							quote_identifier(target_server_name));
+
+		table_close(parent, AccessShareLock);
+		destroyStringInfo(partition_bounds);
+		pfree(parentnspname);
+	}
+	else
+	{
+		/*
+		 * For regular distributed/worldwide tables (including partitioned tables):
+		 * Create actual tables on foreign servers
+		 */
+		appendStringInfo(create_table_sql, "CREATE %s TABLE IF NOT EXISTS %s.%s (",
+						 rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ? "" : "FOREIGN",
+						 quote_identifier(nspname),
+						 quote_identifier(relname));
+		
+		first_col = 1;
+		for (i = 0; i < tupdesc->natts; i++)
+		{
+			Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+
+			if (attr->attisdropped)
+				continue;
+
+			if (!first_col)
+				appendStringInfo(create_table_sql, ", ");
+			first_col = 0;
+
+			appendStringInfo(create_table_sql, "%s %s",
+							 quote_identifier(NameStr(attr->attname)),
+							 format_type_with_typemod(attr->atttypid, attr->atttypmod));
+
+			/* Add NOT NULL constraint if present */
+			if (attr->attnotnull)
+				appendStringInfo(create_table_sql, " NOT NULL");
+		}
+		appendStringInfo(create_table_sql, ")");
+		
+		/* If this is a partitioned table, add PARTITION BY clause */
+		if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+		{
+			PartitionKey partkey = RelationGetPartitionKey(rel);
+			char	   *partkey_str;
+			
+			if (partkey != NULL)
+			{
+				/* Get the partition key definition */
+				partkey_str = pg_get_partkeydef_columns(relationId, false);
+				
+				appendStringInfo(create_table_sql, " DISTRIBUTED BY %s (%s)",
+								 partkey->strategy == PARTITION_STRATEGY_HASH ? "HASH" :
+								 partkey->strategy == PARTITION_STRATEGY_LIST ? "LIST" :
+								 partkey->strategy == PARTITION_STRATEGY_RANGE ? "RANGE" : "UNKNOWN",
+								 partkey_str);
+				pfree(partkey_str);
+			}
+		}
+		else
+		{
+			appendStringInfo(create_table_sql, " SERVER %s", quote_identifier(target_server_name));
+		}
+		/* Add SHARD GROUP clause */
+		appendStringInfo(create_table_sql, " SHARD GROUP %s", quote_identifier(sgname));
+	}
+
+	/*
+	 * Execute the DDL on each shard member.
+	 * For partitions with consistent hashing:
+	 *   - Create real table on target member
+	 *   - Create foreign table references on other members
+	 * For non-partitions:
+	 *   - Create real tables on all members (existing behavior)
+	 */
+	foreach(lc, members)
+	{
+		Oid			serveroid = lfirst_oid(lc);
+		const char *sql_to_execute;
+
+		if (is_partition)
+		{
+			/* Using consistent hashing for partition placement */
+			if (serveroid == target_member)
+			{
+				/* Create real partition table on target member */
+				sql_to_execute = create_table_sql->data;
+			}
+			else if (create_foreign_table_sql->len > 0)
+			{
+				/* 
+				 * Create foreign table reference on other members
+				 * Note: create_foreign_table_sql is only initialized when 
+				 * OidIsValid(target_member) && target_server != NULL
+				 */
+				sql_to_execute = create_foreign_table_sql->data;
+			}
+			else
+			{
+				/* Skip if no foreign table SQL was generated */
+				continue;
+			}
+		}
+		else
+		{
+			/* For non-partitions, use standard behavior */
+			sql_to_execute = create_table_sql->data;
+		}
+
+		/* Execute the DDL command on the remote server */
+		elog(DEBUG1, "Executing on shard member (server OID: %u): %s", serveroid, sql_to_execute);
+		ExecuteDDLOnRemoteServer(serveroid, sql_to_execute);
+	}
+
+	table_close(rel, AccessShareLock);
+	destroyStringInfo(create_table_sql);
+	destroyStringInfo(create_foreign_table_sql);
+	pfree(nspname);
+	pfree(sgname);
+	list_free(members);
 }
 
 /*
@@ -1613,6 +2097,103 @@ RemoveRelations(DropStmt *drop)
 		obj.classId = RelationRelationId;
 		obj.objectId = relOid;
 		obj.objectSubId = 0;
+
+		/* 
+		 * If this table belongs to a shard group, replicate DROP to shard members.
+		 * Skip replication if we're executing DDL from a remote server to prevent infinite recursion.
+		 */
+		if ((drop->removeType == OBJECT_TABLE || drop->removeType == OBJECT_FOREIGN_TABLE ||
+			 drop->removeType == OBJECT_INDEX) && !executing_remote_ddl)
+		{
+			HeapTuple	tuple;
+			Form_pg_class classForm;
+			Oid			sgid;
+			
+			tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relOid));
+			if (HeapTupleIsValid(tuple))
+			{
+				classForm = (Form_pg_class) GETSTRUCT(tuple);
+				sgid = classForm->relsgid;
+						
+				/* If this table belongs to a shard group, replicate the DROP */
+				if (OidIsValid(sgid))
+				{
+					char	   *relname = NameStr(classForm->relname);
+					char	   *nspname = get_namespace_name(classForm->relnamespace);
+					List	   *members;
+					ListCell   *lc;
+					StringInfoData drop_sql;
+					
+					/*
+					 * Check if table belongs to a shard group and reject CONCURRENTLY option
+					 */
+					if (drop->concurrent)
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg("DROP CONCURRENTLY is not supported on shard group tables/indices"),
+								errhint("Remove CONCURRENTLY option.")));
+					
+					/* Null check for namespace name */
+					if (nspname == NULL)
+					{
+						ReleaseSysCache(tuple);
+						elog(ERROR, "cache lookup failed for namespace %u", classForm->relnamespace);
+					}
+					
+					members = get_shardgroup_members(sgid);
+					
+					initStringInfo(&drop_sql);
+					appendStringInfo(&drop_sql, "%s %s IF EXISTS %s.%s",
+									drop->removeType == OBJECT_TABLE ? "DROP FOREIGN" : "DROP",
+									drop->removeType == OBJECT_INDEX ? "INDEX" : "TABLE",
+									 quote_identifier(nspname),
+									 quote_identifier(relname));
+					
+					/* Add CASCADE or RESTRICT based on drop behavior */
+					if (drop->behavior == DROP_CASCADE)
+						appendStringInfoString(&drop_sql, " CASCADE");
+					else
+						appendStringInfoString(&drop_sql, " RESTRICT");
+					
+					ereport(DEBUG1,
+							(errmsg("replicating DROP TABLE/INDEX to shard members"),
+							 errdetail("Table: %s.%s, Shard Group: %u",
+									   nspname, relname, sgid)));
+					
+					/* Execute on all shard members */
+					foreach(lc, members)
+					{
+						Oid			serveroid = lfirst_oid(lc);
+						ForeignServer *server = GetForeignServer(serveroid);
+						ForeignDataWrapper *fdw = GetForeignDataWrapper(server->fdwid);
+						FdwRoutine *fdwroutine = GetFdwRoutine(fdw->fdwhandler);
+						
+						if (fdwroutine->ExecForeignDDL != NULL)
+						{
+							ereport(DEBUG1,
+									(errmsg("executing DROP %s on shard member \"%s\"",
+											drop->removeType == OBJECT_INDEX ? "INDEX" : "TABLE",
+											server->servername)));
+							
+							fdwroutine->ExecForeignDDL(serveroid, drop_sql.data);
+						}
+						else
+						{
+							ereport(NOTICE,
+									(errmsg("table/index should be dropped on shard member \"%s\"",
+											server->servername),
+									 errdetail("Execute: %s", drop_sql.data),
+									 errhint("The FDW for this server does not support automatic DDL execution.")));
+						}
+					}
+					
+					pfree(drop_sql.data);
+					list_free(members);
+				}
+				
+				ReleaseSysCache(tuple);
+			}
+		}
 
 		add_exact_object_address(&obj, objects);
 	}
@@ -17738,7 +18319,8 @@ RangeVarCallbackMaintainsTable(const RangeVar *relation,
 	if (!relkind)
 		return;
 	if (relkind != RELKIND_RELATION && relkind != RELKIND_TOASTVALUE &&
-		relkind != RELKIND_MATVIEW && relkind != RELKIND_PARTITIONED_TABLE)
+		relkind != RELKIND_MATVIEW && relkind != RELKIND_PARTITIONED_TABLE &&
+		relkind != RELKIND_FOREIGN_TABLE)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not a table or materialized view", relation->relname)));
@@ -18737,6 +19319,91 @@ ATExecAttachPartition(List **wqueue, Relation rel, PartitionCmd *cmd,
 	ObjectAddressSet(address, RelationRelationId, RelationGetRelid(attachrel));
 
 	/*
+	 * If the parent table belongs to a shard group, replicate the ATTACH PARTITION
+	 * to all shard members. If the table being attached is a worldwide table,
+	 * it gets converted to a partition distributed across the shard group.
+	 * Skip replication if we're executing DDL from a remote server to prevent infinite recursion.
+	 */
+	if (!executing_remote_ddl)
+	{
+		Oid			parent_sgid = rel->rd_rel->relsgid;
+		
+		if (OidIsValid(parent_sgid))
+		{
+			char	   *parent_relname = RelationGetRelationName(rel);
+			char	   *parent_nspname = get_namespace_name(RelationGetNamespace(rel));
+			char	   *attach_relname = RelationGetRelationName(attachrel);
+			char	   *attach_nspname = get_namespace_name(RelationGetNamespace(attachrel));
+			List	   *members;
+			ListCell   *lc;
+			StringInfoData attach_sql;
+			
+			/* Null checks for namespace names */
+			if (parent_nspname == NULL)
+				elog(ERROR, "cache lookup failed for namespace %u", RelationGetNamespace(rel));
+			if (attach_nspname == NULL)
+				elog(ERROR, "cache lookup failed for namespace %u", RelationGetNamespace(attachrel));
+			
+			members = get_shardgroup_members(parent_sgid);
+			
+			/*
+			 * Generate ATTACH PARTITION DDL with partition bounds
+			 */
+			initStringInfo(&attach_sql);
+			appendStringInfo(&attach_sql,
+							 "ALTER TABLE %s.%s ATTACH PARTITION %s.%s",
+							 quote_identifier(parent_nspname),
+							 quote_identifier(parent_relname),
+							 quote_identifier(attach_nspname),
+							 quote_identifier(attach_relname));
+			
+			/* Add partition bounds if specified */
+			if (cmd->bound)
+			{
+				char *bounds_str = PartitionBoundsSpecToString(cmd->bound);
+				appendStringInfo(&attach_sql, " %s", bounds_str);
+				pfree(bounds_str);
+			}
+			
+			ereport(DEBUG1,
+					(errmsg("replicating ATTACH PARTITION to shard members"),
+					 errdetail("Parent: %s.%s, Partition: %s.%s, Shard Group: %u",
+							   parent_nspname, parent_relname,
+							   attach_nspname, attach_relname, parent_sgid)));
+			
+			/* Execute ATTACH PARTITION on all shard members */
+			foreach(lc, members)
+			{
+				Oid			serveroid = lfirst_oid(lc);
+				ForeignServer *server = GetForeignServer(serveroid);
+				ForeignDataWrapper *fdw = GetForeignDataWrapper(server->fdwid);
+				FdwRoutine *fdwroutine = GetFdwRoutine(fdw->fdwhandler);
+				
+				if (fdwroutine->ExecForeignDDL != NULL)
+				{
+					ereport(DEBUG1,
+							(errmsg("executing ATTACH PARTITION on shard member \"%s\"",
+									server->servername),
+							 errdetail("DDL: %s", attach_sql.data)));
+					
+					fdwroutine->ExecForeignDDL(serveroid, attach_sql.data);
+				}
+				else
+				{
+					ereport(NOTICE,
+							(errmsg("partition should be attached on shard member \"%s\"",
+									server->servername),
+							 errdetail("Execute: %s", attach_sql.data),
+							 errhint("The FDW for this server does not support automatic DDL execution.")));
+				}
+			}
+			
+			pfree(attach_sql.data);
+			list_free(members);
+		}
+	}
+
+	/*
 	 * If the partition we just attached is partitioned itself, invalidate
 	 * relcache for all descendent partitions too to ensure that their
 	 * rd_partcheck expression trees are rebuilt; partitions already locked at
@@ -19260,6 +19927,84 @@ ATExecDetachPartition(List **wqueue, AlteredTableInfo *tab, Relation rel,
 
 	/* Do the final part of detaching */
 	DetachPartitionFinalize(rel, partRel, concurrent, defaultPartOid);
+
+	/* 
+	 * If the parent table belongs to a shard group, replicate the DETACH PARTITION
+	 * to all shard members and convert the detached partition to a worldwide table.
+	 * Skip replication if we're executing DDL from a remote server to prevent infinite recursion.
+	 */
+	if(!executing_remote_ddl)
+	{
+		Oid			parent_sgid = rel->rd_rel->relsgid;
+		
+		if (OidIsValid(parent_sgid))
+		{
+			char	   *parent_relname = RelationGetRelationName(rel);
+			char	   *parent_nspname = get_namespace_name(RelationGetNamespace(rel));
+			char	   *part_relname = RelationGetRelationName(partRel);
+			char	   *part_nspname = get_namespace_name(RelationGetNamespace(partRel));
+			List	   *members;
+			ListCell   *lc;
+			StringInfoData detach_sql;
+			
+			/* Null checks for namespace names */
+			if (parent_nspname == NULL)
+				elog(ERROR, "cache lookup failed for namespace %u", RelationGetNamespace(rel));
+			if (part_nspname == NULL)
+				elog(ERROR, "cache lookup failed for namespace %u", RelationGetNamespace(partRel));
+			
+			members = get_shardgroup_members(parent_sgid);
+			
+			initStringInfo(&detach_sql);
+			appendStringInfo(&detach_sql,
+							 "ALTER TABLE %s.%s DETACH PARTITION %s.%s",
+							 quote_identifier(parent_nspname),
+							 quote_identifier(parent_relname),
+							 quote_identifier(part_nspname),
+							 quote_identifier(part_relname));
+			
+			if (concurrent)
+				appendStringInfoString(&detach_sql, " CONCURRENTLY");
+			
+			ereport(DEBUG1,
+					(errmsg("replicating DETACH PARTITION to shard members"),
+					 errdetail("Parent: %s.%s, Partition: %s.%s, Shard Group: %u",
+							   parent_nspname, parent_relname,
+							   part_nspname, part_relname, parent_sgid)));
+			
+			/* Execute DETACH PARTITION on all shard members */
+			foreach(lc, members)
+			{
+				Oid			serveroid = lfirst_oid(lc);
+				ForeignServer *server = GetForeignServer(serveroid);
+				ForeignDataWrapper *fdw = GetForeignDataWrapper(server->fdwid);
+				FdwRoutine *fdwroutine = GetFdwRoutine(fdw->fdwhandler);
+				
+				if (fdwroutine->ExecForeignDDL != NULL)
+				{
+					ereport(DEBUG1,
+							(errmsg("executing DETACH PARTITION on shard member \"%s\"",
+									server->servername)));
+					
+					fdwroutine->ExecForeignDDL(serveroid, detach_sql.data);
+				}
+				else
+				{
+					ereport(NOTICE,
+							(errmsg("partition should be detached on shard member \"%s\"",
+									server->servername),
+							 errdetail("Execute: %s", detach_sql.data),
+							 errhint("The FDW for this server does not support automatic DDL execution.")));
+				}
+			}
+			
+			pfree(detach_sql.data);
+			list_free(members);
+			ereport(NOTICE,
+					(errmsg("partition \"%s\" has been detached and converted to a worldwide table in shard group",
+							part_relname)));
+		}
+	}
 
 	ObjectAddressSet(address, RelationRelationId, RelationGetRelid(partRel));
 

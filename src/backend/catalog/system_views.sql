@@ -1185,6 +1185,36 @@ CREATE VIEW pg_stat_wal AS
         w.stats_reset
     FROM pg_stat_get_wal() w;
 
+CREATE VIEW pg_stat_multiplexer AS
+    SELECT
+        S.pid,
+        S.mux_ready,
+        S.mux_enabled,
+        S.configured_workers,
+        S.pending_connections,
+        S.channels_total,
+        S.channels_startup,
+        S.channels_connecting,
+        S.channels_ready,
+        S.channels_tx_pending,
+        S.channels_in_tx,
+        S.ctrl_connections,
+        S.workers_total,
+        S.workers_in_tx
+    FROM pg_stat_get_multiplexer() AS S;
+
+CREATE VIEW pg_stat_multiplexer_workers AS
+    SELECT
+        S.worker_id,
+        S.pid,
+        S.state,
+        S.in_tx,
+        S.active_channel_id,
+        S.connect_count,
+        S.database,
+        S.username
+    FROM pg_stat_get_multiplexer_workers() AS S;
+
 CREATE VIEW pg_stat_progress_analyze AS
     SELECT
         S.pid AS pid, S.datid AS datid, D.datname AS datname,

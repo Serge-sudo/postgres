@@ -32,6 +32,12 @@ typedef void (*GetForeignPaths_function) (PlannerInfo *root,
 										  RelOptInfo *baserel,
 										  Oid foreigntableid);
 
+typedef void (*ExecCopyStream_function) (Oid src_serverid,
+                       Oid dst_serverid,
+                       const char *src_nsp,
+                       const char *src_rel,
+                       const char *dst_nsp,
+                       const char *dst_rel);
 typedef ForeignScan *(*GetForeignPlan_function) (PlannerInfo *root,
 												 RelOptInfo *baserel,
 												 Oid foreigntableid,
@@ -164,6 +170,9 @@ typedef void (*ExecForeignTruncate_function) (List *rels,
 											  DropBehavior behavior,
 											  bool restart_seqs);
 
+typedef void (*ExecForeignDDL_function) (Oid serverid,
+										 const char *sql);
+
 typedef Size (*EstimateDSMForeignScan_function) (ForeignScanState *node,
 												 ParallelContext *pcxt);
 typedef void (*InitializeDSMForeignScan_function) (ForeignScanState *node,
@@ -261,6 +270,10 @@ typedef struct FdwRoutine
 
 	/* Support functions for TRUNCATE */
 	ExecForeignTruncate_function ExecForeignTruncate;
+
+	/* Support functions for DDL execution */
+	ExecForeignDDL_function ExecForeignDDL;
+	ExecCopyStream_function ExecCopyStream;
 
 	/* Support functions for parallelism under Gather node */
 	IsForeignScanParallelSafe_function IsForeignScanParallelSafe;

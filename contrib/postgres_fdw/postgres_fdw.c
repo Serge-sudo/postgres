@@ -12,12 +12,14 @@
  */
 #include "postgres.h"
 
+#include <ctype.h>
 #include <limits.h>
 
 #include "access/htup_details.h"
 #include "access/sysattr.h"
 #include "access/table.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_foreign_server.h"
 #include "catalog/pg_opfamily.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
@@ -29,6 +31,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/appendinfo.h"
+#include "common/file_utils.h"
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/inherit.h"
@@ -41,6 +44,7 @@
 #include "optimizer/tlist.h"
 #include "parser/parsetree.h"
 #include "postgres_fdw.h"
+#include "postmaster/conn_multiplexer.h"
 #include "storage/latch.h"
 #include "utils/builtins.h"
 #include "utils/float.h"
@@ -50,6 +54,8 @@
 #include "utils/rel.h"
 #include "utils/sampling.h"
 #include "utils/selfuncs.h"
+#include "utils/syscache.h"
+
 
 PG_MODULE_MAGIC;
 
@@ -316,6 +322,8 @@ typedef struct
 	List	   *already_used;	/* expressions already dealt with */
 } ec_member_foreign_arg;
 
+bool		UseCSNSnapshots;
+
 /*
  * SQL functions
  */
@@ -398,9 +406,18 @@ static void postgresExplainDirectModify(ForeignScanState *node,
 static void postgresExecForeignTruncate(List *rels,
 										DropBehavior behavior,
 										bool restart_seqs);
+static void postgresExecForeignDDL(Oid serverid,
+								   const char *sql);
+static void
+postgresExecCopyStream(Oid src_serverid,
+                       Oid dst_serverid,
+                       const char *src_nsp,
+                       const char *src_rel,
+                       const char *dst_nsp,
+                       const char *dst_rel);
 static bool postgresAnalyzeForeignTable(Relation relation,
-										AcquireSampleRowsFunc *func,
-										BlockNumber *totalpages);
+	AcquireSampleRowsFunc *func,
+	BlockNumber *totalpages);
 static List *postgresImportForeignSchema(ImportForeignSchemaStmt *stmt,
 										 Oid serverOid);
 static void postgresGetForeignJoinPaths(PlannerInfo *root,
@@ -589,6 +606,10 @@ postgres_fdw_handler(PG_FUNCTION_ARGS)
 
 	/* Support function for TRUNCATE */
 	routine->ExecForeignTruncate = postgresExecForeignTruncate;
+
+	/* Support function for DDL execution */
+	routine->ExecForeignDDL = postgresExecForeignDDL;
+	routine->ExecCopyStream = postgresExecCopyStream;
 
 	/* Support functions for ANALYZE */
 	routine->AnalyzeForeignTable = postgresAnalyzeForeignTable;
@@ -1527,16 +1548,6 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 	table = GetForeignTable(rte->relid);
 	user = GetUserMapping(userid, table->serverid);
 
-	/*
-	 * Get connection to the foreign server.  Connection manager will
-	 * establish new connection if necessary.
-	 */
-	fsstate->conn = GetConnection(user, false, &fsstate->conn_state);
-
-	/* Assign a unique ID for my cursor */
-	fsstate->cursor_number = GetCursorNumber(fsstate->conn);
-	fsstate->cursor_exists = false;
-
 	/* Get private info created by planner functions. */
 	fsstate->query = strVal(list_nth(fsplan->fdw_private,
 									 FdwScanPrivateSelectSql));
@@ -1585,6 +1596,16 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 
 	/* Set the async-capable flag */
 	fsstate->async_capable = node->ss.ps.async_capable;
+
+	/*
+	 * Get connection to the foreign server.  Connection manager will
+	 * establish new connection if necessary.
+	 */
+	fsstate->conn = GetConnection(user, false, &fsstate->conn_state);
+
+	/* Assign a unique ID for my cursor */
+	fsstate->cursor_number = GetCursorNumber(fsstate->conn);
+	fsstate->cursor_exists = false;
 }
 
 /*
@@ -3068,6 +3089,704 @@ postgresExecForeignTruncate(List *rels,
 }
 
 /*
+ * postgresExecForeignDDL
+ *		Execute DDL command on a remote PostgreSQL server
+ *
+ * This function is called to execute DDL statements on a foreign server.
+ * It uses the existing postgres_fdw connection infrastructure and participates
+ * in 2PC transactions if enabled.
+ * 
+ * To prevent infinite recursion in DDL replication, we set the 
+ * shardgroup.executing_remote_ddl GUC on the remote server before executing
+ * the DDL. This tells the remote server not to replicate the DDL further.
+ */
+static void
+postgresExecForeignDDL(Oid serverid, const char *sql)
+{
+	UserMapping *user;
+	PGconn	   *conn;
+	StringInfoData full_sql;
+
+	/*
+	 * Prefix the DDL with SET LOCAL to set the executing_remote_ddl flag
+	 * on the REMOTE server. This prevents infinite recursion by telling
+	 * the remote server not to replicate this DDL further.
+	 */
+	initStringInfo(&full_sql);
+	appendStringInfo(&full_sql,
+					 "SET LOCAL shardgroup.executing_remote_ddl = true; %s",
+					 sql);
+
+	/*
+	 * Get user mapping and connection to the foreign server.
+	 * Connection manager will establish new connection if necessary
+	 * and will participate in 2PC if there are multiple servers involved.
+	 */
+	user = GetUserMapping(GetUserId(), serverid);
+	conn = GetConnection(user, false, NULL);
+
+	/* Execute the DDL command on the remote server */
+	do_sql_command(conn, full_sql.data);
+
+	pfree(full_sql.data);
+
+	/*
+	 * Note: Connection is not explicitly released here.
+	 * The connection manager will handle it and will use 2PC
+	 * if there are multiple foreign servers in the transaction.
+	 */
+}
+
+/*
+ * postgres_connections
+ *		Return information about active postgres_fdw connections
+ *
+ * This function iterates over the connection cache and returns mappings
+ * between local backends and remote backend PIDs. This is used by the
+ * distributed deadlock detection system to track FDW connection dependencies.
+ *
+ * Returns a set of rows with columns:
+ *   cluster_name text, local_pid int, remote_backend_pid int
+ */
+PG_FUNCTION_INFO_V1(postgres_connections);
+
+Datum
+postgres_connections(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore;
+	MemoryContext per_query_ctx;
+	MemoryContext oldcontext;
+
+	/* check to see if caller supports us returning a tuplestore */
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+	if (!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("materialize mode required, but it is not allowed in this context")));
+
+	/* Build a tuple descriptor for our result type */
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+	oldcontext = MemoryContextSwitchTo(per_query_ctx);
+
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+
+	MemoryContextSwitchTo(oldcontext);
+
+	/* Iterate over shared memory FDW connections and return mappings */
+	{
+		HASH_SEQ_STATUS scan;
+		char		cluster_name[NAMEDATALEN];
+		int			local_pid;
+		int			remote_backend_pid;
+
+		/* Opportunistically clean up stale rows before reading mappings. */
+		FdwConnShmemCleanupStaleEntries();
+
+		/* Get iterator for shared memory connection tracking */
+		if (FdwConnShmemGetIterator(&scan))
+		{
+			while (FdwConnShmemGetNext(&scan, cluster_name, &local_pid, &remote_backend_pid))
+			{
+				Datum		values[3];
+				bool		nulls[3];
+
+				memset(nulls, 0, sizeof(nulls));
+
+				/* Build tuple: (cluster_name, local_pid, remote_backend_pid) */
+				values[0] = CStringGetTextDatum(cluster_name);
+				values[1] = Int32GetDatum(local_pid);
+				values[2] = Int32GetDatum(remote_backend_pid);
+
+				tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+			}
+			
+			FdwConnShmemGetIteratorFinish();
+		}
+	}
+
+	return (Datum) 0;
+}
+
+/*
+ * postgres_fdw_get_locks
+ *		Query pg_locks on a remote server and return lock wait information
+ *
+ * This function is used by the distributed deadlock detection system to
+ * query lock information from remote PostgreSQL servers. It uses the
+ * postgres_fdw connection infrastructure to execute a query on the remote
+ * server.
+ *
+ * Returns a set of rows with columns:
+ *   waiter_pid int, blocker_pid int, waiter_xid int, blocker_xid int,
+ *   object_oid oid, lock_mode text
+ */
+PG_FUNCTION_INFO_V1(postgres_fdw_get_locks);
+
+Datum
+postgres_fdw_get_locks(PG_FUNCTION_ARGS)
+{
+	Oid			serverid = PG_GETARG_OID(0);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore;
+	MemoryContext per_query_ctx;
+	MemoryContext oldcontext;
+	UserMapping *user;
+	PGconn	   *conn;
+	PGresult   *res;
+	StringInfoData sql;
+	int			i;
+
+	/* check to see if caller supports us returning a tuplestore */
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+	if (!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("materialize mode required, but it is not allowed in this context")));
+
+	/* Build a tuple descriptor for our result type */
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+	oldcontext = MemoryContextSwitchTo(per_query_ctx);
+
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+
+	MemoryContextSwitchTo(oldcontext);
+
+	/* Get connection to the foreign server */
+	user = GetUserMapping(GetUserId(), serverid);
+	conn = NULL;
+
+	PG_TRY();
+	{
+		conn = GetConnectionUncached(user);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata = CopyErrorData();
+
+		FlushErrorState();
+		if (edata != NULL && edata->message != NULL)
+			ereport(WARNING,
+					(errmsg("postgres_fdw_get_locks: failed to open diagnostic connection to server OID %u",
+							serverid),
+					 errdetail_internal("%s", edata->message)));
+		else
+			ereport(WARNING,
+					(errmsg("postgres_fdw_get_locks: failed to open diagnostic connection to server OID %u",
+							serverid)));
+		if (edata)
+			FreeErrorData(edata);
+		return (Datum) 0;
+	}
+	PG_END_TRY();
+
+	/* Construct the query to get lock waits from the remote server */
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "SELECT "
+					 "  blocked.pid AS waiter_pid, "
+					 "  blocking.pid AS blocker_pid, "
+					 "  COALESCE(blocked.transactionid::text::int, 0) AS waiter_xid, "
+					 "  COALESCE(blocking.transactionid::text::int, 0) AS blocker_xid, "
+					 "  COALESCE(blocked.relation, 0) AS object_oid, "
+					 "  blocked.mode AS lock_mode "
+					 "FROM pg_locks blocked "
+					 "JOIN pg_locks blocking ON ("
+					 "  blocked.locktype = blocking.locktype AND "
+					 "  blocked.database = blocking.database AND "
+					 "  blocked.relation = blocking.relation AND "
+					 "  blocked.pid != blocking.pid AND "
+					 "  NOT blocked.granted AND blocking.granted"
+					 ")");
+
+	/* Execute the query on the remote server */
+	res = pgfdw_exec_query(conn, sql.data, NULL);
+
+	if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		if (res != NULL)
+			PQclear(res);
+		pfree(sql.data);
+		DisconnectConnectionUncached(conn);
+		ereport(WARNING,
+				(errmsg("postgres_fdw_get_locks: failed to query remote lock graph on server OID %u",
+						serverid),
+				 errdetail_internal("%s", pchomp(PQerrorMessage(conn)))));
+		PG_RETURN_DATUM((Datum) 0);
+	}
+
+	/* Process results and add to tuplestore */
+	for (i = 0; i < PQntuples(res); i++)
+	{
+		Datum		values[6];
+		bool		nulls[6];
+		int			waiter_pid;
+		int			blocker_pid;
+		int			waiter_xid;
+		int			blocker_xid;
+		Oid			object_oid;
+		char	   *lock_mode;
+
+		memset(nulls, 0, sizeof(nulls));
+
+		/* Extract values from PGresult */
+		waiter_pid = atoi(PQgetvalue(res, i, 0));
+		blocker_pid = atoi(PQgetvalue(res, i, 1));
+		waiter_xid = atoi(PQgetvalue(res, i, 2));
+		blocker_xid = atoi(PQgetvalue(res, i, 3));
+		object_oid = (Oid) atoi(PQgetvalue(res, i, 4));
+		lock_mode = PQgetvalue(res, i, 5);
+
+		/* Build tuple */
+		values[0] = Int32GetDatum(waiter_pid);
+		values[1] = Int32GetDatum(blocker_pid);
+		values[2] = Int32GetDatum(waiter_xid);
+		values[3] = Int32GetDatum(blocker_xid);
+		values[4] = ObjectIdGetDatum(object_oid);
+		values[5] = CStringGetTextDatum(lock_mode);
+
+		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+	}
+
+	PQclear(res);
+	pfree(sql.data);
+	DisconnectConnectionUncached(conn);
+
+	return (Datum) 0;
+}
+
+/*
+ * postgres_fdw_connections
+ *		Query postgres_connections() on a remote server to get FDW connection mappings
+ *
+ * This function is used by the distributed deadlock detection system to
+ * query FDW connection information from remote PostgreSQL servers. It uses the
+ * postgres_fdw connection infrastructure to execute a query on the remote
+ * server that calls postgres_connections().
+ *
+ * Returns a set of rows with columns:
+ *   cluster_name text, local_pid int, remote_backend_pid int
+ */
+PG_FUNCTION_INFO_V1(postgres_fdw_connections);
+
+Datum
+postgres_fdw_connections(PG_FUNCTION_ARGS)
+{
+	Oid			serverid = PG_GETARG_OID(0);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore;
+	MemoryContext per_query_ctx;
+	MemoryContext oldcontext;
+	UserMapping *user;
+	PGconn	   *conn;
+	PGresult   *res;
+	StringInfoData sql;
+	int			i;
+
+	/* check to see if caller supports us returning a tuplestore */
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+	if (!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("materialize mode required, but it is not allowed in this context")));
+
+	/* Build a tuple descriptor for our result type */
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+	oldcontext = MemoryContextSwitchTo(per_query_ctx);
+
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+
+	MemoryContextSwitchTo(oldcontext);
+
+	/* Get user mapping and connection */
+	user = GetUserMapping(GetUserId(), serverid);
+	conn = NULL;
+	PG_TRY();
+	{
+		conn = GetConnectionUncached(user);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata = CopyErrorData();
+
+		FlushErrorState();
+		if (edata != NULL && edata->message != NULL)
+			ereport(WARNING,
+					(errmsg("postgres_fdw_connections: failed to open diagnostic connection to server OID %u",
+							serverid),
+					 errdetail_internal("%s", edata->message)));
+		else
+			ereport(WARNING,
+					(errmsg("postgres_fdw_connections: failed to open diagnostic connection to server OID %u",
+							serverid)));
+		if (edata)
+			FreeErrorData(edata);
+		return (Datum) 0;
+	}
+	PG_END_TRY();
+
+	/*
+	 * Build SQL query to call postgres_connections() on the remote server.
+	 * This function returns the FDW connections that exist on that remote server.
+	 */
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "SELECT cluster_name, local_pid, remote_backend_pid "
+					 "FROM public.postgres_connections()");
+
+	/* Execute the query on the remote server */
+	res = pgfdw_exec_query(conn, sql.data, NULL);
+
+	if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		if (res != NULL)
+			PQclear(res);
+		pfree(sql.data);
+		DisconnectConnectionUncached(conn);
+		ereport(WARNING,
+				(errmsg("postgres_fdw_connections: failed to query remote FDW connections on server OID %u",
+						serverid),
+				 errdetail_internal("%s", pchomp(PQerrorMessage(conn)))));
+		PG_RETURN_DATUM((Datum) 0);
+	}
+
+	/* Process the result tuples */
+	for (i = 0; i < PQntuples(res); i++)
+	{
+		Datum		values[3];
+		bool		nulls[3];
+
+		memset(values, 0, sizeof(values));
+		memset(nulls, 0, sizeof(nulls));
+
+		/* cluster_name */
+		if (PQgetisnull(res, i, 0))
+			nulls[0] = true;
+		else
+			values[0] = CStringGetTextDatum(PQgetvalue(res, i, 0));
+
+		/* local_pid */
+		if (PQgetisnull(res, i, 1))
+			nulls[1] = true;
+		else
+			values[1] = Int32GetDatum(atoi(PQgetvalue(res, i, 1)));
+
+		/* remote_backend_pid */
+		if (PQgetisnull(res, i, 2))
+			nulls[2] = true;
+		else
+			values[2] = Int32GetDatum(atoi(PQgetvalue(res, i, 2)));
+
+		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+	}
+
+	PQclear(res);
+	pfree(sql.data);
+	DisconnectConnectionUncached(conn);
+
+	return (Datum) 0;
+}
+
+#define IS_LOCAL(oid)   ((oid) == InvalidOid)
+#define IS_FOREIGN(oid) ((oid) != InvalidOid)
+
+static void
+get_backend_tempfile(char *path, size_t len)
+{
+    File file;
+    const char *relpath;
+
+    file = OpenTemporaryFile(false);
+    if (file < 0)
+        ereport(ERROR,
+                (errmsg("could not create temporary file")));
+
+    relpath = FilePathName(file);
+
+    /*
+     * COPY requires absolute path, FilePathName() is relative to DataDir
+     */
+    snprintf(path, len, "%s/%s", DataDir, relpath);
+
+    FileClose(file);
+}
+
+
+static void
+stream_local_to_foreign_via_file(Oid dst_serverid,
+                                 const char *src_nsp,
+                                 const char *src_rel,
+                                 const char *dst_nsp,
+                                 const char *dst_rel)
+{
+    char         temp_path[MAXPGPATH];
+    UserMapping *dst_user;
+    PGconn      *dst_conn;
+    PGresult    *res;
+    FILE        *fp;
+    char         buf[8192];
+    StringInfo   cmd;
+
+    /* Create absolute backend temp file */
+    get_backend_tempfile(temp_path, sizeof(temp_path));
+
+    /* Local COPY TO file (ABSOLUTE PATH) */
+    SPI_connect();
+    SPI_execute(psprintf("COPY %s.%s TO '%s' WITH (FORMAT CSV, HEADER)",
+                         quote_identifier(src_nsp),
+                         quote_identifier(src_rel),
+                         temp_path),
+                false, 0);
+    SPI_finish();
+
+    fp = AllocateFile(temp_path, "r");
+    if (!fp)
+        ereport(ERROR,
+                (errmsg("could not open temp file \"%s\"", temp_path)));
+
+    /* Foreign COPY FROM STDIN */
+    dst_user = GetUserMapping(GetUserId(), dst_serverid);
+    dst_conn = GetConnection(dst_user, false, NULL);
+
+    cmd = makeStringInfo();
+    appendStringInfo(cmd,
+                     "COPY %s.%s FROM STDIN WITH (FORMAT CSV, HEADER)",
+                     quote_identifier(dst_nsp),
+                     quote_identifier(dst_rel));
+
+    res = PQexec(dst_conn, cmd->data);
+    if (!res || PQresultStatus(res) != PGRES_COPY_IN)
+        ereport(ERROR,
+                (errmsg("COPY FROM STDIN failed: %s",
+                        PQerrorMessage(dst_conn))));
+    PQclear(res);
+
+    while (fgets(buf, sizeof(buf), fp) != NULL)
+    {
+        if (PQputCopyData(dst_conn, buf, strlen(buf)) != 1)
+            ereport(ERROR,
+                    (errmsg("COPY failed: %s",
+                            PQerrorMessage(dst_conn))));
+    }
+
+    FreeFile(fp);
+    PQputCopyEnd(dst_conn, NULL);
+
+    while ((res = PQgetResult(dst_conn)) != NULL)
+        PQclear(res);
+
+    destroyStringInfo(cmd);
+}
+
+
+static void
+stream_foreign_to_local_via_file(Oid src_serverid,
+                                 const char *src_nsp,
+                                 const char *src_rel,
+                                 const char *dst_nsp,
+                                 const char *dst_rel)
+{
+    char         temp_path[MAXPGPATH];
+    UserMapping *src_user;
+    PGconn      *src_conn;
+    PGresult    *res;
+    FILE        *fp;
+    char        *buf;
+    int          len;
+    StringInfo   cmd;
+
+    get_backend_tempfile(temp_path, sizeof(temp_path));
+
+    fp = AllocateFile(temp_path, "w");
+    if (!fp)
+        ereport(ERROR,
+                (errmsg("could not open temp file \"%s\"", temp_path)));
+
+    /* Foreign COPY TO STDOUT */
+    src_user = GetUserMapping(GetUserId(), src_serverid);
+    src_conn = GetConnection(src_user, false, NULL);
+
+    cmd = makeStringInfo();
+    appendStringInfo(cmd,
+                     "COPY %s.%s TO STDOUT WITH (FORMAT CSV, HEADER)",
+                     quote_identifier(src_nsp),
+                     quote_identifier(src_rel));
+
+    res = PQexec(src_conn, cmd->data);
+    if (!res || PQresultStatus(res) != PGRES_COPY_OUT)
+        ereport(ERROR,
+                (errmsg("COPY TO STDOUT failed: %s",
+                        PQerrorMessage(src_conn))));
+    PQclear(res);
+
+    while ((len = PQgetCopyData(src_conn, &buf, 0)) > 0)
+    {
+        fwrite(buf, 1, len, fp);
+        PQfreemem(buf);
+    }
+	
+	while ((res = PQgetResult(src_conn)) != NULL)
+		PQclear(res);
+	
+    FreeFile(fp);
+
+    /* Local COPY FROM file */
+    SPI_connect();
+    SPI_execute(psprintf("COPY %s.%s FROM '%s' WITH (FORMAT CSV, HEADER)",
+                         quote_identifier(dst_nsp),
+                         quote_identifier(dst_rel),
+                         temp_path),
+                false, 0);
+    SPI_finish();
+
+    destroyStringInfo(cmd);
+}
+
+static void
+stream_foreign_to_foreign(Oid src_serverid,
+                          Oid dst_serverid,
+                          const char *src_nsp,
+                          const char *src_rel,
+                          const char *dst_nsp,
+                          const char *dst_rel)
+{
+    UserMapping *src_user;
+    UserMapping *dst_user;
+    PGconn      *src_conn;
+    PGconn      *dst_conn;
+    PGresult    *res;
+    StringInfo   cmd;
+    char        *buf;
+    int          len;
+
+    src_user = GetUserMapping(GetUserId(), src_serverid);
+    dst_user = GetUserMapping(GetUserId(), dst_serverid);
+
+    src_conn = GetConnection(src_user, false, NULL);
+    dst_conn = GetConnection(dst_user, false, NULL);
+
+    /* COPY TO STDOUT (source) */
+    cmd = makeStringInfo();
+    appendStringInfo(cmd,
+                     "COPY %s.%s TO STDOUT WITH (FORMAT CSV, HEADER)",
+                     quote_identifier(src_nsp),
+                     quote_identifier(src_rel));
+
+    res = PQexec(src_conn, cmd->data);
+    if (!res || PQresultStatus(res) != PGRES_COPY_OUT)
+        ereport(ERROR,
+                (errmsg("COPY TO STDOUT failed: %s",
+                        PQerrorMessage(src_conn))));
+    PQclear(res);
+    resetStringInfo(cmd);
+
+    /* COPY FROM STDIN (destination) */
+    appendStringInfo(cmd,
+                     "COPY %s.%s FROM STDIN WITH (FORMAT CSV, HEADER)",
+                     quote_identifier(dst_nsp),
+                     quote_identifier(dst_rel));
+
+    res = PQexec(dst_conn, cmd->data);
+    if (!res || PQresultStatus(res) != PGRES_COPY_IN)
+        ereport(ERROR,
+                (errmsg("COPY FROM STDIN failed: %s",
+                        PQerrorMessage(dst_conn))));
+    PQclear(res);
+
+    while ((len = PQgetCopyData(src_conn, &buf, 0)) > 0)
+    {
+        if (PQputCopyData(dst_conn, buf, len) != 1)
+            ereport(ERROR,
+                    (errmsg("COPY forwarding failed: %s",
+                            PQerrorMessage(dst_conn))));
+        PQfreemem(buf);
+    }
+
+    if (len < -1)
+	{
+        ereport(ERROR,
+                (errmsg("COPY OUT aborted: %s",
+                        PQerrorMessage(src_conn))));
+	}
+					
+	while ((res = PQgetResult(src_conn)) != NULL)
+		PQclear(res);
+
+    if (PQputCopyEnd(dst_conn, NULL) != 1)
+        ereport(ERROR,
+                (errmsg("COPY END failed: %s",
+                        PQerrorMessage(dst_conn))));
+
+    while ((res = PQgetResult(dst_conn)) != NULL)
+    {
+        if (PQresultStatus(res) != PGRES_COMMAND_OK)
+            ereport(ERROR,
+                    (errmsg("COPY failed: %s",
+                            PQerrorMessage(dst_conn))));
+        PQclear(res);
+    }
+
+    destroyStringInfo(cmd);
+}
+
+static void
+postgresExecCopyStream(Oid src_serverid,
+                       Oid dst_serverid,
+                       const char *src_nsp,
+                       const char *src_rel,
+                       const char *dst_nsp,
+                       const char *dst_rel)
+{
+    if (IS_LOCAL(src_serverid) && IS_LOCAL(dst_serverid))
+        ereport(ERROR,
+                (errmsg("both source and destination cannot be local")));
+
+    if (IS_FOREIGN(src_serverid) && IS_FOREIGN(dst_serverid))
+        stream_foreign_to_foreign(src_serverid, dst_serverid,
+                                  src_nsp, src_rel,
+                                  dst_nsp, dst_rel);
+    else if (IS_LOCAL(src_serverid))
+        stream_local_to_foreign_via_file(dst_serverid,
+                                         src_nsp, src_rel,
+                                         dst_nsp, dst_rel);
+    else
+        stream_foreign_to_local_via_file(src_serverid,
+                                         src_nsp, src_rel,
+                                         dst_nsp, dst_rel);
+}
+
+
+/*
  * estimate_path_cost_size
  *		Get cost and size estimates for a foreign scan on given foreign relation
  *		either a base relation or a join between foreign relations or an upper
@@ -3988,6 +4707,8 @@ create_foreign_modify(EState *estate,
 	/* Begin constructing PgFdwModifyState. */
 	fmstate = (PgFdwModifyState *) palloc0(sizeof(PgFdwModifyState));
 	fmstate->rel = rel;
+	fmstate->conn = NULL;
+	fmstate->conn_state = NULL;
 
 	/* Identify which user to do the remote access as. */
 	userid = ExecGetResultRelCheckAsUser(resultRelInfo, estate);
@@ -3996,9 +4717,9 @@ create_foreign_modify(EState *estate,
 	table = GetForeignTable(RelationGetRelid(rel));
 	user = GetUserMapping(userid, table->serverid);
 
-	/* Open connection; report that we'll create a prepared statement. */
-	fmstate->conn = GetConnection(user, true, &fmstate->conn_state);
 	fmstate->p_name = NULL;		/* prepared statement not made yet */
+
+	fmstate->conn = GetConnection(user, true, &fmstate->conn_state);
 
 	/* Set up remote query information. */
 	fmstate->query = query;
@@ -4103,7 +4824,8 @@ execute_foreign_modify(EState *estate,
 		   operation == CMD_DELETE);
 
 	/* First, process a pending asynchronous request, if any. */
-	if (fmstate->conn_state->pendingAreq)
+	if (fmstate->conn_state != NULL &&
+		fmstate->conn_state->pendingAreq)
 		process_pending_request(fmstate->conn_state->pendingAreq);
 
 	/*
@@ -4127,10 +4849,6 @@ execute_foreign_modify(EState *estate,
 		fmstate->num_slots = *numSlots;
 	}
 
-	/* Set up the prepared statement on the remote server, if we didn't yet */
-	if (!fmstate->p_name)
-		prepare_foreign_modify(fmstate);
-
 	/*
 	 * For UPDATE/DELETE, get the ctid that was passed up as a resjunk column
 	 */
@@ -4150,6 +4868,10 @@ execute_foreign_modify(EState *estate,
 
 	/* Convert parameters needed by prepared statement to text form */
 	p_values = convert_prep_stmt_params(fmstate, ctid, slots, *numSlots);
+
+	/* Set up the prepared statement on the remote server, if we didn't yet */
+	if (!fmstate->p_name)
+		prepare_foreign_modify(fmstate);
 
 	/*
 	 * Execute the prepared statement.
@@ -4374,12 +5096,15 @@ finish_foreign_modify(PgFdwModifyState *fmstate)
 {
 	Assert(fmstate != NULL);
 
-	/* If we created a prepared statement, destroy it */
-	deallocate_query(fmstate);
+	if (fmstate->conn != NULL)
+	{
+		/* If we created a prepared statement, destroy it */
+		deallocate_query(fmstate);
 
-	/* Release remote connection */
-	ReleaseConnection(fmstate->conn);
-	fmstate->conn = NULL;
+		/* Release remote connection */
+		ReleaseConnection(fmstate->conn);
+		fmstate->conn = NULL;
+	}
 }
 
 /*

@@ -12,8 +12,10 @@
  */
 #include "postgres.h"
 
+#include "access/csn_snapshot.h"
 #include "access/htup_details.h"
 #include "access/xact.h"
+#include "access/xlog.h" /* GetSystemIdentifier() */
 #include "catalog/pg_user_mapping.h"
 #include "commands/defrem.h"
 #include "funcapi.h"
@@ -23,6 +25,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postgres_fdw.h"
+#include "postmaster/conn_multiplexer.h"
 #include "storage/fd.h"
 #include "storage/latch.h"
 #include "utils/builtins.h"
@@ -30,6 +33,8 @@
 #include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/memutils.h"
+#include "utils/snapmgr.h"
+#include "utils/snapshot.h"
 #include "utils/syscache.h"
 
 /*
@@ -76,12 +81,29 @@ typedef struct ConnCacheEntry
  */
 static HTAB *ConnectionHash = NULL;
 
+/*
+ * FdwTransactionState
+ *
+ * Holds number of open remote transactions and shared state
+ * needed for all connection entries.
+ */
+typedef struct FdwTransactionState
+{
+	char		*gid;
+	int			nparticipants;
+	CSN			csn;
+	bool		two_phase_commit;
+} FdwTransactionState;
+static FdwTransactionState *fdwTransState;
+
 /* for assigning cursor numbers and prepared statement numbers */
 static unsigned int cursor_number = 0;
 static unsigned int prep_stmt_number = 0;
 
 /* tracks whether any work is needed in callback functions */
 static bool xact_got_connection = false;
+
+static int two_phase_xact_count = 0;
 
 /* custom wait event values, retrieved from shared memory */
 static uint32 pgfdw_we_cleanup_result = 0;
@@ -123,7 +145,7 @@ PG_FUNCTION_INFO_V1(postgres_fdw_disconnect_all);
 
 /* prototypes of private functions */
 static void make_new_connection(ConnCacheEntry *entry, UserMapping *user);
-static PGconn *connect_pg_server(ForeignServer *server, UserMapping *user);
+static PGconn *connect_pg_server(ForeignServer *server, UserMapping *user, bool try_mux);
 static void disconnect_pg_server(ConnCacheEntry *entry);
 static void check_conn_params(const char **keywords, const char **values, UserMapping *user);
 static void configure_remote_session(PGconn *conn);
@@ -132,6 +154,7 @@ static void do_sql_command_end(PGconn *conn, const char *sql,
 							   bool consume_input);
 static void begin_remote_xact(ConnCacheEntry *entry);
 static void pgfdw_xact_callback(XactEvent event, void *arg);
+static void deallocate_prepared_stmts(ConnCacheEntry *entry);
 static void pgfdw_subxact_callback(SubXactEvent event,
 								   SubTransactionId mySubid,
 								   SubTransactionId parentSubid,
@@ -216,6 +239,15 @@ GetConnection(UserMapping *user, bool will_prep_stmt, PgFdwConnState **state)
 									  pgfdw_inval_callback, (Datum) 0);
 		CacheRegisterSyscacheCallback(USERMAPPINGOID,
 									  pgfdw_inval_callback, (Datum) 0);
+	}
+
+	/* allocate FdwTransactionState */
+	if (fdwTransState == NULL)
+	{
+		MemoryContext oldcxt;
+		oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
+		fdwTransState = palloc0(sizeof(FdwTransactionState));
+		MemoryContextSwitchTo(oldcxt);
 	}
 
 	/* Set flag that we did GetConnection during the current transaction */
@@ -342,6 +374,29 @@ GetConnection(UserMapping *user, bool will_prep_stmt, PgFdwConnState **state)
 }
 
 /*
+ * Establish an uncached one-off connection for diagnostic queries.
+ *
+ * Unlike GetConnection(), this bypasses the per-user-mapping cache and does
+ * not participate in postgres_fdw transaction state management.
+ */
+PGconn *
+GetConnectionUncached(UserMapping *user)
+{
+	ForeignServer *server = GetForeignServer(user->serverid);
+	return connect_pg_server(server, user, false);
+}
+
+/*
+ * Close an uncached one-off connection created by GetConnectionUncached().
+ */
+void
+DisconnectConnectionUncached(PGconn *conn)
+{
+	if (conn != NULL)
+		libpqsrv_disconnect(conn);
+}
+
+/*
  * Reset all transient state fields in the cached connection entry and
  * establish new connection to the remote server.
  */
@@ -399,10 +454,21 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 	}
 
 	/* Now try to make the connection */
-	entry->conn = connect_pg_server(server, user);
+	entry->conn = connect_pg_server(server, user, true);
 
 	elog(DEBUG3, "new postgres_fdw connection %p for server \"%s\" (user mapping oid %u, userid %u)",
 		 entry->conn, server->servername, user->umid, user->userid);
+
+	/*
+	 * Register the connection in shared memory for distributed deadlock detection
+	 * Track the mapping: local_pid + server_oid -> remote_backend_pid
+	 */
+	if (entry->conn != NULL)
+	{
+		int remote_backend_pid = PQbackendPID(entry->conn);
+		if (remote_backend_pid > 0)
+			FdwConnShmemRegister(server->servername, remote_backend_pid);
+	}
 }
 
 /*
@@ -450,7 +516,7 @@ pgfdw_security_check(const char **keywords, const char **values, UserMapping *us
  * Connect to remote server using specified server and user mapping properties.
  */
 static PGconn *
-connect_pg_server(ForeignServer *server, UserMapping *user)
+connect_pg_server(ForeignServer *server, UserMapping *user, bool try_mux)
 {
 	PGconn	   *volatile conn = NULL;
 
@@ -462,16 +528,18 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 		const char **keywords;
 		const char **values;
 		char	   *appname = NULL;
+		char	   *mux_options = NULL;
+		char	   *mux_port_str = NULL;
 		int			n;
 
 		/*
 		 * Construct connection params from generic options of ForeignServer
 		 * and UserMapping.  (Some of them might not be libpq options, in
-		 * which case we'll just waste a few array slots.)  Add 4 extra slots
+		 * which case we'll just waste a few array slots.)  Add extra slots
 		 * for application_name, fallback_application_name, client_encoding,
-		 * end marker.
+		 * end marker, and optional mux overrides.
 		 */
-		n = list_length(server->options) + list_length(user->options) + 4;
+		n = list_length(server->options) + list_length(user->options) + 8;
 		keywords = (const char **) palloc(n * sizeof(char *));
 		values = (const char **) palloc(n * sizeof(char *));
 
@@ -480,6 +548,131 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 									  keywords + n, values + n);
 		n += ExtractConnectionOptions(user->options,
 									  keywords + n, values + n);
+
+		/* If the local connection multiplexer is available, route via it. */
+		if (ConnMuxIsAvailable() && try_mux)
+		{
+			const char *orig_host = NULL;
+			const char *orig_port = NULL;
+			const char *orig_options = NULL;
+			int			host_idx = -1;
+			int			port_idx = -1;
+			int			options_idx = -1;
+			int			sslmode_idx = -1;
+			int			i;
+
+			for (i = 0; i < n; i++)
+			{
+				if (keywords[i] == NULL)
+					break;
+				if (strcmp(keywords[i], "host") == 0)
+				{
+					orig_host = values[i];
+					host_idx = i;
+				}
+				else if (strcmp(keywords[i], "port") == 0)
+				{
+					orig_port = values[i];
+					port_idx = i;
+				}
+				else if (strcmp(keywords[i], "options") == 0)
+				{
+					orig_options = values[i];
+					options_idx = i;
+				}
+				else if (strcmp(keywords[i], "sslmode") == 0)
+				{
+					sslmode_idx = i;
+				}
+			}
+
+			if (orig_host != NULL && orig_port != NULL)
+			{
+				/*
+				 * Route through the local mux.  Embed the real target host,
+				 * port, and remote mux port in the options string so the mux
+				 * knows where to connect.  mux_target_mux_port is the TCP
+				 * port of the remote node's multiplexer (from the mux_port
+				 * ForeignServer option); the local mux uses it to open the
+				 * inter-mux control connection.
+				 */
+				const char *remote_mux_port_str = NULL;
+				ListCell   *opt_lc;
+
+				foreach(opt_lc, server->options)
+				{
+					DefElem *def = (DefElem *) lfirst(opt_lc);
+
+					if (strcmp(def->defname, "mux_port") == 0)
+					{
+						remote_mux_port_str = defGetString(def);
+						break;
+					}
+				}
+
+				if (remote_mux_port_str == NULL || *remote_mux_port_str == '\0')
+				{
+					/*
+					 * No mux_port configured for this server.  Fall back to
+					 * the local mux_tcp_port GUC, which only works correctly
+					 * if all nodes use the same mux port.  Add mux_port to
+					 * the ForeignServer definition to avoid this fallback.
+					 */
+					elog(WARNING,
+						 "postgres_fdw: server \"%s\" has no mux_port option; "
+						 "falling back to backend spawn",
+						 server->servername);
+					goto no_mux_set;
+				}
+
+				if (orig_options != NULL && *orig_options != '\0')
+					mux_options = psprintf("%s -c mux_target_host=%s -c mux_target_port=%s -c mux_target_mux_port=%s",
+										   orig_options, orig_host, orig_port,
+										   remote_mux_port_str);
+				else
+					mux_options = psprintf("-c mux_target_host=%s -c mux_target_port=%s -c mux_target_mux_port=%s",
+										   orig_host, orig_port,
+										   remote_mux_port_str);
+
+				if (options_idx >= 0)
+					values[options_idx] = mux_options;
+				else
+				{
+					keywords[n] = "options";
+					values[n] = mux_options;
+					n++;
+				}
+
+				if (host_idx >= 0)
+					values[host_idx] = "localhost";
+				else
+				{
+					keywords[n] = "host";
+					values[n] = "localhost";
+					n++;
+				}
+
+				mux_port_str = psprintf("%d", mux_tcp_port);
+				if (port_idx >= 0)
+					values[port_idx] = mux_port_str;
+				else
+				{
+					keywords[n] = "port";
+					values[n] = mux_port_str;
+					n++;
+				}
+
+				if (sslmode_idx >= 0)
+					values[sslmode_idx] = "disable";
+				else
+				{
+					keywords[n] = "sslmode";
+					values[n] = "disable";
+					n++;
+				}
+			}
+		}
+no_mux_set:
 
 		/*
 		 * Use pgfdw_application_name as application_name if set.
@@ -554,6 +747,7 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 									   false,	/* expand_dbname */
 									   pgfdw_we_connect);
 
+
 		if (!conn || PQstatus(conn) != CONNECTION_OK)
 			ereport(ERROR,
 					(errcode(ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION),
@@ -569,6 +763,10 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 
 		if (appname != NULL)
 			pfree(appname);
+		if (mux_options != NULL)
+			pfree(mux_options);
+		if (mux_port_str != NULL)
+			pfree(mux_port_str);
 		pfree(keywords);
 		pfree(values);
 	}
@@ -590,6 +788,17 @@ disconnect_pg_server(ConnCacheEntry *entry)
 {
 	if (entry->conn != NULL)
 	{
+		ForeignServer *server;
+
+		/* Unregister from shared memory before disconnecting */
+		server = GetForeignServer(entry->serverid);
+		if (server != NULL)
+			FdwConnShmemUnregister(server->servername);
+		else
+			elog(WARNING,
+				 "failed to get foreign server for server OID %u during disconnect",
+				 entry->serverid);
+
 		libpqsrv_disconnect(entry->conn);
 		entry->conn = NULL;
 	}
@@ -702,7 +911,8 @@ configure_remote_session(PGconn *conn)
 }
 
 /*
- * Convenience subroutine to issue a non-data-returning SQL command to remote
+ * Convenience subroutine to issue a non-data-returning SQL command or
+ * statement to remote node.
  */
 void
 do_sql_command(PGconn *conn, const char *sql)
@@ -732,7 +942,8 @@ do_sql_command_end(PGconn *conn, const char *sql, bool consume_input)
 	if (consume_input && !PQconsumeInput(conn))
 		pgfdw_report_error(ERROR, NULL, conn, false, sql);
 	res = pgfdw_get_result(conn);
-	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	if (PQresultStatus(res) != PGRES_COMMAND_OK &&
+			PQresultStatus(res) != PGRES_TUPLES_OK)
 		pgfdw_report_error(ERROR, res, conn, true, sql);
 	PQclear(res);
 }
@@ -760,6 +971,10 @@ begin_remote_xact(ConnCacheEntry *entry)
 		elog(DEBUG3, "starting remote transaction on connection %p",
 			 entry->conn);
 
+		if (UseCSNSnapshots && (/*!IsolationUsesXactSnapshot() ||*/
+								   IsolationIsSerializable()))
+			elog(ERROR, "Global snapshots support only REPEATABLE READ");
+
 		if (IsolationIsSerializable())
 			sql = "START TRANSACTION ISOLATION LEVEL SERIALIZABLE";
 		else
@@ -768,6 +983,23 @@ begin_remote_xact(ConnCacheEntry *entry)
 		do_sql_command(entry->conn, sql);
 		entry->xact_depth = 1;
 		entry->changing_xact_state = false;
+
+		if (UseCSNSnapshots && IsolationUsesXactSnapshot())
+		{
+			char import_sql[128];
+
+			/* Export our snapshot */
+			if (fdwTransState->csn == 0)
+				fdwTransState->csn = ExportCSNSnapshot();
+
+			snprintf(import_sql, sizeof(import_sql),
+				"SELECT pg_csn_snapshot_import("UINT64_FORMAT")",
+				fdwTransState->csn);
+
+			do_sql_command(entry->conn, import_sql);
+		}
+
+		fdwTransState->nparticipants += 1;
 	}
 
 	/*
@@ -925,6 +1157,98 @@ pgfdw_report_error(int elevel, PGresult *res, PGconn *conn,
 	PG_END_TRY();
 }
 
+/* Callback typedef for BroadcastStmt */
+typedef bool (*BroadcastCmdResHandler) (PGresult *result, void *arg);
+
+/*
+ * Broadcast sql in parallel to all ConnectionHash entries
+ */
+static bool
+BroadcastStmt(char const * sql, unsigned expectedStatus,
+				BroadcastCmdResHandler handler, void *arg)
+{
+	HASH_SEQ_STATUS scan;
+	ConnCacheEntry *entry;
+	bool		allOk = true;
+
+	/* Broadcast sql */
+	hash_seq_init(&scan, ConnectionHash);
+	while ((entry = (ConnCacheEntry *) hash_seq_search(&scan)))
+	{
+		pgfdw_reject_incomplete_xact_state_change(entry);
+
+		if (entry->xact_depth > 0 && entry->conn != NULL)
+		{
+			if (!PQsendQuery(entry->conn, sql))
+			{
+				PGresult   *res = PQgetResult(entry->conn);
+
+				elog(WARNING, "Failed to send command %s", sql);
+				pgfdw_report_error(WARNING, res, entry->conn, true, sql);
+				PQclear(res);
+			}
+		}
+	}
+
+	/* Collect responses */
+	hash_seq_init(&scan, ConnectionHash);
+	while ((entry = (ConnCacheEntry *) hash_seq_search(&scan)))
+	{
+		if (entry->xact_depth > 0 && entry->conn != NULL)
+		{
+			PGresult *result = PQgetResult(entry->conn);
+
+			if (PQresultStatus(result) != expectedStatus ||
+				(handler && !handler(result, arg)))
+			{
+				elog(WARNING,
+					 "Failed command %s: status=%d, expected status=%d",
+					 sql, PQresultStatus(result), expectedStatus);
+				pgfdw_report_error(ERROR, result, entry->conn, true, sql);
+				allOk = false;
+			}
+			PQclear(result);
+			PQgetResult(entry->conn);	/* consume NULL result */
+		}
+	}
+
+	return allOk;
+}
+
+/* Wrapper for broadcasting commands */
+static bool
+BroadcastCmd(char const *sql)
+{
+	return BroadcastStmt(sql, PGRES_COMMAND_OK, NULL, NULL);
+}
+
+/* Wrapper for broadcasting statements */
+static bool
+BroadcastFunc(char const *sql)
+{
+	return BroadcastStmt(sql, PGRES_TUPLES_OK, NULL, NULL);
+}
+
+/* Callback for selecting maximal csn */
+static bool
+MaxCsnCB(PGresult *result, void *arg)
+{
+	char		   *resp;
+	CSN	   *max_csn = (CSN *) arg;
+	CSN		csn = 0;
+
+	resp = PQgetvalue(result, 0, 0);
+
+	if (resp == NULL || (*resp) == '\0' ||
+			sscanf(resp, UINT64_FORMAT, &csn) != 1)
+		return false;
+
+	if (*max_csn < csn)
+		*max_csn = csn;
+
+	return true;
+}
+
 /*
  * pgfdw_xact_callback --- cleanup at main-transaction end.
  *
@@ -944,6 +1268,104 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 	if (!xact_got_connection)
 		return;
 
+	/* Handle possible two-phase commit */
+	if (event == XACT_EVENT_PARALLEL_PRE_COMMIT || event == XACT_EVENT_PRE_COMMIT)
+	{
+		bool include_local_tx = false;
+
+		/* Should we take into account this node? */
+		if (TransactionIdIsValid(GetCurrentTransactionIdIfAny()))
+		{
+			include_local_tx = true;
+			fdwTransState->nparticipants += 1;
+		}
+
+		/* Switch to 2PC mode there were more than one participant */
+		if (UseCSNSnapshots && fdwTransState->nparticipants > 1)
+			fdwTransState->two_phase_commit = true;
+
+		/*
+		 * Data change to fast node on slow node, and slow node can see data change.
+		 * In order to implement above we should change code here.
+		 */
+		if (fdwTransState->two_phase_commit)
+		{
+			CSN max_csn = InProgressCSN;
+			CSN my_csn = InProgressCSN;
+			bool res;
+			char *sql;
+
+			fdwTransState->gid = psprintf("pgfdw:%lld:%llu:%d:%u:%d:%d",
+										  (long long) GetCurrentTimestamp(),
+										  (long long) GetSystemIdentifier(),
+										  MyProcPid,
+										  GetCurrentTransactionIdIfAny(),
+										  ++two_phase_xact_count,
+										  fdwTransState->nparticipants);
+
+			/* Broadcast PREPARE */
+			sql = psprintf("PREPARE TRANSACTION '%s'", fdwTransState->gid);
+			res = BroadcastCmd(sql);
+
+			if (IsolationUsesXactSnapshot())
+			{
+				if (!res)
+					goto error;
+
+				/* Broadcast pg_csn_snapshot_prepare() */
+				if (include_local_tx)
+					my_csn = CSNSnapshotPrepareCurrent();
+
+				sql = psprintf("SELECT pg_csn_snapshot_prepare('%s')",
+															fdwTransState->gid);
+				res = BroadcastStmt(sql, PGRES_TUPLES_OK, MaxCsnCB, &max_csn);
+				if (!res)
+					goto error;
+
+				/* select maximal global csn */
+				if (include_local_tx && my_csn > max_csn)
+					max_csn = my_csn;
+
+				/*
+				 * We should always notice local node to update the csn, so local can
+				 * see the change next transaction.
+				 */
+				if (include_local_tx)
+					CSNSnapshotAssignCurrent(max_csn);
+				else
+					/*
+					 * Read-only transactions haven't assigned xid csn. We only
+					 * increase the last csn value.
+					 */
+					GenerateCSN(false, max_csn);
+
+				sql = psprintf("SELECT pg_csn_snapshot_assign('%s',"UINT64_FORMAT")",
+								fdwTransState->gid, max_csn);
+				res = BroadcastFunc(sql);
+			}
+
+error:
+			if (!res)
+			{
+				sql = psprintf("ABORT PREPARED '%s'", fdwTransState->gid);
+				BroadcastCmd(sql);
+				elog(ERROR, "Failed to PREPARE transaction on remote node");
+			}
+
+			/*
+			 * Do not fall down. Consequent COMMIT event will clean thing up.
+			 */
+			return;
+		}
+	}
+
+	/* COMMIT open transaction of we were doing 2PC */
+	if (fdwTransState->two_phase_commit &&
+		(event == XACT_EVENT_PARALLEL_COMMIT || event == XACT_EVENT_COMMIT))
+	{
+		BroadcastCmd(psprintf("COMMIT PREPARED '%s'", fdwTransState->gid));
+	}
+
 	/*
 	 * Scan all connection cache entries to find open remote transactions, and
 	 * close them.
@@ -951,8 +1373,6 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 	hash_seq_init(&scan, ConnectionHash);
 	while ((entry = (ConnCacheEntry *) hash_seq_search(&scan)))
 	{
-		PGresult   *res;
-
 		/* Ignore cache entry if no open connection right now */
 		if (entry->conn == NULL)
 			continue;
@@ -967,6 +1387,7 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 			{
 				case XACT_EVENT_PARALLEL_PRE_COMMIT:
 				case XACT_EVENT_PRE_COMMIT:
+					Assert(!fdwTransState->two_phase_commit);
 
 					/*
 					 * If abort cleanup previously failed for this connection,
@@ -985,29 +1406,22 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 					do_sql_command(entry->conn, "COMMIT TRANSACTION");
 					entry->changing_xact_state = false;
 
-					/*
-					 * If there were any errors in subtransactions, and we
-					 * made prepared statements, do a DEALLOCATE ALL to make
-					 * sure we get rid of all prepared statements. This is
-					 * annoying and not terribly bulletproof, but it's
-					 * probably not worth trying harder.
-					 *
-					 * DEALLOCATE ALL only exists in 8.3 and later, so this
-					 * constrains how old a server postgres_fdw can
-					 * communicate with.  We intentionally ignore errors in
-					 * the DEALLOCATE, so that we can hobble along to some
-					 * extent with older servers (leaking prepared statements
-					 * as we go; but we don't really support update operations
-					 * pre-8.3 anyway).
-					 */
-					if (entry->have_prep_stmt && entry->have_error)
+					if (UseCSNSnapshots)
 					{
-						res = pgfdw_exec_query(entry->conn, "DEALLOCATE ALL",
-											   NULL);
-						PQclear(res);
+						CSN			csn = InvalidCSN;
+						PGresult	*res;
+
+						res = pgfdw_exec_query(entry->conn, "SELECT pg_current_csn()", NULL);
+						if (PQresultStatus(res) == PGRES_TUPLES_OK)
+						{
+							sscanf(PQgetvalue(res, 0, 0), "%lu", &csn);
+
+							if (csn != InvalidCSN)
+								GenerateCSN(false, csn);
+						}
 					}
-					entry->have_prep_stmt = false;
-					entry->have_error = false;
+					
+					deallocate_prepared_stmts(entry);
 					break;
 				case XACT_EVENT_PRE_PREPARE:
 
@@ -1026,6 +1440,11 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 					break;
 				case XACT_EVENT_PARALLEL_COMMIT:
 				case XACT_EVENT_COMMIT:
+					if (fdwTransState->two_phase_commit)
+						deallocate_prepared_stmts(entry);
+					else /* Pre-commit should have closed the open transaction */
+						elog(ERROR, "missed cleaning up connection during pre-commit");
+					break;
 				case XACT_EVENT_PREPARE:
 					/* Pre-commit should have closed the open transaction */
 					elog(ERROR, "missed cleaning up connection during pre-commit");
@@ -1077,6 +1496,38 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 
 	/* Also reset cursor numbering for next transaction */
 	cursor_number = 0;
+
+	/* Reset fdwTransState */
+	memset(fdwTransState, '\0', sizeof(FdwTransactionState));
+}
+
+/*
+ * If there were any errors in subtransactions, and we
+ * made prepared statements, do a DEALLOCATE ALL to make
+ * sure we get rid of all prepared statements. This is
+ * annoying and not terribly bulletproof, but it's
+ * probably not worth trying harder.
+ *
+ * DEALLOCATE ALL only exists in 8.3 and later, so this
+ * constrains how old a server postgres_fdw can
+ * communicate with.  We intentionally ignore errors in
+ * the DEALLOCATE, so that we can hobble along to some
+ * extent with older servers (leaking prepared statements
+ * as we go; but we don't really support update operations
+ * pre-8.3 anyway).
+ */
+static void
+deallocate_prepared_stmts(ConnCacheEntry *entry)
+{
+	PGresult   *res;
+
+	if (entry->have_prep_stmt && entry->have_error)
+	{
+		res = PQexec(entry->conn, "DEALLOCATE ALL");
+		PQclear(res);
+	}
+	entry->have_prep_stmt = false;
+	entry->have_error = false;
 }
 
 /*
@@ -2247,4 +2698,44 @@ disconnect_cached_connections(Oid serverid)
 	}
 
 	return result;
+}
+
+/*
+ * GetConnectionHashIterator
+ *		Initialize a hash sequence scan for the connection cache
+ *
+ * This function allows external callers (e.g., postgres_connections)
+ * to iterate over the connection cache. Returns true if the connection
+ * cache exists and the iterator was initialized, false otherwise.
+ *
+ * The caller should use hash_seq_search() to iterate through the entries.
+ */
+bool
+GetConnectionHashIterator(HASH_SEQ_STATUS *scan)
+{
+	if (!ConnectionHash)
+		return false;
+
+	hash_seq_init(scan, ConnectionHash);
+	return true;
+}
+
+/*
+ * GetConnCacheEntryInfo
+ *		Extract connection information from a ConnCacheEntry.
+ *
+ * Returns true if the entry has a valid connection, false otherwise.
+ * If true, fills in serverid and remote_backend_pid.
+ */
+bool
+GetConnCacheEntryInfo(void *entry_ptr, Oid *serverid, int *remote_backend_pid)
+{
+	ConnCacheEntry *entry = (ConnCacheEntry *) entry_ptr;
+
+	if (entry->conn == NULL)
+		return false;
+
+	*serverid = entry->serverid;
+	*remote_backend_pid = PQbackendPID(entry->conn);
+	return true;
 }

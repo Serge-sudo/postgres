@@ -285,7 +285,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 		AlterDatabaseStmt AlterDatabaseSetStmt AlterDomainStmt AlterEnumStmt
 		AlterFdwStmt AlterForeignServerStmt AlterGroupStmt
 		AlterObjectDependsStmt AlterObjectSchemaStmt AlterOwnerStmt
-		AlterOperatorStmt AlterTypeStmt AlterSeqStmt AlterSystemStmt AlterTableStmt
+		AlterOperatorStmt AlterShardGroupStmt AlterTypeStmt AlterSeqStmt AlterSystemStmt AlterTableStmt
 		AlterTblSpcStmt AlterExtensionStmt AlterExtensionContentsStmt
 		AlterCompositeTypeStmt AlterUserMappingStmt
 		AlterRoleStmt AlterRoleSetStmt AlterPolicyStmt AlterStatsStmt
@@ -294,7 +294,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 		ConstraintsSetStmt CopyStmt CreateAsStmt CreateCastStmt
 		CreateDomainStmt CreateExtensionStmt CreateGroupStmt CreateOpClassStmt
 		CreateOpFamilyStmt AlterOpFamilyStmt CreatePLangStmt
-		CreateSchemaStmt CreateSeqStmt CreateStmt CreateStatsStmt CreateTableSpaceStmt
+		CreateSchemaStmt CreateSeqStmt CreateShardGroupStmt CreateStmt CreateStatsStmt CreateTableSpaceStmt
 		CreateFdwStmt CreateForeignServerStmt CreateForeignTableStmt
 		CreateAssertionStmt CreateTransformStmt CreateTrigStmt CreateEventTrigStmt
 		CreateUserStmt CreateUserMappingStmt CreateRoleStmt CreatePolicyStmt
@@ -607,7 +607,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 %type <list>	constraints_set_list
 %type <boolean> constraints_set_mode
-%type <str>		OptTableSpace OptConsTableSpace
+%type <str>		OptTableSpace OptConsTableSpace OptShardGroup
 %type <rolespec> OptTableSpaceOwner
 %type <ival>	opt_check_option
 
@@ -641,7 +641,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <boolean> opt_if_not_exists
 %type <boolean> opt_unique_null_treatment
 %type <ival>	generated_when override_kind
-%type <partspec>	PartitionSpec OptPartitionSpec
+%type <partspec>	PartitionSpec OptPartitionSpec DistributeSpec OptDistributeSpec
 %type <partelem>	part_elem
 %type <list>		part_params
 %type <partboundspec> PartitionBoundSpec
@@ -720,7 +720,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 	DATA_P DATABASE DAY_P DEALLOCATE DEC DECIMAL_P DECLARE DEFAULT DEFAULTS
 	DEFERRABLE DEFERRED DEFINER DELETE_P DELIMITER DELIMITERS DEPENDS DEPTH DESC
-	DETACH DICTIONARY DISABLE_P DISCARD DISTINCT DO DOCUMENT_P DOMAIN_P
+	DETACH DICTIONARY DISABLE_P DISCARD DISTRIBUTED DISTINCT DO DOCUMENT_P DOMAIN_P
 	DOUBLE_P DROP
 
 	EACH ELSE EMPTY_P ENABLE_P ENCODING ENCRYPTED END_P ENUM_P ERROR_P ESCAPE
@@ -748,7 +748,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	LEADING LEAKPROOF LEAST LEFT LEVEL LIKE LIMIT LISTEN LOAD LOCAL
 	LOCALTIME LOCALTIMESTAMP LOCATION LOCK_P LOCKED LOGGED
 
-	MAPPING MATCH MATCHED MATERIALIZED MAXVALUE MERGE MERGE_ACTION METHOD
+	MAPPING MATCH MATCHED MATERIALIZED MAXVALUE MEMBER MERGE MERGE_ACTION METHOD
 	MINUTE_P MINVALUE MODE MONTH_P MOVE
 
 	NAME_P NAMES NATIONAL NATURAL NCHAR NESTED NEW NEXT NFC NFD NFKC NFKD NO
@@ -769,12 +769,12 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 	RANGE READ REAL REASSIGN RECHECK RECURSIVE REF_P REFERENCES REFERENCING
 	REFRESH REINDEX RELATIVE_P RELEASE RENAME REPEATABLE REPLACE REPLICA
-	RESET RESTART RESTRICT RETURN RETURNING RETURNS REVOKE RIGHT ROLE ROLLBACK ROLLUP
+	RESET RESHARD RESTART RESTRICT RETURN RETURNING RETURNS REVOKE RIGHT ROLE ROLLBACK ROLLUP
 	ROUTINE ROUTINES ROW ROWS RULE
 
 	SAVEPOINT SCALAR SCHEMA SCHEMAS SCROLL SEARCH SECOND_P SECURITY SELECT
 	SEQUENCE SEQUENCES
-	SERIALIZABLE SERVER SESSION SESSION_USER SET SETS SETOF SHARE SHOW
+	SERIALIZABLE SERVER SESSION SESSION_USER SET SETS SETOF SHARD SHARE SHOW
 	SIMILAR SIMPLE SKIP SMALLINT SNAPSHOT SOME SOURCE SQL_P STABLE STANDALONE_P
 	START STATEMENT STATISTICS STDIN STDOUT STORAGE STORED STRICT_P STRING_P STRIP_P
 	SUBSCRIPTION SUBSTRING SUPPORT SYMMETRIC SYSID SYSTEM_P SYSTEM_USER
@@ -790,7 +790,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	VACUUM VALID VALIDATE VALIDATOR VALUE_P VALUES VARCHAR VARIADIC VARYING
 	VERBOSE VERSION_P VIEW VIEWS VOLATILE
 
-	WHEN WHERE WHITESPACE_P WINDOW WITH WITHIN WITHOUT WORK WRAPPER WRITE
+	WHEN WHERE WHITESPACE_P WINDOW WITH WITHIN WITHOUT WORK WORLDWIDE WRAPPER WRITE
 
 	XML_P XMLATTRIBUTES XMLCONCAT XMLELEMENT XMLEXISTS XMLFOREST XMLNAMESPACES
 	XMLPARSE XMLPI XMLROOT XMLSERIALIZE XMLTABLE
@@ -1015,6 +1015,7 @@ stmt:
 			| AlterObjectSchemaStmt
 			| AlterOwnerStmt
 			| AlterOperatorStmt
+			| AlterShardGroupStmt
 			| AlterTypeStmt
 			| AlterPolicyStmt
 			| AlterSeqStmt
@@ -1059,6 +1060,7 @@ stmt:
 			| CreatePLangStmt
 			| CreateSchemaStmt
 			| CreateSeqStmt
+			| CreateShardGroupStmt
 			| CreateStmt
 			| CreateSubscriptionStmt
 			| CreateStatsStmt
@@ -3567,7 +3569,7 @@ copy_generic_opt_arg_list_item:
 
 CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 			OptInherit OptPartitionSpec table_access_method_clause OptWith
-			OnCommitOption OptTableSpace
+			OnCommitOption OptTableSpace OptDistributeSpec OptShardGroup
 				{
 					CreateStmt *n = makeNode(CreateStmt);
 
@@ -3583,11 +3585,15 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $12;
 					n->tablespacename = $13;
 					n->if_not_exists = false;
+					n->is_distributed = ($14 != NULL);
+					n->partspec = ($14 != NULL) ? $14 : n->partspec;  /* DISTRIBUTED BY overrides PARTITION BY */
+					n->is_worldwide = false;
+					n->shardgroup = $15;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE IF_P NOT EXISTS qualified_name '('
 			OptTableElementList ')' OptInherit OptPartitionSpec table_access_method_clause
-			OptWith OnCommitOption OptTableSpace
+			OptWith OnCommitOption OptTableSpace OptDistributeSpec OptShardGroup
 				{
 					CreateStmt *n = makeNode(CreateStmt);
 
@@ -3603,6 +3609,10 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $15;
 					n->tablespacename = $16;
 					n->if_not_exists = true;
+					n->is_distributed = ($17 != NULL);
+					n->partspec = ($17 != NULL) ? $17 : n->partspec;  /* DISTRIBUTED BY overrides PARTITION BY */
+					n->is_worldwide = false;
+					n->shardgroup = $18;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE qualified_name OF any_name
@@ -3624,6 +3634,9 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $11;
 					n->tablespacename = $12;
 					n->if_not_exists = false;
+					n->is_distributed = false;
+					n->is_worldwide = false;
+					n->shardgroup = NULL;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE IF_P NOT EXISTS qualified_name OF any_name
@@ -3645,6 +3658,9 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $14;
 					n->tablespacename = $15;
 					n->if_not_exists = true;
+					n->is_distributed = false;
+					n->is_worldwide = false;
+					n->shardgroup = NULL;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE qualified_name PARTITION OF qualified_name
@@ -3666,6 +3682,9 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $13;
 					n->tablespacename = $14;
 					n->if_not_exists = false;
+					n->is_distributed = false;
+					n->is_worldwide = false;
+					n->shardgroup = NULL;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE IF_P NOT EXISTS qualified_name PARTITION OF
@@ -3687,6 +3706,54 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $16;
 					n->tablespacename = $17;
 					n->if_not_exists = true;
+					n->is_distributed = false;
+					n->is_worldwide = false;
+					n->shardgroup = NULL;
+					$$ = (Node *) n;
+				}
+		| CREATE OptTemp WORLDWIDE TABLE qualified_name '(' OptTableElementList ')'
+			OptInherit table_access_method_clause OptWith OnCommitOption OptTableSpace OptShardGroup
+				{
+					CreateStmt *n = makeNode(CreateStmt);
+
+					$5->relpersistence = $2;
+					n->relation = $5;
+					n->tableElts = $7;
+					n->inhRelations = $9;
+					n->partspec = NULL;
+					n->ofTypename = NULL;
+					n->constraints = NIL;
+					n->accessMethod = $10;
+					n->options = $11;
+					n->oncommit = $12;
+					n->tablespacename = $13;
+					n->if_not_exists = false;
+					n->is_distributed = false;
+					n->is_worldwide = true;
+					n->shardgroup = $14;
+					$$ = (Node *) n;
+				}
+		| CREATE OptTemp WORLDWIDE TABLE IF_P NOT EXISTS qualified_name '('
+			OptTableElementList ')' OptInherit table_access_method_clause OptWith
+			OnCommitOption OptTableSpace OptShardGroup
+				{
+					CreateStmt *n = makeNode(CreateStmt);
+
+					$8->relpersistence = $2;
+					n->relation = $8;
+					n->tableElts = $10;
+					n->inhRelations = $12;
+					n->partspec = NULL;
+					n->ofTypename = NULL;
+					n->constraints = NIL;
+					n->accessMethod = $13;
+					n->options = $14;
+					n->oncommit = $15;
+					n->tablespacename = $16;
+					n->if_not_exists = true;
+					n->is_distributed = false;
+					n->is_worldwide = true;
+					n->shardgroup = $17;
 					$$ = (Node *) n;
 				}
 		;
@@ -4564,6 +4631,27 @@ OnCommitOption:  ON COMMIT DROP				{ $$ = ONCOMMIT_DROP; }
 		;
 
 OptTableSpace:   TABLESPACE name					{ $$ = $2; }
+			| /*EMPTY*/								{ $$ = NULL; }
+		;
+
+/* Optional distribution specification */
+OptDistributeSpec: DistributeSpec	{ $$ = $1; }
+			| /*EMPTY*/				{ $$ = NULL; }
+		;
+
+DistributeSpec: DISTRIBUTED BY ColId '(' part_params ')'
+				{
+					PartitionSpec *n = makeNode(PartitionSpec);
+
+					n->strategy = parsePartitionStrategy($3);
+					n->partParams = $5;
+					n->location = @1;
+
+					$$ = n;
+				}
+		;
+
+OptShardGroup: SHARD GROUP_P name					{ $$ = $3; }
 			| /*EMPTY*/								{ $$ = NULL; }
 		;
 
@@ -5555,7 +5643,7 @@ AlterForeignServerStmt: ALTER SERVER name foreign_server_version alter_generic_o
 CreateForeignTableStmt:
 		CREATE FOREIGN TABLE qualified_name
 			'(' OptTableElementList ')'
-			OptInherit SERVER name create_generic_options
+			OptInherit SERVER name create_generic_options OptShardGroup
 				{
 					CreateForeignTableStmt *n = makeNode(CreateForeignTableStmt);
 
@@ -5572,11 +5660,12 @@ CreateForeignTableStmt:
 					/* FDW-specific data */
 					n->servername = $10;
 					n->options = $11;
+					n->base.shardgroup = $12;
 					$$ = (Node *) n;
 				}
 		| CREATE FOREIGN TABLE IF_P NOT EXISTS qualified_name
 			'(' OptTableElementList ')'
-			OptInherit SERVER name create_generic_options
+			OptInherit SERVER name create_generic_options OptShardGroup
 				{
 					CreateForeignTableStmt *n = makeNode(CreateForeignTableStmt);
 
@@ -5593,6 +5682,7 @@ CreateForeignTableStmt:
 					/* FDW-specific data */
 					n->servername = $13;
 					n->options = $14;
+					n->base.shardgroup = $15;
 					$$ = (Node *) n;
 				}
 		| CREATE FOREIGN TABLE qualified_name
@@ -6986,6 +7076,7 @@ drop_type_name:
 			| PUBLICATION							{ $$ = OBJECT_PUBLICATION; }
 			| SCHEMA								{ $$ = OBJECT_SCHEMA; }
 			| SERVER								{ $$ = OBJECT_FOREIGN_SERVER; }
+			| SHARD GROUP_P							{ $$ = OBJECT_SHARD_GROUP; }
 		;
 
 /* object types attached to a table */
@@ -11371,6 +11462,15 @@ AlterDatabaseStmt:
 														(Node *) makeString($6), @6));
 					$$ = (Node *) n;
 				 }
+			| ALTER DATABASE name SET DEFAULT SHARD GROUP_P name
+				 {
+					AlterDatabaseStmt *n = makeNode(AlterDatabaseStmt);
+
+					n->dbname = $3;
+					n->options = list_make1(makeDefElem("shardgroup",
+														(Node *) makeString($8), @8));
+					$$ = (Node *) n;
+				 }
 			| ALTER DATABASE name REFRESH COLLATION VERSION_P
 				 {
 					AlterDatabaseRefreshCollStmt *n = makeNode(AlterDatabaseRefreshCollStmt);
@@ -11387,6 +11487,147 @@ AlterDatabaseSetStmt:
 
 					n->dbname = $3;
 					n->setstmt = $4;
+					$$ = (Node *) n;
+				}
+		;
+
+
+/*****************************************************************************
+ *
+ *		Sharding DDL statements
+ *
+ *****************************************************************************/
+
+/*****************************************************************************
+ *		CREATE SHARD GROUP
+ *****************************************************************************/
+
+CreateShardGroupStmt:
+			CREATE SHARD GROUP_P name
+				{
+					CreateShardGroupStmt *n = makeNode(CreateShardGroupStmt);
+
+					n->sgname = $4;
+					n->options = NIL;
+					n->if_not_exists = false;
+					$$ = (Node *) n;
+				}
+			| CREATE SHARD GROUP_P IF_P NOT EXISTS name
+				{
+					CreateShardGroupStmt *n = makeNode(CreateShardGroupStmt);
+
+					n->sgname = $7;
+					n->options = NIL;
+					n->if_not_exists = true;
+					$$ = (Node *) n;
+				}
+			| CREATE SHARD GROUP_P name WITH '(' generic_option_list ')'
+				{
+					CreateShardGroupStmt *n = makeNode(CreateShardGroupStmt);
+
+					n->sgname = $4;
+					n->options = $7;
+					n->if_not_exists = false;
+					$$ = (Node *) n;
+				}
+			| CREATE SHARD GROUP_P IF_P NOT EXISTS name WITH '(' generic_option_list ')'
+				{
+					CreateShardGroupStmt *n = makeNode(CreateShardGroupStmt);
+
+					n->sgname = $7;
+					n->options = $10;
+					n->if_not_exists = true;
+					$$ = (Node *) n;
+				}
+		;
+
+/*****************************************************************************
+ *		ALTER SHARD GROUP
+ *****************************************************************************/
+
+AlterShardGroupStmt:
+			ALTER SHARD GROUP_P name ADD_P MEMBER name
+				{
+					AlterShardGroupStmt *n = makeNode(AlterShardGroupStmt);
+
+					n->sgname = $4;
+					n->action = "ADD";
+					n->servername = $7;
+					n->options = NIL;
+					n->if_not_exists = false;
+					n->skip_sync = false;
+					$$ = (Node *) n;
+				}
+			| ALTER SHARD GROUP_P name ADD_P MEMBER IF_P NOT EXISTS name
+				{
+					AlterShardGroupStmt *n = makeNode(AlterShardGroupStmt);
+
+					n->sgname = $4;
+					n->action = "ADD";
+					n->servername = $10;
+					n->options = NIL;
+					n->if_not_exists = true;
+					n->skip_sync = false;
+					$$ = (Node *) n;
+				}
+			| ALTER SHARD GROUP_P name ADD_P MEMBER name WITH '(' generic_option_list ')'
+				{
+					AlterShardGroupStmt *n = makeNode(AlterShardGroupStmt);
+
+					n->sgname = $4;
+					n->action = "ADD";
+					n->servername = $7;
+					n->options = $10;
+					n->if_not_exists = false;
+					n->skip_sync = false;
+					$$ = (Node *) n;
+				}
+			| ALTER SHARD GROUP_P name ADD_P MEMBER IF_P NOT EXISTS name WITH '(' generic_option_list ')'
+				{
+					AlterShardGroupStmt *n = makeNode(AlterShardGroupStmt);
+
+					n->sgname = $4;
+					n->action = "ADD";
+					n->servername = $10;
+					n->options = $13;
+					n->if_not_exists = true;
+					n->skip_sync = false;
+					$$ = (Node *) n;
+				}
+			| ALTER SHARD GROUP_P name DROP MEMBER name
+				{
+					AlterShardGroupStmt *n = makeNode(AlterShardGroupStmt);
+
+					n->sgname = $4;
+					n->action = "DROP";
+					n->servername = $7;
+					n->options = NIL;
+					n->if_not_exists = false;
+					n->skip_sync = false;
+					$$ = (Node *) n;
+				}
+			| ALTER SHARD GROUP_P name RESHARD
+				{
+					AlterShardGroupStmt *n = makeNode(AlterShardGroupStmt);
+
+					n->sgname = $4;
+					n->action = "RESHARD";
+					n->servername = NULL;
+					n->options = NIL;
+					n->if_not_exists = false;
+					n->skip_sync = false;
+					$$ = (Node *) n;
+				}
+			| ALTER SHARD GROUP_P name DETACH name
+				{
+					AlterShardGroupStmt *n = makeNode(AlterShardGroupStmt);
+
+					n->sgname = $4;
+					n->action = "DETACH";
+					n->servername = $6;
+					n->options = NIL;
+					n->if_not_exists = false;
+					n->skip_sync = false;
 					$$ = (Node *) n;
 				}
 		;
@@ -17593,6 +17834,7 @@ unreserved_keyword:
 			| DICTIONARY
 			| DISABLE_P
 			| DISCARD
+			| DISTRIBUTED
 			| DOCUMENT_P
 			| DOMAIN_P
 			| DOUBLE_P
@@ -17674,6 +17916,7 @@ unreserved_keyword:
 			| MATCHED
 			| MATERIALIZED
 			| MAXVALUE
+			| MEMBER
 			| MERGE
 			| METHOD
 			| MINUTE_P
@@ -17751,6 +17994,7 @@ unreserved_keyword:
 			| REPLACE
 			| REPLICA
 			| RESET
+			| RESHARD
 			| RESTART
 			| RESTRICT
 			| RETURN
@@ -17778,6 +18022,7 @@ unreserved_keyword:
 			| SESSION
 			| SET
 			| SETS
+			| SHARD
 			| SHARE
 			| SHOW
 			| SIMPLE
@@ -17840,6 +18085,7 @@ unreserved_keyword:
 			| WITHIN
 			| WITHOUT
 			| WORK
+			| WORLDWIDE
 			| WRAPPER
 			| WRITE
 			| XML_P
@@ -18167,6 +18413,7 @@ bare_label_keyword:
 			| DISABLE_P
 			| DISCARD
 			| DISTINCT
+			| DISTRIBUTED
 			| DO
 			| DOCUMENT_P
 			| DOMAIN_P
@@ -18286,6 +18533,7 @@ bare_label_keyword:
 			| MATCHED
 			| MATERIALIZED
 			| MAXVALUE
+			| MEMBER
 			| MERGE
 			| MERGE_ACTION
 			| METHOD
@@ -18380,6 +18628,7 @@ bare_label_keyword:
 			| REPLACE
 			| REPLICA
 			| RESET
+			| RESHARD
 			| RESTART
 			| RESTRICT
 			| RETURN
@@ -18411,6 +18660,7 @@ bare_label_keyword:
 			| SET
 			| SETOF
 			| SETS
+			| SHARD
 			| SHARE
 			| SHOW
 			| SIMILAR
@@ -18493,6 +18743,7 @@ bare_label_keyword:
 			| WHEN
 			| WHITESPACE_P
 			| WORK
+			| WORLDWIDE
 			| WRAPPER
 			| WRITE
 			| XML_P

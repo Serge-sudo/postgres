@@ -23,6 +23,8 @@
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/varlena.h"
+#include "storage/ipc.h"
+#include "miscadmin.h"
 
 /*
  * Describes the valid options for objects that this wrapper uses.
@@ -50,6 +52,15 @@ static PQconninfoOption *libpq_options;
  * GUC parameters
  */
 char	   *pgfdw_application_name = NULL;
+
+/*
+ * Shared memory hooks
+ */
+static shmem_request_hook_type prev_shmem_request_hook = NULL;
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+
+static void postgres_fdw_shmem_request(void);
+static void postgres_fdw_shmem_startup(void);
 
 /*
  * Helper functions
@@ -275,6 +286,10 @@ InitPgFdwOptions(void)
 		{"parallel_abort", ForeignServerRelationId, false},
 		{"keep_connections", ForeignServerRelationId, false},
 		{"password_required", UserMappingRelationId, false},
+
+		/* connection multiplexer options */
+		{"mux_port", ForeignServerRelationId, false},
+		{"mux_host", ForeignServerRelationId, false},
 
 		/* sampling is available on both server and table */
 		{"analyze_sampling", ForeignServerRelationId, false},
@@ -562,6 +577,32 @@ process_pgfdw_appname(const char *appname)
 }
 
 /*
+ * Shared memory request hook
+ */
+static void
+postgres_fdw_shmem_request(void)
+{
+	if (prev_shmem_request_hook)
+		prev_shmem_request_hook();
+
+	/* Request shared memory space for FDW connection tracking */
+	RequestAddinShmemSpace(FdwConnShmemSize());
+}
+
+/*
+ * Shared memory startup hook
+ */
+static void
+postgres_fdw_shmem_startup(void)
+{
+	if (prev_shmem_startup_hook)
+		prev_shmem_startup_hook();
+
+	/* Initialize FDW connection tracking shared memory */
+	FdwConnShmemInit();
+}
+
+/*
  * Module load callback
  */
 void
@@ -586,5 +627,22 @@ _PG_init(void)
 							   NULL,
 							   NULL);
 
+	DefineCustomBoolVariable("postgres_fdw.use_csn_snapshots",
+		"Use global snapshots for FDW transactions", NULL,
+		&UseCSNSnapshots, false, PGC_USERSET, 0, NULL,
+		NULL, NULL);
 	MarkGUCPrefixReserved("postgres_fdw");
+
+	/*
+	 * Install hooks for shared memory request and initialization
+	 * This is needed for distributed deadlock detection to track FDW connections
+	 */
+	prev_shmem_request_hook = shmem_request_hook;
+	shmem_request_hook = postgres_fdw_shmem_request;
+	
+	prev_shmem_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = postgres_fdw_shmem_startup;
+
+	/* Register backend exit callback */
+	FdwConnShmemOnProcExit();
 }

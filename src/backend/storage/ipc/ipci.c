@@ -16,11 +16,16 @@
 
 #include "access/clog.h"
 #include "access/commit_ts.h"
+#include "access/csn_log.h"
+#include "access/csn_snapshot.h"
+#include "access/heapam.h"
 #include "access/multixact.h"
 #include "access/nbtree.h"
 #include "access/subtrans.h"
 #include "access/syncscan.h"
 #include "access/transam.h"
+#include "access/csn_log.h"
+#include "access/csn_snapshot.h"
 #include "access/twophase.h"
 #include "access/xlogprefetcher.h"
 #include "access/xlogrecovery.h"
@@ -30,6 +35,7 @@
 #include "postmaster/autovacuum.h"
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/bgwriter.h"
+#include "postmaster/conn_multiplexer.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/walsummarizer.h"
 #include "replication/logicallauncher.h"
@@ -125,6 +131,8 @@ CalculateShmemSize(int *num_semaphores)
 	size = add_size(size, XLOGShmemSize());
 	size = add_size(size, XLogRecoveryShmemSize());
 	size = add_size(size, CLOGShmemSize());
+	size = add_size(size, CSNLogShmemSize());
+	size = add_size(size, CSNSnapshotShmemSize());
 	size = add_size(size, CommitTsShmemSize());
 	size = add_size(size, SUBTRANSShmemSize());
 	size = add_size(size, TwoPhaseShmemSize());
@@ -148,10 +156,12 @@ CalculateShmemSize(int *num_semaphores)
 	size = add_size(size, BTreeShmemSize());
 	size = add_size(size, SyncScanShmemSize());
 	size = add_size(size, AsyncShmemSize());
+	size = add_size(size, CSNSnapshotShmemSize());
 	size = add_size(size, StatsShmemSize());
 	size = add_size(size, WaitEventCustomShmemSize());
 	size = add_size(size, InjectionPointShmemSize());
 	size = add_size(size, SlotSyncShmemSize());
+	size = add_size(size, ConnMuxShmemSize());
 #ifdef EXEC_BACKEND
 	size = add_size(size, ShmemBackendArraySize());
 #endif
@@ -302,6 +312,8 @@ CreateOrAttachShmemStructs(void)
 	XLogPrefetchShmemInit();
 	XLogRecoveryShmemInit();
 	CLOGShmemInit();
+	CSNLogShmemInit();
+	CSNSnapshotShmemInit();
 	CommitTsShmemInit();
 	SUBTRANSShmemInit();
 	MultiXactShmemInit();
@@ -354,9 +366,11 @@ CreateOrAttachShmemStructs(void)
 	BTreeShmemInit();
 	SyncScanShmemInit();
 	AsyncShmemInit();
+	CSNSnapshotShmemInit();
 	StatsShmemInit();
 	WaitEventCustomShmemInit();
 	InjectionPointShmemInit();
+	ConnMuxShmemInit();
 }
 
 /*

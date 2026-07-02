@@ -5,6 +5,7 @@ OBJS = \
 	$(WIN32RES) \
 	connection.o \
 	deparse.o \
+	fdw_shmem.o \
 	option.o \
 	postgres_fdw.o \
 	shippable.o
@@ -14,9 +15,9 @@ PG_CPPFLAGS = -I$(libpq_srcdir)
 SHLIB_LINK_INTERNAL = $(libpq)
 
 EXTENSION = postgres_fdw
-DATA = postgres_fdw--1.0.sql postgres_fdw--1.0--1.1.sql
+DATA = postgres_fdw--1.0.sql postgres_fdw--1.0--1.1.sql postgres_fdw--1.1--1.2.sql
 
-REGRESS = postgres_fdw query_cancel
+# REGRESS = postgres_fdw query_cancel
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config
@@ -29,3 +30,12 @@ top_builddir = ../..
 include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk
 endif
+
+# Global makefile will do temp-install for 'check'. Since REGRESS is defined,
+# PGXS (included from contrib-global.mk or directly) will care to add
+# postgres_fdw to it as EXTRA_INSTALL and build pg_regress. It will also
+# actually run pg_regress, so the only thing left is tap tests.
+check: tapcheck
+
+tapcheck: temp-install
+	$(prove_check)

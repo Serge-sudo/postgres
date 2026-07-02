@@ -1,0 +1,257 @@
+--
+-- Test sharding DDL syntax
+--
+-- These tests verify that the basic sharding DDL parses correctly.
+-- Full implementation is TODO.
+--
+CREATE EXTENSION IF NOT EXISTS postgres_fdw;
+SELECT * FROM pg_shardgroups;
+ oid | sgname | sgowner | sgoptions 
+-----+--------+---------+-----------
+(0 rows)
+
+SELECT * FROM pg_shardmembers;
+ oid | sgid | srvid | smpriority | smstate | smoptions 
+-----+------+-------+------------+---------+-----------
+(0 rows)
+
+\d+ pg_shardgroups
+                              Table "pg_catalog.pg_shardgroups"
+  Column   |  Type  | Collation | Nullable | Default | Storage  | Stats target | Description 
+-----------+--------+-----------+----------+---------+----------+--------------+-------------
+ oid       | oid    |           | not null |         | plain    |              | 
+ sgname    | name   |           | not null |         | plain    |              | 
+ sgowner   | oid    |           | not null |         | plain    |              | 
+ sgoptions | text[] | C         |          |         | extended |              | 
+Indexes:
+    "pg_shardgroups_oid_index" PRIMARY KEY, btree (oid)
+    "pg_shardgroups_name_index" UNIQUE CONSTRAINT, btree (sgname)
+
+\d+ pg_shardmembers
+                              Table "pg_catalog.pg_shardmembers"
+   Column   |  Type   | Collation | Nullable | Default | Storage  | Stats target | Description 
+------------+---------+-----------+----------+---------+----------+--------------+-------------
+ oid        | oid     |           | not null |         | plain    |              | 
+ sgid       | oid     |           | not null |         | plain    |              | 
+ srvid      | oid     |           | not null |         | plain    |              | 
+ smpriority | integer |           | not null |         | plain    |              | 
+ smstate    | "char"  |           | not null |         | plain    |              | 
+ smoptions  | text[]  | C         |          |         | extended |              | 
+Indexes:
+    "pg_shardmembers_oid_index" PRIMARY KEY, btree (oid)
+    "pg_shardmembers_sgid_srvid_index" UNIQUE CONSTRAINT, btree (sgid, srvid)
+
+-- CREATE SHARD GROUP 
+CREATE SHARD GROUP sg_test;
+SELECT * FROM pg_shardgroups;
+  oid  | sgname  | sgowner | sgoptions 
+-------+---------+---------+-----------
+ 16491 | sg_test |      10 | 
+(1 row)
+
+-- -- Test error message
+CREATE SHARD GROUP sg_test;
+ERROR:  shard group "sg_test" already exists
+SELECT * FROM pg_shardgroups;
+  oid  | sgname  | sgowner | sgoptions 
+-------+---------+---------+-----------
+ 16491 | sg_test |      10 | 
+(1 row)
+
+ALTER DATABASE regression SET DEFAULT SHARD GROUP sg_test;
+SELECT * FROM pg_database;
+  oid  |  datname   | datdba | encoding | datlocprovider | datistemplate | datallowconn | dathasloginevt | datconnlimit | datfrozenxid | datminmxid | dattablespace | datshardgroup | datcollate | datctype | datlocale | daticurules | datcollversion |            datacl             
+-------+------------+--------+----------+----------------+---------------+--------------+----------------+--------------+--------------+------------+---------------+---------------+------------+----------+-----------+-------------+----------------+-------------------------------
+     5 | postgres   |     10 |        6 | c              | f             | t            | f              |           -1 |          734 |          1 |          1663 |             0 | C.UTF-8    | C.UTF-8  |           |             |                | 
+     1 | template1  |     10 |        6 | c              | t             | t            | f              |           -1 |          734 |          1 |          1663 |             0 | C.UTF-8    | C.UTF-8  |           |             |                | {=c/runner,runner=CTc/runner}
+     4 | template0  |     10 |        6 | c              | t             | f            | f              |           -1 |          734 |          1 |          1663 |             0 | C.UTF-8    | C.UTF-8  |           |             |                | {=c/runner,runner=CTc/runner}
+ 16384 | testdb     |     10 |        6 | c              | f             | t            | f              |           -1 |          734 |          1 |          1663 |         16450 | C.UTF-8    | C.UTF-8  |           |             |                | 
+ 16483 | regression |     10 |        6 | c              | f             | t            | f              |           -1 |          734 |          1 |          1663 |         16491 | C.UTF-8    | C.UTF-8  |           |             |                | 
+(5 rows)
+
+-- ALTER DATABASE ... SET SHARD GROUP
+CREATE SERVER server1
+    FOREIGN DATA WRAPPER postgres_fdw
+    OPTIONS (host 'localhost', dbname 'regression', port '5432');
+ALTER SHARD GROUP sg_test ADD MEMBER server1;
+SELECT * FROM pg_foreign_server;
+  oid  | srvname | srvowner | srvfdw | srvtype | srvversion | srvacl |                  srvoptions                  
+-------+---------+----------+--------+---------+------------+--------+----------------------------------------------
+ 16492 | server1 |       10 |  16487 |         |            |        | {host=localhost,dbname=regression,port=5432}
+(1 row)
+
+SELECT * FROM pg_shardmembers;
+  oid  | sgid  | srvid | smpriority | smstate | smoptions 
+-------+-------+-------+------------+---------+-----------
+ 16493 | 16491 | 16492 |        100 | u       | 
+(1 row)
+
+DROP SERVER server1;
+ERROR:  cannot drop server server1 because other objects depend on it
+DETAIL:  shard group member server1 in sg_test depends on server server1
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+ALTER SHARD GROUP sg_test DROP MEMBER server1;
+SELECT * FROM pg_shardmembers;
+ oid | sgid | srvid | smpriority | smstate | smoptions 
+-----+------+-------+------------+---------+-----------
+(0 rows)
+
+ALTER SHARD GROUP sg_test ADD MEMBER server1;
+SELECT * FROM pg_foreign_server;
+  oid  | srvname | srvowner | srvfdw | srvtype | srvversion | srvacl |                  srvoptions                  
+-------+---------+----------+--------+---------+------------+--------+----------------------------------------------
+ 16492 | server1 |       10 |  16487 |         |            |        | {host=localhost,dbname=regression,port=5432}
+(1 row)
+
+-- check default shard group
+CREATE WORLDWIDE TABLE test_t_worldwide (a int, b int);
+NOTICE:  WORLDWIDE table not yet fully implemented
+DETAIL:  Table will be created as worldwide table.
+NOTICE:  table "public.test_t_worldwide" should be created on shard member "server1"
+DETAIL:  Execute: CREATE TABLE IF NOT EXISTS public.test_t_worldwide (a integer, b integer)
+SELECT * FROM pg_class WHERE relname like 'test_t_%';
+  oid  |     relname      | relnamespace | reltype | reloftype | relowner | relam | relfilenode | reltablespace | relpages | reltuples | relallvisible | reltoastrelid | relhasindex | relisshared | relpersistence | relkind | relnatts | relchecks | relhasrules | relhastriggers | relhassubclass | relrowsecurity | relforcerowsecurity | relispopulated | relreplident | relispartition | relrewrite | relsgid | relfrozenxid | relminmxid | relacl | reloptions | relpartbound 
+-------+------------------+--------------+---------+-----------+----------+-------+-------------+---------------+----------+-----------+---------------+---------------+-------------+-------------+----------------+---------+----------+-----------+-------------+----------------+----------------+----------------+---------------------+----------------+--------------+----------------+------------+---------+--------------+------------+--------+------------+--------------
+ 16495 | test_t_worldwide |         2200 |   16497 |         0 |       10 |     2 |       16495 |             0 |        0 |        -1 |             0 |             0 | f           | f           | p              | r       |        2 |         0 | f           | f              | f              | f              | f                   | t              | d            | f              |          0 |   16491 |          787 |          1 |        |            | 
+(1 row)
+
+DROP TABLE test_t_worldwide;
+--check non-default shard group
+CREATE SHARD GROUP sg_test_2;
+SELECT * FROM pg_shardgroups;
+  oid  |  sgname   | sgowner | sgoptions 
+-------+-----------+---------+-----------
+ 16491 | sg_test   |      10 | 
+ 16498 | sg_test_2 |      10 | 
+(2 rows)
+
+CREATE WORLDWIDE TABLE test_t_worldwide (a int, b int) SHARD GROUP sg_test_2;
+NOTICE:  WORLDWIDE table not yet fully implemented
+DETAIL:  Table will be created as worldwide table.
+CREATE TABLE test_t_distribute (a int, b int) DISTRIBUTED BY LIST(a) SHARD GROUP sg_test_2;
+NOTICE:  DISTRIBUTED BY clause not yet fully implemented
+DETAIL:  Table will be created as distributed table.
+CREATE TABLE test_t_distribute_1 PARTITION OF test_t_distribute FOR VALUES IN (1,2,3);
+CREATE INDEX test_idx_worldwide ON test_t_worldwide(a);
+CREATE INDEX test_idx_distribute ON test_t_distribute(a);
+SELECT relname, relkind, relsgid, relispartition FROM pg_class WHERE relname IN ('test_t_worldwide', 'test_t_distribute', 'test_t_distribute_1', 'test_idx_worldwide', 'test_idx_distribute') ORDER BY relname;
+       relname       | relkind | relsgid | relispartition 
+---------------------+---------+---------+----------------
+ test_idx_distribute | I       |   16498 | f
+ test_idx_worldwide  | i       |   16498 | f
+ test_t_distribute   | p       |   16498 | f
+ test_t_distribute_1 | r       |   16498 | t
+ test_t_worldwide    | r       |   16498 | f
+(5 rows)
+
+-- Test \dt command to verify table type display
+\dt test_t_*
+                   List of relations
+ Schema |       Name        |        Type         | Owner  
+--------+-------------------+---------------------+--------
+ public | test_t_distribute | distributed table   | runner
+ public | test_t_worldwide  | worldwide table     | runner
+(2 rows)
+
+-- Test \d command to verify detailed table type display
+\d test_t_worldwide
+            Worldwide table "public.test_t_worldwide"
+ Column |  Type   | Collation | Nullable | Default 
+--------+---------+-----------+----------+---------
+ a      | integer |           |          | 
+ b      | integer |           |          | 
+Indexes:
+    "test_idx_worldwide" btree (a)
+
+\d test_t_distribute
+       Distributed table "public.test_t_distribute"
+ Column |  Type   | Collation | Nullable | Default 
+--------+---------+-----------+----------+---------
+ a      | integer |           |          | 
+ b      | integer |           |          | 
+Partition key: LIST (a)
+Indexes:
+    "test_idx_distribute" btree (a)
+Number of partitions: 1 (Use \d+ to list them.)
+
+\d test_t_distribute_1
+       Distributed partition "public.test_t_distribute_1"
+ Column |  Type   | Collation | Nullable | Default 
+--------+---------+-----------+----------+---------
+ a      | integer |           |          | 
+ b      | integer |           |          | 
+Partition of: test_t_distribute FOR VALUES IN (1, 2, 3)
+
+\d test_idx_worldwide
+    Worldwide index "public.test_idx_worldwide"
+ Column |  Type   | Collation | Nullable | Default 
+--------+---------+-----------+----------+---------
+ a      | integer |           |          | 
+btree, for table "public.test_t_worldwide"
+
+\d test_idx_distribute
+    Distributed index "public.test_idx_distribute"
+ Column |  Type   | Collation | Nullable | Default 
+--------+---------+-----------+----------+---------
+ a      | integer |           |          | 
+btree, for table "public.test_t_distribute"
+
+SELECT * FROM pg_shardgroups;
+  oid  |  sgname   | sgowner | sgoptions 
+-------+-----------+---------+-----------
+ 16491 | sg_test   |      10 | 
+ 16498 | sg_test_2 |      10 | 
+(2 rows)
+
+SELECT * FROM pg_shardmembers;
+  oid  | sgid  | srvid | smpriority | smstate | smoptions 
+-------+-------+-------+------------+---------+-----------
+ 16494 | 16491 | 16492 |        100 | u       | 
+(1 row)
+
+-- Test DROP MEMBER restriction when foreign tables depend on the member
+-- Create a server to act as data source
+CREATE SERVER data_source
+    FOREIGN DATA WRAPPER postgres_fdw
+    OPTIONS (host 'localhost', dbname 'regression', port '5432');
+-- Create a foreign table pointing to data_source
+CREATE FOREIGN TABLE test_foreign_data (id int, data text) SERVER data_source;
+-- Assign it to sg_test_2 shard group (which has no members yet)
+ALTER TABLE test_foreign_data SET (relsgid = (SELECT oid FROM pg_shardgroups WHERE sgname = 'sg_test_2'));
+-- Add data_source as a member to sg_test_2
+ALTER SHARD GROUP sg_test_2 ADD MEMBER data_source;
+-- Try to drop data_source from sg_test_2 - should fail due to foreign table dependency
+ALTER SHARD GROUP sg_test_2 DROP MEMBER data_source;
+ERROR:  cannot drop shard member "data_source" from shard group "sg_test_2"
+DETAIL:  Foreign tables depend on this member: public.test_foreign_data
+HINT:  Drop or reassign the dependent foreign tables first.
+-- Clean up the foreign table first
+DROP FOREIGN TABLE test_foreign_data;
+-- Now dropping should succeed
+ALTER SHARD GROUP sg_test_2 DROP MEMBER data_source;
+-- Clean up the server
+DROP SERVER data_source;
+DROP SHARD GROUP sg_test_2;
+SELECT * FROM pg_shardgroups;
+  oid  | sgname  | sgowner | sgoptions 
+-------+---------+---------+-----------
+ 16491 | sg_test |      10 | 
+(1 row)
+
+SELECT * FROM pg_shardmembers;
+  oid  | sgid  | srvid | smpriority | smstate | smoptions 
+-------+-------+-------+------------+---------+-----------
+ 16494 | 16491 | 16492 |        100 | u       | 
+(1 row)
+
+DROP SHARD GROUP sg_test;
+SELECT * FROM pg_shardgroups;
+ oid | sgname | sgowner | sgoptions 
+-----+--------+---------+-----------
+(0 rows)
+
+SELECT * FROM pg_shardmembers;
+ oid | sgid | srvid | smpriority | smstate | smoptions 
+-----+------+-------+------------+---------+-----------
+(0 rows)
+

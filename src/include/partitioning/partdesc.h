@@ -65,11 +65,13 @@ typedef struct PartitionDescData
 
 
 extern PartitionDesc RelationGetPartitionDesc(Relation rel, bool omit_detached);
-
+extern PartitionBoundSpec *
+RelationGetPartitionBoundSpec(Relation rel, Oid inhrelid);
 extern PartitionDirectory CreatePartitionDirectory(MemoryContext mcxt, bool omit_detached);
 extern PartitionDesc PartitionDirectoryLookup(PartitionDirectory, Relation);
 extern void DestroyPartitionDirectory(PartitionDirectory pdir);
 
 extern Oid	get_default_oid_from_partdesc(PartitionDesc partdesc);
+
 
 #endif							/* PARTCACHE_H */

@@ -40,6 +40,7 @@
 #include "catalog/pg_collation.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_db_role_setting.h"
+#include "catalog/pg_shardgroups.h"
 #include "catalog/pg_subscription.h"
 #include "catalog/pg_tablespace.h"
 #include "commands/comment.h"
@@ -47,6 +48,7 @@
 #include "commands/dbcommands_xlog.h"
 #include "commands/defrem.h"
 #include "commands/seclabel.h"
+#include "commands/shardgroupcmds.h"
 #include "commands/tablespace.h"
 #include "common/file_perm.h"
 #include "mb/pg_wchar.h"
@@ -2342,6 +2344,7 @@ AlterDatabase(ParseState *pstate, AlterDatabaseStmt *stmt, bool isTopLevel)
 	DefElem    *dallowconnections = NULL;
 	DefElem    *dconnlimit = NULL;
 	DefElem    *dtablespace = NULL;
+	DefElem    *dshardgroup = NULL;
 	Datum		new_record[Natts_pg_database] = {0};
 	bool		new_record_nulls[Natts_pg_database] = {0};
 	bool		new_record_repl[Natts_pg_database] = {0};
@@ -2375,6 +2378,12 @@ AlterDatabase(ParseState *pstate, AlterDatabaseStmt *stmt, bool isTopLevel)
 				errorConflictingDefElem(defel, pstate);
 			dtablespace = defel;
 		}
+		else if (strcmp(defel->defname, "shardgroup") == 0)
+		{
+			if (dshardgroup)
+				errorConflictingDefElem(defel, pstate);
+			dshardgroup = defel;
+		}
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
@@ -2399,6 +2408,65 @@ AlterDatabase(ParseState *pstate, AlterDatabaseStmt *stmt, bool isTopLevel)
 		PreventInTransactionBlock(isTopLevel, "ALTER DATABASE SET TABLESPACE");
 		movedb(stmt->dbname, defGetString(dtablespace));
 		return InvalidOid;
+	}
+
+	if (dshardgroup)
+	{
+		Oid			sgoid;
+		Oid			db_oid;
+
+		/*
+		 * While the SET DEFAULT SHARD GROUP syntax doesn't allow any other options,
+		 * somebody could write "WITH SHARD GROUP ...".  Forbid any other
+		 * options from being specified in that case.
+		 */
+		if (list_length(stmt->options) != 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("option \"%s\" cannot be specified with other options",
+							dshardgroup->defname),
+					 parser_errposition(pstate, dshardgroup->location)));
+		
+		/* Get shard group OID */
+		sgoid = get_shardgroup_oid(defGetString(dshardgroup), false);
+		db_oid = get_database_oid(stmt->dbname, false);
+		
+		/* Check permissions */
+		if (!superuser())
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("permission denied to set default shard group"),
+					 errhint("Must be superuser to set default shard group for a database.")));
+		
+		/* Update the database's default shard group */
+		rel = table_open(DatabaseRelationId, RowExclusiveLock);
+		ScanKeyInit(&scankey,
+					Anum_pg_database_datname,
+					BTEqualStrategyNumber, F_NAMEEQ,
+					CStringGetDatum(stmt->dbname));
+		scan = systable_beginscan(rel, DatabaseNameIndexId, true,
+								  NULL, 1, &scankey);
+		tuple = systable_getnext(scan);
+		if (!HeapTupleIsValid(tuple))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_DATABASE),
+					 errmsg("database \"%s\" does not exist", stmt->dbname)));
+		LockTuple(rel, &tuple->t_self, InplaceUpdateTupleLock);
+		
+		new_record[Anum_pg_database_datshardgroup - 1] = ObjectIdGetDatum(sgoid);
+		new_record_repl[Anum_pg_database_datshardgroup - 1] = true;
+		
+		newtuple = heap_modify_tuple(tuple, RelationGetDescr(rel), new_record,
+									 new_record_nulls, new_record_repl);
+		CatalogTupleUpdate(rel, &tuple->t_self, newtuple);
+		UnlockTuple(rel, &tuple->t_self, InplaceUpdateTupleLock);
+		
+		InvokeObjectPostAlterHook(DatabaseRelationId, db_oid, 0);
+		
+		systable_endscan(scan);
+		table_close(rel, NoLock);
+		
+		return db_oid;
 	}
 
 	if (distemplate && distemplate->arg)
